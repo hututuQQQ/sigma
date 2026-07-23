@@ -103,6 +103,44 @@ const diagnosticSchema = z.discriminatedUnion("kind", [
   }).strict(),
   z.object({ kind: z.literal("recovery.retry_model"), message: nonEmptyStringSchema }).strict(),
   z.object({
+    kind: z.literal("runtime.dependency_observed"),
+    protocolVersion: z.literal(1),
+    callId: nonEmptyStringSchema,
+    toolName: z.enum(["exec", "validate", "process_spawn"]),
+    requestedExecutable: nonEmptyStringSchema,
+    failureCode: z.enum(["executable_not_found", "executable_unavailable"]),
+    runtimeClosureDigest: nonEmptyStringSchema,
+    opportunityId: nonEmptyStringSchema,
+    recoveryAvailable: z.boolean()
+  }).strict(),
+  z.object({
+    kind: z.literal("runtime.dependency_prepared"),
+    protocolVersion: z.literal(1),
+    callId: nonEmptyStringSchema,
+    requestedExecutable: nonEmptyStringSchema,
+    opportunityId: nonEmptyStringSchema,
+    previousRuntimeClosureDigest: nonEmptyStringSchema,
+    runtimeClosureDigest: nonEmptyStringSchema
+  }).strict(),
+  z.object({
+    kind: z.literal("runtime.dependency_reprobed"),
+    protocolVersion: z.literal(1),
+    callId: nonEmptyStringSchema,
+    toolName: z.enum(["exec", "validate", "process_spawn"]),
+    requestedExecutable: nonEmptyStringSchema,
+    opportunityId: nonEmptyStringSchema,
+    runtimeClosureDigest: nonEmptyStringSchema,
+    ok: z.boolean(),
+    failureCode: nonEmptyStringSchema.optional()
+  }).strict(),
+  z.object({
+    kind: z.literal("tool.batch_settled"),
+    callId: nonEmptyStringSchema,
+    ok: z.boolean(),
+    evidenceIds: z.array(nonEmptyStringSchema),
+    diagnosticCodes: z.array(nonEmptyStringSchema)
+  }).strict(),
+  z.object({
     kind: z.literal("deadline.stage"),
     stage: z.enum(["normal", "converge", "stop"]),
     budgetStage: z.enum(["normal", "converge", "terminal"]).optional(),
@@ -151,6 +189,7 @@ export const coreEventPayloadSchemas = {
     writeScope: z.array(z.string()),
     strictWriteScope: z.boolean(),
     modelRole: sharedSchemas.modelExecutionRoleSchema,
+    budgetLimits: sharedSchemas.budgetLimitsSchema.optional(),
     parentSessionId: nonEmptyStringSchema.optional()
   }).strict(),
   "run.started": z.object({ mode: runModeSchema, deadlineAt: dateTimeSchema }).strict(),
@@ -177,6 +216,8 @@ export const coreEventPayloadSchemas = {
     code: nonEmptyStringSchema,
     message: z.string(),
     resumeToken: z.string().optional(),
+    failureKind: z.literal("blocked").optional(),
+    failureCode: nonEmptyStringSchema.optional(),
     outcomeRevision: z.number().int().nonnegative().optional()
   }).strict(),
   "user.message": z.object({ text: z.string() }).strict(),

@@ -147,7 +147,24 @@ export function jsonValue(value: unknown): JsonValue {
 }
 
 export function parseArguments(value: string): JsonValue {
-  try { return jsonValue(JSON.parse(value)); } catch { return value; }
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (typeof parsed !== "string") return jsonValue(parsed);
+    // Some OpenAI-compatible providers occasionally serialize the function
+    // arguments object twice. Accept exactly one extra object layer, then let
+    // the ordinary descriptor schema remain the authority. Never recursively
+    // unwrap strings or accept arrays/scalars through this compatibility path.
+    try {
+      const nested = JSON.parse(parsed) as unknown;
+      return nested && typeof nested === "object" && !Array.isArray(nested)
+        ? jsonValue(nested)
+        : parsed;
+    } catch {
+      return parsed;
+    }
+  } catch {
+    return value;
+  }
 }
 
 export function normalizedFinishReason(value: unknown, hasTools: boolean): ModelFinishReason {

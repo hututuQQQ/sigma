@@ -26,7 +26,7 @@ export interface TuiViewActions {
   approve(requestId: string, decision: "allow" | "deny" | "always_allow"): Promise<void>;
   interrupt(): Promise<void>;
   newSession(): Promise<void>;
-  setMode(mode: RunMode): void;
+  setMode(mode: RunMode): Promise<void>;
   stop(): void;
   userAction(): void;
 }

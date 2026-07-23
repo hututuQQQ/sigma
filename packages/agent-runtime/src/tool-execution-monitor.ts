@@ -19,6 +19,7 @@ import type { RuntimeControlService } from "./runtime-control.js";
 import type { RuntimeOptions, RuntimeSession } from "./types.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 import { ACTION_SETTLEMENT_GRACE_MS } from "./convergence-policy.js";
+import { toolTaskControlContext } from "./repository-recovery-context.js";
 
 export interface ToolExecutionMonitorOptions {
   runtime: RuntimeOptions;
@@ -54,6 +55,18 @@ function deadlineBoundedToolTimeoutMs(session: RuntimeSession, descriptor: ToolD
     descriptor.timeoutMs,
     Math.max(1, remainingMs - ACTION_SETTLEMENT_GRACE_MS)
   ));
+}
+
+function requiresToolSettlement(plan: ToolCallPlan): boolean {
+  return plan.exactEffects.some((effect) => [
+    "filesystem.write", "repository.write", "process.spawn", "process.spawn.readonly",
+    "destructive", "validation", "open_world"
+  ].includes(effect));
+}
+
+function observesWorkspace(plan: ToolCallPlan): boolean {
+  return plan.exactEffects.some((effect) =>
+    ["filesystem.write", "destructive", "validation", "open_world"].includes(effect));
 }
 
 export class ToolExecutionMonitor {
@@ -103,12 +116,8 @@ export class ToolExecutionMonitor {
     };
     heartbeat();
     try {
-      const requiresSettlement = plan.exactEffects.some((effect) =>
-        ["filesystem.write", "repository.write", "process.spawn", "process.spawn.readonly", "destructive", "validation", "open_world"]
-          .includes(effect));
-      const observesWorkspace = plan.exactEffects.some((effect) =>
-        ["filesystem.write", "destructive", "validation", "open_world"].includes(effect));
-      const before = observesWorkspace ? await this.gitState(session, controller.signal) : null;
+      const requiresSettlement = requiresToolSettlement(plan);
+      const before = observesWorkspace(plan) ? await this.gitState(session, controller.signal) : null;
       const execution = this.options.runtime.tools.execute({
         callId: call.id, name: call.name, arguments: call.arguments
       }, {
@@ -116,6 +125,7 @@ export class ToolExecutionMonitor {
         runId: session.durable.runId,
         workspacePath: session.identity.workspacePath,
         runMode: session.durable.mode,
+        ...toolTaskControlContext(session),
         callPlan: plan,
         ...(approval ? { approval } : {}),
         signal: controller.signal,

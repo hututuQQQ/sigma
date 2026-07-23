@@ -1,5 +1,6 @@
 import type { JsonValue } from "./json.js";
 import type { z } from "zod";
+import type { budgetMutationV1Schema } from "./budget-mutation-schemas.js";
 import type {
   budgetAmountsSchema,
   budgetLedgerStateSchema,
@@ -25,8 +26,12 @@ import type {
   planGraphSchema,
   reviewEvidenceSchema,
   repositoryDeltaEvidenceSchema,
+  repositoryAcceptanceEvidenceV1Schema,
+  repositoryRecoveryDecisionEvidenceV1Schema,
+  repositoryRecoverySelectionEvidenceV1Schema,
   usageRecordSchema,
   userWaiverEvidenceSchema,
+  workspaceRestorationEvidenceV1Schema,
   validationEvidenceSchema,
   workspaceDeltaEvidenceSchema
 } from "./domain-schemas.js";
@@ -55,6 +60,13 @@ export type CheckpointDelta = z.infer<typeof checkpointDeltaSchema>;
 export type OpaqueArtifactEvidence = z.infer<typeof opaqueArtifactEvidenceSchema>;
 export type WorkspaceDeltaEvidence = z.infer<typeof workspaceDeltaEvidenceSchema>;
 export type RepositoryDeltaEvidence = z.infer<typeof repositoryDeltaEvidenceSchema>;
+export type RepositoryRecoverySelectionEvidenceV1 = z.infer<
+  typeof repositoryRecoverySelectionEvidenceV1Schema
+>;
+export type RepositoryRecoveryDecisionEvidenceV1 = z.infer<
+  typeof repositoryRecoveryDecisionEvidenceV1Schema
+>;
+export type RepositoryAcceptanceEvidenceV1 = z.infer<typeof repositoryAcceptanceEvidenceV1Schema>;
 export type MutationFrontier = z.infer<typeof mutationFrontierSchema>;
 export type CommandEvidence = z.infer<typeof commandEvidenceSchema>;
 export type ValidationEvidence = z.infer<typeof validationEvidenceSchema>;
@@ -64,6 +76,7 @@ export type ReviewEvidence = z.infer<typeof reviewEvidenceSchema>;
 export type CheckpointEvidence = z.infer<typeof checkpointEvidenceSchema>;
 export type ChildOutcomeEvidence = z.infer<typeof childOutcomeEvidenceSchema>;
 export type UserWaiverEvidence = z.infer<typeof userWaiverEvidenceSchema>;
+export type WorkspaceRestorationEvidenceV1 = z.infer<typeof workspaceRestorationEvidenceV1Schema>;
 export type EvidenceRecord = z.infer<typeof evidenceRecordSchema>;
 export type EvidenceRef = z.infer<typeof evidenceRefSchema>;
 
@@ -86,6 +99,7 @@ export type BudgetLimits = z.infer<typeof budgetLimitsSchema>;
 export type BudgetReservation = z.infer<typeof budgetReservationSchema>;
 export type BudgetReservationStatus = BudgetReservation["status"];
 export type BudgetLedgerState = z.infer<typeof budgetLedgerStateSchema>;
+export type BudgetMutationV1 = z.infer<typeof budgetMutationV1Schema>;
 
 export const DEFAULT_ROOT_BUDGET_LIMITS: BudgetLimits = {
   inputTokens: 8_000_000,

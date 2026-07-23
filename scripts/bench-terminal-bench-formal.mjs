@@ -1,279 +1,462 @@
 #!/usr/bin/env node
-import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { constants } from "node:fs";
+import { mkdir, open, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import {
   assertComparableBenchmarkReports,
   benchRootDir,
+  defaultAgentCliTarball,
   laneMetrics,
   parseArgs,
+  rootDir,
   safePathPart,
   writeJson
 } from "./bench-common.mjs";
+import {
+  assertFrozenBatchControls,
+  canonicalJson,
+  loadFormalPreregistration,
+  sha256,
+  validateFormalPreregistration
+} from "./bench-terminal-bench-formal-preregistration.mjs";
 import { runTerminalBenchCli } from "./bench-terminal-bench.mjs";
 
-const COUNT_KEYS = ["passed", "failed", "infra_failed", "timeout", "api_error", "unknown"];
-const FAILURE_CATEGORIES = [
-  "verifier_failed", "agent_setup_failed", "agent_timeout", "api_error", "agent_crashed", "unknown"
-];
+const execFileAsync = promisify(execFile);
+const ALLOWED_FLAGS = new Set([
+  "preregistration-file", "expected-preregistration-sha256", "output", "batch", "resume"
+]);
 
-function positiveInteger(value, fallback, name) {
-  const parsed = Number.parseInt(String(value ?? fallback), 10);
-  if (!Number.isSafeInteger(parsed) || parsed < 1) throw new Error(`${name} must be a positive integer.`);
-  return parsed;
-}
-
-function requiredString(value, name) {
-  if (typeof value !== "string" || value.trim().length === 0) throw new Error(`${name} is required.`);
+function requiredString(value, label) {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error(`${label} is required.`);
+  }
   return value.trim();
 }
 
-function digest(value, name, length) {
-  const text = requiredString(value, name).toLowerCase();
-  if (!new RegExp(`^[a-f0-9]{${length}}$`, "u").test(text)) {
-    throw new Error(`${name} must be a ${length}-character lowercase hexadecimal digest.`);
+function formalOptions(argv) {
+  const flags = parseArgs(argv);
+  const unknown = Object.keys(flags).filter((key) => key !== "_" && !ALLOWED_FLAGS.has(key));
+  if (unknown.length > 0 || flags._.length > 0) {
+    throw new Error(`Unsupported formal runner arguments: ${[...unknown, ...flags._].join(", ")}.`);
   }
-  return text;
-}
-
-function portableTaskPath(value, label) {
-  const text = requiredString(value, label).replaceAll("\\", "/");
-  if (path.posix.isAbsolute(text) || text.split("/").includes("..")) {
-    throw new Error(`${label} must be a portable relative path.`);
+  if (flags.resume !== undefined && flags.resume !== true) {
+    throw new Error("--resume is a boolean flag.");
   }
-  return text;
-}
-
-function taskRecord(task, plan, batchIndex, taskIndex) {
-  if (!task || typeof task !== "object" || Array.isArray(task)) {
-    throw new Error(`batches[${batchIndex}].tasks[${taskIndex}] must be an object.`);
-  }
-  const taskPath = portableTaskPath(
-    task.task_path ?? task.path,
-    `batches[${batchIndex}].tasks[${taskIndex}].task_path`
-  );
   return {
-    path: taskPath,
-    git_url: plan.taskRepo,
-    git_commit_id: plan.taskCommit,
-    source: plan.source
+    preregistrationFile: path.resolve(requiredString(
+      flags["preregistration-file"], "--preregistration-file"
+    )),
+    expectedPreregistrationSha256: requiredString(
+      flags["expected-preregistration-sha256"], "--expected-preregistration-sha256"
+    ).toLowerCase(),
+    outputDir: flags.output ? path.resolve(requiredString(flags.output, "--output")) : null,
+    batchId: requiredString(flags.batch, "--batch"),
+    resume: flags.resume === true
   };
 }
 
-export function validateFormalPlan(input, options) {
-  if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("Formal plan must be an object.");
-  const taskCommit = digest(input.task_commit, "plan.task_commit", 40);
-  if (taskCommit !== options.taskCommit) throw new Error("Formal plan task commit does not match --task-commit.");
-  const normalized = {
-    taskRepo: requiredString(input.task_repo, "plan.task_repo"),
-    taskCommit,
-    source: safePathPart(input.benchmark ?? "external-task-plan"),
-    batches: []
-  };
-  if (!Array.isArray(input.batches) || input.batches.length !== options.expectedBatches) {
-    throw new Error(`Formal plan must contain exactly ${options.expectedBatches} batches.`);
+async function gitOutput(args, cwd) {
+  try {
+    const result = await execFileAsync("git", args, {
+      cwd,
+      encoding: "utf8",
+      windowsHide: true,
+      maxBuffer: 16 * 1024 * 1024
+    });
+    return String(result.stdout).trim();
+  } catch (error) {
+    throw new Error(`Unable to verify frozen source with git ${args.join(" ")}.`, { cause: error });
   }
-  normalized.batches = input.batches.map((batch, batchIndex) => {
-    if (!batch || !Array.isArray(batch.tasks)) throw new Error(`batches[${batchIndex}].tasks must be an array.`);
-    const expectedSize = batchIndex === input.batches.length - 1
-      ? options.expectedTasks - options.batchSize * (options.expectedBatches - 1)
-      : options.batchSize;
-    if (batch.tasks.length !== expectedSize) {
-      throw new Error(`Batch ${batchIndex + 1} must contain exactly ${expectedSize} tasks.`);
+}
+
+export async function assertFormalSource(source, cwd = rootDir) {
+  const revision = await gitOutput(["rev-parse", "HEAD"], cwd);
+  if (revision !== source.revision) {
+    throw new Error(`Frozen source revision ${source.revision} does not match current HEAD ${revision}.`);
+  }
+  const status = await gitOutput(["status", "--porcelain=v1", "--untracked-files=all"], cwd);
+  if (status.length > 0) throw new Error("Formal evaluation requires the frozen source worktree to be clean.");
+}
+
+export async function assertFormalArchive(expectedSha256, archivePath = null) {
+  const target = path.resolve(archivePath ?? process.env.AGENT_CLI_TARBALL ?? defaultAgentCliTarball);
+  let bytes;
+  try {
+    bytes = await readFile(target);
+  } catch (error) {
+    throw new Error(`Frozen agent archive is unavailable at ${target}.`, { cause: error });
+  }
+  const observed = sha256(bytes);
+  if (observed !== expectedSha256) {
+    throw new Error(`Frozen agent archive SHA-256 ${observed} does not match ${expectedSha256}.`);
+  }
+  return target;
+}
+
+function batchPaths(outputDir, batchId) {
+  const safeId = safePathPart(batchId);
+  return {
+    started: path.join(outputDir, `batch-${safeId}.started.json`),
+    completed: path.join(outputDir, `batch-${safeId}.completed.json`),
+    tasks: path.join(outputDir, `batch-${safeId}.tasks.json`)
+  };
+}
+
+async function readJsonIfPresent(filePath) {
+  try {
+    return JSON.parse(await readFile(filePath, "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw new Error(`Formal run state ${filePath} is unreadable.`, { cause: error });
+  }
+}
+
+async function writeExclusiveJson(filePath, value) {
+  const handle = await open(filePath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+  try {
+    await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function ensureStableJson(filePath, value) {
+  const existing = await readJsonIfPresent(filePath);
+  if (existing === null) {
+    await writeExclusiveJson(filePath, value);
+    return;
+  }
+  if (canonicalJson(existing) !== canonicalJson(value)) {
+    throw new Error(`Formal run state ${filePath} conflicts with the frozen preregistration.`);
+  }
+}
+
+function assertBatchMarker(marker, kind, batch, manifest, preregistrationSha256) {
+  if (!marker || typeof marker !== "object" || Array.isArray(marker)
+    || marker.schemaVersion !== 1 || marker.kind !== kind
+    || marker.formal_run_id !== manifest.formal_run_id
+    || marker.consumption_identity_sha256 !== manifest.consumption_identity_sha256
+    || marker.preregistration_sha256 !== preregistrationSha256
+    || marker.batch !== batch.id
+    || marker.task_selection_sha256 !== batch.task_selection_sha256) {
+    throw new Error(`Formal batch ${batch.id} has a stale or malformed ${kind} receipt.`);
+  }
+}
+
+function batchOperationallyComplete(record, batch) {
+  const report = record?.report;
+  const accounting = report?.trial_accounting;
+  const expected = batch.task_indexes.length;
+  return Boolean(report && report.incomplete_reason === null
+    && record.docker_cleanup?.clean === true
+    && Number(accounting?.expected) === expected
+    && Number(accounting?.observed) === expected
+    && Number(accounting?.missing) === 0
+    && Number(accounting?.errored) === 0);
+}
+
+async function completedBatchRecords(outputDir, manifest, preregistrationSha256) {
+  const records = [];
+  let incompleteStarted = null;
+  let incompleteCompleted = null;
+  for (const batch of manifest.execution.batches) {
+    const files = batchPaths(outputDir, batch.id);
+    const [started, completed] = await Promise.all([
+      readJsonIfPresent(files.started), readJsonIfPresent(files.completed)
+    ]);
+    if ((started || completed) && (incompleteStarted || incompleteCompleted)) {
+      throw new Error("Formal batch receipts are not an append-only successful prefix of the preregistration.");
     }
-    return {
-      id: String(batch.batch ?? batchIndex + 1).padStart(3, "0"),
-      tasks: batch.tasks.map((task, taskIndex) => taskRecord(task, normalized, batchIndex, taskIndex))
-    };
-  });
-  const tasks = normalized.batches.flatMap((batch) => batch.tasks);
-  if (tasks.length !== options.expectedTasks) throw new Error("Formal plan task count mismatch.");
-  const identities = tasks.map((task) => `${task.git_url}\0${task.git_commit_id}\0${task.path}`);
-  if (new Set(identities).size !== identities.length) throw new Error("Formal plan contains duplicate tasks.");
-  return normalized;
+    if (completed && !started) {
+      throw new Error(`Formal batch ${batch.id} has a completion receipt without its started marker.`);
+    }
+    if (started) {
+      assertBatchMarker(
+        started, "SigmaFormalBatchStartedV1", batch, manifest, preregistrationSha256
+      );
+    }
+    if (started && !completed) {
+      incompleteStarted = batch.id;
+      continue;
+    }
+    if (completed) {
+      assertBatchMarker(
+        completed, "SigmaFormalBatchCompletedV1", batch, manifest, preregistrationSha256
+      );
+      if (completed.started_at !== started.started_at) {
+        throw new Error(`Formal batch ${batch.id} completion receipt does not bind its started marker.`);
+      }
+      records.push(completed);
+      if (!batchOperationallyComplete(completed, batch)) incompleteCompleted = batch.id;
+    }
+  }
+  return { records, incompleteStarted, incompleteCompleted };
 }
 
-function number(value) {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : 0;
+function selectedTasks(manifest, batch) {
+  return batch.task_indexes.map((index) => manifest.task_selection.tasks[index]);
 }
 
-function aggregateCounts(reports) {
-  return Object.fromEntries(COUNT_KEYS.map((key) => [
-    key, reports.reduce((total, report) => total + number(report.counts?.[key]), 0)
+function sumReports(reports, pathParts) {
+  return reports.reduce((total, report) => {
+    let value = report;
+    for (const part of pathParts) value = value?.[part];
+    const number = Number(value);
+    return total + (Number.isFinite(number) ? number : 0);
+  }, 0);
+}
+
+function aggregateNumericObjects(reports, key) {
+  const keys = new Set(reports.flatMap((report) => Object.keys(report?.[key] ?? {})));
+  return Object.fromEntries([...keys].sort().map((item) => [
+    item, sumReports(reports, [key, item])
   ]));
 }
 
-function categoryCounts(tasks) {
-  const counts = Object.fromEntries(FAILURE_CATEGORIES.map((key) => [key, 0]));
-  for (const task of tasks.filter((item) => item.status !== "passed")) {
-    const category = Object.hasOwn(counts, task.failure_category) ? task.failure_category : "unknown";
-    counts[category] += 1;
+function aggregateFailureCategories(reports) {
+  const counts = {};
+  for (const report of reports) {
+    for (const task of report.tasks ?? []) {
+      if (task.status === "passed") continue;
+      const category = task.failure_category ?? "unknown";
+      counts[category] = (counts[category] ?? 0) + 1;
+    }
   }
-  return counts;
+  return Object.fromEntries(Object.entries(counts).sort(([left], [right]) => left.localeCompare(right)));
 }
 
-export function aggregateFormalReports(plan, batchRecords, minimumPasses) {
+export function aggregateFormalReports(manifest, batchRecords) {
   const reports = batchRecords.map((record) => record.report).filter(Boolean);
-  assertComparableBenchmarkReports(...reports);
-  const agentProfile = reports.find((report) => report.agent_profile)?.agent_profile ?? null;
-  const evaluationLane = reports.find((report) => report.evaluation_lane)?.evaluation_lane ?? null;
+  if (reports.length > 1) assertComparableBenchmarkReports(...reports);
   const tasks = batchRecords.flatMap((record) => (
-    record.report?.tasks ?? []
-  ).map((task) => ({ batch: record.batch, ...task })));
+    Array.isArray(record.report?.tasks)
+      ? record.report.tasks.map((task) => ({ formal_batch: record.batch, ...task }))
+      : []
+  ));
+  const expected = manifest.task_selection.tasks.length;
   const accounting = {
-    expected: plan.batches.reduce((total, batch) => total + batch.tasks.length, 0),
-    observed: reports.reduce((total, report) => total + number(report.trial_accounting?.observed), 0),
-    scored: reports.reduce((total, report) => total + number(report.trial_accounting?.scored), 0),
-    errored: reports.reduce((total, report) => total + number(report.trial_accounting?.errored), 0),
-    missing: reports.reduce((total, report) => total + number(report.trial_accounting?.missing), 0),
+    expected,
+    observed: sumReports(reports, ["trial_accounting", "observed"]),
+    scored: sumReports(reports, ["trial_accounting", "scored"]),
+    errored: sumReports(reports, ["trial_accounting", "errored"]),
+    missing: sumReports(reports, ["trial_accounting", "missing"]),
     meanReward: null
   };
   const rewardTotal = reports.reduce((total, report) => (
-    total + number(report.trial_accounting?.meanReward) * number(report.trial_accounting?.scored)
+    total + Number(report.trial_accounting?.meanReward ?? 0)
+      * Number(report.trial_accounting?.scored ?? 0)
   ), 0);
   if (accounting.scored > 0) accounting.meanReward = rewardTotal / accounting.scored;
-  const counts = aggregateCounts(reports);
-  const usage = reports.reduce((total, report) => ({
-    input_tokens: total.input_tokens + number(report.usage?.input_tokens),
-    cache_tokens: total.cache_tokens + number(report.usage?.cache_tokens),
-    output_tokens: total.output_tokens + number(report.usage?.output_tokens)
-  }), { input_tokens: 0, cache_tokens: 0, output_tokens: 0 });
-  const complete = batchRecords.length === plan.batches.length
-    && reports.length === plan.batches.length
-    && accounting.observed === accounting.expected
+  const allBatchesRecorded = batchRecords.length === manifest.execution.batches.length;
+  const executionComplete = allBatchesRecorded
+    && reports.length === manifest.execution.batches.length
+    && accounting.observed === expected
+    && accounting.errored === 0
     && accounting.missing === 0
-    && reports.every((report) => report.incomplete_reason === null);
+    && reports.every((report) => report.incomplete_reason === null)
+    && batchRecords.every((record) => {
+      const batch = manifest.execution.batches.find((item) => item.id === record.batch);
+      return batch && batchOperationallyComplete(record, batch);
+    });
+  const status = allBatchesRecorded ? executionComplete ? "complete" : "incomplete" : "running";
+  const usage = aggregateNumericObjects(reports, "usage");
   return {
-    schemaVersion: 1,
-    status: complete ? "complete" : "incomplete",
-    acceptance: complete && counts.passed >= minimumPasses ? "passed" : "failed",
-    agent_profile: agentProfile,
-    evaluation_lane: evaluationLane,
-    lane_metrics: laneMetrics(tasks, evaluationLane),
-    minimum_passes: minimumPasses,
-    batches: { expected: plan.batches.length, completed: reports.length },
+    schemaVersion: 2,
+    kind: "SigmaFormalRunReportV2",
+    formal_run_id: manifest.formal_run_id,
+    consumption_identity_sha256: manifest.consumption_identity_sha256,
+    status,
+    agent_profile: reports.find((report) => report.agent_profile)?.agent_profile ?? null,
+    evaluation_lane: reports.find((report) => report.evaluation_lane)?.evaluation_lane ?? null,
+    model: manifest.model,
+    execution: manifest.execution,
+    task_selection_sha256: manifest.task_selection.task_selection_sha256,
+    batches: {
+      expected: manifest.execution.batches.length,
+      completed: batchRecords.length
+    },
     trial_accounting: accounting,
-    counts,
-    failure_categories: categoryCounts(tasks),
+    counts: aggregateNumericObjects(reports, "counts"),
+    failure_categories: aggregateFailureCategories(reports),
+    lane_metrics: laneMetrics(tasks, reports[0]?.evaluation_lane ?? null),
     usage,
-    cost_usd: reports.reduce((total, report) => total + number(report.cost_usd), 0),
+    cost_usd: sumReports(reports, ["cost_usd"]),
     tasks
   };
 }
 
 function formalMarkdown(report) {
-  return [
-    "# Sigma Formal Benchmark Report", "",
+  const passCount = Number(report.counts?.passed ?? 0);
+  const lines = [
+    "# Sigma Formal Evaluation Report",
+    "",
     `- Status: ${report.status}`,
-    `- Acceptance: ${report.acceptance}`,
-    `- Agent profile: ${report.agent_profile ?? "unknown"}`,
-    `- Evaluation lane: ${report.evaluation_lane ?? "unknown"}`,
-    `- Lane metrics: ${JSON.stringify(report.lane_metrics)}`,
-    `- Passed: ${report.counts.passed}/${report.trial_accounting.expected}`,
-    `- Missing: ${report.trial_accounting.missing}`,
-    `- Verifier failed: ${report.failure_categories.verifier_failed}`,
-    `- Setup error: ${report.failure_categories.agent_setup_failed}`,
-    `- Timeout: ${report.failure_categories.agent_timeout}`,
-    `- API error: ${report.failure_categories.api_error}`,
-    `- Agent crash: ${report.failure_categories.agent_crashed}`,
-    `- Input/cache/output tokens: ${report.usage.input_tokens}/${report.usage.cache_tokens}/${report.usage.output_tokens}`,
-    `- Cost USD: ${report.cost_usd}`, ""
-  ].join("\n");
+    `- Formal run: ${report.formal_run_id}`,
+    `- Preregistration SHA-256: ${report.preregistration_sha256 ?? "unavailable"}`,
+    `- Model: ${report.model.provider}/${report.model.name}`,
+    `- Completed batches: ${report.batches.completed}/${report.batches.expected}`,
+    `- Observed trials: ${report.trial_accounting.observed}/${report.trial_accounting.expected}`,
+    `- Verifier passes: ${passCount}`,
+    `- Verifier reach/pass rate: ${report.lane_metrics.verifier_reached}/${report.lane_metrics.verifier_pass_rate ?? "n/a"}`,
+    `- Counts: ${JSON.stringify(report.counts)}`,
+    `- Failure categories: ${JSON.stringify(report.failure_categories)}`,
+    `- Cost USD: ${report.cost_usd}`,
+    ""
+  ];
+  return lines.join("\n");
 }
 
-function formalOptions(argv) {
-  const flags = parseArgs(argv);
-  const now = new Date().toISOString().replace(/[-:]/gu, "").replace(/\..+$/u, "Z");
-  return {
-    planPath: path.resolve(requiredString(flags.plan, "--plan")),
-    taskCommit: digest(flags["task-commit"], "--task-commit", 40),
-    archiveSha256: digest(flags["archive-sha256"], "--archive-sha256", 64),
-    expectedTasks: positiveInteger(flags["expected-tasks"], 89, "--expected-tasks"),
-    expectedBatches: positiveInteger(flags["expected-batches"], 18, "--expected-batches"),
-    batchSize: positiveInteger(flags["batch-size"], 5, "--batch-size"),
-    minimumPasses: positiveInteger(flags["minimum-passes"], 55, "--minimum-passes"),
-    concurrency: positiveInteger(flags.concurrency, 5, "--concurrency"),
-    provider: String(flags.provider ?? "deepseek"),
-    model: String(flags.model ?? "deepseek-v4-pro"),
-    outputDir: path.resolve(flags.output ?? path.join(benchRootDir, "formal", now)),
-    resume: flags.resume === true,
-    batchId: requiredString(flags.batch, "--batch").padStart(3, "0")
-  };
+async function writeFormalReport(outputDir, manifest, records, preregistrationSha256) {
+  const report = aggregateFormalReports(manifest, records);
+  report.preregistration_sha256 = preregistrationSha256;
+  await writeJson(path.join(outputDir, "report.json"), report);
+  await writeFile(path.join(outputDir, "report.md"), formalMarkdown(report), "utf8");
+  await writeJson(path.join(outputDir, "state.json"), {
+    schemaVersion: 2,
+    kind: "SigmaFormalRunStateV2",
+    formal_run_id: manifest.formal_run_id,
+    consumption_identity_sha256: manifest.consumption_identity_sha256,
+    preregistration_sha256: preregistrationSha256,
+    status: report.status,
+    completed_batches: records.map((record) => record.batch)
+  });
+  return report;
 }
 
-async function initialState(options, planSha256) {
-  const statePath = path.join(options.outputDir, "state.json");
-  if (!existsSync(statePath)) {
-    return {
-      schemaVersion: 1, status: "running", plan_sha256: planSha256,
-      task_commit: options.taskCommit, archive_sha256: options.archiveSha256,
-      provider: options.provider, model: options.model, concurrency: options.concurrency, batches: []
-    };
-  }
-  if (!options.resume) throw new Error("Formal output already exists; pass --resume to continue missing batches only.");
-  const state = JSON.parse(await readFile(statePath, "utf8"));
-  if (state.plan_sha256 !== planSha256 || state.task_commit !== options.taskCommit
-    || state.archive_sha256 !== options.archiveSha256) {
-    throw new Error("Formal resume state does not match the frozen plan or artifacts.");
-  }
-  if (state.batches.some((batch) => batch.status !== "completed")) {
-    throw new Error("Formal state contains an interrupted batch; retrying it is prohibited.");
-  }
-  return state;
-}
-
-async function runBatch(plan, batch, options) {
-  const tasksPath = path.join(options.outputDir, `batch-${batch.id}.tasks.json`);
-  await writeJson(tasksPath, batch.tasks);
-  return await runTerminalBenchCli([
-    "--mode", "batch", "--tasks-file", tasksPath,
-    "--provider", options.provider, "--model", options.model,
-    "--concurrency", String(options.concurrency), "--run-label", `formal-${batch.id}`,
-    "--timeout-leniency-multiplier", "1", "--timeout-leniency-min-extra-sec", "0",
-    "--reuse-package", "--expected-archive-sha256", options.archiveSha256
-  ]);
+async function runBatch(manifest, batch, options, deps) {
+  const files = batchPaths(options.outputDir, batch.id);
+  await ensureStableJson(files.tasks, selectedTasks(manifest, batch));
+  const runner = deps.runTerminalBenchCli ?? runTerminalBenchCli;
+  return await runner([
+    "--mode", "batch",
+    "--tasks-file", files.tasks,
+    "--dataset", manifest.task_selection.dataset,
+    "--provider", manifest.model.provider,
+    "--model", manifest.model.name,
+    "--benchmark-class", manifest.solver_controls.benchmark_class,
+    "--agent-profile", manifest.solver_controls.agent_profile,
+    "--max-turns", String(manifest.solver_controls.max_turns),
+    "--command-timeout-sec", String(manifest.solver_controls.command_timeout_sec),
+    "--agent-timeout-grace-sec", String(manifest.solver_controls.cleanup_grace_sec),
+    "--network", manifest.execution.network_mode,
+    "--execution-mode", manifest.execution.execution_mode,
+    "--managed-environment-mode", manifest.execution.managed_environment_mode,
+    "--harbor-topology", manifest.execution.harbor_topology,
+    "--concurrency", String(manifest.execution.concurrency),
+    "--attempts", String(manifest.execution.attempts_per_task),
+    "--retries", String(manifest.execution.retries),
+    "--timeout-leniency-multiplier", "1",
+    "--timeout-leniency-min-extra-sec", "0",
+    "--run-label", `formal-${safePathPart(manifest.formal_run_id)}-${safePathPart(batch.id)}`,
+    "--reuse-package",
+    "--expected-archive-sha256", manifest.archive_sha256
+  ], {
+    ...(deps.terminalBenchDeps ?? {}),
+    beforeHarborDispatch: deps.beforeHarborDispatch,
+    assertFrozenRunControls: (context) => assertFrozenBatchControls(manifest, batch, context)
+  });
 }
 
 export async function runFormalBenchmark(argv = process.argv.slice(2), deps = {}) {
-  const options = formalOptions(argv);
-  const planBytes = await readFile(options.planPath);
-  const planSha256 = createHash("sha256").update(planBytes).digest("hex");
-  const plan = validateFormalPlan(JSON.parse(planBytes), options);
-  await mkdir(options.outputDir, { recursive: true });
-  const state = await initialState(options, planSha256);
-  await writeJson(path.join(options.outputDir, "frozen-plan.json"), plan);
-  await writeJson(path.join(options.outputDir, "state.json"), state);
-  const runBatchImpl = deps.runBatch ?? runBatch;
-  const batch = plan.batches[state.batches.length];
-  if (!batch) throw new Error("All formal batches are already complete.");
-  if (batch.id !== options.batchId) {
-    throw new Error(`The next formal batch is ${batch.id}; received --batch ${options.batchId}.`);
+  const preliminary = formalOptions(argv);
+  const bundle = await loadFormalPreregistration(
+    preliminary.preregistrationFile, preliminary.expectedPreregistrationSha256
+  );
+  const manifest = bundle.manifest;
+  const outputDir = preliminary.outputDir
+    ?? path.join(benchRootDir, "formal", safePathPart(manifest.formal_run_id));
+  const options = { ...preliminary, outputDir };
+  const verifySource = deps.assertFormalSource ?? assertFormalSource;
+  const verifyArchive = deps.assertFormalArchive ?? assertFormalArchive;
+  await verifySource(manifest.source, rootDir);
+  await verifyArchive(manifest.archive_sha256);
+  await mkdir(outputDir, { recursive: true });
+
+  const frozenPath = path.join(outputDir, "frozen-preregistration.json");
+  const frozen = await readJsonIfPresent(frozenPath);
+  if (frozen) {
+    const validatedFrozen = validateFormalPreregistration(frozen, { baseDir: outputDir });
+    if (validatedFrozen.consumption_identity_sha256 !== manifest.consumption_identity_sha256) {
+      throw new Error("Formal output directory belongs to a different preregistration.");
+    }
+  } else {
+    await writeExclusiveJson(frozenPath, manifest);
   }
-  const started = { batch: batch.id, status: "started", started_at: new Date().toISOString() };
-  state.batches.push(started);
-  await writeJson(path.join(options.outputDir, "state.json"), state);
-  await writeJson(path.join(options.outputDir, "active-batch.json"), started);
-  const result = await runBatchImpl(plan, batch, options);
-  const completed = {
-    batch: batch.id, status: "completed", started_at: started.started_at,
-    finished_at: new Date().toISOString(), runner_exit_code: result.exitCode,
-    run_dir: result.runDir, report: result.report,
-    docker_cleanup: result.dockerCleanup ?? null
+
+  const history = await completedBatchRecords(outputDir, manifest, bundle.sha256);
+  if (history.incompleteStarted) {
+    throw new Error(
+      `Formal batch ${history.incompleteStarted} was already started; retrying a consumed batch is prohibited.`
+    );
+  }
+  if (history.incompleteCompleted) {
+    throw new Error(
+      `Formal batch ${history.incompleteCompleted} completed with infrastructure gaps; later batches are prohibited.`
+    );
+  }
+  if (history.records.length > 0 && !options.resume) {
+    throw new Error("Formal output already contains completed batches; pass --resume for the next frozen batch.");
+  }
+  const nextBatch = manifest.execution.batches[history.records.length];
+  if (!nextBatch) throw new Error("All preregistered formal batches are already complete.");
+  if (options.batchId !== nextBatch.id) {
+    throw new Error(`The next preregistered batch is ${nextBatch.id}; received ${options.batchId}.`);
+  }
+  const files = batchPaths(outputDir, nextBatch.id);
+  let started = null;
+  const beforeHarborDispatch = async () => {
+    if (started) throw new Error(`Formal batch ${nextBatch.id} dispatch boundary was entered more than once.`);
+    started = {
+      schemaVersion: 1,
+      kind: "SigmaFormalBatchStartedV1",
+      formal_run_id: manifest.formal_run_id,
+      consumption_identity_sha256: manifest.consumption_identity_sha256,
+      preregistration_sha256: bundle.sha256,
+      batch: nextBatch.id,
+      task_selection_sha256: nextBatch.task_selection_sha256,
+      started_at: new Date().toISOString()
+    };
+    await writeExclusiveJson(files.started, started);
   };
-  state.batches[state.batches.length - 1] = completed;
-  state.status = state.batches.length === plan.batches.length ? "complete" : "running";
-  await writeJson(path.join(options.outputDir, "state.json"), state);
-  await writeJson(path.join(options.outputDir, "active-batch.json"), completed);
-  const report = aggregateFormalReports(plan, state.batches, options.minimumPasses);
-  await writeJson(path.join(options.outputDir, "report.json"), report);
-  await writeFile(path.join(options.outputDir, "report.md"), formalMarkdown(report), "utf8");
-  const exitCode = state.status === "complete"
-    ? report.acceptance === "passed" ? 0 : 1
-    : result.exitCode;
-  return { options, plan, state, report, exitCode };
+  const result = await (deps.runBatch ?? runBatch)(manifest, nextBatch, options, {
+    ...deps,
+    beforeHarborDispatch
+  });
+  if (!started) {
+    throw new Error(
+      `Formal batch ${nextBatch.id} did not reach Harbor dispatch and remains unconsumed.`
+    );
+  }
+  const completed = {
+    schemaVersion: 1,
+    kind: "SigmaFormalBatchCompletedV1",
+    formal_run_id: manifest.formal_run_id,
+    consumption_identity_sha256: manifest.consumption_identity_sha256,
+    preregistration_sha256: bundle.sha256,
+    batch: nextBatch.id,
+    task_selection_sha256: nextBatch.task_selection_sha256,
+    started_at: started.started_at,
+    finished_at: new Date().toISOString(),
+    runner_exit_code: result.exitCode,
+    run_dir: result.runDir,
+    docker_cleanup: result.dockerCleanup ?? null,
+    report: result.report ?? null
+  };
+  await writeExclusiveJson(files.completed, completed);
+  const records = [...history.records, completed];
+  const report = await writeFormalReport(outputDir, manifest, records, bundle.sha256);
+  const batchComplete = batchOperationallyComplete(completed, nextBatch);
+  return {
+    options,
+    manifest,
+    report,
+    completed,
+    exitCode: batchComplete && report.status !== "incomplete" ? 0 : 1
+  };
 }
 
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);

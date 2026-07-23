@@ -3,6 +3,17 @@ import type { JsonValue } from "agent-protocol";
 
 export interface GitOperation { op: string; [key: string]: JsonValue }
 
+export type GitTransactionAction = "begin" | "continue" | "abort" | "recover";
+
+export interface GitTransactionInput {
+  action: GitTransactionAction;
+  repository: string;
+  operations: GitOperation[];
+  transactionHandle?: string;
+  candidateId?: string;
+  selectionEvidenceId?: string;
+}
+
 export function gitInput(value: JsonValue): Record<string, JsonValue> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("git_transaction arguments must be an object.");
@@ -20,6 +31,80 @@ export function gitOperations(value: JsonValue): GitOperation[] {
     if (typeof operation.op !== "string") throw new Error("Every Git operation requires op.");
     return operation as GitOperation;
   });
+}
+
+function transactionAction(input: Record<string, JsonValue>): GitTransactionAction {
+  const rawAction = input.action ?? "begin";
+  if (rawAction !== "begin" && rawAction !== "continue" && rawAction !== "abort"
+    && rawAction !== "recover") {
+    throw new Error("git_transaction.action must be begin, continue, abort, or recover.");
+  }
+  return rawAction;
+}
+
+function pendingTransactionInput(
+  value: JsonValue,
+  input: Record<string, JsonValue>,
+  action: Extract<GitTransactionAction, "continue" | "abort">
+): GitTransactionInput {
+  if (typeof input.transactionHandle !== "string"
+    || !/^[A-Za-z0-9_.-]{16,200}$/u.test(input.transactionHandle)) {
+    throw new Error(`git_transaction ${action} requires a valid transactionHandle.`);
+  }
+  if (input.repository !== undefined) {
+    throw new Error(`git_transaction ${action} cannot redirect repository.`);
+  }
+  if (action === "abort") {
+    if (input.operations !== undefined) {
+      throw new Error("git_transaction abort cannot include operations.");
+    }
+    return { action, repository: ".", operations: [], transactionHandle: input.transactionHandle };
+  }
+  const operations = input.operations === undefined ? [] : gitOperations(value);
+  if (operations.some((operation) => operation.op !== "add")) {
+    throw new Error("git_transaction continue accepts only add operations before Git --continue.");
+  }
+  return { action, repository: ".", operations, transactionHandle: input.transactionHandle };
+}
+
+function recoveryTransactionInput(
+  input: Record<string, JsonValue>,
+  repository: string
+): GitTransactionInput {
+  if (input.transactionHandle !== undefined || input.operations !== undefined) {
+    throw new Error("git_transaction recover cannot include operations or transactionHandle.");
+  }
+  if (typeof input.candidateId !== "string" || !/^[a-f0-9]{64}$/u.test(input.candidateId)) {
+    throw new Error("git_transaction recover requires a runtime-issued candidateId.");
+  }
+  if (typeof input.selectionEvidenceId !== "string" || input.selectionEvidenceId.length > 512
+    || !input.selectionEvidenceId || /[\0\r\n]/u.test(input.selectionEvidenceId)) {
+    throw new Error("git_transaction recover requires a valid selectionEvidenceId.");
+  }
+  return {
+    action: "recover",
+    repository,
+    operations: [],
+    candidateId: input.candidateId,
+    selectionEvidenceId: input.selectionEvidenceId
+  };
+}
+
+export function gitTransactionInput(value: JsonValue): GitTransactionInput {
+  const input = gitInput(value);
+  const action = transactionAction(input);
+  const repository = input.repository ?? ".";
+  if (typeof repository !== "string" || !repository || repository.includes("\0")) {
+    throw new Error("git_transaction.repository must be non-empty text.");
+  }
+  if (action === "begin") {
+    if (input.transactionHandle !== undefined) {
+      throw new Error("git_transaction begin cannot accept transactionHandle.");
+    }
+    return { action, repository, operations: gitOperations(value) };
+  }
+  if (action === "recover") return recoveryTransactionInput(input, repository);
+  return pendingTransactionInput(value, input, action);
 }
 
 function text(operation: GitOperation, key: string, optional = false): string | undefined {
@@ -54,7 +139,7 @@ function revision(value: string, label: string): string {
 
 function safePathspec(value: string): string {
   const normalized = value.replaceAll("\\", "/");
-  if (!normalized || path.isAbsolute(value) || /^[a-z]:/iu.test(value)
+  if (!normalized || normalized.startsWith(":") || path.isAbsolute(value) || /^[a-z]:/iu.test(value)
     || normalized.split("/").some((part) => part === ".."
       || part.toLowerCase() === ".git" || part.toLowerCase() === ".agent")) {
     throw new Error(`Unsafe Git pathspec '${value}'.`);
@@ -152,6 +237,10 @@ export function gitOperationArgs(operation: GitOperation): string[] {
 
 export function mutatesWorktree(operation: GitOperation): boolean {
   return ["restore", "switch", "reset", "merge", "rebase", "cherry_pick", "revert"].includes(operation.op);
+}
+
+export function canPauseForConflict(operation: GitOperation): boolean {
+  return ["merge", "rebase", "cherry_pick", "revert"].includes(operation.op);
 }
 
 export function isDestructiveGitOperation(operation: GitOperation): boolean {

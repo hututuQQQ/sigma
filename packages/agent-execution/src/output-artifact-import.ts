@@ -60,7 +60,8 @@ export class BrokerOutputArtifactImporter {
   constructor(
     private readonly redactor: SecretRedactor,
     private readonly releaseRemote: (artifactIds: string[]) => Promise<unknown>,
-    private readonly removeRoot: ArtifactRootRemover = removeArtifactRoot
+    private readonly removeRoot: ArtifactRootRemover = removeArtifactRoot,
+    private readonly trustedRootParent?: string
   ) {}
 
   async configureRoot(value: string | undefined): Promise<void> {
@@ -73,16 +74,16 @@ export class BrokerOutputArtifactImporter {
     }
     const resolved = path.resolve(value);
     if (!path.basename(resolved).startsWith("sigma-exec-artifacts-")) {
-      throw new BrokerProtocolError("Broker artifactRoot is outside the dedicated temporary root.");
+      throw new BrokerProtocolError("Broker artifactRoot is not a dedicated sigma-exec artifact directory.");
     }
     const info = await lstat(resolved).catch(() => undefined);
     if (!info?.isDirectory() || info.isSymbolicLink()) {
       throw new BrokerProtocolError("Broker artifactRoot must be an existing non-symlink directory.");
     }
     const canonical = await realpath(resolved);
-    const temporaryRoot = await realpath(os.tmpdir());
-    if (!pathWithin(canonical, temporaryRoot)) {
-      throw new BrokerProtocolError("Broker artifactRoot resolves outside the system temporary directory.");
+    const allowedParents = [await realpath(this.trustedRootParent ?? os.tmpdir())];
+    if (!allowedParents.some((parent) => pathWithin(canonical, parent))) {
+      throw new BrokerProtocolError("Broker artifactRoot resolves outside its trusted parent.");
     }
     this.artifactRoot = canonical;
   }

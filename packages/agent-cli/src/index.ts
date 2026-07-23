@@ -57,7 +57,7 @@ async function runTuiCommand(argv: string[], options: AgentCliMainOptions): Prom
   const tuiOptions: TuiAppOptions = {
     runtime: configured.runtime,
     workspace: configured.workspace,
-    mode: "change",
+    mode: cliConfig.initialMode,
     maxFps: cliConfig.tuiFps,
     sessionId: typeof flags.session === "string" ? flags.session : undefined
   };
@@ -87,7 +87,7 @@ async function dispatchCommand(
         runtime: options.runtime
       });
     case "replay": return await runReplayCommand(argv, { runtime: options.runtime });
-    case "doctor": return await runDoctorCommand(argv);
+    case "doctor": return await runDoctorCommand(argv, { runtimeFactoryDeps: options.runtimeFactoryDeps });
     case "sandbox": return await runSandboxCommand(argv);
     case "version": return await runVersionCommand(argv);
     case "init": return await runInitCommand(argv);

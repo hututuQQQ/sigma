@@ -2,12 +2,17 @@
 mod linux_hardening;
 #[cfg(target_os = "linux")]
 mod linux_mount_source;
+#[cfg(target_os = "linux")]
+mod managed_server;
 mod output;
 mod output_artifact;
 mod platform;
 mod process;
 mod protocol;
+mod repository_lease;
+mod repository_transaction;
 mod sandbox;
+mod scratch;
 #[cfg(target_os = "linux")]
 mod unix_pty;
 #[cfg(windows)]
@@ -18,7 +23,15 @@ use process::{BrokerState, CancelParams, HandleParams, ReleaseArtifactParams, Wr
 use protocol::{
     PROTOCOL_VERSION, Request, RpcError, SharedWriter, read_request, send_error, send_result,
 };
+use repository_lease::AcquireRepositoryMetadataLeaseParams;
+use repository_transaction::{
+    AcquireRepositoryTransactionLeaseParams, BeginRepositoryTransactionParams,
+    BoundRepositoryTransactionParams, ContinueRepositoryTransactionParams,
+    RecoverRepositoryTransactionsParams, ReleaseRepositoryRunBaselineParams,
+    RestoreRepositoryRunBaselineParams,
+};
 use sandbox::ProcessParams;
+use scratch::{AcquireScratchLeaseParams, ReleaseScratchLeaseParams};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
@@ -59,9 +72,13 @@ fn dispatch(state: &BrokerState, request: Request) -> Result<Value, RpcError> {
                 "server": { "name": "sigma-exec", "version": env!("CARGO_PKG_VERSION") }
             }))
         }
-        "doctor" => Ok(sandbox::doctor_report()),
-        "sandbox.setup" => sandbox::setup_sandbox(),
-        "sandbox.repair" => sandbox::repair_sandbox(),
+        "doctor" => Ok(state.doctor_report()),
+        "sandbox.setup" => {
+            sandbox::setup_sandbox().map(|report| state.decorate_doctor_report(report))
+        }
+        "sandbox.repair" => {
+            sandbox::repair_sandbox().map(|report| state.decorate_doctor_report(report))
+        }
         "sandbox.status" => {
             let params = decode::<SandboxWorkspaceParams>(request.params, "sandbox status params")?;
             sandbox::sandbox_lease_status(&params.workspace_path)
@@ -70,6 +87,77 @@ fn dispatch(state: &BrokerState, request: Request) -> Result<Value, RpcError> {
             let params = decode::<SandboxWorkspaceParams>(request.params, "sandbox revoke params")?;
             sandbox::revoke_sandbox(&params.workspace_path)
         }
+        "repositoryMetadata.acquire" => {
+            state.acquire_repository_metadata_lease(decode::<AcquireRepositoryMetadataLeaseParams>(
+                request.params,
+                "repository metadata lease params",
+            )?)
+        }
+        "repositoryTransaction.acquire" => state.acquire_repository_transaction_lease(decode::<
+            AcquireRepositoryTransactionLeaseParams,
+        >(
+            request.params,
+            "repository transaction lease params",
+        )?),
+        "repositoryTransaction.begin" => state.begin_repository_transaction(
+            request.request_id,
+            decode::<BeginRepositoryTransactionParams>(
+                request.params,
+                "repository transaction begin params",
+            )?,
+        ),
+        "repositoryTransaction.continue" => state.continue_repository_transaction(
+            request.request_id,
+            decode::<ContinueRepositoryTransactionParams>(
+                request.params,
+                "repository transaction continue params",
+            )?,
+        ),
+        "repositoryTransaction.abort" => {
+            state.abort_repository_transaction(decode::<BoundRepositoryTransactionParams>(
+                request.params,
+                "repository transaction abort params",
+            )?)
+        }
+        "repositoryTransaction.recover" => {
+            state.recover_repository_transactions(decode::<RecoverRepositoryTransactionsParams>(
+                request.params,
+                "repository transaction recovery params",
+            )?)
+        }
+        "repositoryTransaction.seal" => {
+            state.seal_repository_transaction(decode::<BoundRepositoryTransactionParams>(
+                request.params,
+                "repository transaction seal params",
+            )?)
+        }
+        "repositoryRunBaseline.restore" => {
+            state.restore_repository_run_baseline(decode::<RestoreRepositoryRunBaselineParams>(
+                request.params,
+                "repository run baseline restore params",
+            )?)
+        }
+        "repositoryRunBaseline.release" => {
+            state.release_repository_run_baseline(decode::<ReleaseRepositoryRunBaselineParams>(
+                request.params,
+                "repository run baseline release params",
+            )?)
+        }
+        "scratch.acquire" => state.acquire_scratch_lease(decode::<AcquireScratchLeaseParams>(
+            request.params,
+            "scratch lease params",
+        )?),
+        "scratch.release" => state.release_scratch_lease(decode::<ReleaseScratchLeaseParams>(
+            request.params,
+            "scratch release params",
+        )?),
+        #[cfg(target_os = "linux")]
+        "environment.prepare" => state.prepare_managed_environment(decode::<
+            managed_server::ManagedEnvironmentPrepareParams,
+        >(
+            request.params,
+            "managed environment preparation params",
+        )?),
         "exec" => state.execute(
             request.request_id,
             decode::<ProcessParams>(request.params, "exec params")?,
@@ -114,7 +202,7 @@ fn state_instance_id(state: &BrokerState) -> String {
     state.instance_id().to_owned()
 }
 
-fn handle_request(state: Arc<BrokerState>, writer: SharedWriter, request: Request) {
+pub(crate) fn handle_request(state: Arc<BrokerState>, writer: SharedWriter, request: Request) {
     let request_id = request.request_id;
     if request.protocol_version != PROTOCOL_VERSION {
         send_error(
@@ -262,6 +350,10 @@ fn main() {
     if let Some(code) = unix_pty::try_run_internal_mode() {
         std::process::exit(code);
     }
+    #[cfg(target_os = "linux")]
+    if let Some(code) = managed_server::try_run_managed_server() {
+        std::process::exit(code);
+    }
     #[cfg(windows)]
     if let Some(code) = windows_sandbox::try_run_internal_mode() {
         std::process::exit(code);
@@ -298,8 +390,10 @@ fn main() {
             continue;
         }
         if request.method == "shutdown" {
-            send_result(&writer, request.request_id, json!({ "shutdown": true }));
-            state.shutdown();
+            match state.shutdown() {
+                Ok(()) => send_result(&writer, request.request_id, json!({ "shutdown": true })),
+                Err(error) => send_error(&writer, request.request_id, error),
+            }
             thread::sleep(Duration::from_millis(100));
             return;
         }
@@ -311,7 +405,7 @@ fn main() {
         let request_writer = writer.clone();
         thread::spawn(move || handle_request(request_state, request_writer, request));
     }
-    state.shutdown();
+    let _ = state.shutdown();
 }
 
 #[cfg(test)]

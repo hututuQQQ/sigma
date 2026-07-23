@@ -30,6 +30,9 @@ export interface ReviewerInput {
   frontierRevision: number;
   stateDigest: string;
   reviewBasisDigest: string;
+  reviewMode: "workspace" | "completion";
+  completionCandidate?: string;
+  completionCandidateDigest?: string;
   workspaceDeltas: WorkspaceDeltaEvidence[];
   validations: ValidationEvidence[];
   inputAccesses?: InputAccessEvidence[];
@@ -220,7 +223,7 @@ export class ModelReviewer implements ReviewerPort {
 function reviewMessages(input: ReviewerInput): ModelMessage[] {
   return [{
     role: "system",
-    content: "You are Sigma's independent read-only code reviewer. Review only the supplied goal, durable workspace delta, input-access evidence, and validation evidence. Evaluate every explicit goal dimension in one pass, including correctness, performance, format, and delivery behavior when the goal mentions them; do not stop after the first missing proof. A failed validation is a real correctness signal: never describe it as passed or treat review approval as validation_passed. Absence of input-access evidence is not itself a failure; only a recorded failed access to a required user-declared input is actionable. Never accept a run-created sample or fixture as a substitute for a user-declared external input whose access failed. Check that each validation command plausibly exercises every workspace delta linked to it; a file-specific syntax check cannot establish unrelated files or runtime behavior. Complete opaque or content-omitted artifacts are reviewable by workspace path, SHA-256, size, checkpoint-bound delta, and passed validation, but their hidden content must not be claimed as inspected. Return strict JSON: {\"verdict\":\"approved\"|\"changes_requested\",\"findings\":[{\"actionable\":boolean,\"severity\":\"error\"|\"warning\"|\"info\",\"summary\":string}]}. Set changes_requested only when at least one finding is both actionable=true and severity=error. Positive observations must be non-actionable info findings. Never claim to have edited files."
+    content: "You are Sigma's independent read-only code reviewer. Review only the supplied goal, durable workspace delta, input-access evidence, validation evidence, and optional completion candidate. Evaluate every explicit goal dimension in one pass, including correctness, performance, format, and delivery behavior when the goal mentions them; do not stop after the first missing proof. A failed validation is a real correctness signal: never describe it as passed or treat review approval as validation_passed. In completion mode, an exited failed validation may prove that a user-requested check was executed and honestly reported; approve only when the goal is satisfied by observing/reporting that result and the completion candidate accurately states the failure. If the goal requires working behavior or a passing check, request repair instead. Absence of input-access evidence is not itself a failure; only a recorded failed access to a required user-declared input is actionable. Never accept a run-created sample or fixture as a substitute for a user-declared external input whose access failed. A user-visible configuration or policy value that was neither specified by the goal nor supported by supplied workspace evidence is an actionable error with code user_decision_required; direct the agent to restore speculative changes and ask one focused question. Check that each validation command plausibly exercises every workspace delta linked to it; a file-specific syntax check cannot establish unrelated files or runtime behavior. Complete opaque or content-omitted artifacts are reviewable by workspace path, SHA-256, size, checkpoint-bound delta, and passed validation, but their hidden content must not be claimed as inspected. Return strict JSON: {\"verdict\":\"approved\"|\"changes_requested\",\"findings\":[{\"actionable\":boolean,\"severity\":\"error\"|\"warning\"|\"info\",\"summary\":string,\"code\":string optional}]}. Set changes_requested only when at least one finding is both actionable=true and severity=error. Positive observations must be non-actionable info findings. Never claim to have edited files."
   }, {
     role: "user",
     content: JSON.stringify({
@@ -228,6 +231,13 @@ function reviewMessages(input: ReviewerInput): ModelMessage[] {
       frontierRevision: input.frontierRevision,
       stateDigest: input.stateDigest,
       reviewBasisDigest: input.reviewBasisDigest,
+      reviewMode: input.reviewMode,
+      ...(input.reviewMode === "completion" && input.completionCandidate
+        ? {
+            completionCandidate: input.completionCandidate,
+            completionCandidateDigest: input.completionCandidateDigest
+          }
+        : {}),
       inputAccesses: input.inputAccesses ?? [],
       workspaceDeltas: input.workspaceDeltas.map((item) => ({
         evidenceId: item.evidenceId,
@@ -254,20 +264,33 @@ export function isActionableErrorFinding(finding: JsonValue): boolean {
   return true;
 }
 
+interface ParsedReviewResult {
+  findings: JsonValue[];
+  protocolFailure: boolean;
+  verdict: "approved" | "changes_requested";
+}
+
+function parsedReviewResult(input: ReviewerInput, response: ModelResponse): ParsedReviewResult {
+  const parsed = responseObject(response.message.content);
+  const inputProblem = reviewInputFailure(input);
+  const rawFindings = Array.isArray(parsed?.findings) ? parsed.findings : undefined;
+  const validVerdict = parsed?.verdict === "approved" || parsed?.verdict === "changes_requested";
+  const protocolFailure = !inputProblem && (!parsed || !validVerdict || rawFindings === undefined);
+  const findings = inputProblem ? [inputProblem] : rawFindings
+    ? rawFindings.filter((item): item is JsonValue => item === null
+      || ["string", "number", "boolean", "object"].includes(typeof item))
+    : [];
+  const verdict = !inputProblem && !protocolFailure && !findings.some(isActionableErrorFinding)
+    ? "approved" : "changes_requested";
+  return { findings, protocolFailure, verdict };
+}
+
 function reviewEvidence(
   input: ReviewerInput,
   reviewerId: string,
   response: ModelResponse
 ): ReviewEvidence {
-    const parsed = responseObject(response.message.content);
-    const inputProblem = reviewInputFailure(input);
-    const rawFindings = Array.isArray(parsed?.findings) ? parsed.findings : undefined;
-    const validFindings = rawFindings !== undefined;
-    const findings = inputProblem ? [inputProblem] : validFindings
-      ? rawFindings.filter((item): item is JsonValue => item === null || ["string", "number", "boolean", "object"].includes(typeof item))
-      : [parsed ? "Reviewer response omitted findings." : "Reviewer returned invalid JSON."];
-    const verdict = !inputProblem && validFindings && !findings.some(isActionableErrorFinding)
-      ? "approved" : "changes_requested";
+    const { findings, protocolFailure, verdict } = parsedReviewResult(input, response);
     return {
       evidenceId: randomUUID(),
       sessionId: input.sessionId,
@@ -276,7 +299,9 @@ function reviewEvidence(
       status: verdict === "approved" ? "passed" : "failed",
       createdAt: new Date().toISOString(),
       producer: { authority: "runtime", id: reviewerId },
-      summary: verdict === "approved" ? "Independent reviewer approved the change." : "Independent reviewer requested changes.",
+      summary: protocolFailure ? "Independent reviewer returned an invalid protocol response."
+        : verdict === "approved" ? "Independent reviewer approved the change."
+          : "Independent reviewer requested changes.",
       data: {
         reviewerId,
         verdict,
@@ -285,6 +310,9 @@ function reviewEvidence(
         stateDigest: input.stateDigest,
         reviewBasisDigest: input.reviewBasisDigest,
         validationEvidenceIds: input.validations.map((item) => item.evidenceId),
+        ...(protocolFailure
+          ? { failureKind: "protocol" as const, failureCode: "review_protocol_invalid" as const }
+          : {}),
         ...(input.workspaceDeltas.some((item) => item.data.reviewProblem?.code === "review_scope_too_large")
           ? { failureCode: "review_scope_too_large" as const } : {})
       }

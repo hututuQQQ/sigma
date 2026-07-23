@@ -38,7 +38,9 @@ TERMINAL_EVENT_TYPES = {"run.completed", "run.cancelled", "run.failed"}
 FAILURE_KINDS = {
     "needs_input", "timeout", "tool_error", "api_error", "agent_failure", "verifier_failure",
     "validation_blocked", "convergence_no_progress", "runtime_invariant_failure",
+    "structured_blocker",
 }
+DECLARED_FAILURE_KINDS = FAILURE_KINDS - {"structured_blocker"}
 DOCTOR_REPORT_SCHEMA_VERSION = 1
 BROKER_PROTOCOL_VERSION = 1
 SUPPORTED_NETWORK_MODES = {"none", "full"}
@@ -75,6 +77,13 @@ def _failure_kind_for_code(code: Any, payload: dict[str, Any] | None = None) -> 
     if normalized.startswith(("tool_", "execution_", "process_")):
         return "tool_error"
     return None
+
+
+def _structured_blocker_code(payload: dict[str, Any]) -> str | None:
+    """Recognize only the explicit runtime-authorized CLI blocker contract."""
+    kind = payload.get("failureKind") or payload.get("failure_kind")
+    code = payload.get("failureCode") or payload.get("failure_code")
+    return code if kind == "blocked" and isinstance(code, str) and code.strip() else None
 
 
 def _default_model(provider: str) -> str:
@@ -140,7 +149,7 @@ def _is_timeout_error(error: BaseException) -> bool:
         "timeout", "timed_out", "process_timed_out", "broker_timeout", "process_deadline"
     }:
         return True
-    return "timed out" in str(error).lower() or "timeout" in str(error).lower()
+    return False
 
 
 def _bounded_text(value: str, maximum: int = MAX_CONTEXT_TEXT_CHARS) -> str:
@@ -180,29 +189,39 @@ def _write_utf8_artifact(path: pathlib.Path, value: str) -> None:
         handle.write(value)
 
 
-def _append_bounded_jsonl(path: pathlib.Path, record: dict[str, Any], maximum: int) -> None:
-    line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
-    existing_size = path.stat().st_size if path.is_file() else 0
-    if existing_size + len(line) <= maximum:
-        with path.open("ab") as handle:
-            handle.write(line)
-        return
-    existing = path.read_bytes() if path.is_file() else b""
-    content = existing + line
-    digest = hashlib.sha256(content).hexdigest()
-    marker = (json.dumps({
-        "type": "trace_truncated",
-        "omitted_bytes_sha256": digest,
-    }, ensure_ascii=False) + "\n").encode("utf-8")
-    if len(marker) >= maximum:
-        bounded = marker[:maximum]
-    else:
-        tail = content[-(maximum - len(marker)):].decode("utf-8", errors="ignore").encode("utf-8")
-        bounded = marker + tail
-        if len(bounded) > maximum:
-            bounded = bounded[:maximum]
-    with path.open("wb") as handle:
-        handle.write(bounded)
+class _BoundedJsonlWriter:
+    """Append-only JSONL writer with a stable prefix and a hard byte cap."""
+
+    def __init__(self, path: pathlib.Path, maximum: int, *, reset: bool = False) -> None:
+        self.path = path
+        self.maximum = max(0, maximum)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if reset:
+            self.path.unlink(missing_ok=True)
+            self.path.touch()
+        existing = self.path.read_bytes() if self.path.is_file() else b""
+        self.size = len(existing)
+        self.truncated = b'"type": "trace_truncated"' in existing
+
+    def append(self, record: dict[str, Any]) -> None:
+        if self.truncated or self.maximum <= 0:
+            return
+        line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+        marker = (json.dumps({
+            "type": "trace_truncated",
+            "omitted_record_sha256": hashlib.sha256(line).hexdigest(),
+        }, ensure_ascii=False) + "\n").encode("utf-8")
+        reserve = min(len(marker), self.maximum)
+        if self.size + len(line) <= self.maximum - reserve:
+            with self.path.open("ab") as handle:
+                handle.write(line)
+            self.size += len(line)
+            return
+        if self.size + len(marker) <= self.maximum:
+            with self.path.open("ab") as handle:
+                handle.write(marker)
+            self.size += len(marker)
+        self.truncated = True
 
 
 def _text_artifact_summary(value: str) -> dict[str, Any]:
@@ -280,6 +299,63 @@ def _bounded_event(event: dict[str, Any], maximum: int = 32_768) -> dict[str, An
     }
 
 
+def _trace_record(
+    event: dict[str, Any],
+    summary: dict[str, Any] | None = None,
+    trace_type: str | None = None,
+) -> dict[str, Any]:
+    """Store the bounded Sigma event once and only scalar indexing metadata."""
+    event_type = str(event.get("type") or "event")
+    payload = _event_payload(event)
+    if trace_type is None:
+        if event_type == "usage.recorded":
+            trace_type = "usage"
+        elif event_type == "tool.started":
+            trace_type = "tool_start"
+        elif event_type in {"tool.completed", "tool.failed"}:
+            trace_type = "tool_end"
+        elif event_type == "model.started":
+            trace_type = "model_start"
+        elif event_type in {"model.completed", "model.failed"}:
+            trace_type = "model_end"
+        elif event_type in TERMINAL_EVENT_TYPES:
+            trace_type = "run_end"
+        else:
+            trace_type = event_type
+
+    metadata: dict[str, Any] = {"event_type": event_type}
+    scalar_keys = {
+        "status", "finishReason", "failureKind", "failureCode", "code", "origin",
+        "toolName", "name", "inputTokens", "outputTokens", "reasoningTokens",
+        "cacheReadTokens", "cacheWriteTokens", "costMicroUsd", "durationMs",
+    }
+    for key in scalar_keys:
+        value = payload.get(key)
+        if isinstance(value, (int, float, bool)) or (isinstance(value, str) and len(value) <= 512):
+            metadata[key] = value
+    if "toolName" not in metadata and isinstance(metadata.get("name"), str):
+        metadata["toolName"] = metadata.pop("name")
+    if summary is not None and event_type in TERMINAL_EVENT_TYPES:
+        summary_keys = {
+            "status", "finish_reason", "commands_executed", "input_tokens", "output_tokens",
+            "reasoning_tokens", "cache_tokens", "cache_read_tokens", "length_finish_count",
+            "converge_turns", "cost_usd", "duration_ms", "suspension_to_exit_ms",
+            "terminal_origin", "execution_mode", "managed_environment_mode", "agent_profile",
+            "harbor_topology", "failure_kind", "failure_code",
+        }
+        for key in summary_keys:
+            value = summary.get(key)
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                metadata[key] = value
+    return {
+        "type": trace_type,
+        "seq": event.get("seq"),
+        "occurredAt": event.get("occurredAt"),
+        "metadata": metadata,
+        "sigma_event": _bounded_event(event),
+    }
+
+
 def _decode_stream_line(
     line: str,
     chunks: dict[str, dict[str, Any]],
@@ -352,8 +428,11 @@ class _OutputRecorder:
         self._suspended_monotonic: float | None = None
         self._process_exit_monotonic: float | None = None
         logs_dir.mkdir(parents=True, exist_ok=True)
-        for path in (self.stdout_path, self.stderr_path, self.trace_path):
+        for path in (self.stdout_path, self.stderr_path):
             path.write_text("", encoding="utf-8")
+        self._trace_writer = _BoundedJsonlWriter(
+            self.trace_path, MAX_TRACE_ARTIFACT_BYTES, reset=True
+        )
         self._write_state()
 
     async def callback(self, text: str, stream: str) -> None:
@@ -419,13 +498,7 @@ class _OutputRecorder:
             if "retry" in event_type.lower() or "retry" in str(payload.get("status", "")).lower():
                 self.retry_count += 1
                 self.last_retry = _bounded_event(event)
-            _append_bounded_jsonl(self.trace_path, {
-                "type": "event",
-                "seq": event.get("seq"),
-                "occurredAt": event.get("occurredAt"),
-                "metadata": {"event_type": event_type},
-                "sigma_event": _bounded_event(event),
-            }, MAX_TRACE_ARTIFACT_BYTES)
+            self.append_trace(_trace_record(event))
             self._write_state()
             return
         if value.get("kind") == "result" or value.get("type") == "result":
@@ -444,6 +517,19 @@ class _OutputRecorder:
                 **({"failureKind": failure} if failure else {}),
             }
             self._write_state()
+
+    def append_trace(self, record: dict[str, Any]) -> None:
+        self._trace_writer.append(record)
+
+    def reconcile_trace(self, events: list[dict[str, Any]]) -> None:
+        """Append events missed by the callback without rewriting its prefix."""
+        for event in events:
+            identity = _event_identity(event)
+            if identity in self._seen:
+                continue
+            self._seen.add(identity)
+            self.events.append(event)
+            self.append_trace(_trace_record(event))
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -492,6 +578,8 @@ class SigmaCliHarborAgent(BaseAgent):
         agent_profile: str = "standard",
         network_mode: str = "full",
         execution_mode: str = "sandboxed",
+        managed_environment_mode: str = "disabled",
+        harbor_topology: str = "main_only",
         max_wall_time_sec: int = 7200,
         agent_timeout_grace_sec: int = 120,
         outer_trial_deadline_sec: int | float | None = None,
@@ -528,6 +616,28 @@ class SigmaCliHarborAgent(BaseAgent):
                 "execution_mode must be one of: sandboxed, container"
             )
         self.execution_mode = execution_mode
+        if managed_environment_mode not in {"disabled", "required"}:
+            raise ValueError(
+                "managed_environment_mode must be one of: disabled, required"
+            )
+        if harbor_topology not in {"main_only", "managed_three_role"}:
+            raise ValueError(
+                "harbor_topology must be one of: main_only, managed_three_role"
+            )
+        if managed_environment_mode == "required" and (
+            execution_mode != "container" or network_mode != "full"
+            or harbor_topology != "managed_three_role"
+        ):
+            raise ValueError(
+                "managed_environment_mode=required needs execution_mode=container, "
+                "network_mode=full, and harbor_topology=managed_three_role"
+            )
+        if harbor_topology == "managed_three_role" and managed_environment_mode != "required":
+            raise ValueError(
+                "harbor_topology=managed_three_role needs managed_environment_mode=required"
+            )
+        self.managed_environment_mode = managed_environment_mode
+        self.harbor_topology = harbor_topology
         self.effective_network_mode: str | None = network_mode
         self.available_network_modes: list[str] = []
         self.effective_read_scope = "host"
@@ -549,6 +659,9 @@ class SigmaCliHarborAgent(BaseAgent):
         self.check_api = bool(check_api)
         self._output_recorder: _OutputRecorder | None = None
         self._process_cleanup: dict[str, Any] | None = None
+        self._managed_broker_bootstrap: dict[str, Any] | None = None
+        self._managed_broker_cleanup: dict[str, Any] | None = None
+        self._managed_environment_verified = False
         self.checkpoint_recovery = recovery_policy
         self.reviewer_waiver_reason = (
             str(reviewer_waiver_reason).strip() if reviewer_waiver_reason else None
@@ -563,16 +676,26 @@ class SigmaCliHarborAgent(BaseAgent):
         return "0.1.0"
 
     async def setup(self, environment: BaseEnvironment) -> None:
+        self._managed_environment_verified = False
+        try:
+            await self._setup_agent(environment)
+        except Exception as exc:
+            self._mirror_setup_failure(exc)
+            raise
+
+    async def _setup_agent(self, environment: BaseEnvironment) -> None:
         self._workspace = await self._resolve_workspace(environment)
         await environment.exec("mkdir -p /tmp/agent", timeout_sec=30)
         installed = await environment.exec("command -v /usr/local/bin/agent >/dev/null 2>&1", timeout_sec=30)
         if _return_code(installed) == 0:
+            await self._bootstrap_managed_broker(environment)
             await self._verify_agent_ready(environment)
             return
 
         tarball = self.agent_cli_tarball or self._tarball_from_env()
         if tarball is not None:
             await self._install_tarball(environment, tarball)
+            await self._bootstrap_managed_broker(environment)
             await self._verify_agent_ready(environment)
             return
 
@@ -596,6 +719,7 @@ class SigmaCliHarborAgent(BaseAgent):
         result: Any | None = None
         error_message: str | None = None
         failure_kind: str | None = None
+        failure_code: str | None = None
         timed_out = False
         cancelled_error: asyncio.CancelledError | None = None
         artifact_warnings: list[str] = []
@@ -624,8 +748,12 @@ class SigmaCliHarborAgent(BaseAgent):
                     error_message = recovery[2]
                     failure_kind = "checkpoint_recovery_required"
             reported_failure = output_result.get("failureKind") or output_result.get("failure_kind")
-            if reported_failure not in FAILURE_KINDS:
+            if reported_failure not in DECLARED_FAILURE_KINDS:
                 reported_failure = None
+            blocker_code = _structured_blocker_code(output_result) or next((
+                code for event in reversed(events)
+                if (code := _structured_blocker_code(_event_payload(event))) is not None
+            ), None)
             event_failure = self._failure_kind_from_events(events, output_result)
             protocol_failure = self._incomplete_terminal_protocol(result, events, output_result)
             # needs_input is a terminal protocol state, even when the CLI uses
@@ -636,6 +764,10 @@ class SigmaCliHarborAgent(BaseAgent):
             elif output_result.get("status") == "needs_input":
                 error_message = str(output_result.get("finalMessage") or output_result.get("message") or "agent requires external input")
                 failure_kind = "needs_input"
+            elif blocker_code is not None:
+                error_message = str(output_result.get("finalMessage") or output_result.get("message") or blocker_code)
+                failure_kind = "structured_blocker"
+                failure_code = blocker_code
             elif reported_failure is not None:
                 error_message = str(output_result.get("message") or output_result.get("finalMessage") or reported_failure)
                 failure_kind = reported_failure
@@ -672,15 +804,20 @@ class SigmaCliHarborAgent(BaseAgent):
                         or "agent requires external input"
                     )
                 elif status != "completed":
+                    blocker_code = _structured_blocker_code(recorded_terminal)
                     reported_failure = (
                         recorded_terminal.get("failureKind")
                         or recorded_terminal.get("failure_kind")
                     )
-                    failure_kind = (
-                        reported_failure
-                        if reported_failure in FAILURE_KINDS
-                        else "agent_failure"
-                    )
+                    if blocker_code is not None:
+                        failure_kind = "structured_blocker"
+                        failure_code = blocker_code
+                    else:
+                        failure_kind = (
+                            reported_failure
+                            if reported_failure in DECLARED_FAILURE_KINDS
+                            else "agent_failure"
+                        )
                     error_message = str(
                         recorded_terminal.get("finalMessage")
                         or recorded_terminal.get("message")
@@ -729,26 +866,24 @@ class SigmaCliHarborAgent(BaseAgent):
         finally:
             recorder.mark_process_exit()
             if cancelled_error is None and not timed_out:
-                for remote_path, filename in (
-                    ("/tmp/agent/summary.json", "summary.json"),
-                    ("/tmp/agent/trace.jsonl", "trace.jsonl"),
-                ):
-                    try:
-                        downloaded = await self._download_if_present(environment, remote_path, filename)
-                        if filename == "summary.json":
-                            summary_path = downloaded
-                        else:
-                            trace_path = downloaded
-                    except Exception as exc:
-                        artifact_warnings.append(f"{filename}: {exc}")
+                try:
+                    summary_path = await self._download_if_present(
+                        environment, "/tmp/agent/summary.json", "summary.json"
+                    )
+                except Exception as exc:
+                    artifact_warnings.append(f"summary.json: {exc}")
                 try:
                     artifact_warnings.extend(await self._download_attempt_artifacts(environment))
                 except Exception as exc:
                     artifact_warnings.append(f"attempts: {exc}")
                 summary_path = summary_path or self._latest_downloaded_artifact("summary.json")
-                trace_path = trace_path or self._latest_downloaded_artifact("trace.jsonl")
-                if trace_path == recorder.trace_path:
-                    trace_path = None
+                recorder.reconcile_trace(events)
+                trace_path = recorder.trace_path if events else None
+            self._managed_broker_cleanup = await self._cleanup_managed_broker(environment)
+            if self._managed_broker_cleanup and self._managed_broker_cleanup.get("error"):
+                artifact_warnings.append(
+                    f"managed broker cleanup: {self._managed_broker_cleanup['error']}"
+                )
 
         derived_summary = self._summary_from_events(events, output_result)
         derived_summary.update(recorder.timing_snapshot())
@@ -788,22 +923,32 @@ class SigmaCliHarborAgent(BaseAgent):
                 "last_error": error_message,
                 "protocol_failure": protocol_failure,
             })
-        if failure_kind is None and summary.get("failure_kind") in FAILURE_KINDS:
+        if failure_kind is None and summary.get("failure_kind") in DECLARED_FAILURE_KINDS:
             failure_kind = summary["failure_kind"]
         if failure_kind is not None:
             summary["failure_kind"] = failure_kind
+        if failure_code is not None:
+            summary["failure_code"] = failure_code
         summary["network_mode_requested"] = self.network_mode
         summary["network_mode_effective"] = self.effective_network_mode
         summary["execution_mode"] = self.execution_mode
+        summary["managed_environment_mode"] = self.managed_environment_mode
+        summary["harbor_topology"] = self.harbor_topology
+        summary["permission_mode_effective"] = self._permission_mode()
         summary["agent_profile"] = self.agent_profile
         summary["read_scope_effective"] = self.effective_read_scope
         summary["process_handoff_available"] = self.process_handoff_available
         if self._process_cleanup is not None:
             summary["process_cleanup"] = self._process_cleanup
+        if self._managed_broker_bootstrap is not None:
+            summary["managed_broker_bootstrap"] = self._managed_broker_bootstrap
+        if self._managed_broker_cleanup is not None:
+            summary["managed_broker_cleanup"] = self._managed_broker_cleanup
         self._populate_context(context, result, summary, error_message)
         if timed_out or protocol_failure is not None:
             self._set_context_value(context, "exit_code", 1)
         self._set_context_value(context, "failure_kind", failure_kind)
+        self._set_context_value(context, "failure_code", failure_code)
         self._set_context_value(context, "artifact_warnings", artifact_warnings)
         if summary_path is not None:
             summary_path.write_text(
@@ -819,6 +964,14 @@ class SigmaCliHarborAgent(BaseAgent):
             raise RuntimeError(f"agent_crash: {error_message or 'agent execution raised an exception.'}")
         if failure_kind in {"agent_failure", "checkpoint_recovery_required", *FAILURE_KINDS}:
             raise RuntimeError(f"{failure_kind}: {error_message or 'agent exited unsuccessfully.'}")
+
+    def _permission_mode(self) -> str:
+        # A required managed environment is disposable, isolated, and
+        # launcher-attested before the first model turn. Once its strict
+        # doctor contract has passed, asking a non-interactive Harbor process
+        # for human approval cannot add authority; it can only deadlock the
+        # run. Other topologies retain the narrower workspace-auto policy.
+        return "auto" if self._managed_environment_verified else "workspace-auto"
 
     def _agent_command(self, context: AgentContext | None = None) -> list[str]:
         if self._workspace is None:
@@ -845,9 +998,11 @@ class SigmaCliHarborAgent(BaseAgent):
             "--process-handoff",
             "allow",
             "--permission-mode",
-            "workspace-auto",
+            self._permission_mode(),
             "--execution-mode",
             self.execution_mode,
+            "--managed-environment-mode",
+            self.managed_environment_mode,
             "--output-format",
             "stream-json",
             "--output-schema",
@@ -1044,8 +1199,10 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
                          if event.get("type") in {"run.failed", "run.cancelled"}), None)
         if terminal is not None:
             payload = _event_payload(terminal)
+            if _structured_blocker_code(payload) is not None:
+                return "structured_blocker"
             explicit = payload.get("failureKind") or payload.get("failure_kind")
-            if explicit in FAILURE_KINDS:
+            if explicit in DECLARED_FAILURE_KINDS:
                 return explicit
             classified = _failure_kind_for_code(
                 payload.get("code") or payload.get("diagnosticCode") or payload.get("failureCode"),
@@ -1058,8 +1215,10 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
         for event in reversed(events):
             event_type = event.get("type")
             payload = _event_payload(event)
+            if _structured_blocker_code(payload) is not None:
+                return "structured_blocker"
             explicit = payload.get("failureKind") or payload.get("failure_kind")
-            if explicit in FAILURE_KINDS:
+            if explicit in DECLARED_FAILURE_KINDS:
                 return explicit
             code = payload.get("code") or payload.get("diagnosticCode") or payload.get("failureCode")
             if isinstance(code, str):
@@ -1263,9 +1422,11 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "--agent-profile",
             self.agent_profile,
             "--permission-mode",
-            "workspace-auto",
+            self._permission_mode(),
             "--execution-mode",
             self.execution_mode,
+            "--managed-environment-mode",
+            self.managed_environment_mode,
             "--network",
             self.network_mode,
             "--read-scope",
@@ -1426,6 +1587,8 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "network_mode_requested": self.network_mode,
             "network_mode_effective": self.effective_network_mode,
             "execution_mode": self.execution_mode,
+            "managed_environment_mode": self.managed_environment_mode,
+            "harbor_topology": self.harbor_topology,
             "agent_profile": self.agent_profile,
             "harbor_deadline_sec": self.outer_trial_deadline_sec,
             "sigma_deadline_sec": self.max_wall_time_sec,
@@ -1523,12 +1686,20 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
         trace_target = trace_path or (self.logs_dir / "trace.jsonl")
         existing = trace_target.read_text(encoding="utf-8") if trace_target.is_file() else ""
         if '"type": "run_timeout"' not in existing:
-            _append_bounded_jsonl(trace_target, {
-                "type": "run_timeout",
+            timeout_event = {
+                "type": "run.timeout",
                 "occurredAt": time.time(),
-                "metadata": {"timeout": state},
-                "sigma_event": last_event,
-            }, MAX_TRACE_ARTIFACT_BYTES)
+                "payload": {
+                    "failureKind": "timeout",
+                    "failureCode": "adapter_timeout",
+                    "origin": "adapter_timeout",
+                },
+            }
+            timeout_record = _trace_record(timeout_event, trace_type="run_timeout")
+            if recorder is not None and trace_target == recorder.trace_path:
+                recorder.append_trace(timeout_record)
+            else:
+                _BoundedJsonlWriter(trace_target, MAX_TRACE_ARTIFACT_BYTES).append(timeout_record)
         return summary_target, trace_target
 
     def _trace_records(
@@ -1536,65 +1707,7 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
         events: list[dict[str, Any]],
         summary: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        records: list[dict[str, Any]] = []
-        for event in events:
-            event_type = event.get("type")
-            payload = _event_payload(event)
-            if event_type == "usage.recorded":
-                trace_type = "usage"
-                metadata = {"usage": {
-                    **payload,
-                    "cacheTokens": payload.get("cacheTokens", _as_int(payload.get("cacheReadTokens"), 0)
-                        + _as_int(payload.get("cacheWriteTokens"), 0)),
-                    "costUsd": payload.get("costUsd", _as_int(payload.get("costMicroUsd"), 0) / 1_000_000),
-                }}
-            elif event_type == "tool.started":
-                trace_type = "tool_start"
-                metadata = {**payload, "toolName": payload.get("toolName") or payload.get("name")}
-            elif event_type in {"tool.completed", "tool.failed"}:
-                trace_type = "tool_end"
-                metadata = {**payload, "toolName": payload.get("toolName") or payload.get("name")}
-            elif event_type == "model.started":
-                trace_type = "model_start"
-                metadata = payload
-            elif event_type in {"model.completed", "model.failed"}:
-                trace_type = "model_end"
-                metadata = payload
-            elif event_type in TERMINAL_EVENT_TYPES:
-                trace_type = "run_end"
-                result = {
-                    **payload,
-                    **({
-                        "status": summary.get("status"),
-                        "finishReason": summary.get("finish_reason"),
-                        "commands_executed": summary.get("commands_executed", 0),
-                        "input_tokens": summary.get("input_tokens", 0),
-                        "output_tokens": summary.get("output_tokens", 0),
-                        "reasoning_tokens": summary.get("reasoning_tokens", 0),
-                        "cache_tokens": summary.get("cache_tokens", 0),
-                        "cache_read_tokens": summary.get("cache_read_tokens", 0),
-                        "length_finish_count": summary.get("length_finish_count", 0),
-                        "converge_turns": summary.get("converge_turns", 0),
-                        "cost_usd": summary.get("cost_usd"),
-                        "duration_ms": summary.get("duration_ms", 0),
-                        "suspension_to_exit_ms": summary.get("suspension_to_exit_ms"),
-                        "terminal_origin": summary.get("terminal_origin"),
-                        "execution_mode": summary.get("execution_mode"),
-                        "agent_profile": summary.get("agent_profile"),
-                    } if summary is not None else {}),
-                }
-                metadata = {"result": result}
-            else:
-                trace_type = str(event_type or "event")
-                metadata = {"payload": payload}
-            records.append({
-                "type": trace_type,
-                "seq": event.get("seq"),
-                "occurredAt": event.get("occurredAt"),
-                "metadata": metadata,
-                "sigma_event": event,
-            })
-        return records
+        return [_trace_record(event, summary) for event in events]
 
     def _write_accounting_artifacts(
         self,
@@ -1609,10 +1722,9 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
         if summary_path is not None:
             summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         if trace_path is not None:
-            trace_path.write_text(
-                "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in self._trace_records(events, summary)),
-                encoding="utf-8",
-            )
+            writer = _BoundedJsonlWriter(trace_path, MAX_TRACE_ARTIFACT_BYTES, reset=True)
+            for record in self._trace_records(events, summary):
+                writer.append(record)
         return summary_path, trace_path
 
     def _tarball_from_env(self) -> pathlib.Path | None:
@@ -1640,10 +1752,112 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             timeout_sec=180,
         )
 
+    async def _bootstrap_managed_broker(self, environment: BaseEnvironment) -> None:
+        if self.managed_environment_mode != "required":
+            return
+        if self._workspace is None:
+            raise RuntimeError("agent_setup_failed: workspace was not resolved")
+        workspace = shlex.quote(self._workspace)
+        command = f"""
+set -eu
+test ! -e /run/sigma-oci
+test -x /opt/agent-cli/bin/sigma-exec
+umask 077
+nohup /opt/agent-cli/bin/sigma-exec --managed-server --workspace {workspace} --engine docker --network full >/tmp/agent/managed-broker.log 2>&1 &
+broker_pid=$!
+printf '%s\n' "$broker_pid" >/tmp/agent/managed-broker.pid
+ready=0
+for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50; do
+  if test -S /run/sigma-oci/broker.sock && test -f /run/sigma-oci/attestation.json; then ready=1; break; fi
+  kill -0 "$broker_pid" 2>/dev/null || break
+  sleep 0.1
+done
+if test "$ready" -ne 1; then
+  kill "$broker_pid" 2>/dev/null || true
+  wait "$broker_pid" 2>/dev/null || true
+  sed -n '1,80p' /tmp/agent/managed-broker.log >&2 || true
+  exit 1
+fi
+test "$(stat -c %u /run/sigma-oci)" = 0
+test "$(stat -c %u /run/sigma-oci/attestation.json)" = 0
+test "$(stat -c %u /run/sigma-oci/broker.sock)" = 0
+printf '{{"status":"ready","pid":%s}}\n' "$broker_pid"
+""".strip()
+        result = await environment.exec(command, timeout_sec=30)
+        self._managed_broker_bootstrap = self._setup_check_record(
+            "managed_broker_bootstrap", result
+        )
+        if _return_code(result) != 0:
+            raise RuntimeError(
+                self._setup_failure_message("managed_broker_bootstrap", result)
+            )
+
+    async def _cleanup_managed_broker(self, environment: BaseEnvironment) -> dict[str, Any] | None:
+        if self.managed_environment_mode != "required":
+            return None
+        command = """
+set +e
+pid_file=/tmp/agent/managed-broker.pid
+if test ! -f "$pid_file"; then
+  printf '%s\n' '{"status":"missing","pid_recorded":false}'
+  exit 0
+fi
+broker_pid=$(sed -n '1{s/[^0-9].*$//;p;}' "$pid_file")
+case "$broker_pid" in ''|*[!0-9]*) printf '%s\n' '{"status":"invalid_pid"}'; exit 1;; esac
+expected=/opt/agent-cli/bin/sigma-exec
+observed=$(readlink -f "/proc/$broker_pid/exe" 2>/dev/null)
+if test -n "$observed" && test "$observed" != "$expected"; then
+  printf '{"status":"identity_mismatch","pid":%s}\n' "$broker_pid"
+  exit 1
+fi
+kill -TERM "$broker_pid" 2>/dev/null
+term_status=$?
+for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  kill -0 "$broker_pid" 2>/dev/null || break
+  sleep 0.1
+done
+kill -0 "$broker_pid" 2>/dev/null
+alive=$?
+if test "$alive" -eq 0; then kill -KILL "$broker_pid" 2>/dev/null; fi
+wait "$broker_pid" 2>/dev/null
+if test -d /run/sigma-oci && test ! -L /run/sigma-oci && test "$(stat -c %u /run/sigma-oci)" = 0; then
+  chmod 0700 /run/sigma-oci
+  rm -f /run/sigma-oci/broker.sock /run/sigma-oci/attestation.json
+  if test -d /run/sigma-oci/artifacts && test ! -L /run/sigma-oci/artifacts; then rm -rf /run/sigma-oci/artifacts; fi
+  rmdir /run/sigma-oci 2>/dev/null
+fi
+rm -f "$pid_file"
+printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n' "$broker_pid" "$term_status" "$alive"
+""".strip()
+        try:
+            result = await environment.exec(command, timeout_sec=15)
+        except Exception as exc:
+            return {"status": "cleanup_failed", "error": _bounded_text(str(exc))}
+        output = _stdout_text(result).strip()
+        if output:
+            try:
+                parsed = json.loads(output.splitlines()[-1])
+                if isinstance(parsed, dict):
+                    if _return_code(result) != 0:
+                        parsed["error"] = _bounded_text(_stderr_text(result) or output)
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+        return {
+            "status": "cleanup_failed" if _return_code(result) != 0 else "stopped",
+            "return_code": _return_code(result),
+            "stdout": _bounded_text(output),
+            "stderr": _bounded_text(_stderr_text(result)),
+        }
+
     async def _verify_agent_ready(self, environment: BaseEnvironment) -> None:
         if self._workspace is None:
             raise RuntimeError("agent_setup_failed: workspace was not resolved")
-        checks: list[dict[str, Any]] = []
+        checks: list[dict[str, Any]] = (
+            [dict(self._managed_broker_bootstrap)]
+            if self._managed_broker_bootstrap is not None
+            else []
+        )
         help_check = await environment.exec("/usr/local/bin/agent --help", timeout_sec=30)
         checks.append(self._setup_check_record("help", help_check))
         self._write_setup_checks(checks, "running")
@@ -1656,6 +1870,12 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
                 "/usr/local/bin/agent doctor --workspace",
                 shlex.quote(self._workspace),
                 "--json --strict",
+                "--execution-mode",
+                shlex.quote(self.execution_mode),
+                "--network",
+                shlex.quote(self.network_mode),
+                "--managed-environment-mode",
+                shlex.quote(self.managed_environment_mode),
                 *( ["--check-api"] if self.check_api else [] ),
             ]),
             env=self._agent_env() or None,
@@ -1685,6 +1905,7 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             )
         self.effective_network_mode = self.network_mode
         self.process_handoff_available = capabilities["processHandoff"]
+        self._managed_environment_verified = self.managed_environment_mode == "required"
         self._write_setup_checks(checks, "passed")
 
     def _setup_check_record(self, stage: str, result: Any) -> dict[str, Any]:
@@ -1731,6 +1952,18 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             return "capabilities.networkModes are missing or invalid"
         if not isinstance(capabilities.get("processHandoff"), bool):
             return "capabilities.processHandoff is missing or invalid"
+        if self.managed_environment_mode == "required":
+            container = doctor_json.get("container")
+            managed = capabilities.get("managedEnvironment")
+            closure = capabilities.get("runtimeClosure")
+            if not isinstance(container, dict) or container.get("available") is not True \
+                    or container.get("target") != "managed":
+                return "required managed container identity is unavailable"
+            if not isinstance(managed, dict) or managed.get("available") is not True \
+                    or managed.get("prepare") is not True:
+                return "required managed environment preparation capability is unavailable"
+            if not isinstance(closure, dict) or closure.get("complete") is not True:
+                return "required managed runtime closure is incomplete"
         return None
 
     def _write_setup_checks(self, checks: list[dict[str, Any]], status: str) -> None:
@@ -1741,6 +1974,10 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             "network_mode_requested": self.network_mode,
             "network_mode_effective": self.effective_network_mode,
             "execution_mode": self.execution_mode,
+            "managed_environment_mode": self.managed_environment_mode,
+            "harbor_topology": self.harbor_topology,
+            "permission_mode_effective": self._permission_mode(),
+            "managed_broker_bootstrap": self._managed_broker_bootstrap,
             "agent_profile": self.agent_profile,
             "available_network_modes": list(self.available_network_modes),
             "read_scope_effective": self.effective_read_scope,
@@ -1903,6 +2140,10 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             "suspension_to_exit_ms": summary.get("suspension_to_exit_ms"),
             "terminal_origin": summary.get("terminal_origin"),
             "execution_mode": summary.get("execution_mode", self.execution_mode),
+            "managed_environment_mode": summary.get(
+                "managed_environment_mode", self.managed_environment_mode
+            ),
+            "harbor_topology": summary.get("harbor_topology", self.harbor_topology),
             "agent_profile": summary.get("agent_profile", self.agent_profile),
             "network_mode_requested": summary.get("network_mode_requested", self.network_mode),
             "network_mode_effective": summary.get("network_mode_effective", self.effective_network_mode),
@@ -1933,6 +2174,59 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
         except Exception:
             pass
 
+    def _mirror_setup_failure(self, error: BaseException) -> None:
+        run_dir = os.environ.get("SIGMA_BENCH_RUN_DIR")
+        run_slot = os.environ.get("SIGMA_BENCH_RUN_SLOT")
+        if not run_dir or not run_slot:
+            return
+        safe_slot = re.sub(r"[^A-Za-z0-9._-]+", "-", run_slot).strip("-") or "task"
+        task_dir = self._unique_task_dir(pathlib.Path(run_dir) / "tasks" / safe_slot)
+        task_dir.mkdir(parents=True, exist_ok=True)
+        failure_code = (
+            "managed_environment_required_unavailable"
+            if self.managed_environment_mode == "required"
+            else "agent_setup_failed"
+        )
+        message = _bounded_text(str(error) or failure_code)
+        summary = {
+            "schema_version": 1,
+            "status": "error",
+            "failure_kind": "infrastructure_incomplete",
+            "failure_code": failure_code,
+            "last_error": message,
+            "network_mode_requested": self.network_mode,
+            "execution_mode": self.execution_mode,
+            "managed_environment_mode": self.managed_environment_mode,
+            "harbor_topology": self.harbor_topology,
+            "terminal_origin": "adapter_setup",
+            "termination_source": "adapter_setup",
+        }
+        (task_dir / "summary.json").write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        setup_check = self.logs_dir / "setup-check.json"
+        if setup_check.is_file():
+            shutil.copy2(setup_check, task_dir / "setup-check.json")
+        metadata = {
+            "task_id": run_slot,
+            "run_slot": run_slot,
+            "source_logs_dir": str(self.logs_dir),
+            "agent_setup_ok": False,
+            "exit_code": 1,
+            "error_message": message,
+            "failure_kind": "infrastructure_incomplete",
+            "failure_code": failure_code,
+            "terminal_origin": "adapter_setup",
+            "termination_source": "adapter_setup",
+            "network_mode_requested": self.network_mode,
+            "execution_mode": self.execution_mode,
+            "managed_environment_mode": self.managed_environment_mode,
+            "harbor_topology": self.harbor_topology,
+        }
+        (task_dir / "metadata.json").write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+
     def _mirror_bench_artifacts(
         self,
         context: AgentContext,
@@ -1945,7 +2239,8 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
         if not run_dir:
             return
 
-        task_id = self._context_task_id(context) or str(uuid.uuid4())
+        run_slot = os.environ.get("SIGMA_BENCH_RUN_SLOT")
+        task_id = run_slot or str(uuid.uuid4())
         safe_task_id = re.sub(r"[^A-Za-z0-9._-]+", "-", task_id).strip("-") or "task"
         task_dir = self._unique_task_dir(pathlib.Path(run_dir) / "tasks" / safe_task_id)
         task_dir.mkdir(parents=True, exist_ok=True)
@@ -1961,15 +2256,21 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
 
         metadata = {
             "task_id": task_id,
+            "run_slot": run_slot,
             "source_logs_dir": str(self.logs_dir),
             "agent_setup_ok": True,
             "exit_code": getattr(context, "exit_code", None),
             "error_message": getattr(context, "error_message", None),
             "failure_kind": getattr(context, "failure_kind", None),
+            "failure_code": getattr(context, "failure_code", None),
             "duration_ms": getattr(context, "duration_ms", 0),
             "suspension_to_exit_ms": getattr(context, "suspension_to_exit_ms", None),
             "terminal_origin": getattr(context, "terminal_origin", None),
             "execution_mode": getattr(context, "execution_mode", self.execution_mode),
+            "managed_environment_mode": getattr(
+                context, "managed_environment_mode", self.managed_environment_mode
+            ),
+            "harbor_topology": getattr(context, "harbor_topology", self.harbor_topology),
             "agent_profile": getattr(context, "agent_profile", self.agent_profile),
             "network_mode_requested": getattr(context, "network_mode_requested", self.network_mode),
             "network_mode_effective": getattr(context, "network_mode_effective", self.effective_network_mode),
@@ -2010,7 +2311,7 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
                     files.update(str(path) for path in related if isinstance(path, str))
         return sorted(files)
 
-    def _failure_signals_for_metadata(self, result: Any | None, summary: dict[str, Any]) -> list[str]:
+    def _failure_signals_for_metadata(self, _result: Any | None, summary: dict[str, Any]) -> list[str]:
         signals: list[str] = []
 
         def add(signal: str) -> None:
@@ -2023,30 +2324,12 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             add(failure_kind)
         if isinstance(summary.get("timeout"), dict):
             add("partial_trace_saved")
-        result_text = _output_text(result) if result is not None else ""
-        if re.search(r"finish[_ ]?reason\"?\s*[:=]\s*\"?max_wall_time", result_text, flags=re.IGNORECASE) or re.search(
-            r"agent execution timed out|timed out after|max wall time",
-            result_text,
-            flags=re.IGNORECASE,
-        ):
+        if (summary.get("finish_reason") == "max_wall_time"
+                or summary.get("terminal_origin") == "adapter_timeout"
+                or summary.get("termination_source") == "adapter_timeout"):
             add("max_wall_time")
 
         return signals
-
-    def _context_task_id(self, context: AgentContext) -> str | None:
-        for attr in ("task_id", "task_name", "benchmark_task_id", "id", "name"):
-            value = getattr(context, attr, None)
-            if isinstance(value, str) and value:
-                return value
-
-        metadata = getattr(context, "metadata", None)
-        if isinstance(metadata, dict):
-            for key in ("task_id", "task_name", "benchmark_task_id", "id", "name"):
-                value = metadata.get(key)
-                if isinstance(value, str) and value:
-                    return value
-
-        return None
 
     def _unique_task_dir(self, base_dir: pathlib.Path) -> pathlib.Path:
         if not base_dir.exists() or not any(base_dir.iterdir()):

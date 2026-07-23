@@ -247,20 +247,23 @@ describe("typed workspace mutation contracts", () => {
     const fixture = brokerFixture();
     const tools = registerBuiltinTools(new EffectToolRegistry(), {
       broker: fixture.broker,
-      shells: ["powershell"]
+      shells: ["powershell"],
+      executionBackend: "oci",
+      executionPlatform: "linux"
     });
+    const targetExecutable = "/usr/bin/node";
     const calls = [
       request("read-exec", "exec", {
-        executable: process.execPath, cwd: "work"
+        executable: targetExecutable, cwd: "work"
       }),
       request("read-shell", "shell", {
         shell: "powershell", command: "Get-Location", cwd: "work"
       }),
       request("read-validate", "validate", {
-        executable: process.execPath, cwd: "work"
+        executable: targetExecutable, cwd: "work"
       }),
       request("read-spawn", "process_spawn", {
-        executable: process.execPath, cwd: "work"
+        executable: targetExecutable, cwd: "work"
       })
     ];
 
@@ -278,6 +281,10 @@ describe("typed workspace mutation contracts", () => {
       expect(item.policy.protectedPaths).not.toContain(path.join(workspace, ".git"));
       expect(item.policy.protectedPaths).not.toContain(path.join(workspace, ".agent"));
     }
+    const validation = fixture.executions.find((item) =>
+      item.policy.disposableWorkspaceRoot === workspace);
+    expect(validation?.policy.writeRoots).toEqual([]);
+    expect(validation?.policy.readOnlyValidationWorkspaceRoot).toBeUndefined();
     expect(fixture.spawns).toHaveLength(1);
     expect(fixture.spawns[0]?.policy.readRoots).toEqual(expected);
     expect(fixture.spawns[0]?.policy.protectedPaths).not.toContain(path.join(workspace, ".git"));

@@ -9,11 +9,15 @@ import {
   requestedInput
 } from "./model-convergence.js";
 import {
-  semanticInfrastructureFailureMessage,
-  SEMANTIC_INFRASTRUCTURE_FAILURE_CODE
+  semanticInfrastructureFailureMessage
 } from "./semantic-failures.js";
 import { isCurrentModelTurn, modelTurn } from "./model-event-parsing.js";
 import type { KernelState, PendingTool } from "./state.js";
+import {
+  completionEvidenceObligation,
+  protectCompletionCandidate,
+  recordToolPolicyViolation
+} from "./task-control.js";
 
 export function nextPhase(pending: readonly PendingTool[]): KernelState["phase"] {
   if (pending.some((item) => item.approval === "pending")) return "needs_input";
@@ -60,8 +64,11 @@ export function terminalState(state: KernelState, outcome: RunOutcome): KernelSt
     activeModelTurn: undefined,
     activeModelSemanticDelta: undefined,
     pendingTools: [],
-    completionRepairAttempts: 0,
-    completionRepair: undefined,
+    taskControl: {
+      ...state.taskControl,
+      phase: "terminal",
+      policyCorrection: undefined
+    },
     proposedOutcome: undefined,
     outcome
   };
@@ -81,7 +88,7 @@ export function protectedToolBatchFailure(
   state: KernelState,
   calls: readonly ModelToolCall[]
 ): { code: "terminal_batch_conflict" | "terminal_protocol_invalid"; message: string } | null {
-  if (state.completionRepair?.kind !== "protected_completion") return null;
+  if (!state.taskControl.completionCandidate || state.taskControl.phase !== "terminal") return null;
   const terminal = calls[0]?.name === "runtime_finalize" || calls[0]?.name === "report_blocked"
     || calls[0]?.name === "request_user_input";
   if (calls.length === 1 && terminal) return null;
@@ -157,18 +164,22 @@ function hasCurrentFailedValidation(state: KernelState): boolean {
 
 function invalidBlockedReportState(state: KernelState, progressed: KernelState): KernelState | null {
   if (hasCurrentFailedValidation(progressed)) return null;
-  if (state.completionRepairAttempts >= 2) {
-    return proposedOutcomeState(progressed, {
+  const taskControl = recordToolPolicyViolation(
+    progressed.taskControl,
+    "invalid_blocked_report",
+    progressed.revision
+  );
+  if (taskControl.phase === "terminal") {
+    return proposedOutcomeState({ ...progressed, taskControl }, {
       kind: "recoverable_failure",
-      code: "convergence_no_progress",
+      code: "invalid_blocked_report",
       message: "report_blocked was repeated without a failed validation on the current workspace state."
     });
   }
   return {
     ...progressed,
     phase: "ready_model",
-    completionRepairAttempts: state.completionRepairAttempts + 1,
-    completionRepair: { kind: "terminal_action" },
+    taskControl,
     messages: [...progressed.messages, {
       role: "developer",
       content: "report_blocked requires a failed semantic validation on the current workspace state. Continue repair or validation, complete if the frontier is ready, or request user input only for a genuine user decision."
@@ -187,41 +198,83 @@ function isCompletionPrerequisiteFailure(input: TerminalReceiptTransition): bool
   return input.receipt.diagnostics.some((code) => COMPLETION_PREREQUISITE_CODES.has(code));
 }
 
+function completionPrerequisiteCode(input: TerminalReceiptTransition): string {
+  return input.receipt.diagnostics.find((code) => COMPLETION_PREREQUISITE_CODES.has(code))
+    ?? "completion_prerequisite_unresolved";
+}
+
+function completionPrerequisiteExhausted(input: TerminalReceiptTransition, retryCount: number): KernelState | null {
+  if (retryCount < 2) return null;
+  const failureCode = completionPrerequisiteCode(input);
+  return proposedOutcomeState(input.progressed, {
+    kind: "recoverable_failure",
+    code: failureCode,
+    message: completionRepairFailureMessage(
+      input.state,
+      `Completion prerequisite ${failureCode} remained unresolved after two correction turns.`
+    )
+  });
+}
+
+function completionCandidateForReceipt(input: TerminalReceiptTransition, summary: string): string {
+  return protectedCompletionAnswer(input.state)
+    || assistantBodyForToolCall(input.state, input.receipt.callId)
+    || summary;
+}
+
+function withCompletionRepairAttempts(
+  taskControl: KernelState["taskControl"],
+  attempts: number
+): KernelState["taskControl"] {
+  return taskControl.obligation?.kind === "completion_evidence"
+    ? { ...taskControl, obligation: { ...taskControl.obligation, attempts } }
+    : taskControl;
+}
+
+function pendingCompletionTool(input: TerminalReceiptTransition): PendingTool | undefined {
+  return input.state.pendingTools.find((item) => item.request.callId === input.receipt.callId);
+}
+
+function completionRepairSummary(pending: PendingTool): string {
+  const raw = pending.request.arguments;
+  if (raw && typeof raw === "object" && !Array.isArray(raw) && typeof raw.summary === "string") {
+    return raw.summary;
+  }
+  return "Task completion is awaiting required evidence.";
+}
+
 function completionPrerequisiteRepair(input: TerminalReceiptTransition): KernelState | null {
   if (!isCompletionPrerequisiteFailure(input)) return null;
-  const pending = input.state.pendingTools.find((item) => item.request.callId === input.receipt.callId);
-  if (!pending) return null;
-  const previous = input.state.completionRepair?.kind === "completion_prerequisite"
-    ? input.state.completionRepair : undefined;
-  const retryCount = previous ? previous.retryCount + 1 : 0;
-  if (retryCount >= 2) {
-    return proposedOutcomeState(input.progressed, {
-      kind: "recoverable_failure",
-      code: "convergence_no_progress",
-      message: completionRepairFailureMessage(
-        input.state,
-        "Completion prerequisites remained unresolved after two correction turns."
-      )
-    });
+  if (input.progressed.taskControl.obligation?.kind === "review_repair") {
+    return { ...input.progressed, phase: "ready_model" };
   }
-  const raw = pending.request.arguments;
-  const summary = raw && typeof raw === "object" && !Array.isArray(raw)
-    && typeof raw.summary === "string" ? raw.summary : "Task completion is awaiting required evidence.";
+  const pending = pendingCompletionTool(input);
+  if (!pending) return null;
+  const previous = input.state.taskControl.obligation?.kind === "completion_evidence"
+    ? input.state.taskControl.obligation : undefined;
+  const retryCount = previous ? previous.attempts + 1 : 0;
+  const exhausted = completionPrerequisiteExhausted(input, retryCount);
+  if (exhausted) return exhausted;
+  const summary = completionRepairSummary(pending);
+  const protectedControl = protectCompletionCandidate(
+    input.progressed.taskControl,
+    completionCandidateForReceipt(input, summary)
+  );
+  const taskControl = completionEvidenceObligation(
+    protectedControl,
+    input.progressed.revision,
+    "acquire",
+    currentRunReferenceableEvidenceCount(input.progressed),
+    {
+      failureCode: previous?.failureCode ?? completionPrerequisiteCode(input),
+      originalCallId: previous?.originalCallId ?? input.receipt.callId,
+      arguments: pending.request.arguments
+    }
+  );
   return {
     ...input.progressed,
     phase: "ready_model",
-    completionRepairAttempts: Math.max(1, input.state.completionRepairAttempts),
-    completionRepair: {
-      kind: "completion_prerequisite",
-      answer: protectedCompletionAnswer(input.state)
-        || assistantBodyForToolCall(input.state, input.receipt.callId)
-        || summary,
-      arguments: pending.request.arguments,
-      originalCallId: previous?.originalCallId ?? input.receipt.callId,
-      evidenceCount: currentRunReferenceableEvidenceCount(input.progressed),
-      retryCount,
-      modelTurn: pending.modelTurn
-    }
+    taskControl: withCompletionRepairAttempts(taskControl, retryCount)
   };
 }
 
@@ -236,45 +289,66 @@ export interface TerminalReceiptTransition {
   semanticLimitReached: boolean;
 }
 
-export function terminalReceiptTransition(input: TerminalReceiptTransition): KernelState | null {
-  const inputMessage = requestedInput(input.receipt);
-  if (inputMessage) {
-    const failure = terminalReceiptFailure(input.state, input.progressed, input.toolName, "request_input");
-    if (failure) return failure;
-    return proposedOutcomeState(input.progressed, {
+function explicitTerminalFailure(input: TerminalReceiptTransition): KernelState | null {
+  if (input.toolName !== "runtime_finalize" || input.receipt.ok || input.remainingTools !== 0) return null;
+  const failureCode = input.receipt.diagnostics.find((code) =>
+    code === "validation_failed" || code === "review_unavailable");
+  if (!failureCode) return null;
+  return proposedOutcomeState(input.progressed, {
+    kind: "recoverable_failure",
+    code: failureCode,
+    message: completionRepairFailureMessage(input.state, input.receipt.output)
+  });
+}
+
+function requestedInputTransition(input: TerminalReceiptTransition): KernelState | null {
+  const message = requestedInput(input.receipt);
+  if (!message) return null;
+  return terminalReceiptFailure(input.state, input.progressed, input.toolName, "request_input")
+    ?? proposedOutcomeState(input.progressed, {
       kind: "needs_input",
       requestId: input.receipt.callId,
-      message: inputMessage
+      message
     });
-  }
-  const blocked = blockedReport(input.receipt);
-  if (blocked) {
-    const failure = terminalReceiptFailure(input.state, input.progressed, input.toolName, "report_blocked");
-    if (failure) return failure;
-    const invalid = invalidBlockedReportState(input.state, input.progressed);
-    if (invalid) return invalid;
-    return proposedOutcomeState(input.progressed, {
+}
+
+function blockedReportTransition(input: TerminalReceiptTransition): KernelState | null {
+  const report = blockedReport(input.receipt);
+  if (!report) return null;
+  return terminalReceiptFailure(input.state, input.progressed, input.toolName, "report_blocked")
+    ?? invalidBlockedReportState(input.state, input.progressed)
+    ?? proposedOutcomeState(input.progressed, {
       kind: "recoverable_failure",
-      code: blocked.code,
-      message: blocked.message
+      code: report.code,
+      message: report.message,
+      failureKind: "blocked",
+      failureCode: report.code
     });
-  }
+}
+
+function completionTransition(input: TerminalReceiptTransition): KernelState | null {
   const summary = completionSummary(input.receipt);
-  if (summary) {
-    const failure = terminalReceiptFailure(input.state, input.progressed, input.toolName, "complete");
-    if (failure) return failure;
-    const sameTurnAnswer = assistantBodyForToolCall(input.state, input.receipt.callId);
-    return proposedOutcomeState(input.progressed, {
-      kind: "completed",
-      // A protected substantive answer is intentionally immutable during its
-      // terminal repair. On an ordinary completion, retain both handoff
-      // surfaces so a generic same-turn status cannot hide
-      // the structured completion summary.
-      message: `${protectedCompletionAnswer(input.state)
-        || ordinaryCompletionMessage(sameTurnAnswer, summary)}${advisoryReviewWarnings(input.progressed)}`,
-      evidence: input.progressed.evidence
-    });
-  }
+  if (!summary) return null;
+  const failure = terminalReceiptFailure(input.state, input.progressed, input.toolName, "complete");
+  if (failure) return failure;
+  const sameTurnAnswer = assistantBodyForToolCall(input.state, input.receipt.callId);
+  return proposedOutcomeState(input.progressed, {
+    kind: "completed",
+    message: `${ordinaryCompletionMessage(
+      protectedCompletionAnswer(input.state) || sameTurnAnswer,
+      summary
+    )}${advisoryReviewWarnings(input.progressed)}`,
+    evidence: input.progressed.evidence
+  });
+}
+
+export function terminalReceiptTransition(input: TerminalReceiptTransition): KernelState | null {
+  const terminalOutcome = requestedInputTransition(input)
+    ?? blockedReportTransition(input)
+    ?? completionTransition(input);
+  if (terminalOutcome) return terminalOutcome;
+  const explicitFailure = explicitTerminalFailure(input);
+  if (explicitFailure) return explicitFailure;
   const prerequisiteRepair = completionPrerequisiteRepair(input);
   if (prerequisiteRepair) return prerequisiteRepair;
   const failedRepair = failedTerminalRepairState(
@@ -285,11 +359,13 @@ export function terminalReceiptTransition(input: TerminalReceiptTransition): Ker
     input.remainingTools
   );
   if (failedRepair) return failedRepair;
-  if (input.semanticLimitReached && input.remainingTools === 0 && input.progressed.semanticFailureCluster) {
+  const terminalResolution = input.progressed.taskControl.obligation;
+  if (input.semanticLimitReached && input.remainingTools === 0
+    && terminalResolution?.kind === "terminal_resolution") {
     return proposedOutcomeState(input.progressed, {
       kind: "recoverable_failure",
-      code: SEMANTIC_INFRASTRUCTURE_FAILURE_CODE,
-      message: semanticInfrastructureFailureMessage(input.progressed.semanticFailureCluster)
+      code: terminalResolution.failureCode,
+      message: semanticInfrastructureFailureMessage(input.progressed)
     });
   }
   return null;

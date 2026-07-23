@@ -15,9 +15,11 @@ import {
 import { mutatingPlan, planAllowsMutation, turnPayload, type ToolAttempt } from "./effect-runner-helpers.js";
 import type { EffectRunnerOptions } from "./effect-runner.js";
 import { profileAllowsTool } from "./profile-policy.js";
-import { assertToolReceiptIdentity, normalizeReceiptEvidence } from "./tool-evidence.js";
+import { assertToolReceiptIdentity } from "./tool-evidence.js";
 import {
   assertCheckpointActionAllowed,
+  assertTaskControlCallAllowed,
+  assertTaskControlPlanAllowed,
   assertReceiptWithinPlan,
   validationScope
 } from "./tool-plan-enforcement.js";
@@ -39,6 +41,9 @@ import {
 } from "./tool-transaction-support.js";
 import { convergedToolFailure } from "./capability-failure-convergence.js";
 import type { PreparedTool, TransactionState } from "./tool-transaction-types.js";
+import { recordRuntimeDependencyFailure } from "./runtime-dependency-observation.js";
+import { toolTaskControlContext } from "./repository-recovery-context.js";
+import { normalizeToolTransactionReceipt } from "./tool-receipt-normalization.js";
 export class ToolTransactionRunner {
   private readonly locks = new ResourceLockManager();
   private readonly workspaceLease = new WorkspaceMutationLease();
@@ -86,15 +91,6 @@ export class ToolTransactionRunner {
     const { call, modelTurn } = attempt;
     const descriptor = this.options.runtime.tools.descriptors().find((item) => item.name === call.name);
     if (!descriptor) return failed(call, startedAt, `Unknown tool '${call.name}'.`, "unknown_tool");
-    if (descriptor.possibleEffects.some((effect) => effect === "process.spawn" || effect === "process.spawn.readonly")
-      && [...session.interaction.capabilityFailures.values()].some((count) => count >= 2)) {
-      return failed(
-        call,
-        startedAt,
-        "Execution is blocked after the same sandbox capability failed twice. Do not substitute a weaker probe; report the typed environment blocker.",
-        "capability_retry_exhausted"
-      );
-    }
     await this.options.emit(session, "tool.requested", "runtime", {
       callId: call.id, name: call.name, arguments: call.arguments, ...turnPayload(modelTurn)
     });
@@ -105,7 +101,7 @@ export class ToolTransactionRunner {
       return failed(call, startedAt, `Tool '${call.name}' is denied by the frozen Agent Profile.`, "profile_denied");
     }
     const repairPhase = completionRepairPhase(session);
-    if (!descriptorAllowedForRepair(descriptor, repairPhase)) {
+    if (!descriptorAllowedForRepair(session, descriptor, repairPhase)) {
       return failed(
         call,
         startedAt,
@@ -113,11 +109,13 @@ export class ToolTransactionRunner {
         "tool_unavailable_for_repair"
       );
     }
+    assertTaskControlCallAllowed(session, call);
     const context = {
       sessionId: session.identity.sessionId,
       runId: session.durable.runId,
       workspacePath: session.identity.workspacePath,
       runMode: session.durable.mode,
+      ...toolTaskControlContext(session),
       runtimeControl: this.options.control.forSession(session)
     } as const;
     const plan = this.options.runtime.tools.prepare
@@ -125,7 +123,7 @@ export class ToolTransactionRunner {
         callId: call.id, name: call.name, arguments: call.arguments
       }, context)
       : await prepareToolCallPlan(descriptor, call.arguments, context);
-    if (!effectsAllowedForRepair(plan.exactEffects, repairPhase)) {
+    if (!effectsAllowedForRepair(session, plan.exactEffects, repairPhase)) {
       return failed(
         call,
         startedAt,
@@ -168,6 +166,7 @@ export class ToolTransactionRunner {
         "plan_required"
       );
     }
+    await assertTaskControlPlanAllowed(session, plan);
     const scopeError = await writeScopeFailure(session, call, descriptor, startedAt, plan);
     if (scopeError) return scopeError;
     const completionError = completionFailure(session, call, descriptor, startedAt);
@@ -245,6 +244,13 @@ export class ToolTransactionRunner {
       );
       return await this.runReserved(session, { ...prepared, ...(approval ? { approval } : {}) }, reservationId, signal);
     } catch (error) {
+      try {
+        await recordRuntimeDependencyFailure(this.options, session, call, error);
+      } catch {
+        // The observation is an authorization prerequisite. If it cannot be
+        // durably recorded, preserve the original failure and expose no
+        // environment-recovery capability.
+      }
       const code = failureCode(error, signal);
       const receipt = failed(
         call,
@@ -335,16 +341,7 @@ export class ToolTransactionRunner {
       await assertReceiptWithinPlan(session, receipt, plan);
       if (checkpoint) await this.options.control.sealCheckpoint(session, checkpoint.checkpointId);
       await recordProcessReceipt(session, call, plan, receipt, this.options.emit);
-      const finalValidationScope = plan.exactEffects.includes("validation")
-        && plan.exactEffects.includes("filesystem.write")
-        ? validationScope(session, call, plan)
-        : prepared.validationScope;
-      const normalizedReceipt = normalizeReceiptEvidence(receipt, descriptor.name, plan, {
-        sessionId: session.identity.sessionId,
-        runId: session.durable.runId,
-        workspaceDeltas: [],
-        ...(finalValidationScope ? { validationScope: finalValidationScope } : {})
-      });
+      const normalizedReceipt = normalizeToolTransactionReceipt(session, prepared, receipt);
       await this.options.emit(session, "execution.completed", "runtime", {
         executionId: call.id,
         evidenceIds: (normalizedReceipt.evidence ?? []).map((item) => item.evidenceId)
@@ -393,4 +390,5 @@ export class ToolTransactionRunner {
       throw error;
     }
   }
+
 }

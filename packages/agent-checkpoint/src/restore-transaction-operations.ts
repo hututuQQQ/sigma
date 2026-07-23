@@ -120,7 +120,7 @@ function journalValue(
       ...(desired.has(entryPath) ? { desiredMode: desired.get(entryPath) } : {})
     }));
   return JSON.stringify({
-    schemaVersion: 3,
+    schemaVersion: 4,
     phase,
     finalization: options.finalization,
     directoryModes,

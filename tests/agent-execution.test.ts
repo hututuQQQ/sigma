@@ -507,6 +507,7 @@ describe("agent-execution protocol validation", () => {
       capabilities: {
         foreground: true, background: true, stdin: true, pty: false, networkModes: ["none"],
         executionRoots: true,
+        managedEnvironment: { available: true, prepare: true },
         shells: [{ kind: "bash", executable: "/bin/bash", verified: true }]
       }
     };
@@ -523,8 +524,13 @@ describe("agent-execution protocol validation", () => {
     });
     expect(parsedDoctor.capabilities).toMatchObject({
       executionRoots: true,
+      managedEnvironment: { available: true, prepare: true },
       shells: [{ kind: "bash", executable: "/bin/bash", verified: true }]
     });
+    expect(() => parseDoctor({
+      ...doctor,
+      capabilities: { ...doctor.capabilities, managedEnvironment: { available: true, prepare: "yes" } }
+    })).toThrow(BrokerProtocolError);
     expect(parseDoctor({
       ...doctor,
       platform: "windows",

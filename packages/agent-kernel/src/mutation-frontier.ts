@@ -146,11 +146,16 @@ export function frontierAfterEvidence(
   }
   if (evidence.kind !== "repository_delta") return frontier;
   const repository = evidence as RepositoryDeltaEvidence;
+  const worktreePaths = repository.data.worktreeDelta ? [
+    ...repository.data.worktreeDelta.added,
+    ...repository.data.worktreeDelta.modified,
+    ...repository.data.worktreeDelta.deleted
+  ] : [];
   return {
     ...frontier,
     revision: frontier.revision + 1,
     repositoryStateDigest: repository.data.afterStateDigest,
-    changedPaths: [...new Set([...frontier.changedPaths, ".git"])].sort(),
+    changedPaths: [...new Set([...frontier.changedPaths, ...worktreePaths, ".git"])].sort(),
     currentStateDigest: digest({
       workspaceStateDigest: frontier.currentStateDigest,
       repositoryStateDigest: repository.data.afterStateDigest

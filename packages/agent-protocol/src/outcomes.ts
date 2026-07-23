@@ -6,7 +6,16 @@ export type RunOutcome =
   | { kind: "completed"; message: string; evidence: EvidenceRecord[] }
   | { kind: "needs_input"; requestId: string; message: string }
   | { kind: "cancelled"; reason: string }
-  | { kind: "recoverable_failure"; code: string; message: string; resumeToken?: string }
+  | {
+    kind: "recoverable_failure";
+    code: string;
+    message: string;
+    resumeToken?: string;
+    /** Present only for a runtime-authorized report_blocked outcome. */
+    failureKind?: "blocked";
+    /** Stable structured code mirrored for external runners. */
+    failureCode?: string;
+  }
   | { kind: "fatal"; code: string; message: string };
 
 export type RunCommand =

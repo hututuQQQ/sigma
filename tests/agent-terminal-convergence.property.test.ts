@@ -13,6 +13,7 @@ import {
   assertKernelInvariants,
   createKernelState,
   evolve,
+  terminalResolutionObligation,
   type KernelState
 } from "../packages/agent-kernel/src/index.js";
 import {
@@ -22,10 +23,12 @@ import {
   descriptorAllowedForRepair,
   effectsAllowedForRepair
 } from "../packages/agent-runtime/src/tool-turn-policy.js";
+import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
 
 const NOW = "2026-01-01T00:00:00.000Z";
 const nonBlankText = fc.string({ minLength: 1, maxLength: 80 })
   .filter((value) => value.trim().length > 0);
+const completionText = nonBlankText.filter((value) => !/[?？]\s*$/u.test(value));
 
 function initial(): KernelState {
   return createKernelState({
@@ -115,7 +118,7 @@ function descriptor(
 }
 
 describe("terminal convergence properties", () => {
-  it("keeps every normal tool available during terminal correction", () => {
+  it("projects only terminal effects during terminal resolution", () => {
     const effects = fc.uniqueArray(fc.constantFrom<ToolEffect>(
       "outcome.propose",
       "outcome.request_input",
@@ -127,23 +130,29 @@ describe("terminal convergence properties", () => {
     fc.assert(fc.property(effects, effects, effects, names,
       (possibleEffects, maximumEffects, exactEffects, name) => {
       const tool = descriptor(possibleEffects, maximumEffects, name);
-      expect(descriptorAllowedForRepair(tool, "protected_completion")).toBe(true);
+      const state = initial();
+      state.taskControl = terminalResolutionObligation(state.taskControl, state.revision, "property_terminal");
+      const session = { durable: { state } } as RuntimeSession;
+      const terminalEffects = new Set<ToolEffect>([
+        "outcome.propose", "outcome.report_blocked", "outcome.request_input"
+      ]);
+      const expectedDescriptor = name !== "request_user_input" && possibleEffects.length > 0
+        && possibleEffects.every((effect) => terminalEffects.has(effect));
+      expect(descriptorAllowedForRepair(session, tool, "terminal")).toBe(expectedDescriptor);
       const pureAction = possibleEffects.length === 1 && maximumEffects.length === 1
         && possibleEffects[0] === maximumEffects[0]
         ? possibleEffects[0] === "outcome.propose" ? "complete"
           : possibleEffects[0] === "outcome.request_input" ? "request_input" : null
         : null;
       expect(terminalProtocolAction(tool)).toBe(pureAction);
-      expect(descriptorAllowedForRepair(tool, "evidence")).toBe(true);
-      expect(descriptorAllowedForRepair(tool, "protected_recovery")).toBe(true);
-      expect(effectsAllowedForRepair(exactEffects, "protected_completion")).toBe(true);
-      expect(effectsAllowedForRepair(exactEffects, "evidence")).toBe(true);
-      expect(effectsAllowedForRepair(exactEffects, "protected_recovery")).toBe(true);
+      expect(effectsAllowedForRepair(session, exactEffects, "terminal")).toBe(
+        exactEffects.length > 0 && exactEffects.every((effect) => terminalEffects.has(effect))
+      );
     }));
   });
 
   it("always converges an explicit concrete question to a typed input proposal", () => {
-    fc.assert(fc.property(nonBlankText, nonBlankText, (answer, question) => {
+    fc.assert(fc.property(completionText, nonBlankText, (answer, question) => {
       let prepared = apply(initial(), "user.message", { text: answer });
       prepared = apply(prepared, "evidence.recorded", evidence());
       let attempted = settleModel(startModel(prepared, 1), {
@@ -189,7 +198,7 @@ describe("terminal convergence properties", () => {
   });
 
   it("always publishes ordinary text when its runtime completion intent succeeds", () => {
-    fc.assert(fc.property(nonBlankText, nonBlankText, (answer, summary) => {
+    fc.assert(fc.property(completionText, nonBlankText, (answer, summary) => {
       let state = protectedAnswer(answer);
       const pending = state.pendingTools[0]!;
       state = apply(state, "tool.completed", {
@@ -242,14 +251,17 @@ describe("terminal convergence properties", () => {
   });
 
   it("rejects an input-effect receipt from a custom tool during protected recovery", () => {
-    fc.assert(fc.property(nonBlankText, nonBlankText, (answer, question) => {
+    fc.assert(fc.property(completionText, nonBlankText, (answer, question) => {
       const protectedState = protectedAnswer(answer);
       const modelTurn = { turnId: 2, effectRevision: protectedState.revision };
       const recoveryState: KernelState = {
         ...protectedState,
         phase: "tool_pending",
-        completionRepairAttempts: 0,
-        completionRepair: { kind: "protected_recovery", answer: answer.trim() },
+        taskControl: terminalResolutionObligation(
+          protectedState.taskControl,
+          protectedState.revision,
+          "terminal_protocol_invalid"
+        ),
         pendingTools: [{
           request: { callId: "custom-input", name: "custom_terminal_alias", arguments: {} },
           modelTurn,

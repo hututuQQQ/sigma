@@ -1,6 +1,12 @@
 import { z } from "zod";
 import { nonEmptyStringSchema } from "./domain-schemas.js";
 import {
+  budgetBindMutationV1Schema,
+  budgetLimitMutationV1Schema,
+  budgetReserveMutationV1Schema,
+  budgetSettleMutationV1Schema
+} from "./budget-mutation-schemas.js";
+import {
   sourceSchema,
   sharedSchemas,
   toolCallPlanSchema
@@ -10,6 +16,44 @@ const budgetEventSchema = z.object({
   ledger: sharedSchemas.budgetLedgerStateSchema,
   reservationId: nonEmptyStringSchema
 }).strict();
+
+const compactBudgetReserveEventSchema = z.object({
+  reservationId: nonEmptyStringSchema,
+  mutation: budgetReserveMutationV1Schema
+}).strict().refine(
+  (value) => value.reservationId === value.mutation.reservation.reservationId,
+  { path: ["mutation", "reservation", "reservationId"], message: "Reservation identifiers must match" }
+);
+
+const compactBudgetSettleEventSchema = z.object({
+  reservationId: nonEmptyStringSchema,
+  mutation: budgetSettleMutationV1Schema
+}).strict().refine(
+  (value) => value.reservationId === value.mutation.reservationId,
+  { path: ["mutation", "reservationId"], message: "Reservation identifiers must match" }
+);
+
+const compactBudgetCommittedEventSchema = compactBudgetSettleEventSchema.refine(
+  (value) => value.mutation.status === "committed",
+  { path: ["mutation", "status"], message: "Committed events require a committed mutation" }
+);
+
+const compactBudgetReleasedEventSchema = compactBudgetSettleEventSchema.refine(
+  (value) => value.mutation.status === "released",
+  { path: ["mutation", "status"], message: "Released events require a released mutation" }
+);
+
+const compactBudgetBindEventSchema = z.object({
+  reservationId: nonEmptyStringSchema,
+  ownerId: nonEmptyStringSchema,
+  mutation: budgetBindMutationV1Schema
+}).strict().refine(
+  (value) => value.reservationId === value.mutation.reservationId
+    && value.ownerId === value.mutation.ownerId,
+  { path: ["mutation"], message: "Reservation binding fields must match" }
+);
+
+const compactBudgetLimitEventSchema = z.object({ mutation: budgetLimitMutationV1Schema }).strict();
 
 const budgetOverrunDimensionSchema = z.object({
   dimension: z.enum(["inputTokens", "outputTokens", "costMicroUsd", "modelTurns", "toolCalls", "children"]),
@@ -145,14 +189,14 @@ export const durableEventPayloadSchemas = {
     plan: sharedSchemas.planGraphSchema,
     previousRevision: z.number().int().nonnegative()
   }).strict(),
-  "budget.reserved": budgetEventSchema,
-  "budget.reservation_bound": z.object({
+  "budget.reserved": z.union([budgetEventSchema, compactBudgetReserveEventSchema]),
+  "budget.reservation_bound": z.union([z.object({
     ledger: sharedSchemas.budgetLedgerStateSchema,
     reservationId: nonEmptyStringSchema,
     ownerId: nonEmptyStringSchema
-  }).strict(),
-  "budget.committed": budgetEventSchema,
-  "budget.released": budgetEventSchema,
+  }).strict(), compactBudgetBindEventSchema]),
+  "budget.committed": z.union([budgetEventSchema, compactBudgetCommittedEventSchema]),
+  "budget.released": z.union([budgetEventSchema, compactBudgetReleasedEventSchema]),
   "budget.exhausted": z.object({
     dimension: nonEmptyStringSchema,
     requested: z.number().int().nonnegative(),
@@ -162,11 +206,11 @@ export const durableEventPayloadSchemas = {
     reservationId: nonEmptyStringSchema,
     dimensions: z.array(budgetOverrunDimensionSchema).min(1)
   }).strict(),
-  "budget.limit_increased": z.object({
+  "budget.limit_increased": z.union([z.object({
     previousLimits: sharedSchemas.budgetLimitsSchema,
     increase: sharedSchemas.budgetLimitsSchema.partial(),
     ledger: sharedSchemas.budgetLedgerStateSchema
-  }).strict(),
+  }).strict(), compactBudgetLimitEventSchema]),
   "checkpoint.created": sharedSchemas.checkpointRefSchema.refine(
     (checkpoint) => checkpoint.status === "open",
     { path: ["status"], message: "Created checkpoints must be open" }

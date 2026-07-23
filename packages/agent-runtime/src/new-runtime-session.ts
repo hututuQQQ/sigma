@@ -55,7 +55,6 @@ export async function newRuntimeSession(
     approvals: new Map(),
     callApprovals: new Map(),
     alwaysAllowedEffects: new Set(),
-    capabilityFailures: new Map(),
     processHandles: new Map(),
     steeringPending: 0,
     followUps: [],

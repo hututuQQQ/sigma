@@ -12,6 +12,7 @@ import type {
   CheckpointReviewMaterial,
   CreateCheckpointInput,
   OpenCheckpointInspection,
+  RunRestorationInspection,
   SealedCheckpointInspection
 } from "./types.js";
 import { CheckpointConflictError, isCheckpointRecord } from "./types.js";
@@ -24,6 +25,9 @@ import { CheckpointCasStore } from "./cas-store.js";
 import { buildCheckpointReviewMaterial } from "./checkpoint-review.js";
 import { checkpointOpaqueArtifacts } from "./opaque-artifacts.js";
 import type { CheckpointRestoreFaultInjector } from "./fault-injection.js";
+import { runScopePaths } from "./run-restoration.js";
+import type { RestoreFinalization } from "./restore-transaction.js";
+import { RunRestorationCoordinator } from "./run-restoration-coordinator.js";
 
 export { checkpointDelta } from "./manifest.js";
 export class CheckpointManager {
@@ -201,6 +205,14 @@ export class CheckpointManager {
     return restored;
   }
 
+  async inspectRunRestoration(sessionId: string, runId: string): Promise<RunRestorationInspection> {
+    return await this.runRestorationCoordinator().inspect(sessionId, runId);
+  }
+
+  async restoreRunChanges(sessionId: string, runId: string): Promise<RunRestorationInspection> {
+    return await this.runRestorationCoordinator().restore(sessionId, runId);
+  }
+
   async restoreOpen(
     sessionId: string,
     checkpointId: string,
@@ -316,6 +328,10 @@ export class CheckpointManager {
     await durableReplaceFile(target, JSON.stringify(record, null, 2), { mode: 0o600 });
   }
 
+  private async writeRecords(records: readonly CheckpointRecord[]): Promise<void> {
+    for (const record of records) await this.writeRecord(record);
+  }
+
   private async readRecord(sessionId: string, checkpointId: string): Promise<CheckpointRecord> {
     const value: unknown = JSON.parse(await readFile(this.recordPath(sessionId, checkpointId), "utf8"));
     if (!isCheckpointRecord(value) || value.sessionId !== sessionId || value.checkpointId !== checkpointId) {
@@ -337,22 +353,26 @@ export class CheckpointManager {
     await recoverCheckpointTransactions({
       workspacePath: canonical,
       transactionRootDir: await this.transactionRoot(canonical),
-      finalize: async ({ record, desiredManifestDigest }) => {
-        if (record.schemaVersion !== 1 || record.status !== "restored"
-          || path.resolve(record.workspacePath) !== canonical
-          || record.preManifestDigest !== desiredManifestDigest) {
-          throw new CheckpointConflictError("Checkpoint recovery finalization identity is invalid.");
-        }
-        // Recompute the target through validated identifiers; never trust a path from the workspace journal.
-        this.recordPath(record.sessionId, record.checkpointId);
-        const current = await this.capture(canonical, record.scopePaths);
-        const currentDigest = await this.putManifest(current);
-        if (currentDigest !== desiredManifestDigest) {
-          throw new CheckpointConflictError("Verified checkpoint recovery no longer matches its desired manifest.");
-        }
-        await this.writeRecord(record);
-      }
+      finalize: async (finalization) => await this.finalizeRecovery(canonical, finalization)
     });
+  }
+
+  private async finalizeRecovery(canonical: string, finalization: RestoreFinalization): Promise<void> {
+    const records = finalization.kind === "run" ? finalization.records : [finalization.record];
+    if (records.some((record) => record.schemaVersion !== 1 || record.status !== "restored"
+      || path.resolve(record.workspacePath) !== canonical)) {
+      throw new CheckpointConflictError("Checkpoint recovery finalization identity is invalid.");
+    }
+    for (const record of records) this.recordPath(record.sessionId, record.checkpointId);
+    const scopes = finalization.kind === "run" ? runScopePaths(records) : records[0]!.scopePaths;
+    const current = await this.capture(canonical, scopes);
+    const currentDigest = await this.putManifest(current);
+    if (currentDigest !== finalization.desiredManifestDigest
+      || (finalization.kind !== "run"
+        && records[0]!.preManifestDigest !== finalization.desiredManifestDigest)) {
+      throw new CheckpointConflictError("Verified checkpoint recovery no longer matches its desired manifest.");
+    }
+    await this.writeRecords(records);
   }
 
   private async transactionRoot(workspacePath: string): Promise<string> {
@@ -360,6 +380,21 @@ export class CheckpointManager {
       workspacePath,
       stateRootDir: this.rootDir,
       namespace: "checkpoint-restore"
+    });
+  }
+
+  private runRestorationCoordinator(): RunRestorationCoordinator {
+    return new RunRestorationCoordinator({
+      list: async (sessionId) => await this.list(sessionId),
+      recover: async (workspacePath) => await this.recover(workspacePath),
+      capture: async (workspacePath, scopePaths, ignoredRootName) =>
+        await this.capture(workspacePath, scopePaths, ignoredRootName),
+      getManifest: async (digest) => await this.getManifest(digest),
+      putManifest: async (manifest) => await this.putManifest(manifest),
+      transactionRoot: async (workspacePath) => await this.transactionRoot(workspacePath),
+      writeRecords: async (records) => await this.writeRecords(records),
+      readCas: (digest) => this.cas.stream(digest),
+      ...(this.restoreFaultInjector ? { restoreFaultInjector: this.restoreFaultInjector } : {})
     });
   }
 }

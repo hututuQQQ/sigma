@@ -4,6 +4,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type {
   AgentEventEnvelope,
+  BudgetLedgerState,
   ModelCapabilities,
   ModelGateway,
   ModelMessage,
@@ -12,6 +13,7 @@ import type {
   ModelStreamEvent,
   ModelToolDefinition
 } from "../packages/agent-protocol/src/index.js";
+import { replayBudgetLedgerEvent } from "../packages/agent-kernel/src/index.js";
 import { createRuntime } from "../packages/agent-runtime/src/testing.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
@@ -115,6 +117,13 @@ async function storedEvents(store: SegmentedJsonlStore, sessionId: string): Prom
   return result;
 }
 
+function replayBudget(events: AgentEventEnvelope[]): BudgetLedgerState {
+  let ledger: BudgetLedgerState | undefined;
+  for (const event of events) ledger = replayBudgetLedgerEvent(ledger, event);
+  if (!ledger) throw new Error("The durable event stream did not initialize a budget ledger.");
+  return ledger;
+}
+
 describe("provider-measured model budget settlement", () => {
   it("uses one transient forced-tool turn after a length finish", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-length-recovery-workspace-"));
@@ -200,7 +209,9 @@ describe("provider-measured model budget settlement", () => {
     }));
     const committed = events.filter((event) => event.type === "budget.committed").at(-1);
     expect(committed?.payload).toEqual(expect.objectContaining({
-      ledger: expect.objectContaining({ consumed: expect.objectContaining({ inputTokens: 130 }) })
+      mutation: expect.objectContaining({
+        totals: expect.objectContaining({ consumed: expect.objectContaining({ inputTokens: 130 }) })
+      })
     }));
   });
 
@@ -294,17 +305,7 @@ describe("provider-measured model budget settlement", () => {
       });
       const events = await storedEvents(store, session.sessionId);
       const committed = events.filter((event) => event.type === "budget.committed");
-      const ledger = (committed[0]?.payload as {
-        ledger: {
-          reservations: {
-            status: string;
-            requested: { inputTokens: number; outputTokens: number };
-            consumed: { inputTokens: number; outputTokens: number };
-          }[];
-          reserved: { inputTokens: number; outputTokens: number };
-          consumed: { inputTokens: number; outputTokens: number };
-        };
-      }).ledger;
+      const ledger = replayBudget(events);
       const modelReservation = ledger.reservations.find((reservation) => reservation.status === "committed");
       expect(injected).toBe(true);
       expect(gateway.streamCalls).toBe(1);

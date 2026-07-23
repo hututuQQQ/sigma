@@ -460,6 +460,7 @@ describe("optimizer one-way boundary", () => {
       conformanceEventPaths: [conformancePath]
     }, {
       repositoryStateRoot: sharedState,
+      asOf: "2026-07-14T01:00:00.000Z",
       verifyGenericConformanceStream: async () => true
     });
     expect(collected.observationDirectory).toBe(path.join(sharedState, "optimizer", "observations"));

@@ -21,7 +21,7 @@ export interface RecoveryOperation {
 }
 
 export interface RecoveryJournal {
-  schemaVersion: 1 | 2 | 3;
+  schemaVersion: 1 | 2 | 3 | 4;
   phase: string;
   operations: RecoveryOperation[];
   directoryModes?: RestoreDirectoryMode[];
@@ -86,12 +86,22 @@ function recoveryOperation(value: unknown, schemaVersion: number): value is Reco
 
 function recoveryFinalization(value: unknown): value is RestoreFinalization {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const finalization = value as Partial<RestoreFinalization>;
-  return typeof finalization.desiredManifestDigest === "string"
-    && /^[a-f0-9]{64}$/u.test(finalization.desiredManifestDigest)
-    && isCheckpointRecord(finalization.record)
-    && finalization.record.status === "restored"
-    && finalization.record.preManifestDigest === finalization.desiredManifestDigest;
+  const finalization = value as Record<string, unknown>;
+  if (typeof finalization.desiredManifestDigest !== "string"
+    || !/^[a-f0-9]{64}$/u.test(finalization.desiredManifestDigest)) return false;
+  if (finalization.kind !== "run") {
+    return isCheckpointRecord(finalization.record)
+      && finalization.record.status === "restored"
+      && finalization.record.preManifestDigest === finalization.desiredManifestDigest;
+  }
+  if (!Array.isArray(finalization.records) || finalization.records.length === 0
+    || !finalization.records.every(isCheckpointRecord)
+    || finalization.records.some((record) => record.status !== "restored")) return false;
+  const records = finalization.records;
+  return new Set(records.map((record) => record.checkpointId)).size === records.length
+    && records.every((record) => record.sessionId === records[0]!.sessionId
+      && record.runId === records[0]!.runId
+      && record.workspacePath === records[0]!.workspacePath);
 }
 
 function recoveryDirectoryMode(value: unknown): value is RestoreDirectoryMode {
@@ -107,7 +117,7 @@ function recoveryDirectoryMode(value: unknown): value is RestoreDirectoryMode {
 }
 
 function recoverySchemaVersion(value: unknown): value is RecoveryJournal["schemaVersion"] {
-  return value === 1 || value === 2 || value === 3;
+  return value === 1 || value === 2 || value === 3 || value === 4;
 }
 
 function recoveryPhase(value: unknown): value is string {
@@ -120,7 +130,7 @@ function operationsHaveUniqueIndices(operations: readonly RecoveryOperation[]): 
 }
 
 function validDirectoryModes(candidate: Partial<RecoveryJournal>): boolean {
-  if (candidate.schemaVersion !== 3) return true;
+  if ((candidate.schemaVersion ?? 0) < 3) return true;
   return Array.isArray(candidate.directoryModes)
     && candidate.directoryModes.every(recoveryDirectoryMode);
 }

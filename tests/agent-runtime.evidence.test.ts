@@ -2,12 +2,13 @@ import { mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { createKernelState } from "../packages/agent-kernel/src/index.js";
+import { createKernelState, reviewRepairObligation } from "../packages/agent-kernel/src/index.js";
 import type {
   AgentEventEnvelope,
   EvidenceRecord,
   JsonValue,
   ModelToolCall,
+  RepositoryDeltaEvidence,
   ReviewEvidence,
   ToolCallPlan,
   ToolDescriptor,
@@ -23,11 +24,16 @@ import { RuntimeControlService } from "../packages/agent-runtime/src/runtime-con
 import type { RuntimeControlServiceOptions } from "../packages/agent-runtime/src/runtime-control-contracts.js";
 import { assertToolReceiptIdentity, normalizeReceiptEvidence } from "../packages/agent-runtime/src/tool-evidence.js";
 import {
+  assertTaskControlPlanAllowed,
   assertReceiptWithinPlan,
   validationScope
 } from "../packages/agent-runtime/src/tool-plan-enforcement.js";
 import { ReviewCoordinator, reviewReadiness } from "../packages/agent-runtime/src/review-coordinator.js";
-import { frontierValidationReadiness, unresolvedWorkspaceDeltas } from "../packages/agent-runtime/src/mutation-evidence.js";
+import {
+  frontierValidationReadiness,
+  reviewBasisDigest,
+  unresolvedWorkspaceDeltas
+} from "../packages/agent-runtime/src/mutation-evidence.js";
 import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
 import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
 
@@ -190,6 +196,61 @@ function proofEvidence(): EvidenceRecord {
   };
 }
 
+function repositoryDelta(target = "1".repeat(40)): RepositoryDeltaEvidence {
+  const digest = "a".repeat(64);
+  return {
+    evidenceId: "repository-delta",
+    sessionId: "session",
+    runId: "run",
+    kind: "repository_delta",
+    status: "passed",
+    createdAt: now,
+    producer: { authority: "tool", id: "git-call" },
+    summary: "repository recovered",
+    data: {
+      repositoryRoot: ".",
+      operationCount: 1,
+      operations: ["reset"],
+      beforeStateDigest: "b".repeat(64),
+      afterStateDigest: digest,
+      headBefore: "2".repeat(40),
+      headAfter: target,
+      refsBeforeDigest: "c".repeat(64),
+      refsAfterDigest: digest,
+      indexBeforeDigest: "d".repeat(64),
+      indexAfterDigest: digest,
+      reachableObjectsBefore: 1,
+      reachableObjectsAfter: 2,
+      transactionHandle: "transaction",
+      selectionEvidenceId: "selection",
+      candidateId: "e".repeat(64),
+      selectedObject: target,
+      semanticAssertions: {
+        schemaVersion: 3,
+        head: target,
+        symbolicRef: "refs/heads/main",
+        refsDigest: digest,
+        reachabilityDigest: digest,
+        reachableObjectCount: 2,
+        indexDigest: digest,
+        conflictsDigest: digest,
+        conflictCount: 0,
+        trackedDigest: digest,
+        trackedCount: 1,
+        untrackedDigest: digest,
+        untrackedCount: 0,
+        targetAssertions: {
+          schemaVersion: 3,
+          selectedHead: target,
+          selectedSymbolicRef: "refs/heads/main",
+          requiredReachableObjects: [target],
+          satisfied: true
+        }
+      }
+    }
+  };
+}
+
 function session(evidence: EvidenceRecord[]): RuntimeSession {
   const state = createKernelState({
     sessionId: "session", runId: "run", mode: "change", startedAt: now, deadlineAt: now
@@ -309,6 +370,257 @@ describe("V5 assurance-coordinated mutation completion", () => {
     expect(acceptance).toMatchObject({
       coveredPaths: ["native/sigma-exec/src/main.rs", "docs/readme.md"],
       claim: { kind: "acceptance" }
+    });
+  });
+
+  it("recognizes direct Node test and check runners as semantic validation", () => {
+    const active = frontierSession();
+    active.durable.state.mutationFrontier.changedPaths = ["src/code.mjs", "config.json"];
+
+    expect(validationScope(active, {
+      id: "node-test", name: "validate",
+      arguments: { executable: "node", args: ["--test", "tests/code.test.mjs"] }
+    }, validationPlan)).toMatchObject({
+      coveredPaths: ["src/code.mjs"],
+      claim: { kind: "unit", subject: { selectedTests: ["tests/code.test.mjs"] } }
+    });
+    expect(validationScope(active, {
+      id: "node-check-script", name: "validate",
+      arguments: { executable: "node", args: ["check.mjs"] }
+    }, validationPlan)).toMatchObject({
+      coveredPaths: ["src/code.mjs", "config.json"],
+      claim: { kind: "acceptance" }
+    });
+  });
+
+  it("gives falsifiable inline Node assertions exact-file coverage only", () => {
+    const active = frontierSession();
+    active.durable.state.mutationFrontier.changedPaths = [
+      "src/app.mjs", "config.json", "docs/unrelated.md"
+    ];
+
+    const source = validationScope(active, {
+      id: "inline-source", name: "validate",
+      arguments: {
+        executable: "node",
+        args: ["-e", "import('./src/app.mjs').then(m => { if (!m.ok) process.exit(1); })"]
+      }
+    }, validationPlan);
+    expect(source).toMatchObject({
+      coveredPaths: ["src/app.mjs"],
+      claim: { kind: "unit", subject: { exactFiles: ["src/app.mjs"] } }
+    });
+
+    const config = validationScope(active, {
+      id: "inline-config", name: "validate",
+      arguments: {
+        executable: "node",
+        args: ["--eval", "const c=JSON.parse(readFileSync('config.json','utf8')); if (!c.ok) throw new Error('bad')"]
+      }
+    }, validationPlan);
+    expect(config).toMatchObject({
+      coveredPaths: ["config.json"],
+      claim: { kind: "acceptance", subject: { exactFiles: ["config.json"] } }
+    });
+
+    const observation = validationScope(active, {
+      id: "inline-observation", name: "validate",
+      arguments: {
+        executable: "node",
+        args: ["-e", "console.log(readFileSync('config.json','utf8'))"]
+      }
+    }, validationPlan);
+    expect(observation).toMatchObject({ coveredPaths: [], claim: { kind: "probe" } });
+
+    const unrelated = validationScope(active, {
+      id: "inline-unrelated", name: "validate",
+      arguments: {
+        executable: "node",
+        args: ["-e", "const c=readFileSync('not-changed.json','utf8'); if (!c) process.exit(1)"]
+      }
+    }, validationPlan);
+    expect(unrelated).toMatchObject({
+      coveredPaths: [],
+      claim: { kind: "acceptance", subject: { exactFiles: ["not-changed.json"] } }
+    });
+  });
+
+  it("keeps an explicitly requested direct Node check as an acceptance obligation", () => {
+    const active = frontierSession();
+    active.durable.state.plan = {
+      ...active.durable.state.plan,
+      goal: "Update service.mjs, then run `node check.mjs` and report the result."
+    };
+    active.durable.state.mutationFrontier.changedPaths = ["service.mjs"];
+
+    expect(assuranceRequirement(active)).toMatchObject({ requiredClaims: ["acceptance"] });
+    expect(evidenceLedger(active).content).toContain(
+      "required validation claim kinds still missing/failed: acceptance"
+    );
+
+    active.durable.state.plan = {
+      ...active.durable.state.plan,
+      goal: "Update service.mjs, then run `node checker.mjs`."
+    };
+    expect(assuranceRequirement(active)).toMatchObject({ requiredClaims: ["unit"] });
+  });
+
+  it("turns recognized Node validation into current-frontier readiness", () => {
+    const active = frontierSession();
+    active.durable.state.mutationFrontier.changedPaths = ["src/code.mjs"];
+    const scope = validationScope(active, {
+      id: "node-test", name: "validate",
+      arguments: { executable: "node", args: ["--test", "tests/code.test.mjs"] }
+    }, validationPlan)!;
+    active.durable.state.evidence.push({
+      evidenceId: "node-test-evidence",
+      sessionId: "session",
+      runId: "run",
+      kind: "validation",
+      status: "passed",
+      createdAt: now,
+      producer: { authority: "tool", id: "node-test" },
+      summary: "tests passed",
+      data: {
+        validator: "command",
+        command: "node --test tests/code.test.mjs",
+        exitCode: 0,
+        artifactIds: [],
+        frontierRevision: scope.frontierRevision,
+        stateDigest: scope.stateDigest,
+        coveredPaths: scope.coveredPaths,
+        claim: { ...scope.claim, status: "passed" }
+      }
+    });
+
+    expect(frontierValidationReadiness(active)).toMatchObject({
+      ready: true,
+      coveredPaths: ["src/code.mjs"],
+      missingClaims: []
+    });
+  });
+
+  it("requires completion review before accepting an honestly reported failed check", () => {
+    const active = frontierSession();
+    active.durable.state.plan = {
+      ...active.durable.state.plan,
+      goal: "Update service.mjs, then run `node check.mjs` and report the result."
+    };
+    active.durable.state.mutationFrontier.changedPaths = ["service.mjs"];
+    const scope = validationScope(active, {
+      id: "node-check", name: "validate",
+      arguments: { executable: "node", args: ["check.mjs"] }
+    }, validationPlan)!;
+    active.durable.state.evidence.push({
+      evidenceId: "node-check-failed",
+      sessionId: "session",
+      runId: "run",
+      kind: "validation",
+      status: "failed",
+      createdAt: now,
+      producer: { authority: "tool", id: "node-check" },
+      summary: "check failed",
+      data: {
+        validator: "command",
+        command: "node check.mjs",
+        exitCode: 1,
+        termination: {
+          processStarted: true,
+          state: "exited",
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          idleTimedOut: false,
+          cancelled: false
+        },
+        artifactIds: [],
+        frontierRevision: scope.frontierRevision,
+        stateDigest: scope.stateDigest,
+        coveredPaths: scope.coveredPaths,
+        claim: { ...scope.claim, status: "failed" }
+      }
+    });
+
+    const call: ModelToolCall = {
+      id: "runtime_completion_intent_failed-check",
+      name: "runtime_finalize",
+      arguments: { summary: "The requested check failed." }
+    };
+    expect(frontierValidationReadiness(active)).toMatchObject({
+      ready: false,
+      executionReady: true,
+      missingClaims: ["acceptance"],
+      latestFailed: { evidenceId: "node-check-failed" }
+    });
+    expect(completionFailure(active, call, {
+      possibleEffects: ["outcome.propose"]
+    } as ToolDescriptor, now)).toMatchObject({
+      ok: false,
+      diagnostics: ["validation_result_reporting_required"],
+      result: { nextActions: [{ tool: "request_review", arguments: {} }] }
+    });
+
+    const candidateDigest = "c".repeat(64);
+    active.durable.state.taskControl.completionCandidate = {
+      answer: "The requested check failed.",
+      digest: candidateDigest
+    };
+    active.durable.state.evidence.push({
+      evidenceId: "completion-review",
+      sessionId: "session",
+      runId: "run",
+      kind: "review",
+      status: "passed",
+      createdAt: now,
+      producer: { authority: "runtime", id: "reviewer" },
+      summary: "The requested failed check was reported honestly.",
+      data: {
+        reviewerId: "reviewer",
+        verdict: "approved",
+        findings: [],
+        frontierRevision: active.durable.state.mutationFrontier.revision,
+        stateDigest: active.durable.state.mutationFrontier.currentStateDigest,
+        reviewBasisDigest: reviewBasisDigest(active, undefined, candidateDigest),
+        validationEvidenceIds: ["node-check-failed"]
+      }
+    });
+    expect(completionFailure(active, call, {
+      possibleEffects: ["outcome.propose"]
+    } as ToolDescriptor, now)).toBeNull();
+
+    active.durable.state.mutationFrontier.changedPaths = ["packages/agent-runtime/service.mjs"];
+    const failedEvidence = active.durable.state.evidence.find(
+      (item): item is ValidationEvidence => item.evidenceId === "node-check-failed"
+    )!;
+    failedEvidence.data.coveredPaths = ["packages/agent-runtime/service.mjs"];
+    active.durable.state.evidence = active.durable.state.evidence.filter(
+      (item) => item.evidenceId !== "completion-review"
+    );
+    active.durable.state.evidence.push({
+      evidenceId: "high-risk-completion-review",
+      sessionId: "session",
+      runId: "run",
+      kind: "review",
+      status: "passed",
+      createdAt: now,
+      producer: { authority: "runtime", id: "reviewer" },
+      summary: "The failed check was reported, but high-risk validation remains required.",
+      data: {
+        reviewerId: "reviewer",
+        verdict: "approved",
+        findings: [],
+        frontierRevision: active.durable.state.mutationFrontier.revision,
+        stateDigest: active.durable.state.mutationFrontier.currentStateDigest,
+        reviewBasisDigest: reviewBasisDigest(active, undefined, candidateDigest),
+        validationEvidenceIds: ["node-check-failed"]
+      }
+    });
+    expect(assuranceRequirement(active).risk).toBe("high");
+    expect(completionFailure(active, call, {
+      possibleEffects: ["outcome.propose"]
+    } as ToolDescriptor, now)).toMatchObject({
+      ok: false,
+      diagnostics: ["validation_result_reporting_required"]
     });
   });
 
@@ -456,6 +768,46 @@ describe("leaf-aware effect-plan enforcement", () => {
     };
 
     await expect(assertReceiptWithinPlan(active, result, plan)).resolves.toBeUndefined();
+  });
+});
+
+describe("review repair plan enforcement", () => {
+  function repairPlan(writePaths: string[]): ToolCallPlan {
+    return {
+      exactEffects: ["filesystem.write"], readPaths: [], writePaths,
+      network: "none", processMode: "none", checkpointScope: writePaths,
+      idempotence: "non_replayable"
+    };
+  }
+
+  it("allows only writes inside the runtime-authenticated finding scope", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-review-repair-plan-"));
+    await mkdir(path.join(workspace, "src"));
+    const active = runtimeSessionFixture({ workspacePath: workspace });
+    active.durable.state.taskControl = reviewRepairObligation(
+      active.durable.state.taskControl,
+      active.durable.state.revision,
+      "a".repeat(64),
+      ["src/target.ts"]
+    );
+
+    await expect(assertTaskControlPlanAllowed(active, repairPlan(["src/target.ts"])))
+      .resolves.toBeUndefined();
+    await expect(assertTaskControlPlanAllowed(active, repairPlan(["src/other.ts"])))
+      .rejects.toMatchObject({ code: "tool_unavailable_for_repair" });
+  });
+
+  it("rejects mutation plans without an exact write target", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-review-repair-empty-plan-"));
+    const active = runtimeSessionFixture({ workspacePath: workspace });
+    active.durable.state.taskControl = reviewRepairObligation(
+      active.durable.state.taskControl,
+      active.durable.state.revision,
+      "b".repeat(64),
+      ["target.ts"]
+    );
+    await expect(assertTaskControlPlanAllowed(active, repairPlan([])))
+      .rejects.toMatchObject({ code: "tool_unavailable_for_repair" });
   });
 });
 
@@ -920,6 +1272,53 @@ describe.skip("V3 run-scoped completion evidence", () => {
     expect(normalized.evidence?.[0]?.evidenceId).not.toBe("attacker-id");
     expect(() => assertToolReceiptIdentity(receipt("forged-call"), "requested-call"))
       .toThrow("does not match requested callId");
+  });
+
+  it("issues repository acceptance only for broker-proved recovery targets in the current goal epoch", () => {
+    const raw = repositoryDelta();
+    const plan: ToolCallPlan = {
+      exactEffects: ["repository.write"], readPaths: [], writePaths: [], network: "none",
+      processMode: "pipe", checkpointScope: [], idempotence: "non_idempotent"
+    };
+    const transactionReceipt = {
+      ...receipt("git-call"),
+      actualEffects: ["repository.write"] as const,
+      observedEffects: ["repository.write"] as const,
+      evidence: [raw]
+    };
+    const frontier = {
+      revision: 4,
+      baselineManifestDigest: "0".repeat(64),
+      currentStateDigest: "3".repeat(64),
+      changedPaths: [],
+      sourceCheckpointIds: []
+    };
+    const normalized = normalizeReceiptEvidence(transactionReceipt, "git_transaction", plan, {
+      sessionId: "session",
+      runId: "run",
+      workspaceDeltas: [],
+      repositoryScope: { goalEpoch: 7, frontier, mutationEvidence: [] }
+    });
+    const acceptance = normalized.evidence?.find((item) => item.kind === "repository_acceptance");
+    expect(acceptance).toMatchObject({
+      kind: "repository_acceptance",
+      producer: { authority: "runtime", id: "git-call" },
+      data: {
+        goalEpoch: 7,
+        frontierRevision: 5,
+        selectionEvidenceId: "selection",
+        candidateId: "e".repeat(64)
+      }
+    });
+
+    const mismatched = repositoryDelta();
+    mismatched.data.semanticAssertions!.targetAssertions!.selectedHead = "4".repeat(40);
+    const rejected = normalizeReceiptEvidence({ ...transactionReceipt, evidence: [mismatched] },
+      "git_transaction", plan, {
+        sessionId: "session", runId: "run", workspaceDeltas: [],
+        repositoryScope: { goalEpoch: 7, frontier, mutationEvidence: [] }
+      });
+    expect(rejected.evidence?.some((item) => item.kind === "repository_acceptance")).toBe(false);
   });
 
   it("clears evidence, waiver, receipts, and checkpoint head at a follow-up run boundary", () => {

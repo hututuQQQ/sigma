@@ -44,6 +44,11 @@ def _timeout_record(trial_task_config: Any, task_path: Path | None) -> dict[str,
         task_definition = TaskDefinitionConfig.model_validate_toml(config_path.read_text(encoding="utf-8"))
 
     metadata = task_definition.metadata if task_definition is not None else {}
+    network_mode = (
+        getattr(task_definition.environment.network_mode, "value", task_definition.environment.network_mode)
+        if task_definition is not None
+        else None
+    )
     return {
         "task_name": _task_name(trial_task_config, task_definition),
         "task_path": str(task_path) if task_path is not None else None,
@@ -57,26 +62,33 @@ def _timeout_record(trial_task_config: Any, task_path: Path | None) -> dict[str,
         "environment_build_timeout_sec": (
             _number(task_definition.environment.build_timeout_sec) if task_definition is not None else None
         ),
+        "network_mode": str(network_mode) if network_mode is not None else None,
         "expert_time_estimate_min": _number(metadata.get("expert_time_estimate_min")),
         "junior_time_estimate_min": _number(metadata.get("junior_time_estimate_min")),
     }
 
 
 def _resolved_task_config(trial_task_config: Any, record: dict[str, Any]) -> dict[str, Any]:
-    name = record.get("task_name")
-    if isinstance(name, str) and name and name != "unknown":
-        return {"name": name}
-
     try:
         dumped = trial_task_config.model_dump(mode="json", exclude_none=True)
         if isinstance(dumped, dict):
-            for key in ["name", "path", "git_url", "git_commit_id", "ref", "source"]:
-                value = dumped.get(key)
-                if value:
-                    return {key: value}
+            config_name = dumped.get("name")
+            config_path = dumped.get("path")
+            if isinstance(config_name, str) and config_name:
+                return {"name": config_name}
+            if isinstance(config_path, str) and config_path:
+                resolved = {"path": config_path}
+                git_url = dumped.get("git_url")
+                git_commit = dumped.get("git_commit_id")
+                if isinstance(git_url, str) and git_url and isinstance(git_commit, str) and git_commit:
+                    resolved.update({"git_url": git_url, "git_commit_id": git_commit})
+                return resolved
     except Exception:
         pass
 
+    name = record.get("task_name")
+    if isinstance(name, str) and name and name != "unknown":
+        return {"name": name}
     path_value = record.get("task_path")
     if isinstance(path_value, str) and path_value:
         return {"path": path_value}

@@ -5,7 +5,8 @@ import {
   type CheckpointRef,
   type PlanGraph,
   type ReviewRequestResult,
-  type RuntimeControlPort
+  type RuntimeControlPort,
+  type WorkspaceRestorationEvidenceV1
 } from "agent-protocol";
 import type { ChildCheckpointRecovery, RuntimeSession } from "./types.js";
 import { ChildBudgetControl } from "./child-budget-control.js";
@@ -17,6 +18,7 @@ import {
   type RuntimeControlServiceOptions
 } from "./runtime-control-contracts.js";
 import { RuntimeCheckpointControl } from "./runtime-checkpoint-control.js";
+import { RuntimeRestorationControl } from "./runtime-restoration-control.js";
 import { RuntimeSkillControl } from "./runtime-skill-control.js";
 import { reviewReadiness } from "./review-coordinator.js";
 import {
@@ -33,11 +35,13 @@ export type { OpenCheckpointRecoveryResult, RuntimeControlServiceOptions } from 
 export class RuntimeControlService {
   private readonly planQueues = new Map<string, Promise<void>>();
   private readonly checkpoints: RuntimeCheckpointControl;
+  private readonly restoration: RuntimeRestorationControl;
   private readonly childBudgets: ChildBudgetControl;
   private readonly skillControl: RuntimeSkillControl;
 
   constructor(private readonly options: RuntimeControlServiceOptions) {
     this.checkpoints = new RuntimeCheckpointControl(options);
+    this.restoration = new RuntimeRestorationControl(options, this.checkpoints);
     this.childBudgets = new ChildBudgetControl(options.budgets);
     this.skillControl = new RuntimeSkillControl(options);
   }
@@ -50,6 +54,8 @@ export class RuntimeControlService {
       listCheckpoints: async () => (await this.options.checkpoints.list(session.identity.sessionId)).map(checkpointRef),
       createCheckpoint: async (scopePaths) => await this.createCheckpoint(session, scopePaths),
       restoreRunCheckpoint: async (checkpointId) => await this.restoreRunCheckpoint(session, checkpointId),
+      restoreRunChanges: async (callId) => await this.restoreRunChanges(session, callId),
+      confirmRunRestored: async (callId) => await this.confirmRunRestored(session, callId),
       requestReview: async () => this.requestReview(session),
       loadSkill: async (qualifiedName) => await this.skillControl.loadSkill(session, qualifiedName),
       resolveLoadedSkillResource: async (input) => await this.skillControl.resolveLoadedSkillResource(session, input),
@@ -62,10 +68,12 @@ export class RuntimeControlService {
   }
 
   private requestReview(session: RuntimeSession): ReviewRequestResult {
-    const readiness = reviewReadiness(session);
+    const candidateDigest = session.durable.state.taskControl.completionCandidate?.digest;
+    const reviewMode = candidateDigest ? "completion" as const : "workspace" as const;
+    const readiness = reviewReadiness(session, reviewMode);
     const validation = frontierValidationReadiness(session);
     const frontier = session.durable.state.mutationFrontier;
-    const currentReview = currentFrontierReview(session);
+    const currentReview = currentFrontierReview(session, candidateDigest);
     const latestReview = latestFrontierReview(session);
     return {
       status: readiness.pending.length === 0
@@ -73,7 +81,7 @@ export class RuntimeControlService {
         : readiness.eligible.length === 0 ? "validation_required"
           : readiness.blockedReview ? "changes_required" : "review_requested",
       reviewState: currentReview ? "current" : latestReview ? "stale" : "none",
-      reviewBasisDigest: reviewBasisDigest(session),
+      reviewBasisDigest: reviewBasisDigest(session, undefined, candidateDigest),
       frontierRevision: frontier.revision,
       stateDigest: frontier.currentStateDigest,
       changedPaths: [...frontier.changedPaths],
@@ -191,6 +199,20 @@ export class RuntimeControlService {
 
   async restoreRunCheckpoint(session: RuntimeSession, checkpointId: string): Promise<CheckpointRef> {
     return await this.checkpoints.restoreRun(session, checkpointId);
+  }
+
+  async restoreRunChanges(
+    session: RuntimeSession,
+    callId: string
+  ): Promise<WorkspaceRestorationEvidenceV1["data"]> {
+    return await this.restoration.restoreRunChanges(session, callId);
+  }
+
+  async confirmRunRestored(
+    session: RuntimeSession,
+    callId: string
+  ): Promise<WorkspaceRestorationEvidenceV1["data"]> {
+    return await this.restoration.confirmRunRestored(session, callId);
   }
 
   async sealCheckpoint(session: RuntimeSession, checkpointId: string): Promise<CheckpointRef> {

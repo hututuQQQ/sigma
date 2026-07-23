@@ -8,7 +8,10 @@ import {
 } from "../packages/agent-protocol/src/index.js";
 import {
   assertKernelInvariants,
+  completionEvidenceObligation,
   createKernelState,
+  protectCompletionCandidate,
+  terminalResolutionObligation,
   type KernelState
 } from "../packages/agent-kernel/src/index.js";
 import {
@@ -258,30 +261,37 @@ describe("durable reducer contracts", () => {
 
   it("transitions evidence-acquisition repairs according to the first referenceable evidence", () => {
     const eligible = diagnosticEvidence("eligible");
+    const base = initial();
     const explicitRepair: KernelState = {
-      ...initial(),
-      completionRepairAttempts: 2,
-      completionRepair: { kind: "evidence_acquisition" }
+      ...base,
+      taskControl: completionEvidenceObligation(base.taskControl, base.revision, "acquire", 0)
     };
-    expect(reduce(explicitRepair, "evidence.recorded", eligible)).toMatchObject({
-      completionRepairAttempts: 0,
-      completionRepair: undefined
-    });
+    expect(reduce(explicitRepair, "evidence.recorded", eligible).taskControl)
+      .toMatchObject({ phase: "normal", obligation: undefined });
 
-    const inferredRepair: KernelState = {
-      ...initial(),
-      completionRepairAttempts: 2
-    };
-    expect(reduce(inferredRepair, "evidence.recorded", {
+    const ordinary = initial();
+    expect(reduce(ordinary, "evidence.recorded", {
       ...eligible,
       evidenceId: "inferred-eligible"
-    })).toMatchObject({ completionRepairAttempts: 0, completionRepair: undefined });
+    }).taskControl).toEqual(ordinary.taskControl);
 
     const failedValidation = failedValidationEvidence("failed-referenceable");
-    expect(reduce(explicitRepair, "evidence.recorded", failedValidation)).toMatchObject({
-      completionRepairAttempts: 2,
-      completionRepair: { kind: "terminal_action" }
-    });
+    expect(reduce(explicitRepair, "evidence.recorded", failedValidation).taskControl.obligation)
+      .toMatchObject({ kind: "completion_evidence", stage: "terminal" });
+  });
+
+  it("settles evidence acquisition against its opening count, not the whole run", () => {
+    const prior = diagnosticEvidence("prior");
+    const base = initial();
+    const repairing: KernelState = {
+      ...base,
+      evidence: [prior],
+      taskControl: completionEvidenceObligation(base.taskControl, base.revision, "acquire", 1)
+    };
+
+    const settled = reduce(repairing, "evidence.recorded", diagnosticEvidence("new"));
+    expect(settled.taskControl).toMatchObject({ phase: "normal", obligation: undefined });
+    expect(settled.evidence.map((item) => item.evidenceId)).toEqual(["prior", "new"]);
   });
 
   it("requires monotonic plans and validates frozen runtime identities", () => {
@@ -416,37 +426,40 @@ describe("durable reducer contracts", () => {
     expect(reduce(state, "checkpoint.restored", { malformed: true })).toBe(state);
 
     const delta = workspaceDelta("protected-delta");
+    const protectedControl = completionEvidenceObligation(
+      protectCompletionCandidate(state.taskControl, "Protected answer."),
+      state.revision,
+      "terminal",
+      1
+    );
     const protectedCompletion: KernelState = {
       ...state,
-      completionRepairAttempts: 1,
-      completionRepair: { kind: "protected_completion", answer: "Protected answer." },
+      taskControl: protectedControl,
       messages: [{ role: "assistant", content: "Protected answer." }],
       evidence: [delta],
       mutationEvidence: [delta]
     };
     const reconciled = reduce(protectedCompletion, "checkpoint.restored", restored);
     expect(reconciled).toMatchObject({
-      completionRepairAttempts: 1,
-      completionRepair: { kind: "evidence_acquisition" },
+      taskControl: { obligation: { kind: "completion_evidence", stage: "acquire" } },
       evidence: [],
       mutationEvidence: []
     });
     expect(reconciled.messages.at(-1)?.content).toContain("removed the durable evidence");
     expect(() => assertKernelInvariants(reconciled)).not.toThrow();
 
-    for (const completionRepair of [
-      { kind: "protected_recovery", answer: "Recovered answer." },
-      { kind: "terminal_action" }
-    ] as const) {
+    for (const taskControl of [
+      completionEvidenceObligation(state.taskControl, state.revision, "terminal", 1),
+      terminalResolutionObligation(state.taskControl, state.revision, "terminal_action_failed")
+    ]) {
       const repairing: KernelState = {
         ...state,
-        completionRepairAttempts: 1,
-        completionRepair,
+        taskControl,
         evidence: [delta],
         mutationEvidence: [delta]
       };
-      expect(reduce(repairing, "checkpoint.restored", restored).completionRepair)
-        .toEqual({ kind: "evidence_acquisition" });
+      expect(reduce(repairing, "checkpoint.restored", restored).taskControl.obligation)
+        .toMatchObject({ kind: "completion_evidence", stage: "acquire" });
     }
   });
 

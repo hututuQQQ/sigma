@@ -11,7 +11,7 @@ import type {
   ModelStreamEvent,
   ModelToolDefinition
 } from "../packages/agent-protocol/src/index.js";
-import { runCommand } from "../packages/agent-cli/src/commands/run.js";
+import { runCommand, runResult } from "../packages/agent-cli/src/commands/run.js";
 import { createModelGateway } from "../packages/agent-model/src/index.js";
 import { describe, expect, it } from "vitest";
 import { typedCompletion } from "./helpers/typed-evidence.js";
@@ -184,6 +184,23 @@ function runDeps(script: ScriptedResponse[]) {
 }
 
 describe("run command branch coverage", () => {
+  it("emits blocker fields only for a runtime-authorized blocked outcome", () => {
+    expect(runResult({
+      kind: "recoverable_failure",
+      code: "dependency_unavailable",
+      message: "blocked",
+      failureKind: "blocked",
+      failureCode: "dependency_unavailable"
+    }, "session")).toMatchObject({
+      failureKind: "blocked",
+      failureCode: "dependency_unavailable"
+    });
+    expect(runResult({
+      kind: "recoverable_failure",
+      code: "dependency_unavailable",
+      message: "blocked"
+    }, "session")).not.toHaveProperty("failureKind");
+  });
   it("renders both run and inspect help and reports empty instructions", async () => {
     const runHelp = new Capture();
     await expect(runCommand(["--help"], { stdout: runHelp })).resolves.toBe(0);
@@ -265,6 +282,35 @@ describe("run command branch coverage", () => {
     expect(records.some((record) => record.type === "tool.completed")).toBe(true);
     expect(records.some((record) => record.type === "run.completed")).toBe(true);
     expect(stderr.text()).not.toContain("Allow exec");
+  });
+
+  it("emits one coherent NeedsInput terminal for a headless workspace-auto sensitive call", async () => {
+    const root = await workspace("sigma-run-network-workspace-auto-");
+    const stdout = new Capture();
+    const stderr = new Capture();
+    const stdin = Object.assign(new PassThrough(), { isTTY: false });
+    const code = await runCommand([
+      "run a network-enabled process",
+      "--workspace", root,
+      "--network", "full",
+      "--permission-mode", "workspace-auto",
+      "--output-format", "stream-json"
+    ], { stdin, stdout, stderr, mode: "analyze", ...runDeps([
+      networkExecutionRequest()
+    ]) });
+
+    expect(code).toBe(2);
+    const records = stdout.text().trim().split(/\r?\n/).map((line) => JSON.parse(line) as {
+      type: string;
+      status?: string;
+      payload?: { kind?: string; approvalMode?: string };
+    });
+    expect(records.filter((record) => record.type === "run.suspended")).toHaveLength(1);
+    expect(records.some((record) => record.type === "run.failed")).toBe(false);
+    expect(records.find((record) => record.type === "tool.approval_requested")?.payload)
+      .toMatchObject({ approvalMode: "human" });
+    expect(records.at(-1)).toMatchObject({ type: "result", status: "needs_input" });
+    expect(stderr.text()).toBe("");
   });
 
   it.each([true, false])("reads instructions from stdin (explicit=%s)", async (explicit) => {
@@ -428,8 +474,8 @@ describe("run command branch coverage", () => {
     const records = stdout.text().trim().split(/\r?\n/).map((line) => JSON.parse(line) as {
       type: string;
       status?: string;
-      payload?: { code?: string; diagnostics?: Record<string, unknown>; ledger?: {
-        reserved?: Record<string, number>;
+      payload?: { code?: string; diagnostics?: Record<string, unknown>; mutation?: {
+        totals?: { reserved?: Record<string, number> };
       } };
     });
 
@@ -452,7 +498,7 @@ describe("run command branch coverage", () => {
       ssePayloads: 1,
       sseTrailingBytes: 0
     });
-    expect(records.find((record) => record.type === "budget.committed")?.payload?.ledger?.reserved)
+    expect(records.find((record) => record.type === "budget.committed")?.payload?.mutation?.totals?.reserved)
       .toMatchObject({ inputTokens: 0, outputTokens: 0, costMicroUsd: 0, modelTurns: 0 });
     expect(records.some((record) => record.type === "run.failed")).toBe(true);
     expect(records.at(-1)).toMatchObject({ type: "result", status: "error" });

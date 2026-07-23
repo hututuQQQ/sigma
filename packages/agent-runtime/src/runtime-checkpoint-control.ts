@@ -1,4 +1,8 @@
-import { CheckpointConflictError, type CheckpointRecord } from "agent-checkpoint";
+import {
+  CheckpointConflictError,
+  type CheckpointRecord,
+  type RunRestorationInspection
+} from "agent-checkpoint";
 import type { CheckpointRef } from "agent-protocol";
 import { CheckpointEvidenceRecorder } from "./checkpoint-evidence-recorder.js";
 import { checkpointRef, type OpenCheckpointRecoveryResult, type RuntimeControlServiceOptions } from "./runtime-control-contracts.js";
@@ -53,6 +57,34 @@ export class RuntimeCheckpointControl {
       });
     }
     return await this.undoLatest(session);
+  }
+
+  async restoreRunChanges(session: RuntimeSession): Promise<RunRestorationInspection> {
+    if (session.recovery.openCheckpointRecovery) {
+      throw Object.assign(new Error("Resolve the interrupted open checkpoint before restoring sealed run changes."), {
+        code: "checkpoint_recovery_required"
+      });
+    }
+    const restored = await this.options.checkpoints.restoreRunChanges(
+      session.identity.sessionId,
+      session.durable.runId
+    );
+    for (const checkpoint of restored.checkpoints) {
+      await this.options.emit(session, "checkpoint.restored", "runtime", checkpointRef(checkpoint));
+    }
+    return restored;
+  }
+
+  async inspectRunRestoration(session: RuntimeSession): Promise<RunRestorationInspection> {
+    if (session.recovery.openCheckpointRecovery) {
+      throw Object.assign(new Error("Resolve the interrupted open checkpoint before confirming restoration."), {
+        code: "checkpoint_recovery_required"
+      });
+    }
+    return await this.options.checkpoints.inspectRunRestoration(
+      session.identity.sessionId,
+      session.durable.runId
+    );
   }
 
   async seal(session: RuntimeSession, checkpointId: string): Promise<CheckpointRef> {

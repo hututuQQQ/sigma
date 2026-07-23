@@ -16,7 +16,7 @@ import {
   applySubjectLaunchEnvironment, createDevNodeLaunch, loadPackagedSubjectLaunch
 } from "./subject-launch.mjs";
 import { runTuiSubject } from "./subject-tui.mjs";
-import { runPostVerifier } from "./verifier.mjs";
+import { connectVerifierBroker, runPostVerifier } from "./verifier.mjs";
 import {
   copyWorkspaceEvidence, diffWorkspaceSnapshots, evaluatorLinkTargetRoot, gitDiff, seedWorkspace, snapshotWorkspace,
   unauthorizedChanges
@@ -859,18 +859,14 @@ async function collectAttemptEvidence(context, lifecycle, prepared, subjectResul
   return { stored, events, rawMetrics, metrics, delta, git };
 }
 
-async function verifyAttempt(context, lifecycle, prepared, subjectResult, collected) {
+async function runVerifierWitness(context, lifecycle, prepared, subjectResult, collected, witness) {
   const { scenario, manifestDir, verifierRuntime, redactor } = context;
   const { attemptArtifactDir } = lifecycle;
-  const { controllerDir, workspace, initialGit } = prepared;
+  const { workspace, initialGit } = prepared;
   const { delta, git, events, metrics } = collected;
-  const verifierWorkspace = path.join(controllerDir, "verifier-workspace");
-  const verifierManifestDir = path.join(controllerDir, "verifier-manifest");
-  const verifierHome = path.join(controllerDir, "verifier-home");
-  lifecycle.phase = "verifier";
-  await mkdir(verifierHome, { recursive: true });
+  const { verifierWorkspace, verifierManifestDir, verifierHome, broker, scratchLease } = witness;
   await Promise.all([
-    copyWorkspaceEvidence(workspace, verifierWorkspace),
+    copyWorkspaceEvidence(workspace, verifierWorkspace, { excludeRepositoryMetadata: true }),
     cp(manifestDir, verifierManifestDir, { recursive: true, force: false, errorOnExist: true })
   ]);
   const verifierBefore = await snapshotWorkspace(verifierWorkspace);
@@ -887,10 +883,10 @@ async function verifyAttempt(context, lifecycle, prepared, subjectResult, collec
     artifactDir: attemptArtifactDir,
     redactor,
     verifierHome,
+    ...(scratchLease ? { scratchLease } : {}),
+    ...(broker ? { broker } : {}),
     nodePath: verifierRuntime.nodePath,
     brokerPath: verifierRuntime.brokerPath,
-    // Provider credentials belong to the subject transport. The verifier
-    // broker receives no provider/evaluation secrets.
     secrets: {}
   });
   lifecycle.verifier = verifier;
@@ -899,6 +895,59 @@ async function verifyAttempt(context, lifecycle, prepared, subjectResult, collec
   lifecycle.verifierDelta = verifierDelta;
   await writeJson(path.join(attemptArtifactDir, "verifier-workspace-delta.json"), verifierDelta, redactor);
   return { verifier, verifierDelta };
+}
+
+async function verifyAttempt(context, lifecycle, prepared, subjectResult, collected) {
+  const { scenario, verifierRuntime } = context;
+  const { controllerDir } = prepared;
+  lifecycle.phase = "verifier";
+  const commandVerification = (scenario.verifier?.checks ?? [])
+    .some((check) => check.type === "command");
+  if (!commandVerification) {
+    const verifierHome = path.join(controllerDir, "verifier-home");
+    await mkdir(verifierHome, { recursive: true });
+    return await runVerifierWitness(context, lifecycle, prepared, subjectResult, collected, {
+      verifierWorkspace: path.join(controllerDir, "verifier-workspace"),
+      verifierManifestDir: path.join(controllerDir, "verifier-manifest"),
+      verifierHome
+    });
+  }
+
+  const broker = await connectVerifierBroker({
+    nodePath: verifierRuntime.nodePath,
+    brokerPath: verifierRuntime.brokerPath,
+    // Provider credentials belong to the subject transport. The verifier
+    // broker receives no provider/evaluation secrets.
+    secrets: {}
+  });
+  const verifierSessionId = `eval-verifier-${randomUUID()}`;
+  let scratchLease;
+  try {
+    scratchLease = await broker.acquireScratchLease({
+      protocolVersion: 1,
+      sessionId: verifierSessionId
+    }, { timeoutMs: 5_000 });
+    const verifierWorkspace = path.join(scratchLease.home, "workspace");
+    const verifierManifestDir = path.join(scratchLease.home, "manifest");
+    // Windows has no same-path COW mount. A broker-issued RuntimeSession
+    // scratch lease supplies the equivalent ephemeral writable witness while
+    // preserving Git metadata and host-workspace fail-closed defaults.
+    return await runVerifierWitness(context, lifecycle, prepared, subjectResult, collected, {
+      verifierWorkspace,
+      verifierManifestDir,
+      verifierHome: scratchLease.home,
+      scratchLease,
+      broker
+    });
+  } finally {
+    try {
+      if (scratchLease) {
+        await broker.releaseScratchLease(verifierSessionId, { timeoutMs: 5_000 });
+      }
+    } finally {
+      await broker.close();
+    }
+  }
 }
 
 function attemptReliabilitySignals(collected, verified, expectedActual, subjectResult) {

@@ -12,16 +12,20 @@ import {
   acceptMutationFrontier,
   assertKernelInvariants,
   createKernelState,
+  completionEvidenceObligation,
+  createTaskControlState,
   decide,
   emptyMutationFrontier,
   evolve,
   frontierAfterCheckpoint,
   frontierAfterEvidence,
-  isCompletionRepairState,
+  isTaskControlStateV1,
+  InvalidBudgetTransitionError,
   isKernelState,
   isStaleEffect,
   isTerminal,
   netChangedPaths,
+  protectCompletionCandidate,
   rehydrate,
   type KernelState
 } from "../packages/agent-kernel/src/index.js";
@@ -138,22 +142,16 @@ function completedReceipt(
 }
 
 describe("agent-kernel exhaustive protocol behavior", () => {
-  it("rejects a mixed terminal batch atomically and bounds a repeated conflict", () => {
+  it("durably records every call in a mixed terminal batch for runtime policy receipts", () => {
     let state = apply(initial(), "user.message", { text: "inspect or ask" });
     const mixed = (turn: number) => [
       { id: `ask-${turn}`, name: "request_user_input", arguments: { message: "Which path?" } },
       { id: `read-${turn}`, name: "read", arguments: { path: "seed.txt" } }
     ];
     state = proposeToolBatch(state, 1, mixed(1));
-    expect(state).toMatchObject({ phase: "ready_model", completionRepairAttempts: 1 });
-    expect(state.pendingTools).toEqual([]);
+    expect(state).toMatchObject({ phase: "tool_pending" });
+    expect(state.pendingTools.map((item) => item.request.callId)).toEqual(["ask-1", "read-1"]);
     expect(state.receipts).toEqual([]);
-
-    state = proposeToolBatch(state, 2, mixed(2));
-    expect(state.pendingTools).toEqual([]);
-    expect(state.proposedOutcome).toMatchObject({
-      kind: "recoverable_failure", code: "terminal_batch_conflict"
-    });
   });
 
   it("allows one completion alongside ordinary work outside a repair turn", () => {
@@ -162,33 +160,29 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       { id: "write-1", name: "write", arguments: { path: "result.txt", content: "done" } },
       { id: "complete-1", name: "runtime_finalize", arguments: { summary: "done" } }
     ]);
-    expect(state).toMatchObject({ phase: "tool_pending", completionRepairAttempts: 0 });
+    expect(state).toMatchObject({ phase: "tool_pending" });
     expect(state.pendingTools.map((item) => item.request.callId)).toEqual(["write-1", "complete-1"]);
   });
 
-  it("rejects completion mixed with ordinary work during a repair turn", () => {
+  it("retains the active obligation while recording a mixed repair batch", () => {
     let state = apply(initial(), "user.message", { text: "finish cleanly" });
     state = {
       ...state,
-      completionRepairAttempts: 1,
-      completionRepair: { kind: "evidence_acquisition" }
+      taskControl: completionEvidenceObligation(state.taskControl, state.revision, "acquire", 0)
     };
     state = proposeToolBatch(state, 1, [
       { id: "read-1", name: "read", arguments: { path: "seed.txt" } },
       { id: "complete-1", name: "runtime_finalize", arguments: { summary: "done" } }
     ]);
-    expect(state.pendingTools).toEqual([]);
-    expect(state.proposedOutcome).toMatchObject({
-      kind: "recoverable_failure", code: "terminal_batch_conflict"
-    });
+    expect(state.pendingTools.map((item) => item.request.callId)).toEqual(["read-1", "complete-1"]);
+    expect(state.taskControl.obligation).toMatchObject({ kind: "completion_evidence", stage: "acquire" });
   });
 
   it("returns recoverable task-state failures from terminal repair to normal tools", () => {
     let state = apply(initial(), "user.message", { text: "finish after the process exits" });
     state = {
       ...state,
-      completionRepairAttempts: 1,
-      completionRepair: { kind: "terminal_action" },
+      taskControl: completionEvidenceObligation(state.taskControl, state.revision, "terminal", 1),
       evidence: [diagnosticEvidence("current-run-evidence")]
     };
     state = proposeToolBatch(state, 1, [{
@@ -203,12 +197,18 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       diagnostics: ["active_processes"]
     };
     state = toolEvent(state, "tool.failed", "complete-while-active", failed);
-    expect(state).toMatchObject({ phase: "ready_model", completionRepairAttempts: 0 });
+    expect(state).toMatchObject({
+      phase: "ready_model",
+      taskControl: {
+        obligation: { kind: "completion_evidence", stage: "terminal" },
+        policyCorrection: { attempts: 1 }
+      }
+    });
     expect(state.proposedOutcome).toBeUndefined();
     expect(state.receipts.at(-1)?.diagnostics).toEqual(["active_processes"]);
   });
 
-  it("converts an evidence-backed ordinary text stop into a completion intent", () => {
+  it("converts an evidence-backed final question into a typed input intent", () => {
     let state = apply(initial(), "user.message", { text: "inspect the current state" });
     state = apply(state, "evidence.recorded", diagnosticEvidence("answer-evidence"));
     state = settleModel(startModel(state), "model.completed", {
@@ -218,16 +218,15 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     });
     expect(state).toMatchObject({
       phase: "tool_pending",
-      completionRepairAttempts: 0,
-      pendingTools: [{ request: { name: "runtime_finalize", arguments: {
-        summary: "Which target should I change?"
+      pendingTools: [{ request: { name: "request_user_input", arguments: {
+        message: "Which target should I change?"
       } } }]
     });
     const callId = state.pendingTools[0]!.request.callId;
     state = toolEvent(state, "tool.completed", callId, {
       ok: true,
-      output: JSON.stringify({ summary: "Which target should I change?" }),
-      observedEffects: ["outcome.propose"],
+      output: JSON.stringify({ message: "Which target should I change?" }),
+      observedEffects: ["outcome.request_input"],
       artifacts: [],
       diagnostics: [],
       startedAt: "start",
@@ -236,26 +235,29 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(state).toMatchObject({
       phase: "outcome_pending",
       proposedOutcome: {
-        kind: "completed",
+        kind: "needs_input",
+        requestId: callId,
         message: "Which target should I change?"
       }
     });
     expect(() => assertKernelInvariants(state)).not.toThrow();
 
     const outcomeRevision = state.revision;
-    state = apply(state, "run.completed", {
+    state = apply(state, "run.suspended", {
+      kind: "needs_input",
+      requestId: callId,
       message: "Which target should I change?",
       outcomeRevision
     });
     expect(state).toMatchObject({
-      phase: "terminal",
-      completionRepairAttempts: 0,
+      phase: "needs_input",
       outcome: {
-        kind: "completed",
+        kind: "needs_input",
+        requestId: callId,
         message: "Which target should I change?"
       }
     });
-    expect(state.completionRepair).toBeUndefined();
+    expect(state.taskControl.completionCandidate).toBeUndefined();
     expect(() => assertKernelInvariants(state)).not.toThrow();
   });
 
@@ -305,9 +307,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       completedAt: "end"
     });
     expect(state).toMatchObject({
-      phase: "ready_model",
-      completionRepairAttempts: 0,
-      completionRepair: undefined
+      phase: "ready_model"
     });
     expect(() => assertKernelInvariants(state)).not.toThrow();
 
@@ -318,8 +318,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     }]);
     expect(requestedInput).toMatchObject({
       phase: "tool_pending",
-      pendingTools: [{ request: { callId: "blocked-input-request", name: "request_user_input" } }],
-      completionRepair: undefined
+      pendingTools: [{ request: { callId: "blocked-input-request", name: "request_user_input" } }]
     });
     requestedInput = toolEvent(requestedInput, "tool.completed", "blocked-input-request", {
       ok: true,
@@ -343,12 +342,11 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       arguments: { processId: "process" }
     }]);
     expect(recoveryWork).toMatchObject({
-      phase: "tool_pending",
-      completionRepair: undefined
+      phase: "tool_pending"
     });
   });
 
-  it("blocks a third identical batch only after two identical completed outcomes", () => {
+  it("counts duplicate content as no progress without terminating before the seven-batch bound", () => {
     let state = apply(initial(), "user.message", { text: "inspect repeatedly" });
     for (const index of [1, 2]) {
       const callId = `same-${index}`;
@@ -358,11 +356,10 @@ describe("agent-kernel exhaustive protocol behavior", () => {
         `2026-01-01T00:00:0${index}.000Z`
       ));
     }
-    expect(state.repeatedToolBatchCount).toBe(2);
+    expect(state.taskControl.episode.noProgressBatches).toBe(1);
     state = proposeToolBatch(state, 3, [{ id: "same-3", name: "read", arguments: { path: "seed.txt" } }]);
-    expect(state.pendingTools).toEqual([]);
-    expect(state.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "convergence_no_progress" });
-    expect(state.repeatedToolBatchCount).toBe(2);
+    expect(state.pendingTools).toHaveLength(1);
+    expect(state.proposedOutcome).toBeUndefined();
   });
 
   it("hashes large repeated outputs without weakening repeated-action convergence", () => {
@@ -378,8 +375,8 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     }
     state = proposeToolBatch(state, 3, [{ id: "large-3", name: "read", arguments: { path: "large.txt" } }]);
 
-    expect(state.pendingTools).toEqual([]);
-    expect(state.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "convergence_no_progress" });
+    expect(state.pendingTools).toHaveLength(1);
+    expect(state.proposedOutcome).toBeUndefined();
   });
 
   it("resets the completed-outcome streak when another batch intervenes", () => {
@@ -391,7 +388,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     }
     state = proposeToolBatch(state, 3, [{ id: "other-path", name: "read", arguments: { path: "b.txt" } }]);
     state = toolEvent(state, "tool.completed", "other-path", completedReceipt("B", "2026-01-01T00:00:03.000Z"));
-    expect(state.repeatedToolBatchCount).toBe(1);
+    expect(state.taskControl.episode.noProgressBatches).toBe(0);
     state = proposeToolBatch(state, 4, [{ id: "first-path-again", name: "read", arguments: { path: "a.txt" } }]);
     expect(state.phase).toBe("tool_pending");
     expect(state.proposedOutcome).toBeUndefined();
@@ -411,7 +408,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     state = toolEvent(state, "tool.completed", "changing-1", first);
     state = proposeToolBatch(state, 2, [{ id: "changing-2", name: "read", arguments: { path: "seed.txt" } }]);
     state = toolEvent(state, "tool.completed", "changing-2", second);
-    expect(state.repeatedToolBatchCount).toBe(1);
+    expect(state.taskControl.episode.noProgressBatches).toBe(0);
     state = proposeToolBatch(state, 3, [{ id: "changing-3", name: "read", arguments: { path: "seed.txt" } }]);
     expect(state.phase).toBe("tool_pending");
     expect(state.pendingTools).toHaveLength(1);
@@ -433,17 +430,18 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     state = proposeToolBatch(state, 2, calls(2));
     state = toolEvent(state, "tool.completed", "batch-2-b", completedReceipt("B", "2026-01-01T00:00:03.000Z"));
     state = toolEvent(state, "tool.completed", "batch-2-a", completedReceipt("A", "2026-01-01T00:00:04.000Z"));
-    expect(state.repeatedToolBatchCount).toBe(2);
+    expect(state.taskControl.episode.noProgressBatches).toBe(1);
     state = proposeToolBatch(state, 3, calls(3, true));
-    expect(state.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "convergence_no_progress" });
+    expect(state.pendingTools).toHaveLength(2);
+    expect(state.proposedOutcome).toBeUndefined();
   });
 
-  it("accepts legacy repetition snapshots without an outcome signature", () => {
+  it("rejects legacy repetition authorities in new snapshots", () => {
     expect(isKernelState({
       ...initial(),
       lastToolBatchSignature: "legacy-call-signature",
       repeatedToolBatchCount: 2
-    })).toBe(true);
+    })).toBe(false);
     expect(isKernelState({ ...initial(), lastToolBatchOutcomeSignature: 42 })).toBe(false);
   });
 
@@ -553,7 +551,6 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     const conversational = settleModel(inFlight(), "model.completed", { message: { role: "assistant", content: "answer" }, toolCalls: [], finishReason: "stop" });
     expect(conversational).toMatchObject({
       phase: "tool_pending",
-      completionRepairAttempts: 0,
       proposedOutcome: undefined
     });
     const receipt = {
@@ -610,9 +607,20 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       code: "model_protocol_error"
     });
     const invalidMessage = settleModel(inFlight(), "model.completed", { message: { role: "invalid" }, text: "fallback", toolCalls: [] });
-    expect(invalidMessage.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "model_no_action" });
+    expect(invalidMessage).toMatchObject({
+      phase: "ready_model",
+      taskControl: { obligation: { kind: "terminal_resolution", failureCode: "empty_visible_response" } }
+    });
+    const invalidTwice = settleModel(startModel(invalidMessage, 2), "model.completed", {
+      message: { role: "invalid" }, toolCalls: []
+    });
+    expect(invalidTwice.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "model_no_action" });
     const missingMessage = settleModel(inFlight(), "model.completed", { message: null, toolCalls: [] });
-    expect(missingMessage.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "model_no_action" });
+    expect(missingMessage.taskControl.obligation).toMatchObject({ failureCode: "empty_visible_response" });
+    const nonStringContent = settleModel(inFlight(), "model.completed", {
+      message: { role: "assistant", content: 7 }, toolCalls: []
+    });
+    expect(nonStringContent.taskControl.obligation).toMatchObject({ failureCode: "empty_visible_response" });
 
     const modelFailure = settleModel(inFlight(), "model.failed", { message: "network" });
     expect(modelFailure.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "model_error" });
@@ -658,6 +666,17 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(apply(initial(), "run.cancelled", { reason: "user" }).outcome).toMatchObject({ reason: "user" });
     expect(apply(initial(), "run.failed", { kind: "recoverable_failure", code: "retry", message: "later", resumeToken: "r" }).outcome)
       .toEqual({ kind: "recoverable_failure", code: "retry", message: "later", resumeToken: "r" });
+    expect(apply(initial(), "run.failed", {
+      kind: "recoverable_failure",
+      code: "dependency_unavailable",
+      message: "blocked",
+      failureKind: "blocked",
+      failureCode: "dependency_unavailable"
+    }).outcome).toMatchObject({
+      kind: "recoverable_failure",
+      failureKind: "blocked",
+      failureCode: "dependency_unavailable"
+    });
     expect(apply(initial(), "run.failed", { kind: "fatal" }).outcome).toMatchObject({ kind: "fatal", code: "runtime_error" });
     expect(apply(initial(), "run.completed", { message: "forged", evidence: [], outcomeRevision: 0 }).phase).toBe("idle");
 
@@ -755,8 +774,10 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     let repairedCompletion = withPendingTool("repair-complete", "runtime_finalize");
     repairedCompletion = {
       ...repairedCompletion,
-      completionRepairAttempts: 1,
-      completionRepair: { kind: "protected_completion", answer: "Detailed final answer." },
+      taskControl: protectCompletionCandidate(
+        repairedCompletion.taskControl,
+        "Detailed final answer."
+      ),
       evidence: [diagnosticEvidence("repair-evidence")],
       messages: [...repairedCompletion.messages, {
         role: "assistant",
@@ -769,7 +790,10 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       startedAt: "start", completedAt: "end"
     });
     expect(repairedCompletion).toMatchObject({
-      proposedOutcome: { kind: "completed", message: "Detailed final answer." }
+      proposedOutcome: {
+        kind: "completed",
+        message: "Detailed final answer.\n\nResult: short summary"
+      }
     });
     const committedRevision = completion.revision;
     expect(apply(completion, "run.completed", {
@@ -859,12 +883,13 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     });
     expect(state).toMatchObject({
       phase: "ready_model",
-      completionRepair: {
-        kind: "completion_prerequisite",
+      taskControl: { obligation: {
+        kind: "completion_evidence",
+        stage: "acquire",
         originalCallId: "completion-needs-validation",
         evidenceCount: 0,
-        retryCount: 0
-      }
+        attempts: 0
+      } }
     });
 
     state = apply(state, "evidence.recorded", {
@@ -899,7 +924,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(state).toMatchObject({
       phase: "ready_model",
       pendingTools: [],
-      completionRepair: { kind: "completion_prerequisite" }
+      taskControl: { phase: "normal", obligation: undefined }
     });
     expect(decide(state).map((effect) => effect.type)).toEqual(["request_model"]);
     expect(() => assertKernelInvariants(state)).not.toThrow();
@@ -1051,33 +1076,17 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     })).toBe(false);
     expect(() => assertKernelInvariants({
       ...initial(), completionRepairAttempts: 1
-    })).toThrow("attempts require explicit repair state");
-    expect(() => assertKernelInvariants({
+    })).toThrow("superseded task-control authorities");
+    expect(isKernelState({
       ...initial(),
-      completionRepairAttempts: 1,
-      completionRepair: { kind: "protected_completion", answer: "answer" }
-    })).toThrow("requires current-run referenceable evidence");
-    expect(() => assertKernelInvariants({
-      ...initial(),
-      phase: "outcome_pending",
-      completionRepairAttempts: 1,
-      completionRepair: { kind: "protected_completion", answer: "answer" },
-      evidence: [diagnosticEvidence("protected-invariant")],
-      proposedOutcome: { kind: "needs_input", requestId: "ask", message: "question" }
-    })).not.toThrow();
+      taskControl: {
+        ...initial().taskControl,
+        completionCandidate: { answer: "   ", digest: "a".repeat(64) }
+      }
+    })).toBe(false);
     expect(() => assertKernelInvariants({
       ...initial(),
       phase: "needs_input",
-      completionRepairAttempts: 1,
-      completionRepair: { kind: "protected_completion", answer: "answer" },
-      evidence: [diagnosticEvidence("protected-snapshot")],
-      outcome: { kind: "needs_input", requestId: "forged", message: "question" }
-    })).toThrow("only for a pending tool approval");
-    expect(() => assertKernelInvariants({
-      ...initial(),
-      phase: "needs_input",
-      completionRepair: { kind: "protected_recovery", answer: "answer" },
-      evidence: [diagnosticEvidence("protected-approval")],
       toolCallIds: ["approve-read"],
       pendingTools: [{
         request: { callId: "approve-read", name: "read", arguments: null },
@@ -1112,14 +1121,6 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       consumed: { inputTokens: 0, outputTokens: 0, costMicroUsd: 0, modelTurns: 0, toolCalls: 0, children: 0 },
       createdAt: "2026-01-01T00:00:00.000Z"
     };
-    const semanticCluster: NonNullable<KernelState["semanticFailureCluster"]> = {
-      family: "infrastructure",
-      attempts: 1,
-      firstRevision: 0,
-      lastRevision: 0,
-      diagnosticCodes: ["fixture_failure"],
-      progress: { workspaceChanges: 0, durableEvidence: 0, revision: 0 }
-    };
     const invalidStates: Array<[KernelState, string]> = [
       [{ ...base, schemaVersion: 2 } as unknown as KernelState, "schema version"],
       [{ ...base, plan: { revision: 0, goal: "", activeNodeId: "missing", nodes: [] } }, "plan graph"],
@@ -1143,24 +1144,16 @@ describe("agent-kernel exhaustive protocol behavior", () => {
         ...base.budget,
         reserved: { ...base.budget.reserved, inputTokens: 1 }
       } }, "does not match its active reservations"],
-      [{ ...base, semanticProgress: null } as unknown as KernelState, "semantic failure progress"],
-      [{ ...base, semanticFailureCluster: {} } as unknown as KernelState, "semantic failure progress"],
-      [{ ...base, semanticFailureCluster: {
-        ...semanticCluster, progress: { ...semanticCluster.progress, workspaceChanges: 1 }
-      } }, "does not match its progress watermark"],
-      [{ ...base, semanticFailureCluster: {
-        ...semanticCluster, progress: { ...semanticCluster.progress, durableEvidence: 1 }
-      } }, "does not match its progress watermark"],
-      [{ ...base, semanticFailureCluster: {
-        ...semanticCluster, progress: { ...semanticCluster.progress, revision: 1 }
-      } }, "does not match its progress watermark"],
-      [{ ...base, semanticProgress: { ...base.semanticProgress, revision: 1 } }, "exceeds the current revision"],
-      [{ ...base, semanticFailureCluster: {
-        ...semanticCluster, firstRevision: 1
-      } }, "semantic failure revisions"],
-      [{ ...base, semanticFailureCluster: {
-        ...semanticCluster, lastRevision: 1
-      } }, "semantic failure revisions"],
+      [{ ...base, semanticProgress: null } as unknown as KernelState, "superseded task-control authorities"],
+      [{ ...base, semanticFailureCluster: {} } as unknown as KernelState, "superseded task-control authorities"],
+      [{ ...base, taskControl: {} } as unknown as KernelState, "task-control state is invalid"],
+      [{
+        ...base,
+        taskControl: {
+          ...base.taskControl,
+          semanticFacts: { entries: [{ kind: "content", digest: "a".repeat(64), revision: 1 }] }
+        }
+      }, "exceed the current kernel revision"],
       [{ ...base, toolCallIds: ["same", "same"] }, "Duplicate run tool"],
       [{ ...base, phase: "tool_pending", pendingTools: [{
         request: { callId: "missing", name: "read", arguments: null },
@@ -1211,12 +1204,16 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(apply(state, "usage.recorded", { ...usage, usageId: "other", sessionId: "other" }).usage).toHaveLength(1);
 
     expect(apply(state, "plan.updated", { previousRevision: "0", plan: null }).plan).toBe(state.plan);
-    expect(apply(state, "budget.released", { ledger: null }).budget).toBe(state.budget);
+    expect(() => apply(state, "budget.released", { ledger: null })).toThrow(InvalidBudgetTransitionError);
     const increased = createBudgetLedger({ ...state.budget.limits, toolCalls: state.budget.limits.toolCalls + 1 });
-    expect(apply(state, "budget.limit_increased", { ledger: increased, increase: { toolCalls: 1 } }).budget)
-      .toBe(state.budget);
+    expect(() => apply(state, "budget.limit_increased", {
+      ledger: increased, previousLimits: state.budget.limits, increase: { toolCalls: 1 }
+    })).toThrow(InvalidBudgetTransitionError);
+    const previousLimits = state.budget.limits;
     state = evolve(state, {
-      ...envelope(state, "budget.limit_increased", { ledger: increased, increase: { toolCalls: 1 } }), authority: "user"
+      ...envelope(state, "budget.limit_increased", {
+        ledger: increased, previousLimits, increase: { toolCalls: 1 }
+      }), authority: "user"
     });
     expect(state.budget.limits.toolCalls).toBe(increased.limits.toolCalls);
 
@@ -1418,6 +1415,21 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     });
 
     frontier = frontierAfterEvidence(frontier, [], {
+      ...importedCheckpoint,
+      evidenceId: "imported-later",
+      data: {
+        checkpointId: "imported-cp-later",
+        preManifestDigest: "9".repeat(64),
+        sourceSessionId: "source-session-later"
+      }
+    });
+    expect(frontier).toMatchObject({
+      revision: 2,
+      baselineManifestDigest: "a".repeat(64),
+      sourceCheckpointIds: ["imported-cp", "imported-cp-later"]
+    });
+
+    frontier = frontierAfterEvidence(frontier, [], {
       evidenceId: "repo", sessionId: "session", runId: "run",
       kind: "repository_delta", status: "passed", createdAt: "2026-01-01T00:00:01.000Z",
       producer: { authority: "runtime" }, summary: "updated repository",
@@ -1430,7 +1442,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       }
     });
     expect(frontier).toMatchObject({
-      revision: 2, repositoryStateDigest: "d".repeat(64), changedPaths: [".git"]
+      revision: 3, repositoryStateDigest: "d".repeat(64), changedPaths: [".git"]
     });
 
     const unchanged = frontierAfterEvidence(frontier, [], diagnosticEvidence("diagnostic-v4"));
@@ -1445,37 +1457,32 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(workspace.changedPaths).toEqual([".git", "file.ts"]);
   });
 
-  it("validates optional persisted state branches and rejects malformed repair state", () => {
+  it("validates optional persisted branches and the sole task-control schema", () => {
     const base = initial();
     expect(isKernelState({ ...base, deadlineRemainingMs: 1 })).toBe(true);
-    expect(isKernelState({ ...base, lastToolBatchSignature: "read:{}" })).toBe(true);
+    expect(isKernelState({ ...base, lastToolBatchSignature: "read:{}" })).toBe(false);
     expect(isKernelState({
       ...base,
       lastToolBatchSignature: "read:{}",
       lastToolBatchOutcomeSignature: "a".repeat(64),
       repeatedToolBatchCount: 1
-    })).toBe(true);
+    })).toBe(false);
     expect(isKernelState({ ...base, activeModelSemanticDelta: true })).toBe(true);
-    expect(isKernelState({ ...base, semanticProgress: { ...base.semanticProgress, revision: 1 } })).toBe(false);
-    expect(isKernelState({
-      ...base,
-      semanticFailureCluster: {
-        family: "validation", attempts: 1, firstRevision: 0, lastRevision: 0,
-        diagnosticCodes: ["validation_failed"], progress: base.semanticProgress
-      }
-    })).toBe(true);
+    expect(isKernelState({ ...base, semanticProgress: { revision: 1 } })).toBe(false);
     expect(isKernelState({ schemaVersion: base.schemaVersion })).toBe(false);
 
-    expect(isCompletionRepairState(null)).toBe(false);
-    expect(isCompletionRepairState({ kind: "evidence_acquisition" })).toBe(true);
-    expect(isCompletionRepairState({ kind: "terminal_action" })).toBe(true);
-    expect(isCompletionRepairState({
-      kind: "completion_prerequisite", answer: "continue", originalCallId: "complete-1",
-      arguments: { summary: "done" }, evidenceCount: 0, retryCount: 0,
-      modelTurn: { turnId: 1, effectRevision: 0 }
-    })).toBe(true);
-    expect(isCompletionRepairState({ kind: "protected_completion", answer: "preserved" })).toBe(true);
-    expect(isCompletionRepairState({ kind: "protected_completion", answer: "" })).toBe(false);
+    expect(isTaskControlStateV1(null)).toBe(false);
+    expect(isTaskControlStateV1(createTaskControlState())).toBe(true);
+    expect(isTaskControlStateV1({ ...createTaskControlState(), goalEpochSource: "unknown" })).toBe(false);
+    expect(isTaskControlStateV1({
+      ...createTaskControlState(),
+      semanticFacts: {
+        entries: [
+          { kind: "content", digest: "a".repeat(64), revision: 0 },
+          { kind: "content", digest: "a".repeat(64), revision: 0 }
+        ]
+      }
+    })).toBe(false);
   });
 
   it.skip("reconciles V3 evidence-id relationships across checkpoint restoration", () => {

@@ -174,12 +174,13 @@ export async function snapshotWorkspace(workspace, options = {}) {
   return entries;
 }
 
-export async function copyWorkspaceEvidence(source, destination) {
+export async function copyWorkspaceEvidence(source, destination, options = {}) {
   const links = [];
   async function copyDirectory(currentSource, currentDestination) {
     await mkdir(currentDestination, { recursive: true });
     const entries = await readdir(currentSource, { withFileTypes: true });
     for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+      if (options.excludeRepositoryMetadata === true && entry.name === ".git") continue;
       const from = path.join(currentSource, entry.name);
       const to = path.join(currentDestination, entry.name);
       const info = await lstat(from);

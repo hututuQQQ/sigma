@@ -22,7 +22,7 @@ import type {
   SkillCatalog
 } from "agent-extensions";
 import type { ProcessExecutionPort, RuntimeEnvironment } from "agent-platform";
-import type { ProcessHandle } from "agent-execution";
+import type { ManagedSessionBindingV1, ProcessHandle } from "agent-execution";
 import type { ReviewerPort } from "./reviewer.js";
 import type { AsyncQueue } from "./async-queue.js";
 import type { ApprovalBinding } from "./approval-binding.js";
@@ -64,6 +64,8 @@ export interface RuntimeOptions {
   availableProfiles?: readonly RuntimeAgentProfile[];
   gatewayForRole?(role: ModelExecutionRole, profile: FrozenAgentProfile | undefined): ModelGateway;
   execution?: ProcessExecutionPort;
+  managedEnvironmentMode?: "disabled" | "required";
+  managedNetworkMode?: "none" | "loopback" | "full";
   runtimeEnvironment?: RuntimeEnvironment;
   /** Runtime-authority provenance supplied by a trusted launcher. Never derive
    * this from the workspace being operated on. */
@@ -153,6 +155,8 @@ export interface RuntimeSessionExecutionState {
   running: Promise<void> | null;
   /** Runtime-local broker handles; never restored across process restart. */
   processHandles: Map<string, ProcessHandle>;
+  /** Runtime-only capability; never serialized into model-visible history. */
+  managedSessionBinding?: ManagedSessionBindingV1;
 }
 
 export interface RuntimeSessionInteractionState {
@@ -161,9 +165,6 @@ export interface RuntimeSessionInteractionState {
   /** One-shot grants, bound to a call and intentionally not restored. */
   callApprovals: Map<string, CallApprovalGrant>;
   alwaysAllowedEffects: Set<string>;
-  /** Runtime-local convergence guard; infrastructure failures are summarized
-   * instead of being replayed through durable model history. */
-  capabilityFailures: Map<string, number>;
   steeringPending: number;
   followUps: QueuedFollowUp[];
   contextItems: ContextItem[];

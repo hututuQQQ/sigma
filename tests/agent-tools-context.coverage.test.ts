@@ -268,7 +268,9 @@ describe("context, platform, and repository tool capabilities", () => {
       tools: [], contextWindowTokens: 160, outputReserveTokens: 20, promptCache: false
     });
     expect(compacted.omittedHistoryTurns).toBeGreaterThan(0);
-    expect(compacted.summary).toMatchObject({ authority: "tool", provenance: "lossy conversation compaction" });
+    expect(compacted.summary).toMatchObject({
+      authority: "tool", provenance: "lossy conversation compaction archive"
+    });
     expect(() => planContext({
       system: [{ id: "required", authority: "system", provenance: "required", content: "required", tokenCount: 90, priority: 1 }],
       dynamic: [], history: [{ role: "user", content: "request" }], tools: [],

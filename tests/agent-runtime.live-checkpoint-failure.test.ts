@@ -147,6 +147,13 @@ describe("live mutation checkpoint failure recovery", () => {
     expect(stored.some((event) => event.type === "tool.requested"
       && (event.payload as { callId?: string }).callId === "same-turn-completion")).toBe(false);
     expect(stored).toContainEqual(expect.objectContaining({
+      type: "tool.failed",
+      payload: expect.objectContaining({
+        callId: "same-turn-completion",
+        diagnostics: expect.arrayContaining(["checkpoint_recovery_required"])
+      })
+    }));
+    expect(stored).toContainEqual(expect.objectContaining({
       type: "run.suspended",
       payload: expect.objectContaining({ requestId: expect.stringMatching(/^checkpoint:/u) })
     }));

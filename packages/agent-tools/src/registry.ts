@@ -109,6 +109,10 @@ function assertPlanEffects(descriptor: ToolDescriptor, plan: ToolCallPlan): void
       `Tool '${descriptor.name}' planned undeclared or duplicated effects: ${[...new Set(outside)].join(", ")}.`
     );
   }
+  if (plan.mutationAuthority === "broker_repository_transaction_v2"
+    && descriptor.brokerMutationAuthority !== "repository_transaction_v2") {
+    throw planError(`Tool '${descriptor.name}' cannot delegate mutation rollback to the repository broker.`);
+  }
 }
 
 export async function prepareToolCallPlan(

@@ -73,18 +73,15 @@
     "verify:containment": "cargo build --locked --manifest-path native/sigma-exec/Cargo.toml && node scripts/verify-containment.mjs",
     "perf:repo-100k": "pnpm build && node scripts/perf-repository-100k.mjs",
     "perf:replay-v5-100k": "pnpm build && node --expose-gc scripts/perf-v5-replay-100k.mjs",
-    "bench:deepseek": "pnpm bench:tb:deepseek",
     "bench:tb:smoke": "node scripts/bench-terminal-bench.mjs --mode smoke",
     "bench:tb:k": "node scripts/bench-terminal-bench.mjs --mode k",
     "bench:tb:task": "node scripts/bench-terminal-bench.mjs --mode task",
-    "bench:tb:deepseek": "node scripts/bench-terminal-bench.mjs --mode k --provider deepseek --model deepseek-v4-pro",
-    "bench:tb:deepseek:k5": "node scripts/bench-terminal-bench.mjs --mode k --provider deepseek --model deepseek-v4-pro --k 5",
-    "bench:tb:deepseek:k10": "node scripts/bench-terminal-bench.mjs --mode k --provider deepseek --model deepseek-v4-pro --k 10",
-    "bench:tb:deepseek:task": "node scripts/bench-terminal-bench.mjs --mode task --provider deepseek --model deepseek-v4-pro",
     "bench:tb:config:portable": "node scripts/package-harbor-runtime.mjs",
     "bench:tb:report": "node scripts/bench-report.mjs",
     "bench:tb:report:all": "node scripts/bench-report.mjs --all",
-    "bench:tb:formal": "node scripts/bench-terminal-bench-formal.mjs"
+    "bench:tb:formal": "node scripts/bench-terminal-bench-formal.mjs",
+    "bench:tb:preregister": "node scripts/bench-terminal-bench-formal-preregistration.mjs",
+    "bench:tb:identity-archive": "node scripts/bench-task-identity-archive.mjs"
   },
   "devDependencies": {
     "@opentui/core": "0.4.3",

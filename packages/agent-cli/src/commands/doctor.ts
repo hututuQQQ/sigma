@@ -1,8 +1,9 @@
 import { access } from "node:fs/promises";
 import { discoverLanguageServers, type LanguageServerPreset } from "agent-code-intel";
 import { SIGMA_PROJECT_FACTS } from "agent-config";
-import { LazyExecutionBroker, type ExecutionBroker } from "agent-execution";
+import type { ExecutionBroker } from "agent-execution";
 import { checkProviderHealth, type ProviderHealthReport } from "agent-model";
+import { configuredExecutionBroker, type RuntimeFactoryDeps } from "agent-runtime";
 import { loadCliConfig, parseArgs } from "../config.js";
 
 export const DOCTOR_REPORT_SCHEMA_VERSION = 1 as const;
@@ -12,12 +13,13 @@ interface DoctorDeps {
   stderr?: NodeJS.WritableStream;
   executionBroker?: ExecutionBroker;
   createExecutionBroker?: () => ExecutionBroker;
+  runtimeFactoryDeps?: RuntimeFactoryDeps;
   languageServers?: LanguageServerPreset[];
 }
 
 async function sandboxCheck(broker: ExecutionBroker, workspace: string): Promise<SandboxProbe> {
   try {
-    const report = await broker.doctor();
+    const report = await broker.connect();
     const lease = broker.sandboxLeaseStatus
       ? await broker.sandboxLeaseStatus(workspace).catch(() => undefined) : undefined;
     const ready = report.sandbox.available && report.sandbox.selfTestPassed;
@@ -39,6 +41,25 @@ async function sandboxCheck(broker: ExecutionBroker, workspace: string): Promise
       check: { name: "sandbox", status: "warning", message: error instanceof Error ? error.message : String(error) }
     };
   }
+}
+
+function managedEnvironmentCheck(
+  report: BrokerDoctorReport | undefined,
+  required: boolean
+): DoctorCheck | undefined {
+  if (!required) return undefined;
+  const ready = report?.container?.available === true
+    && report.container.target === "managed"
+    && report.capabilities.runtimeClosure?.complete === true
+    && report.capabilities.managedEnvironment?.available === true
+    && report.capabilities.managedEnvironment.prepare === true;
+  return {
+    name: "managed_environment",
+    status: ready ? "ok" : "error",
+    message: ready
+      ? `target=${report!.container!.targetId}; closure=${report!.capabilities.runtimeClosure!.digest}`
+      : "required managed container proof, runtime closure, or preparation port is unavailable"
+  };
 }
 
 function languageServerChecks(presets: LanguageServerPreset[]): DoctorCheck[] {
@@ -158,14 +179,19 @@ async function executeDoctor(
 ): Promise<number> {
   const { flags } = parseArgs(argv);
   const config = loadCliConfig(flags);
-  const ownedBroker = deps.executionBroker ? undefined : (deps.createExecutionBroker?.() ?? new LazyExecutionBroker({
-    sandboxMode: "required"
-  }));
+  const ownedBroker = deps.executionBroker ? undefined : await (
+    deps.createExecutionBroker?.()
+      ?? configuredExecutionBroker(config, deps.runtimeFactoryDeps ?? {}, config.workspace)
+  );
   try {
     const broker = deps.executionBroker ?? ownedBroker!;
     const checks: DoctorCheck[] = [nodeCheck(), await workspaceCheck(config.workspace), providerKeyCheck(config.provider)];
     const sandbox = await sandboxCheck(broker, config.workspace);
     checks.push(sandbox.check);
+    const managed = managedEnvironmentCheck(
+      sandbox.report, config.managedEnvironmentMode === "required"
+    );
+    if (managed) checks.push(managed);
     checks.push(...languageServerChecks(deps.languageServers ?? discoverLanguageServers()));
     checks.push(await apiCheck(config.provider, config.model, flags["check-api"] === true));
     const strict = flags.strict === true;
@@ -182,7 +208,7 @@ async function executeDoctor(
         sandbox: sandbox.report.sandbox,
         capabilities: sandbox.report.capabilities,
         workspaceLease: sandbox.lease ?? null,
-        container: {
+        container: sandbox.report.container ?? {
           available: false,
           backend: "oci",
           reason: "No OCI backend is installed in this Sigma build. Container mode fails with container_unavailable."

@@ -31,6 +31,18 @@ export interface ExecutionPolicy {
   /** Read/execute-only roots for explicitly trusted absolute executables. */
   executionRoots?: string[];
   protectedPaths?: string[];
+  /** Trusted validation adapter request: mount a broker-owned writable copy at
+   * this exact in-sandbox path and discard it when the process exits. */
+  disposableWorkspaceRoot?: string;
+  /** Explicit fallback for targets without same-path COW. The broker executes
+   * at the real path with read-only workspace access and writable scratch. */
+  readOnlyValidationWorkspaceRoot?: string;
+  /** Broker-issued one-use capability for an exact local Git executable and
+   * canonical repository topology. Model/tool arguments cannot mint it. */
+  repositoryMetadataLease?: RepositoryMetadataLeaseV1;
+  /** Runtime-only broker capability. Tool/model arguments cannot construct or
+   * select its host paths or lease id. */
+  scratchLease?: ScratchLeaseV1;
 }
 
 export interface ExecutionRequest {
@@ -148,9 +160,25 @@ export interface BrokerCapabilities {
   executionRoots?: boolean;
   /** Shells listed here have passed the native sandbox self-test. */
   shells?: BrokerVerifiedShell[];
-  /** Bare executable aliases from package-trusted toolchains accepted during
-   * this broker connection. Absolute host paths are deliberately omitted. */
+  /** Bare executables proved present in the execution target for this connection. */
   runtimeCommands?: string[];
+  /** True only when omission proves unavailability in this connection's bounded
+   * executable namespace (the target-PATH probe for OCI, the manifest allowlist for native). */
+  runtimeCommandSnapshotComplete?: boolean;
+  /** Absolute PATH entries observed by the broker process. OCI clients use
+   * this connection-bound value instead of inheriting the control process's
+   * PATH when the target resolves a bare executable name. */
+  executableSearchPaths?: string[];
+  /** Digest of broker-attested runtime data installed in the disposable
+   * target. It is absent for legacy/native brokers and cannot be supplied by
+   * a model request. */
+  runtimeDataDigest?: string;
+  /** Connection-bound closure of the authenticated target runtime. */
+  runtimeClosure?: BrokerRuntimeClosureV1;
+  managedEnvironment?: {
+    available: boolean;
+    prepare: boolean;
+  };
 }
 
 export interface BrokerVerifiedShell {
@@ -168,6 +196,22 @@ export interface BrokerDoctorReport {
   architecture: string;
   sandbox: BrokerSandboxReport;
   capabilities: BrokerCapabilities;
+  /** OCI availability, or the authenticated identity when this is an OCI broker. */
+  container?: BrokerContainerReport;
+}
+
+export interface TrustedContainerBrokerRequest {
+  workspace: string;
+  config: ContainerExecutionConfig;
+  managedAttestation?: TrustedManagedContainerAttestationV1;
+}
+
+/** Product/launcher dependency only. Never construct this value from CLI,
+ * environment, workspace configuration, task metadata, or model output. */
+export interface TrustedContainerLauncherV1 {
+  protocolVersion: 1;
+  managedAttestation?: TrustedManagedContainerAttestationV1;
+  createBroker(request: TrustedContainerBrokerRequest): ExecutionBroker;
 }
 
 export interface BrokerSandboxLeaseStatus {
@@ -231,7 +275,7 @@ export interface BrokerRequestOptions {
   timeoutMs?: number;
 }
 
-export interface ExecutionBroker {
+export interface ExecutionBroker extends RepositoryExecutionBroker {
   readonly lostProcessHandles: readonly ProcessHandle[];
   connect(signal?: AbortSignal): Promise<BrokerDoctorReport>;
   doctor(signal?: AbortSignal): Promise<BrokerDoctorReport>;
@@ -240,6 +284,21 @@ export interface ExecutionBroker {
   repairSandbox?(signal?: AbortSignal): Promise<BrokerDoctorReport>;
   sandboxLeaseStatus?(workspacePath: string, signal?: AbortSignal): Promise<BrokerSandboxLeaseStatus>;
   revokeSandboxLease?(workspacePath: string, signal?: AbortSignal): Promise<BrokerSandboxRevokeResult>;
+  acquireScratchLease?(
+    request: ScratchLeaseRequestV1,
+    options?: BrokerRequestOptions
+  ): Promise<ScratchLeaseV1>;
+  /** Idempotently ends a RuntimeSession lease after all of its processes have
+   * reached a terminal state. */
+  releaseScratchLease?(sessionId: string, options?: BrokerRequestOptions): Promise<void>;
+  bindManagedSession?(
+    request: ManagedSessionBindingRequestV1,
+    options?: BrokerRequestOptions
+  ): Promise<ManagedSessionBindingV1>;
+  prepareManagedEnvironment?(
+    request: ManagedEnvironmentPrepareRequestV1,
+    options?: BrokerRequestOptions
+  ): Promise<ManagedEnvironmentPrepareResultV1>;
   execute(request: ExecutionRequest, options?: BrokerRequestOptions): Promise<ExecutionResult>;
   spawn(request: ProcessSpawnRequest, options?: BrokerRequestOptions): Promise<ProcessHandle>;
   poll(handle: ProcessHandle, options?: BrokerRequestOptions): Promise<ProcessPollResult>;
@@ -252,8 +311,15 @@ export interface ExecutionBroker {
 }
 
 export interface SigmaExecBrokerClientOptions {
-  helperPath: string;
+  /** Exactly one transport is required. socketPath/trustedStream are trusted
+   * product boundaries and must never come from model/workspace configuration. */
+  helperPath?: string;
+  socketPath?: string;
+  trustedStream?: Duplex;
   helperArgs?: string[];
+  /** Additional fixed parent for shared broker output artifacts. */
+  artifactRootParent?: string;
+  executionBackend?: "native" | "oci";
   sandboxMode?: SandboxMode;
   requestTimeoutMs?: number;
   /** Deadline for startup doctor/recovery and explicit sandbox setup. */
@@ -273,3 +339,59 @@ export interface SigmaExecBrokerClientOptions {
    */
   trustedToolchains?: TrustedToolchainManifestEntry[];
 }
+import type { Duplex } from "node:stream";
+import type { ScratchLeaseRequestV1, ScratchLeaseV1 } from "./scratch-lease-types.js";
+import type { RepositoryMetadataLeaseV1 } from "./repository-metadata-lease-types.js";
+import type { RepositoryExecutionBroker } from "./repository-execution-broker.js";
+import type {
+  ManagedEnvironmentPrepareRequestV1,
+  ManagedEnvironmentPrepareResultV1
+} from "./managed-environment-types.js";
+import type {
+  BrokerContainerReport,
+  BrokerRuntimeClosureV1,
+  ContainerExecutionConfig,
+  ManagedSessionBindingRequestV1,
+  ManagedSessionBindingV1,
+  TrustedManagedContainerAttestationV1
+} from "./container-types.js";
+export type { ScratchLeaseRequestV1, ScratchLeaseV1 } from "./scratch-lease-types.js";
+export type {
+  RepositoryMetadataLeaseRequestV1,
+  RepositoryMetadataLeaseV1
+} from "./repository-metadata-lease-types.js";
+export type {
+  RepositoryExpectedPostconditionsV3,
+  RepositoryOperationV2,
+  RepositoryRunBaselineLeaseV1,
+  RepositoryRunBaselineBoundRequestV1,
+  RepositoryRunBaselineRequestV1,
+  RepositoryRunBaselineResultV1,
+  RepositorySemanticAssertionsV3,
+  RepositoryTargetAssertionsV3,
+  RepositoryTransactionBeginRequestV2,
+  RepositoryTransactionBoundRequestV2,
+  RepositoryTransactionContinueRequestV2,
+  RepositoryTransactionLeaseRequestV2,
+  RepositoryTransactionLeaseV2,
+  RepositoryTransactionRecoverRequestV2,
+  RepositoryTransactionResultV2,
+  RepositoryTransactionResultV3
+} from "./repository-transaction-types.js";
+export type {
+  BrokerContainerReport,
+  BrokerRuntimeClosureV1,
+  ContainerEngine,
+  ContainerExecutionConfig,
+  ContainerTarget,
+  ManagedSessionBindingRequestV1,
+  ManagedSessionBindingV1,
+  ResolvedContainerEngine,
+  TrustedManagedContainerAttestationV1,
+  TrustedManagedEnvironmentProofV1
+} from "./container-types.js";
+export type {
+  ManagedEnvironmentPrepareRequestV1,
+  ManagedEnvironmentPrepareResultV1,
+  RuntimeDependencyObservationV1
+} from "./managed-environment-types.js";

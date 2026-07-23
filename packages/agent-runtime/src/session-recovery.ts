@@ -10,6 +10,7 @@ import type { RuntimeSession } from "./types.js";
 import type { BoundRuntimeEventEmitter } from "./runtime-event-emitter.js";
 
 interface RecoveryOptions {
+  execution?: import("agent-platform").ProcessExecutionPort;
   descriptors: readonly ToolDescriptor[];
   emit: BoundRuntimeEventEmitter;
   settleToolBudget(callId: string, disposition: "commit" | "release", checkpointId?: string): Promise<void>;
@@ -107,7 +108,11 @@ async function recoverUnstartedTool(
 }
 
 export async function recoverInterruptedSession(session: RuntimeSession, options: RecoveryOptions): Promise<void> {
-  await recoverInterruptedRepositoryTransactions(session.identity.workspacePath, session.identity.sessionId);
+  await recoverInterruptedRepositoryTransactions(
+    options.execution,
+    session.identity.sessionId,
+    session.durable.runId
+  );
   if (session.durable.state.phase === "terminal") return;
   const lostProcessIds = [...session.durable.state.activeProcessIds];
   for (const processId of lostProcessIds) {

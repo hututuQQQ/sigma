@@ -16,6 +16,7 @@ describe("Sigma config", () => {
     expect(config).toMatchObject({
       sandboxMode: "required",
       executionMode: "sandboxed",
+      managedEnvironmentMode: "disabled",
       permissionMode: "workspace-auto",
       readScope: "workspace",
       networkMode: "none",
@@ -80,6 +81,21 @@ describe("Sigma config", () => {
     expect(() => loadCliConfig({ "unsafe-host-exec": true }, {
       env: {}, cwd: root, homeDir: path.join(root, "missing-home")
     })).toThrow(/Unknown option/u);
+  });
+
+  it("can require but cannot synthesize a managed environment capability", () => {
+    const root = path.join(process.cwd(), ".managed-environment-fixture");
+    const config = loadCliConfig({
+      "execution-mode": "container",
+      "managed-environment-mode": "required"
+    }, { env: {}, cwd: root, homeDir: path.join(root, "missing-home") });
+    expect(config).toMatchObject({
+      executionMode: "container",
+      managedEnvironmentMode: "required"
+    });
+    expect(() => loadCliConfig({ "managed-environment-mode": "opportunistic" }, {
+      env: {}, cwd: root, homeDir: path.join(root, "missing-home")
+    })).toThrow(/disabled, required/u);
   });
 
   it("checks and atomically writes a V2 migration with a backup", async () => {

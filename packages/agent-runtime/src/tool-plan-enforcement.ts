@@ -6,13 +6,17 @@ import type {
   ModelToolCall,
   ToolCallPlan,
   ToolReceipt,
-  ValidationClaimKindV1,
   ValidationClaimV1
 } from "agent-protocol";
 import { canonicalWorkspacePath, isInside } from "agent-platform";
 import { effectsOutsidePlan } from "./tool-evidence.js";
 import type { RuntimeSession } from "./types.js";
 import { assurancePathsForClaim } from "./assurance-engine.js";
+import {
+  assertRepositoryConflictPlanAllowed,
+  assertRepositoryRecoveryCallAllowed
+} from "./repository-task-control-policy.js";
+import { semanticValidationCommand } from "./semantic-validation-command.js";
 
 export interface FrozenValidationScope {
   frontierRevision: number;
@@ -37,6 +41,38 @@ function argumentObject(value: JsonValue): Record<string, JsonValue> {
     ? value as Record<string, JsonValue> : {};
 }
 
+function requestedExecutable(call: ModelToolCall): string | undefined {
+  const input = argumentObject(call.arguments);
+  return typeof input.executable === "string" ? input.executable : undefined;
+}
+
+/** Bind a capability-recovery action to the runtime-issued opportunity. The
+ * model may choose one package set, but cannot change the missing executable,
+ * substitute another probe, or reuse the obligation for unrelated execution. */
+export function assertTaskControlCallAllowed(
+  session: RuntimeSession,
+  call: ModelToolCall
+): void {
+  const obligation = session.durable.state.taskControl.obligation;
+  if (obligation?.kind === "repository_recovery") {
+    assertRepositoryRecoveryCallAllowed(session, call);
+    return;
+  }
+  if (obligation?.kind !== "capability_recovery") return;
+  const executable = requestedExecutable(call);
+  const allowed = obligation.stage === "prepare"
+    ? call.name === "environment_prepare" && (() => {
+        const input = argumentObject(call.arguments);
+        return input.requestedExecutable === obligation.requestedExecutable;
+      })()
+    : call.name === obligation.probeToolName
+      && executable === obligation.requestedExecutable;
+  if (allowed) return;
+  throw Object.assign(new Error(
+    "The active capability recovery is bound to one broker-observed executable and probe."
+  ), { code: "tool_unavailable_for_repair" });
+}
+
 function shellWords(command: string): string[] {
   const words: string[] = [];
   const pattern = /"([^"\\]*(?:\\.[^"\\]*)*)"|'([^']*)'|([^\s]+)/gu;
@@ -56,58 +92,13 @@ function invocation(call: ModelToolCall): { executable: string; args: string[]; 
   return { executable: words[0] ?? "", args: words.slice(1), display: command };
 }
 
-function executableName(value: string): string {
-  return path.basename(value).toLowerCase().replace(/\.(?:exe|cmd|bat|ps1)$/u, "");
-}
-
-function scriptName(executable: string, args: string[]): string | undefined {
-  if (!["pnpm", "npm", "yarn", "bun"].includes(executable)) return undefined;
-  const candidate = args[0] === "run" ? args[1] : args[0];
-  return candidate?.toLowerCase();
-}
-
-function cargoSubcommand(args: string[]): string | undefined {
-  const optionsWithValues = new Set(["--color", "--config", "-C", "-Z"]);
-  let skipValue = false;
-  for (const argument of args) {
-    if (skipValue) {
-      skipValue = false;
-      continue;
-    }
-    if (argument.startsWith("+")) continue;
-    const option = argument.split("=", 1)[0] ?? argument;
-    if (optionsWithValues.has(option)) {
-      skipValue = !argument.includes("=");
-      continue;
-    }
-    if (argument.startsWith("-")) continue;
-    return argument.toLowerCase();
-  }
-  return undefined;
-}
-
-function cargoClaimKind(args: string[]): ValidationClaimKindV1 | undefined {
-  const subcommand = cargoSubcommand(args);
-  if (subcommand === "test") return "unit";
-  if (subcommand === "clippy" || subcommand === "fmt") return "lint";
-  if (["build", "check", "bench"].includes(subcommand ?? "")) return "acceptance";
-  return undefined;
-}
-
-function claimKind(executable: string, args: string[]): ValidationClaimKindV1 {
-  if (executable === "node" && args[0] === "--check") return "syntax";
-  if (executable === "tsc" || args.some((item) => executableName(item) === "tsc")) return "typecheck";
-  if (["eslint", "biome", "stylelint", "ruff"].includes(executable)) return "lint";
-  if (["vitest", "jest", "mocha", "pytest", "cargo-test"].includes(executable)) return "unit";
-  if (executable === "cargo") return cargoClaimKind(args) ?? "probe";
-  const script = scriptName(executable, args);
-  if (!script) return "probe";
-  if (/integration|e2e/u.test(script)) return "integration";
-  if (/test|spec/u.test(script)) return "unit";
-  if (/typecheck|check-types|tsc/u.test(script)) return "typecheck";
-  if (/lint|format-check/u.test(script)) return "lint";
-  if (/build|verify|validate|check/u.test(script)) return "acceptance";
-  return "probe";
+function inlineNodeExactFiles(
+  workspaceRoot: string,
+  projectRoot: string,
+  candidates: readonly string[]
+): string[] {
+  return [...new Set(candidates.flatMap((value) =>
+    workspaceSubjectPath(workspaceRoot, projectRoot, value) ?? []))].sort();
 }
 
 function workspaceSubjectPath(workspaceRoot: string, projectRoot: string, requested: string): string | undefined {
@@ -129,13 +120,22 @@ function validationClaim(
   call: ModelToolCall
 ): Omit<ValidationClaimV1, "status"> {
   const command = invocation(call);
-  const executable = executableName(command.executable);
+  const semantic = semanticValidationCommand(command.executable, command.args);
+  const executable = semantic.executable;
   // Registered non-process validators are trusted semantic adapters. Process
   // tools still derive their exact strength from the executable and args.
-  const kind = !executable && call.name !== "validate"
-    ? "acceptance" as const : claimKind(executable, command.args);
+  const adaptedKind = !executable && call.name !== "validate"
+    ? "acceptance" as const : semantic.kind;
   const project = projectRootForCall(workspaceRoot, call);
-  const exactFiles = kind === "syntax"
+  const inlineExactFiles = executable === "node"
+    ? inlineNodeExactFiles(workspaceRoot, project.absolute, semantic.inlineExactPathCandidates) : [];
+  const kind = adaptedKind === "probe" && inlineExactFiles.length > 0
+    ? inlineExactFiles.some((item) => assurancePathsForClaim([item], "unit").includes(item))
+      ? "unit" as const : "acceptance" as const
+    : adaptedKind;
+  const exactFiles = inlineExactFiles.length > 0
+    ? inlineExactFiles
+    : kind === "syntax"
     ? command.args.slice(1, 2).flatMap((item) => workspaceSubjectPath(workspaceRoot, project.absolute, item) ?? [])
     : [];
   const projectFlag = command.args.findIndex((item) => item === "-p" || item === "--project");
@@ -175,6 +175,56 @@ async function canonicalWrittenObjectPath(
   return parent ? path.join(parent, path.basename(lexical)) : null;
 }
 
+/** Keep a review-directed mutation inside the runtime-authenticated finding
+ * scope. The model may narrow the prepared write plan, but it cannot widen
+ * the obligation by changing arguments, checkpoint roots, or call IDs. */
+export async function assertTaskControlPlanAllowed(
+  session: RuntimeSession,
+  plan: ToolCallPlan
+): Promise<void> {
+  const obligation = session.durable.state.taskControl.obligation;
+  if (obligation?.kind === "repository_recovery" && obligation.stage === "transact"
+    && obligation.transactionId && obligation.scopePaths?.length
+    && !plan.exactEffects.includes("repository.write")) {
+    await assertRepositoryConflictPlanAllowed(session, plan, obligation.scopePaths);
+    return;
+  }
+  if (obligation?.kind === "review_repair" && obligation.stage === "mutate") {
+    await assertReviewRepairPlanAllowed(session, plan, obligation.scopePaths);
+  }
+}
+
+async function assertReviewRepairPlanAllowed(
+  session: RuntimeSession,
+  plan: ToolCallPlan,
+  scopePaths: string[]
+): Promise<void> {
+  if (!plan.exactEffects.includes("filesystem.write")) {
+    throw Object.assign(new Error(
+      "The active review repair requires one scoped workspace mutation."
+    ), { code: "tool_unavailable_for_repair" });
+  }
+  const requested = plan.writePaths.length > 0 ? plan.writePaths : plan.checkpointScope;
+  if (requested.length === 0) {
+    throw Object.assign(new Error(
+      "The review repair mutation did not declare any exact write path."
+    ), { code: "tool_unavailable_for_repair" });
+  }
+  const allowed = (await Promise.all(scopePaths.map(async (item) =>
+    await canonicalWrittenObjectPath(session.identity.workspacePath, item))))
+    .filter((item): item is string => Boolean(item));
+  const targets = await Promise.all(requested.map(async (item) => ({
+    item,
+    canonical: await canonicalWrittenObjectPath(session.identity.workspacePath, item)
+  })));
+  const outside = targets.filter(({ canonical }) => !canonical
+    || !allowed.some((scope) => isInside(scope, canonical))).map(({ item }) => item);
+  if (allowed.length === scopePaths.length && outside.length === 0) return;
+  throw Object.assign(new Error(
+    `Review repair write plan is outside the authenticated finding scope: ${outside.join(", ") || "invalid scope"}.`
+  ), { code: "tool_unavailable_for_repair" });
+}
+
 /** Freeze validation authority at preparation time. Coverage comes only from
  * a semantic command adapter and its selected project/files. Filesystem grants
  * and cwd traversal authority are deliberately irrelevant. */
@@ -191,7 +241,7 @@ export function validationScope(
   const project = claim.subject.projectId ?? ".";
   const coveredPaths = claim.kind === "probe"
     ? []
-    : claim.kind === "syntax"
+    : exact.size > 0
       ? frontier.changedPaths.filter((item) => exact.has(portable(item)))
       : assurancePathsForClaim(
           frontier.changedPaths.filter((item) => coveredByProject(item, project)),

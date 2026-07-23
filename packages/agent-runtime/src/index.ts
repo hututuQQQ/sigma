@@ -4,6 +4,7 @@ export {
   type RuntimeFactoryDeps,
   type RuntimeFactoryOptions
 } from "./configured-runtime.js";
+export { configuredExecutionBroker } from "./container-runtime-execution.js";
 export {
   SUBJECT_ATTESTATION_SOURCE_V1,
   SUBJECT_ATTESTOR_ID_V1,

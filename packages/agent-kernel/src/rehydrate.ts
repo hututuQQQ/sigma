@@ -2,14 +2,15 @@ import {
   KERNEL_STATE_VERSION,
   isBudgetLedgerState,
   isCheckpointRef,
-  isCompletionReferenceableEvidence,
   isEvidenceRecord,
   isPlanGraph,
   isUsageRecord,
   type AgentEventEnvelope
 } from "agent-protocol";
 import { evolve } from "./reducer.js";
-import { isSemanticFailureCluster, isSemanticProgressWatermark, type KernelState } from "./state.js";
+import type { KernelState } from "./state.js";
+import { isTaskControlStateV1 } from "./task-control-state.js";
+import { hasPublishedTaskControlLegacyFields } from "./task-control.js";
 
 export function rehydrate(initial: KernelState, events: Iterable<AgentEventEnvelope>): KernelState {
   let state = initial;
@@ -33,27 +34,7 @@ function assertDurableLedgers(state: KernelState): void {
   if (new Set(state.budget.reservations.map((item) => item.reservationId)).size !== state.budget.reservations.length) {
     throw new Error("Duplicate budget reservation IDs.");
   }
-  assertSemanticFailureState(state);
-}
-
-function assertSemanticFailureState(state: KernelState): void {
-  if (!isSemanticProgressWatermark(state.semanticProgress)
-    || (state.semanticFailureCluster && !isSemanticFailureCluster(state.semanticFailureCluster))) {
-    throw new Error("Kernel semantic failure progress state is invalid.");
-  }
-  const clusterProgress = state.semanticFailureCluster?.progress;
-  if (clusterProgress && (clusterProgress.workspaceChanges !== state.semanticProgress.workspaceChanges
-    || clusterProgress.durableEvidence !== state.semanticProgress.durableEvidence
-    || clusterProgress.revision !== state.semanticProgress.revision)) {
-    throw new Error("Kernel semantic failure cluster does not match its progress watermark.");
-  }
-  if (state.semanticProgress.revision > state.revision) {
-    throw new Error("Kernel semantic progress revision exceeds the current revision.");
-  }
-  const cluster = state.semanticFailureCluster;
-  if (cluster && (cluster.firstRevision > cluster.lastRevision || cluster.lastRevision > state.revision)) {
-    throw new Error("Kernel semantic failure revisions are invalid.");
-  }
+  assertTaskControlState(state);
 }
 
 function assertEvidenceLedgers(state: KernelState): void {
@@ -108,55 +89,16 @@ function assertToolLedger(state: KernelState): void {
   }
 }
 
-function assertRepairAttemptState(state: KernelState): void {
-  const repair = state.completionRepair;
-  if (!repair) {
-    if (state.completionRepairAttempts !== 0) {
-      throw new Error("Completion repair attempts require explicit repair state.");
-    }
-    return;
+function assertTaskControlState(state: KernelState): void {
+  if (hasPublishedTaskControlLegacyFields(state)) {
+    throw new Error("Kernel state contains superseded task-control authorities.");
   }
-  if (repair.kind === "protected_recovery") {
-    if (state.completionRepairAttempts !== 0) {
-      throw new Error("Protected completion recovery cannot consume a protocol-repair attempt.");
-    }
-  } else if (state.completionRepairAttempts === 0) {
-    throw new Error("Explicit protocol-repair state requires a repair attempt.");
+  if (!isTaskControlStateV1(state.taskControl)) throw new Error("Kernel task-control state is invalid.");
+  if (state.taskControl.episode.startedRevision > state.revision
+    || state.taskControl.semanticFacts.entries.some((fact) => fact.revision > state.revision)
+    || (state.taskControl.obligation?.openedRevision ?? 0) > state.revision) {
+    throw new Error("Task-control facts or obligation exceed the current kernel revision.");
   }
-}
-
-function assertProtectedInputState(state: KernelState): void {
-  if (state.phase !== "needs_input" && state.outcome?.kind !== "needs_input") return;
-  const requestId = state.outcome?.kind === "needs_input" ? state.outcome.requestId : null;
-  const approval = state.pendingTools.some((item) =>
-    item.approval === "pending" && (requestId === null || item.request.callId === requestId));
-  if (!approval) {
-    throw new Error("A protected completion state can await input only for a pending tool approval.");
-  }
-}
-
-function assertProtectedRepairState(state: KernelState): void {
-  const repair = state.completionRepair;
-  if (!repair) return;
-  const protectedAnswer = repair.kind === "protected_completion" || repair.kind === "protected_recovery";
-  if (!protectedAnswer) return;
-  if (!state.evidence.some((item) =>
-    isCompletionReferenceableEvidence(item, state.sessionId, state.runId))) {
-    throw new Error("A protected completion repair requires current-run referenceable evidence.");
-  }
-  if (repair.kind === "protected_completion" && state.pendingTools.length > 0) {
-    const terminalName = state.pendingTools[0]?.request.name;
-    if (state.pendingTools.length !== 1
-      || (terminalName !== "runtime_finalize" && terminalName !== "request_user_input")) {
-      throw new Error("A protected terminal-intent repair can pend only one runtime completion intent or request_user_input call.");
-    }
-  }
-  assertProtectedInputState(state);
-}
-
-function assertCompletionRepairState(state: KernelState): void {
-  assertRepairAttemptState(state);
-  if (state.completionRepair) assertProtectedRepairState(state);
 }
 
 function assertPhaseState(state: KernelState): void {
@@ -170,7 +112,7 @@ function assertPhaseState(state: KernelState): void {
   if (state.phase !== "terminal" && state.outcome?.kind !== "needs_input") {
     if (state.outcome) throw new Error("Non-terminal kernel state cannot have a terminal outcome.");
   }
-  assertCompletionRepairState(state);
+  assertTaskControlState(state);
 }
 
 export function assertKernelInvariants(state: KernelState): void {

@@ -1,21 +1,9 @@
-import type {
-  ModelToolCall,
-  RunOutcome,
-  ToolDescriptor,
-  ToolOutcome,
-  ToolReceipt
-} from "agent-protocol";
-import { decide, type ActiveModelTurn, type KernelEffect } from "agent-kernel";
-import { loadNestedInstructions } from "agent-context";
-import {
-  failed, requestTargets, requiresInstructionReplan, steeringRestart
-} from "./effect-helpers.js";
+import type { RunOutcome } from "agent-protocol";
+import { decide, type KernelEffect } from "agent-kernel";
 import {
   attemptFromEffect,
   childOutcomeEvidence,
-  turnPayload,
-  type ExecuteToolEffect,
-  type ToolAttempt
+  type ExecuteToolEffect
 } from "./effect-runner-helpers.js";
 import { ModelEffectRunner } from "./model-effect-runner.js";
 import { convergenceAdmissionFailure } from "./convergence-policy.js";
@@ -29,6 +17,7 @@ import { ToolExecutionMonitor } from "./tool-execution-monitor.js";
 import { ToolTransactionRunner } from "./tool-transaction-runner.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 import type { RunSuspensionContext } from "./runtime-session-finish.js";
+import { ToolBatchCoordinator } from "./tool-batch-coordinator.js";
 
 export interface EffectRunnerOptions {
   runtime: RuntimeOptions;
@@ -50,44 +39,12 @@ export interface EffectRunnerOptions {
   hooks: RuntimeHookCoordinator;
 }
 
-type DurableToolReceipt = ToolReceipt & { outcome: ToolOutcome };
-
-function durableToolReceipt(receipt: ToolReceipt): DurableToolReceipt {
-  const diagnosticCodes = [...new Set([
-    ...(receipt.outcome?.diagnosticCodes ?? []),
-    ...receipt.diagnostics
-  ])];
-  return {
-    ...receipt,
-    outcome: {
-      status: receipt.ok ? "succeeded" : "failed",
-      output: receipt.output,
-      diagnosticCodes
-    }
-  };
-}
-
-function receiptToolName(
-  session: RuntimeSession,
-  receipt: ToolReceipt,
-  modelTurn: ActiveModelTurn
-): string {
-  return session.durable.state.pendingTools.find((item) => item.request.callId === receipt.callId
-    && item.modelTurn.turnId === modelTurn.turnId
-    && item.modelTurn.effectRevision === modelTurn.effectRevision)?.request.name ?? "tool";
-}
-
-function shouldReviewReceipt(name: string, reviewMode: "off" | "advisory" | "required"): boolean {
-  if (name === "request_review") return true;
-  if (name === "runtime_finalize") return reviewMode !== "off";
-  return reviewMode === "required" && name === "validate";
-}
-
 export class EffectRunner {
   private readonly models: ModelEffectRunner;
   private readonly reviews: ReviewCoordinator;
   private readonly execution: ToolExecutionMonitor;
   private readonly transactions: ToolTransactionRunner;
+  private readonly toolBatches: ToolBatchCoordinator;
 
   constructor(private readonly options: EffectRunnerOptions) {
     this.models = new ModelEffectRunner(options);
@@ -98,6 +55,7 @@ export class EffectRunner {
     );
     this.execution = new ToolExecutionMonitor(options);
     this.transactions = new ToolTransactionRunner(options, this.execution);
+    this.toolBatches = new ToolBatchCoordinator(options, this.reviews, this.transactions);
   }
 
   async waitForQuiescence(sessionId: string, signal?: AbortSignal): Promise<void> {
@@ -136,7 +94,7 @@ export class EffectRunner {
       kind: "tool", count: effects.length, terminalOnly
     });
     if (failure) return await this.options.finish(session, failure);
-    await this.executeTools(session, effects.map(attemptFromEffect), signal);
+    await this.toolBatches.execute(session, effects.map(attemptFromEffect), signal);
     return false;
   }
 
@@ -146,25 +104,8 @@ export class EffectRunner {
       const effects = decide(session.durable.state);
       const terminal = effects.find((effect): effect is Extract<KernelEffect, { type: "finish_run" }> => effect.type === "finish_run");
       if (terminal) {
-        let outcome = terminal.outcome;
-        let outcomeRevision = terminal.revision;
-        if (outcome.kind === "completed" && this.options.runtime.joinChildren) {
-          const children = await this.options.runtime.joinChildren(session.identity.sessionId, signal);
-          if (children.failures.length > 0) {
-            await this.options.emit(session, "diagnostic", "runtime", {
-              kind: "child.join_failed",
-              failures: children.failures,
-              evidence: children.evidence
-            });
-            continue;
-          }
-          for (const [index, value] of children.evidence.entries()) {
-            await this.options.emit(session, "evidence.recorded", "runtime", childOutcomeEvidence(session, value, index));
-          }
-          outcome = { ...outcome, evidence: [...session.durable.state.evidence] };
-          outcomeRevision = session.durable.state.revision;
-        }
-        if (await this.options.finish(session, outcome, outcomeRevision)) return;
+        const finished = await this.finishTerminalEffect(session, terminal, signal);
+        if (finished) return;
         continue;
       }
       if (effects.some((effect) => effect.type === "publish_outcome")) return;
@@ -181,6 +122,32 @@ export class EffectRunner {
       return;
     }
     throw signal.reason ?? new Error("Run cancelled.");
+  }
+
+  private async finishTerminalEffect(
+    session: RuntimeSession,
+    terminal: Extract<KernelEffect, { type: "finish_run" }>,
+    signal: AbortSignal
+  ): Promise<boolean> {
+    let outcome = terminal.outcome;
+    let outcomeRevision = terminal.revision;
+    if (outcome.kind === "completed" && this.options.runtime.joinChildren) {
+      const children = await this.options.runtime.joinChildren(session.identity.sessionId, signal);
+      if (children.failures.length > 0) {
+        await this.options.emit(session, "diagnostic", "runtime", {
+          kind: "child.join_failed",
+          failures: children.failures,
+          evidence: children.evidence
+        });
+        return false;
+      }
+      for (const [index, value] of children.evidence.entries()) {
+        await this.options.emit(session, "evidence.recorded", "runtime", childOutcomeEvidence(session, value, index));
+      }
+      outcome = { ...outcome, evidence: [...session.durable.state.evidence] };
+      outcomeRevision = session.durable.state.revision;
+    }
+    return await this.options.finish(session, outcome, outcomeRevision);
   }
 
   private async suspendForLostProcesses(session: RuntimeSession): Promise<boolean> {
@@ -201,146 +168,4 @@ export class EffectRunner {
       message: "A background process was lost when the execution broker ended. It was not replayed; review its durable output before continuing."
     }, undefined, { processIds: lost.map((handle) => handle.id) });
   }
-
-  private async executeTools(session: RuntimeSession, attempts: ToolAttempt[], signal: AbortSignal): Promise<void> {
-    const turnController = session.execution.turnController ?? new AbortController();
-    session.execution.turnController = turnController;
-    const turnSignal = AbortSignal.any([signal, turnController.signal]);
-    if (steeringRestart(turnSignal)) return;
-    try {
-      let loadedInstructions = false;
-      const instructionFailures = new Set<string>();
-      for (const { call } of attempts) {
-        const descriptor = this.options.runtime.tools.descriptors().find((item) => item.name === call.name);
-        if (!descriptor) continue;
-        const instructionResult = await this.loadInstructions(session, call, descriptor);
-        if (instructionResult.failure) {
-          instructionFailures.add(call.id);
-          await this.emitReceipt(session, instructionResult.failure, attempts.find((item) => item.call.id === call.id)!.modelTurn);
-        } else if (instructionResult.loaded) {
-          loadedInstructions = true;
-        }
-      }
-      const isCompletion = ({ call }: ToolAttempt): boolean => Boolean(
-        this.options.runtime.tools.descriptors().find((item) => item.name === call.name)
-          ?.possibleEffects.includes("outcome.propose")
-      );
-      const pending = attempts.filter((attempt) => !isCompletion(attempt));
-      const completions = attempts.filter(isCompletion);
-      const executeAttempt = async (attempt: ToolAttempt): Promise<void> => {
-        const { call, modelTurn } = attempt;
-        if (instructionFailures.has(call.id)) return;
-        const descriptor = this.options.runtime.tools.descriptors().find((item) => item.name === call.name);
-        if (loadedInstructions && descriptor && requiresInstructionReplan(descriptor)) {
-          const startedAt = new Date().toISOString();
-          await this.options.emit(session, "tool.requested", "runtime", {
-            callId: call.id, name: call.name, arguments: call.arguments, ...turnPayload(modelTurn)
-          });
-          await this.emitReceipt(session, failed(
-            call,
-            startedAt,
-            "New nested project instructions were loaded. Re-evaluate the request and propose a new tool call that follows them.",
-            "nested_instructions_require_replan"
-          ), modelTurn);
-          return;
-        }
-        const receipt = await this.transactions.execute(session, attempt, turnSignal);
-        await this.emitReceipt(session, receipt, modelTurn);
-      };
-      while (pending.length > 0) {
-        if (steeringRestart(turnSignal)) return;
-        const batch = pending.splice(0, this.options.maxParallelTools);
-        await Promise.all(batch.map(executeAttempt));
-        if (await this.suspendForCheckpointRecovery(session)) return;
-      }
-      for (const completion of completions) {
-        if (steeringRestart(turnSignal)) return;
-        await executeAttempt(completion);
-      }
-    } finally {
-      if (session.execution.turnController === turnController) session.execution.turnController = null;
-    }
-  }
-
-  private async suspendForCheckpointRecovery(session: RuntimeSession): Promise<boolean> {
-    const recovery = session.recovery.openCheckpointRecovery;
-    if (!recovery) return false;
-    return await this.options.finish(session, {
-      kind: "needs_input",
-      requestId: `checkpoint:${recovery.checkpointId}`,
-      message: `Mutation checkpoint '${recovery.checkpointId}' contains an interrupted delta. Choose safe restore or keep before continuing.`
-    }, undefined, { checkpointId: recovery.checkpointId, choices: ["restore", "keep"] });
-  }
-
-  private async loadInstructions(
-    session: RuntimeSession,
-    call: ModelToolCall,
-    descriptor: ToolDescriptor
-  ): Promise<{ loaded: boolean; failure?: ToolReceipt }> {
-    let discovered;
-    try {
-      discovered = await Promise.all(requestTargets(call, descriptor).map(async (targetPath) =>
-        await loadNestedInstructions({ workspacePath: session.identity.workspacePath, targetPath })));
-    } catch (error) {
-      if ((error as { code?: unknown })?.code !== "path_escape") throw error;
-      return {
-        loaded: false,
-        failure: failed(
-          call,
-          new Date().toISOString(),
-          error instanceof Error ? error.message : String(error),
-          "path_escape"
-        )
-      };
-    }
-    const unseen = discovered.flat().filter((item) => !session.interaction.loadedContextIds.has(item.id));
-    for (const item of unseen) {
-      session.interaction.loadedContextIds.add(item.id);
-      session.interaction.contextItems.push(item);
-    }
-    if (unseen.length === 0) return { loaded: false };
-    await this.options.emit(session, "diagnostic", "runtime", {
-      kind: "nested_instructions_loaded",
-      callId: call.id,
-      provenance: unseen.map((item) => item.provenance),
-      items: unseen,
-      affectsMutation: descriptor.possibleEffects.includes("filesystem.write")
-    });
-    return { loaded: true };
-  }
-
-  private async emitReceipt(session: RuntimeSession, receipt: ToolReceipt, modelTurn: ActiveModelTurn): Promise<void> {
-    const name = receiptToolName(session, receipt, modelTurn);
-    const durableReceipt = durableToolReceipt(receipt);
-    await this.options.emit(session, receipt.ok ? "tool.completed" : "tool.failed", "tool", {
-      ...durableReceipt, name, ...turnPayload(modelTurn)
-    });
-    for (const evidence of receipt.evidence ?? []) {
-      await this.options.emit(session, "evidence.recorded", "tool", evidence);
-    }
-    try {
-      await this.options.hooks.dispatch(session, "post_tool", {
-        sessionId: session.identity.sessionId,
-        runId: session.durable.runId,
-        callId: receipt.callId,
-        toolName: name,
-        ok: receipt.ok,
-        diagnostics: receipt.diagnostics,
-        actualEffects: receipt.actualEffects ?? receipt.observedEffects,
-        evidenceIds: (receipt.evidence ?? []).map((item) => item.evidenceId),
-        artifactRefs: receipt.artifactRefs ?? []
-      }, session.execution.controller?.signal ?? new AbortController().signal);
-      const reviewMode = session.services.profile?.profile.mutationPolicy.reviewMode ?? "advisory";
-      if (shouldReviewReceipt(name, reviewMode)) {
-        await this.reviews.maybeReview(
-          session,
-          session.execution.controller?.signal ?? new AbortController().signal,
-          name === "request_review"
-        );
-      }
-    } finally {
-      await this.transactions.settleBudgetsAfterReceipt(session);
-    }
-  }
-
 }

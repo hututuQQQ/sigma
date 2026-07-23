@@ -78,6 +78,26 @@ def current_doctor_payload(network_modes: list[str] | None = None) -> str:
     })
 
 
+def managed_doctor_payload() -> str:
+    payload = json.loads(current_doctor_payload(["none", "full"]))
+    payload["sandbox"]["backend"] = "oci"
+    payload["container"] = {
+        "available": True,
+        "backend": "oci",
+        "target": "managed",
+        "targetId": "managed-target",
+    }
+    payload["capabilities"]["managedEnvironment"] = {
+        "available": True,
+        "prepare": True,
+    }
+    payload["capabilities"]["runtimeClosure"] = {
+        "complete": True,
+        "digest": "sha256:" + "1" * 64,
+    }
+    return json.dumps(payload)
+
+
 class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
     async def test_model_name_is_used_unless_model_is_explicit(self):
         module = import_portable_agent_module()
@@ -94,6 +114,27 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(module.SigmaCliHarborAgent(network_mode="loopback").network_mode, "loopback")
         with self.assertRaisesRegex(ValueError, "agent_profile"):
             module.SigmaCliHarborAgent(agent_profile="untrusted")
+        with self.assertRaisesRegex(ValueError, "managed_environment_mode"):
+            module.SigmaCliHarborAgent(managed_environment_mode="optional")
+        with self.assertRaisesRegex(ValueError, "harbor_topology"):
+            module.SigmaCliHarborAgent(harbor_topology="sidecar")
+        with self.assertRaisesRegex(ValueError, "needs execution_mode=container"):
+            module.SigmaCliHarborAgent(managed_environment_mode="required")
+        with self.assertRaisesRegex(ValueError, "needs execution_mode=container"):
+            module.SigmaCliHarborAgent(
+                execution_mode="container",
+                network_mode="none",
+                managed_environment_mode="required",
+                harbor_topology="managed_three_role",
+            )
+        with self.assertRaisesRegex(ValueError, "needs managed_environment_mode=required"):
+            module.SigmaCliHarborAgent(harbor_topology="managed_three_role")
+        with self.assertRaisesRegex(ValueError, "managed_environment_mode"):
+            module.SigmaCliHarborAgent(
+                execution_mode="container",
+                network_mode="full",
+                managed_environment_mode="unknown",
+            )
 
     async def test_container_execution_mode_is_forwarded_without_host_opt_in(self):
         module = import_portable_agent_module()
@@ -101,6 +142,9 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             agent = module.SigmaCliHarborAgent(
                 logs_dir=Path(tmp) / "logs",
                 execution_mode="container",
+                network_mode="full",
+                managed_environment_mode="required",
+                harbor_topology="managed_three_role",
             )
             agent._workspace = "/app"
 
@@ -110,14 +154,152 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(command[0], "/usr/local/bin/agent")
             self.assertIn("--execution-mode", command)
             self.assertIn("container", command)
+            self.assertIn("--managed-environment-mode", command)
+            self.assertIn("required", command)
             self.assertIn("--agent-profile", command)
             self.assertIn("standard", command)
             self.assertEqual(session_command[0], "/usr/local/bin/agent")
             self.assertIn("--execution-mode", session_command)
             self.assertIn("container", session_command)
+            self.assertIn("--managed-environment-mode", session_command)
+            self.assertIn("required", session_command)
             self.assertIn("--agent-profile", session_command)
             self.assertIn("standard", session_command)
+            self.assertIn("workspace-auto", command)
+            self.assertIn("workspace-auto", session_command)
             self.assertNotIn("HOME=/tmp/agent/disposable-home", command)
+
+    async def test_verified_managed_environment_uses_noninteractive_auto_approval(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            agent = module.SigmaCliHarborAgent(
+                logs_dir=Path(tmp) / "logs",
+                execution_mode="container",
+                network_mode="full",
+                managed_environment_mode="required",
+                harbor_topology="managed_three_role",
+            )
+            agent._workspace = "/app"
+
+            # Configuration alone is not authority. The strict managed doctor
+            # contract must have succeeded before Harbor can remove prompts.
+            self.assertEqual(agent._permission_mode(), "workspace-auto")
+            agent._managed_environment_verified = True
+
+            command = agent._agent_command()
+            session_command = agent._session_command("resume", "session-fixture")
+            permission_index = command.index("--permission-mode")
+            session_permission_index = session_command.index("--permission-mode")
+            self.assertEqual(command[permission_index + 1], "auto")
+            self.assertEqual(session_command[session_permission_index + 1], "auto")
+
+    async def test_required_managed_setup_bootstraps_before_configured_doctor(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            env = SimpleNamespace(
+                exec=AsyncMock(side_effect=[
+                    SimpleNamespace(return_code=0, stdout="/app\n", stderr=""),
+                    SimpleNamespace(return_code=0),
+                    SimpleNamespace(return_code=0),
+                    SimpleNamespace(return_code=0),
+                    SimpleNamespace(return_code=0, stdout='{"status":"ready","pid":7}\n', stderr=""),
+                    SimpleNamespace(return_code=0, stdout="usage", stderr=""),
+                    SimpleNamespace(return_code=0, stdout=managed_doctor_payload(), stderr=""),
+                ]),
+                upload_file=AsyncMock(),
+                upload_dir=AsyncMock(),
+                download_file=AsyncMock(),
+            )
+            agent = module.SigmaCliHarborAgent(
+                logs_dir=Path(tmp) / "logs",
+                execution_mode="container",
+                network_mode="full",
+                managed_environment_mode="required",
+                harbor_topology="managed_three_role",
+            )
+
+            await agent.setup(env)
+
+            commands = [call.args[0] for call in env.exec.await_args_list]
+            self.assertIn("--managed-server --workspace /app --engine docker --network full", commands[4])
+            self.assertIn("--execution-mode container", commands[6])
+            self.assertIn("--managed-environment-mode required", commands[6])
+            self.assertTrue(agent._managed_environment_verified)
+            self.assertEqual(agent._permission_mode(), "auto")
+            self.assertNotIn("harbor-topology", commands[6])
+            record = json.loads((Path(tmp) / "logs" / "setup-check.json").read_text(encoding="utf-8"))
+            self.assertEqual(record["managed_environment_mode"], "required")
+            self.assertEqual(record["harbor_topology"], "managed_three_role")
+            self.assertEqual(record["permission_mode_effective"], "auto")
+            self.assertEqual(
+                [check["stage"] for check in record["checks"]],
+                ["managed_broker_bootstrap", "help", "strict_doctor"],
+            )
+
+    async def test_required_managed_cleanup_pins_process_identity_and_boundary(self):
+        module = import_portable_agent_module()
+        env = SimpleNamespace(exec=AsyncMock(return_value=SimpleNamespace(
+            return_code=0,
+            stdout='{"status":"stopped","pid":7,"term_status":0,"alive_after_grace":1}\n',
+            stderr="",
+        )))
+        agent = module.SigmaCliHarborAgent(
+            execution_mode="container",
+            network_mode="full",
+            managed_environment_mode="required",
+            harbor_topology="managed_three_role",
+        )
+
+        result = await agent._cleanup_managed_broker(env)
+
+        self.assertEqual(result["status"], "stopped")
+        command = env.exec.await_args.args[0]
+        self.assertIn('readlink -f "/proc/$broker_pid/exe"', command)
+        self.assertIn("test ! -L /run/sigma-oci", command)
+        self.assertIn("rm -rf /run/sigma-oci/artifacts", command)
+
+    async def test_required_managed_setup_failure_is_structured_infrastructure(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            old_run_dir = os.environ.get("SIGMA_BENCH_RUN_DIR")
+            old_run_slot = os.environ.get("SIGMA_BENCH_RUN_SLOT")
+            os.environ["SIGMA_BENCH_RUN_DIR"] = tmp
+            os.environ["SIGMA_BENCH_RUN_SLOT"] = "managed-slot"
+            env = SimpleNamespace(exec=AsyncMock(return_value=SimpleNamespace(
+                return_code=1, stdout="", stderr="workspace unavailable"
+            )))
+            agent = module.SigmaCliHarborAgent(
+                logs_dir=Path(tmp) / "logs",
+                execution_mode="container",
+                network_mode="full",
+                managed_environment_mode="required",
+                harbor_topology="managed_three_role",
+            )
+            try:
+                with self.assertRaisesRegex(RuntimeError, "workspace_discovery"):
+                    await agent.setup(env)
+                task_dir = Path(tmp) / "tasks" / "managed-slot"
+                summary = json.loads((task_dir / "summary.json").read_text(encoding="utf-8"))
+                metadata = json.loads((task_dir / "metadata.json").read_text(encoding="utf-8"))
+                self.assertEqual(summary["failure_kind"], "infrastructure_incomplete")
+                self.assertEqual(summary["failure_code"], "managed_environment_required_unavailable")
+                self.assertFalse(metadata["agent_setup_ok"])
+                self.assertEqual(metadata["run_slot"], "managed-slot")
+            finally:
+                if old_run_dir is None:
+                    os.environ.pop("SIGMA_BENCH_RUN_DIR", None)
+                else:
+                    os.environ["SIGMA_BENCH_RUN_DIR"] = old_run_dir
+                if old_run_slot is None:
+                    os.environ.pop("SIGMA_BENCH_RUN_SLOT", None)
+                else:
+                    os.environ["SIGMA_BENCH_RUN_SLOT"] = old_run_slot
+
+    def test_timeout_classification_requires_exception_type_or_code(self):
+        module = import_portable_agent_module()
+        self.assertTrue(module._is_timeout_error(asyncio.TimeoutError()))
+        self.assertTrue(module._is_timeout_error(SimpleNamespace(code="process_deadline")))
+        self.assertFalse(module._is_timeout_error(RuntimeError("the user discussed timeout behavior")))
 
     async def test_container_setup_never_manufactures_host_persistence(self):
         module = import_portable_agent_module()
@@ -217,7 +399,9 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                     "mkdir -p /tmp/agent",
                     "command -v /usr/local/bin/agent >/dev/null 2>&1",
                     "/usr/local/bin/agent --help",
-                    "/usr/local/bin/agent doctor --workspace /app --json --strict --check-api",
+                    "/usr/local/bin/agent doctor --workspace /app --json --strict "
+                    "--execution-mode sandboxed --network full "
+                    "--managed-environment-mode disabled --check-api",
                 ],
             )
 
@@ -592,7 +776,62 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                 for line in (logs_dir / "trace.jsonl").read_text(encoding="utf-8").splitlines()
             ]
             self.assertEqual([record["type"] for record in trace], ["model_end", "run_end"])
-            self.assertEqual(trace[0]["metadata"]["diagnostics"], diagnostics)
+            self.assertEqual(trace[0]["sigma_event"]["payload"]["diagnostics"], diagnostics)
+            self.assertNotIn("diagnostics", trace[0]["metadata"])
+            self.assertNotIn("payload", trace[0]["metadata"])
+
+    async def test_only_explicit_runtime_blocker_contract_is_structured(self):
+        module = import_portable_agent_module()
+        cases = (
+            ({"failureKind": "blocked", "failureCode": "dependency_unavailable"}, "structured_blocker"),
+            ({}, "agent_failure"),
+            ({"failureKind": "structured_blocker", "failureCode": "dependency_unavailable"}, "agent_failure"),
+        )
+        for marker, expected in cases:
+            with self.subTest(marker=marker), TemporaryDirectory() as tmp:
+                payload = {
+                    "kind": "recoverable_failure",
+                    "code": "dependency_unavailable",
+                    "message": "blocked after recovery was exhausted",
+                    **marker,
+                }
+                stdout = "\n".join([
+                    json.dumps({"kind": "event", "event": {
+                        "eventId": "run-failure",
+                        "sessionId": "blocked-session",
+                        "seq": 1,
+                        "type": "run.failed",
+                        "payload": payload,
+                    }}),
+                    json.dumps({"kind": "result", "result": {
+                        "status": "error",
+                        "finishReason": "recoverable_failure",
+                        "sessionId": "blocked-session",
+                        "finalMessage": payload["message"],
+                        **marker,
+                    }}),
+                ]) + "\n"
+
+                async def exec_side_effect(command, **kwargs):
+                    if "/usr/local/bin/agent run" in command:
+                        return SimpleNamespace(return_code=1, stdout=stdout, stderr="")
+                    if command.startswith("test -f ") or command.startswith("test -d "):
+                        return SimpleNamespace(return_code=1, stdout="", stderr="")
+                    return SimpleNamespace(return_code=0, stdout="", stderr="")
+
+                env = SimpleNamespace(
+                    exec=AsyncMock(side_effect=exec_side_effect),
+                    upload_file=AsyncMock(),
+                    download_file=AsyncMock(),
+                )
+                context = SimpleNamespace(task_id="blocked")
+                agent = module.SigmaCliHarborAgent(logs_dir=Path(tmp) / "logs")
+                agent._workspace = "/app"
+                with self.assertRaisesRegex(RuntimeError, f"^{expected}:"):
+                    await agent.run("run", env, context)
+                self.assertEqual(context.failure_kind, expected)
+                if marker.get("failureKind") == "blocked":
+                    self.assertEqual(context.failure_code, "dependency_unavailable")
 
     async def test_terminal_model_and_tool_errors_keep_distinct_categories(self):
         module = import_portable_agent_module()
@@ -727,7 +966,9 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
         module = import_portable_agent_module()
         with TemporaryDirectory() as tmp:
             old_run_dir = os.environ.get("SIGMA_BENCH_RUN_DIR")
+            old_run_slot = os.environ.get("SIGMA_BENCH_RUN_SLOT")
             os.environ["SIGMA_BENCH_RUN_DIR"] = tmp
+            os.environ["SIGMA_BENCH_RUN_SLOT"] = "frozen-slot"
             logs_dir = Path(tmp) / "logs"
             result_json = {"status": "completed", "finishReason": "completed", "sessionId": "session", "finalMessage": "done"}
 
@@ -756,16 +997,21 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(context.commands_executed, 0)
 
                 metadata = json.loads(
-                    (Path(tmp) / "tasks" / "service-task" / "metadata.json").read_text(encoding="utf-8")
+                    (Path(tmp) / "tasks" / "frozen-slot" / "metadata.json").read_text(encoding="utf-8")
                 )
                 self.assertEqual(metadata["exit_code"], 0)
+                self.assertEqual(metadata["run_slot"], "frozen-slot")
                 self.assertEqual(metadata["failure_signals"], ["agent_setup_ok"])
-                self.assertTrue((Path(tmp) / "tasks" / "service-task" / "agent.log").is_file())
+                self.assertTrue((Path(tmp) / "tasks" / "frozen-slot" / "agent.log").is_file())
             finally:
                 if old_run_dir is None:
                     os.environ.pop("SIGMA_BENCH_RUN_DIR", None)
                 else:
                     os.environ["SIGMA_BENCH_RUN_DIR"] = old_run_dir
+                if old_run_slot is None:
+                    os.environ.pop("SIGMA_BENCH_RUN_SLOT", None)
+                else:
+                    os.environ["SIGMA_BENCH_RUN_SLOT"] = old_run_slot
 
     async def test_run_derives_usage_and_trace_from_stream_json(self):
         module = import_portable_agent_module()
@@ -1074,6 +1320,8 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("broker errno=5", context.error_message)
                 self.assertTrue((logs_dir / "summary.json").is_file())
                 self.assertTrue((logs_dir / "trace.jsonl").is_file())
+                downloaded = [call.args[0] for call in env.download_file.await_args_list]
+                self.assertNotIn("/tmp/agent/trace.jsonl", downloaded)
             finally:
                 if old_run_dir is None:
                     os.environ.pop("SIGMA_BENCH_RUN_DIR", None)
@@ -1122,7 +1370,17 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                         },
                     }) + "\n", "stdout")
                     await active_callback(json.dumps(result) + "\n", "stdout")
-                    return SimpleNamespace(return_code=0, stdout="", stderr="")
+                    terminal = {
+                        "kind": "event",
+                        "event": {
+                            **event["event"],
+                            "eventId": "parsed-terminal",
+                            "seq": 3,
+                            "type": "run.completed",
+                            "payload": {"status": "completed"},
+                        },
+                    }
+                    return SimpleNamespace(return_code=0, stdout=json.dumps(terminal) + "\n", stderr="")
                 if command.startswith("test -f ") or command.startswith("test -d "):
                     return SimpleNamespace(return_code=1, stdout="", stderr="")
                 return SimpleNamespace(return_code=0, stdout="", stderr="")
@@ -1142,7 +1400,9 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(context.model_turns, 1)
             self.assertEqual(context.n_input_tokens, 3)
             self.assertEqual(context.n_output_tokens, 2)
-            self.assertIn("model_start", (logs_dir / "trace.jsonl").read_text(encoding="utf-8"))
+            trace = (logs_dir / "trace.jsonl").read_text(encoding="utf-8")
+            self.assertIn("model_start", trace)
+            self.assertEqual(trace.count('"type": "run_end"'), 1)
             self.assertTrue((logs_dir / "stdout.partial.log").is_file())
 
     async def test_cancelled_run_persists_timeout_artifacts_before_reraising(self):
@@ -1291,16 +1551,42 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                 module.MAX_PARTIAL_ARTIFACT_CHARS,
             )
 
-    async def test_incremental_trace_is_bounded_and_keeps_tail(self):
+    async def test_incremental_trace_is_bounded_and_keeps_stable_prefix(self):
         module = import_portable_agent_module()
         with TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "trace.jsonl"
-            for index in range(20):
-                module._append_bounded_jsonl(trace_path, {"type": "event", "seq": index, "payload": "z" * 40}, 256)
+            writer = module._BoundedJsonlWriter(trace_path, 256, reset=True)
+            writer.append({"type": "event", "seq": 0, "payload": "z" * 40})
+            prefix = trace_path.read_bytes()
+            for index in range(1, 20):
+                writer.append({"type": "event", "seq": index, "payload": "z" * 40})
             self.assertLessEqual(trace_path.stat().st_size, 256)
+            self.assertTrue(trace_path.read_bytes().startswith(prefix))
             trace_lines = trace_path.read_text(encoding="utf-8").splitlines()
             self.assertTrue(any(json.loads(line).get("type") == "trace_truncated" for line in trace_lines))
-            self.assertEqual(json.loads(trace_lines[-1]).get("seq"), 19)
+            self.assertEqual(json.loads(trace_lines[-1]).get("type"), "trace_truncated")
+
+    async def test_accounting_trace_is_single_copy_and_strictly_bounded(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            agent = module.SigmaCliHarborAgent(logs_dir=Path(tmp) / "logs")
+            events = [{
+                "eventId": f"event-{index}",
+                "sessionId": "session",
+                "seq": index,
+                "type": "tool.completed",
+                "payload": {"toolName": "exec", "output": "x" * 40_000},
+            } for index in range(200)]
+            _, trace_path = agent._write_accounting_artifacts(events, {}, write_summary=False)
+            self.assertIsNotNone(trace_path)
+            self.assertLessEqual(trace_path.stat().st_size, module.MAX_TRACE_ARTIFACT_BYTES)
+            records = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+            events_written = [record for record in records if record.get("type") != "trace_truncated"]
+            self.assertGreater(len(events_written), 0)
+            for record in events_written:
+                self.assertIn("sigma_event", record)
+                self.assertNotIn("payload", record["metadata"])
+                self.assertNotIn("output", record["metadata"])
 
 
 if __name__ == "__main__":

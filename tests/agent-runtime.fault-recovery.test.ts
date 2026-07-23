@@ -130,9 +130,11 @@ class RecoveryGateway implements ModelGateway {
 class CountingReviewer implements AccountableReviewerPort {
   readonly reviewerId = "fault-injection-reviewer";
   calls = 0;
+  readonly inputs: ReviewerInput[] = [];
 
   async review(input: ReviewerInput): Promise<ReviewEvidence> {
     this.calls += 1;
+    this.inputs.push(input);
     return this.evidence(input);
   }
 
@@ -155,6 +157,7 @@ class CountingReviewer implements AccountableReviewerPort {
     _signal: AbortSignal
   ): Promise<{ evidence: ReviewEvidence; usage: UsageRecord }> {
     this.calls += 1;
+    this.inputs.push(input);
     return { evidence: this.evidence(input), usage: this.usage(input, requestId, {
       inputTokens: 1, outputTokens: 1, costMicroUsd: 0, modelTurns: 1,
       toolCalls: 0, children: 0
@@ -842,10 +845,19 @@ describe("durable transaction fault-injection recovery", () => {
       const outcome = await runtime.waitForOutcome(fixture.sessionId);
       const stored = await events(fixture.store, fixture.sessionId);
       expect(executions.count).toBe(0);
-      expect(reviewer.calls).toBe(boundary === "validation_evidence" ? 1 : 0);
+      const completionReviewRequired = boundary === "validation_evidence"
+        || boundary === "review_started" || boundary === "review_completed";
+      expect(reviewer.calls).toBe(completionReviewRequired ? 1 : 0);
       const convergedCompletion = boundary === "validation_evidence"
         || boundary === "review_started" || boundary === "review_completed";
-      expect(outcome.kind).toBe(convergedCompletion ? "completed" : "needs_input");
+      if (boundary === "delta_evidence") {
+        expect(outcome).toMatchObject({
+          kind: "recoverable_failure",
+          code: "validation_evidence_required"
+        });
+      } else {
+        expect(outcome.kind).toBe(convergedCompletion ? "completed" : "needs_input");
+      }
       if (convergedCompletion) expect(gateway.calls).toBe(1);
 
       const checkpointId = fixture.checkpoint!.checkpointId;
@@ -877,17 +889,35 @@ describe("durable transaction fault-injection recovery", () => {
           if (item.type !== "budget.reserved") return [];
           const payload = item.payload as {
             ledger?: { reservations?: Array<{ reservationId?: string; ownerId?: string }> };
+            mutation?: {
+              kind?: string;
+              reservation?: { reservationId?: string; ownerId?: string };
+            };
           };
-          return (payload.ledger?.reservations ?? []).flatMap((reservation) =>
+          const legacy = (payload.ledger?.reservations ?? []).flatMap((reservation) =>
             reservation.ownerId?.startsWith("reviewer:") && reservation.reservationId
               ? [reservation.reservationId] : []);
+          const compact = payload.mutation?.kind === "reserve"
+            && payload.mutation.reservation?.ownerId?.startsWith("reviewer:")
+            && payload.mutation.reservation.reservationId
+            ? [payload.mutation.reservation.reservationId] : [];
+          return [...legacy, ...compact];
         }));
+        const expectedReviewRecords = boundary === "review_completed" ? 2 : 1;
         expect(stored.filter((item) => item.type === "budget.committed"
           && reviewerReservationIds.has((item.payload as { reservationId?: string }).reservationId ?? "")))
-          .toHaveLength(1);
+          .toHaveLength(expectedReviewRecords);
         expect(stored.filter((item) => item.type === "usage.recorded"
-          && (item.payload as { role?: string }).role === "reviewer")).toHaveLength(1);
-        expect(stored.filter((item) => item.type === "review.completed")).toHaveLength(1);
+          && (item.payload as { role?: string }).role === "reviewer")).toHaveLength(expectedReviewRecords);
+        expect(stored.filter((item) => item.type === "review.completed")).toHaveLength(expectedReviewRecords);
+      }
+      if (completionReviewRequired) {
+        expect(reviewer.inputs).toHaveLength(1);
+        expect(reviewer.inputs[0]).toMatchObject({
+          reviewMode: "completion",
+          completionCandidate: "Recovered mutation is complete."
+        });
+        expect(reviewer.inputs[0]?.completionCandidateDigest).toMatch(/^[a-f0-9]{64}$/u);
       }
     });
   }

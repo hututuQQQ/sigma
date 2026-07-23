@@ -29,6 +29,7 @@ export interface CliConfig {
   permissionMode: "workspace-auto" | "ask" | "auto" | "deny";
   sandboxMode: "required";
   executionMode: "sandboxed" | "container";
+  managedEnvironmentMode: "disabled" | "required";
   readScope: "workspace" | "host";
   networkMode: "none" | "loopback" | "full";
   processHandoff: "allow" | "deny";
@@ -56,6 +57,7 @@ export interface CliConfig {
   outputFormat: "text" | "json" | "stream-json";
   outputSchema: 2 | 3;
   streamJsonMaxLineBytes: number;
+  initialMode: "analyze" | "change";
   tuiFps: number;
   mcpServers: McpServerConfigValue[];
   mcpSource: McpConfigSource;
@@ -223,6 +225,7 @@ function cliConfig(
     permissionMode: values.permissionMode as CliConfig["permissionMode"],
     sandboxMode: values.sandboxMode as CliConfig["sandboxMode"],
     executionMode: values.executionMode as CliConfig["executionMode"],
+    managedEnvironmentMode: values.managedEnvironmentMode as CliConfig["managedEnvironmentMode"],
     readScope: values.readScope as CliConfig["readScope"],
     networkMode: values.networkMode as CliConfig["networkMode"],
     processHandoff: values.processHandoff as CliConfig["processHandoff"],
@@ -246,6 +249,7 @@ function cliConfig(
     outputFormat: values.outputFormat as CliConfig["outputFormat"],
     outputSchema: Number(values.outputSchema) as 2 | 3,
     streamJsonMaxLineBytes: Number(values.streamJsonMaxLineBytes),
+    initialMode: values.initialMode as CliConfig["initialMode"],
     tuiFps: Number(values.tuiFps),
     mcpServers,
     mcpSource: source,

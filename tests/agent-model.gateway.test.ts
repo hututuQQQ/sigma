@@ -113,6 +113,7 @@ describe("OpenAI-compatible model gateway", () => {
           reasoning_content: "provider reasoning",
           tool_calls: [
             { id: "provided", function: { name: "read_file", arguments: "{\"path\":\"a.ts\"}" } },
+            { id: "double", function: { name: "read_file", arguments: "\"{\\\"path\\\":\\\"b.ts\\\"}\"" } },
             { function: { name: "opaque", arguments: "not-json" } },
             { id: "ignored", function: { arguments: "{}" } },
             null
@@ -183,7 +184,8 @@ describe("OpenAI-compatible model gateway", () => {
         reasoningContent: "provider reasoning",
         toolCalls: [
           { id: "provided", name: "read_file", arguments: { path: "a.ts" } },
-          { id: "call_1", name: "opaque", arguments: "not-json" }
+          { id: "double", name: "read_file", arguments: { path: "b.ts" } },
+          { id: "call_2", name: "opaque", arguments: "not-json" }
         ]
       },
       finishReason: "tool_calls",

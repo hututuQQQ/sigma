@@ -2,7 +2,9 @@ import { randomUUID } from "node:crypto";
 import {
   SNAPSHOT_SCHEMA_VERSION,
   STORE_LAYOUT_VERSION,
+  createBudgetLedger,
   type AgentEventEnvelope,
+  type BudgetLimits,
   type ContextItem,
   type JsonValue,
   type ModelExecutionRole,
@@ -16,13 +18,16 @@ import {
   assertKernelInvariants,
   createKernelState,
   evolve,
-  isCompletionRepairState,
   isKernelState,
-  isSemanticFailureCluster,
-  isSemanticProgressWatermark,
+  migratePublishedTaskControlState,
+  PUBLISHED_TASK_CONTROL_LEGACY_KEYS,
   type KernelState
 } from "agent-kernel";
 import { jsonValue } from "./json.js";
+import {
+  createdSessionMetadata,
+  type RestoredSessionMetadata
+} from "./restore-session-metadata.js";
 import {
   approvalEffectsForPlan,
   createApprovalBinding,
@@ -47,41 +52,22 @@ export interface RestoredSessionData {
   pendingApprovals: Array<RecoveredApprovalMetadata & { callId: string }>;
 }
 
-function createdData(event: AgentEventEnvelope | undefined): {
-  workspacePath: string;
-  parentSessionId?: string;
-  mode: RunMode;
-  writeScope: string[];
-  strictWriteScope: boolean;
-  modelRole: ModelExecutionRole;
-} | null {
-  if (!event || event.type !== "session.created" || !event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) return null;
-  const value = event.payload as Record<string, JsonValue>;
-  return {
-    workspacePath: typeof value.workspacePath === "string" ? value.workspacePath : ".",
-    ...(typeof value.parentSessionId === "string" && value.parentSessionId
-      ? { parentSessionId: value.parentSessionId } : {}),
-    mode: value.mode === "analyze" ? "analyze" : "change",
-    writeScope: Array.isArray(value.writeScope)
-      ? value.writeScope.filter((item): item is string => typeof item === "string") : [],
-    strictWriteScope: value.strictWriteScope === true,
-    modelRole: modelExecutionRole(value.modelRole)
-  };
-}
-
-function modelExecutionRole(value: JsonValue | undefined): ModelExecutionRole {
-  return value === "planner" || value === "reviewer" || value === "child_analyze"
-    || value === "child_write" || value === "summarizer" ? value : "orchestrator";
-}
-
-function freshState(sessionId: string, event: AgentEventEnvelope, mode: RunMode, runDeadlineMs: number): KernelState {
-  return createKernelState({
+function freshState(
+  sessionId: string,
+  event: AgentEventEnvelope,
+  mode: RunMode,
+  runDeadlineMs: number,
+  budgetLimits?: BudgetLimits
+): KernelState {
+  const state = createKernelState({
     sessionId,
     runId: event.runId || randomUUID(),
     mode,
     startedAt: event.occurredAt,
     deadlineAt: new Date(Date.now() + runDeadlineMs).toISOString()
   });
+  if (budgetLimits) state.budget = createBudgetLedger(budgetLimits);
+  return state;
 }
 
 function eventRunMode(event: AgentEventEnvelope, fallback: RunMode): RunMode {
@@ -108,7 +94,7 @@ function nextRun(state: KernelState, event: AgentEventEnvelope, runDeadlineMs: n
 }
 
 interface RestoreAccumulator {
-  metadata: ReturnType<typeof createdData>;
+  metadata: RestoredSessionMetadata | null;
   state: KernelState | undefined;
   modelTurn: number;
   lastSeq: number;
@@ -226,53 +212,28 @@ function validSnapshotShape(state: KernelState, sessionId: string): boolean {
   return isKernelState(state) && state.sessionId === sessionId;
 }
 
-function restoredSemanticState(stored: Partial<KernelState>): Pick<
-  KernelState,
-  "semanticProgress" | "semanticFailureCluster"
-> {
-  return {
-    semanticProgress: isSemanticProgressWatermark(stored.semanticProgress)
-      ? stored.semanticProgress
-      : { workspaceChanges: 0, durableEvidence: 0, revision: 0 },
-    semanticFailureCluster: isSemanticFailureCluster(stored.semanticFailureCluster)
-      ? stored.semanticFailureCluster : undefined
-  };
-}
-
-function restoredCompletionRepairState(stored: Partial<KernelState>): Pick<
-  KernelState,
-  "completionRepairAttempts" | "completionRepair"
-> | null {
-  const completionRepairAttempts = Number.isInteger(stored.completionRepairAttempts)
-    ? Number(stored.completionRepairAttempts)
-    : 0;
-  const repair = stored.completionRepair;
-  if (repair !== undefined && !isCompletionRepairState(repair)) return null;
-  if (completionRepairAttempts > 0 && !isCompletionRepairState(repair)) return null;
-  return {
-    completionRepairAttempts,
-    completionRepair: isCompletionRepairState(repair) ? repair : undefined
-  };
-}
-
 function snapshotState(snapshot: Awaited<ReturnType<RunStore["latestSnapshot"]>>, sessionId: string): KernelState | undefined {
   if (!snapshot?.state || typeof snapshot.state !== "object" || Array.isArray(snapshot.state)) return undefined;
-  const stored = snapshot.state as unknown as Partial<KernelState>;
-  const completionRepair = restoredCompletionRepairState(stored);
-  if (!completionRepair) return undefined;
+  const raw = snapshot.state as unknown as Record<string, unknown>;
+  if (["actionConvergenceState", "convergenceStageHighWater", "semanticFactLedgerV2",
+    "taskControlStateV2", "taskControlStateV3", "taskControlStateV4"].some((key) => key in raw)) {
+    throw Object.assign(new Error("Experimental PR #55 session schemas are not supported."), {
+      code: "unsupported_experimental_session_schema"
+    });
+  }
+  const stored = raw as unknown as Partial<KernelState>;
+  const taskControl = migratePublishedTaskControlState(raw, Number(stored.revision ?? 0));
+  if (!taskControl) return undefined;
+  const migrated = { ...raw };
+  for (const key of PUBLISHED_TASK_CONTROL_LEGACY_KEYS) delete migrated[key];
   const state = {
-    ...stored,
+    ...migrated,
     toolCallIds: Array.isArray(stored.toolCallIds)
       ? stored.toolCallIds
       : [...new Set([...(stored.receipts ?? []).map((receipt) => receipt.callId),
         ...(stored.pendingTools ?? []).map((pending) => pending.request.callId)])],
     activeProcessIds: Array.isArray(stored.activeProcessIds) ? stored.activeProcessIds : [],
-    ...restoredSemanticState(stored),
-    ...completionRepair,
-    continuationAttempts: Number.isInteger(stored.continuationAttempts) ? stored.continuationAttempts : 0,
-    repeatedToolBatchCount: Number.isInteger(stored.repeatedToolBatchCount) ? stored.repeatedToolBatchCount : 0,
-    receiptCountAtLastUserInput: Number.isInteger(stored.receiptCountAtLastUserInput)
-      ? stored.receiptCountAtLastUserInput : 0
+    taskControl
   } as KernelState;
   if (!validSnapshotShape(state, sessionId)) return undefined;
   try {
@@ -290,9 +251,15 @@ function initializeFromCreated(
   runDeadlineMs: number
 ): void {
   if (accumulator.metadata || event.type !== "session.created") return;
-  accumulator.metadata = createdData(event);
+  accumulator.metadata = createdSessionMetadata(event);
   if (!accumulator.state && accumulator.metadata) {
-    accumulator.state = freshState(sessionId, event, accumulator.metadata.mode, runDeadlineMs);
+    accumulator.state = freshState(
+      sessionId,
+      event,
+      accumulator.metadata.mode,
+      runDeadlineMs,
+      accumulator.metadata.budgetLimits
+    );
   }
 }
 

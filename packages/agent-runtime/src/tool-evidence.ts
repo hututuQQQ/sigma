@@ -4,12 +4,17 @@ import type {
   DiagnosticEvidence,
   EvidenceRecord,
   InputAccessEvidence,
+  MutationFrontier,
+  RepositoryAcceptanceEvidenceV1,
+  RepositoryRecoveryDecisionEvidenceV1,
+  RepositoryRecoverySelectionEvidenceV1,
   RepositoryDeltaEvidence,
   ToolCallPlan,
   ToolReceipt,
   ValidationEvidence,
   WorkspaceDeltaEvidence
 } from "agent-protocol";
+import { frontierAfterEvidence } from "agent-kernel";
 
 export interface ReceiptEvidenceScope {
   sessionId: string;
@@ -20,6 +25,11 @@ export interface ReceiptEvidenceScope {
     stateDigest: string;
     coveredPaths: string[];
     claim?: Omit<import("agent-protocol").ValidationClaimV1, "status">;
+  };
+  repositoryScope?: {
+    goalEpoch: number;
+    frontier: MutationFrontier;
+    mutationEvidence: EvidenceRecord[];
   };
 }
 
@@ -143,7 +153,95 @@ function sanitizeRepositoryDelta(
     kind: "repository_delta",
     status: receipt.ok && raw.status === "passed" ? "passed" : "failed",
     summary: raw.summary,
-    data: { ...raw.data, operations: [...raw.data.operations] }
+    data: {
+      ...raw.data,
+      operations: [...raw.data.operations],
+      ...(receipt.workspaceDelta ? { worktreeDelta: {
+        added: [...receipt.workspaceDelta.added],
+        modified: [...receipt.workspaceDelta.modified],
+        deleted: [...receipt.workspaceDelta.deleted]
+      } } : raw.data.worktreeDelta ? { worktreeDelta: {
+        added: [...raw.data.worktreeDelta.added],
+        modified: [...raw.data.worktreeDelta.modified],
+        deleted: [...raw.data.worktreeDelta.deleted]
+      } } : {})
+    }
+  };
+}
+
+function repositoryAcceptance(
+  delta: RepositoryDeltaEvidence,
+  receipt: ToolReceipt,
+  scope: ReceiptEvidenceScope
+): RepositoryAcceptanceEvidenceV1 | undefined {
+  const repository = scope.repositoryScope;
+  const assertions = delta.data.semanticAssertions;
+  const target = assertions?.targetAssertions;
+  if (!repository || !assertions || !target || target.satisfied !== true
+    || !delta.data.transactionHandle || !delta.data.selectionEvidenceId
+    || !delta.data.candidateId || !delta.data.selectedObject
+    || target.selectedHead !== delta.data.selectedObject
+    || !target.requiredReachableObjects.includes(delta.data.selectedObject)) {
+    return undefined;
+  }
+  const frontier = frontierAfterEvidence(
+    repository.frontier,
+    [...repository.mutationEvidence, delta],
+    delta
+  );
+  return {
+    evidenceId: randomUUID(),
+    sessionId: scope.sessionId,
+    runId: scope.runId,
+    kind: "repository_acceptance",
+    status: "passed",
+    createdAt: receipt.completedAt || new Date().toISOString(),
+    producer: { authority: "runtime", id: receipt.callId },
+    summary: "The runtime accepted broker-asserted repository recovery postconditions.",
+    data: {
+      schemaVersion: 1,
+      goalEpoch: repository.goalEpoch,
+      frontierRevision: frontier.revision,
+      frontierStateDigest: frontier.currentStateDigest,
+      repositoryRoot: delta.data.repositoryRoot ?? ".",
+      transactionHandle: delta.data.transactionHandle,
+      operationClasses: [...delta.data.operations],
+      repositoryStateDigest: delta.data.afterStateDigest,
+      selectionEvidenceId: delta.data.selectionEvidenceId,
+      candidateId: delta.data.candidateId,
+      semanticAssertions: assertions
+    }
+  };
+}
+
+function sanitizeRepositorySelection(
+  raw: RepositoryRecoverySelectionEvidenceV1,
+  receipt: ToolReceipt,
+  scope: ReceiptEvidenceScope
+): RepositoryRecoverySelectionEvidenceV1 | undefined {
+  if (scope.repositoryScope?.goalEpoch !== raw.data.goalEpoch) return undefined;
+  return {
+    ...raw,
+    ...evidenceBase(scope, receipt),
+    producer: { authority: "runtime", id: receipt.callId },
+    data: { ...raw.data }
+  };
+}
+
+function sanitizeRepositoryDecision(
+  raw: RepositoryRecoveryDecisionEvidenceV1,
+  receipt: ToolReceipt,
+  scope: ReceiptEvidenceScope
+): RepositoryRecoveryDecisionEvidenceV1 | undefined {
+  if (scope.repositoryScope?.goalEpoch !== raw.data.goalEpoch) return undefined;
+  return {
+    ...raw,
+    ...evidenceBase(scope, receipt),
+    producer: { authority: "runtime", id: receipt.callId },
+    data: {
+      ...raw.data,
+      candidates: raw.data.candidates.map((candidate) => ({ ...candidate, subjectTrusted: false }))
+    }
   };
 }
 
@@ -166,6 +264,60 @@ function synthesizedDiagnostic(
   };
 }
 
+function normalizeRepositoryInspectionEvidence(
+  raw: EvidenceRecord,
+  receipt: ToolReceipt,
+  toolName: string,
+  scope: ReceiptEvidenceScope,
+  actualEffects: ToolReceipt["observedEffects"]
+): EvidenceRecord[] | undefined {
+  if (toolName !== "repository_inspect" || !receipt.ok
+    || !actualEffects.includes("filesystem.read")) return undefined;
+  if (raw.kind === "repository_recovery_selection") {
+    const selection = sanitizeRepositorySelection(raw, receipt, scope);
+    return selection ? [selection] : [];
+  }
+  if (raw.kind === "repository_recovery_decision") {
+    const decision = sanitizeRepositoryDecision(raw, receipt, scope);
+    return decision ? [decision] : [];
+  }
+  return undefined;
+}
+
+function normalizeEvidenceRecord(
+  raw: EvidenceRecord,
+  receipt: ToolReceipt,
+  toolName: string,
+  plan: ToolCallPlan,
+  scope: ReceiptEvidenceScope,
+  actualEffects: ToolReceipt["observedEffects"]
+): EvidenceRecord[] {
+  if (raw.kind === "validation") {
+    return plan.exactEffects.includes("validation") && actualEffects.includes("validation")
+      ? [sanitizeValidation(raw, receipt, scope)] : [];
+  }
+  if (raw.kind === "repository_delta") {
+    if (!plan.exactEffects.includes("repository.write")
+      || !actualEffects.includes("repository.write")) return [];
+    const delta = sanitizeRepositoryDelta(raw, receipt, scope);
+    const acceptance = repositoryAcceptance(delta, receipt, scope);
+    return [delta, ...(acceptance ? [acceptance] : [])];
+  }
+  if (raw.kind === "command") {
+    return actualEffects.some((effect) =>
+      effect === "process.spawn" || effect === "process.spawn.readonly")
+      ? [sanitizeCommand(raw, receipt, scope)] : [];
+  }
+  if (raw.kind === "diagnostic") return [sanitizeDiagnostic(raw, receipt, scope)];
+  if (raw.kind === "input_access") {
+    return actualEffects.includes("filesystem.read")
+      ? [sanitizeInputAccess(raw, receipt, scope)] : [];
+  }
+  return normalizeRepositoryInspectionEvidence(
+    raw, receipt, toolName, scope, actualEffects
+  ) ?? [];
+}
+
 /**
  * Tool-returned evidence is untrusted data. Re-issue only kinds justified by
  * the approved/observed effects, stamp the active run, and discard privileged
@@ -179,23 +331,8 @@ export function normalizeReceiptEvidence(
   scope: ReceiptEvidenceScope
 ): ToolReceipt {
   const actualEffects = [...new Set(receipt.actualEffects ?? receipt.observedEffects)];
-  const evidence = (receipt.evidence ?? []).flatMap((raw): EvidenceRecord[] => {
-    if (raw.kind === "validation" && plan.exactEffects.includes("validation") && actualEffects.includes("validation")) {
-      return [sanitizeValidation(raw, receipt, scope)];
-    }
-    if (raw.kind === "repository_delta" && plan.exactEffects.includes("repository.write")
-      && actualEffects.includes("repository.write")) {
-      return [sanitizeRepositoryDelta(raw, receipt, scope)];
-    }
-    if (raw.kind === "command" && actualEffects.some((effect) => effect === "process.spawn" || effect === "process.spawn.readonly")) {
-      return [sanitizeCommand(raw, receipt, scope)];
-    }
-    if (raw.kind === "diagnostic") return [sanitizeDiagnostic(raw, receipt, scope)];
-    if (raw.kind === "input_access" && actualEffects.includes("filesystem.read")) {
-      return [sanitizeInputAccess(raw, receipt, scope)];
-    }
-    return [];
-  });
+  const evidence = (receipt.evidence ?? []).flatMap((raw) =>
+    normalizeEvidenceRecord(raw, receipt, toolName, plan, scope, actualEffects));
   return {
     ...receipt,
     actualEffects,

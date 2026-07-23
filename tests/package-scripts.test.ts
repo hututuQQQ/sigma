@@ -15,12 +15,20 @@ function stageIds(graph: string): string[] {
 }
 
 describe("package script semantics", () => {
-  it("keeps convenience entry points key-free and delegates to shared runners", async () => {
+  it("keeps benchmark entry points key-free and formal controls externalized", async () => {
     const { scripts } = await rootPackage();
-    expect(scripts["bench:deepseek"]).toBe("pnpm bench:tb:deepseek");
-    for (const name of ["bench:tb:deepseek", "bench:tb:deepseek:k5", "bench:tb:deepseek:k10", "bench:tb:deepseek:task"]) {
+    for (const name of ["bench:tb:smoke", "bench:tb:k", "bench:tb:task"]) {
       expect(scripts[name]).toContain("scripts/bench-terminal-bench.mjs");
     }
+    for (const name of [
+      "bench:deepseek", "bench:tb:deepseek", "bench:tb:deepseek:k5",
+      "bench:tb:deepseek:k10", "bench:tb:deepseek:task",
+    ]) {
+      expect(scripts).not.toHaveProperty(name);
+    }
+    expect(scripts["bench:tb:formal"]).toBe("node scripts/bench-terminal-bench-formal.mjs");
+    expect(scripts["bench:tb:preregister"])
+      .toBe("node scripts/bench-terminal-bench-formal-preregistration.mjs");
     expect(scripts["package:harbor-runtime"]).toBe(scripts["bench:tb:config:portable"]);
     expect(scripts["eval:agent"]).toContain("scripts/eval/agent-eval.mjs");
     expect(scripts["eval:report"]).toBe("node scripts/eval/report.mjs");

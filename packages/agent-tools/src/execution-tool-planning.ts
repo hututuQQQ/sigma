@@ -1,6 +1,6 @@
 import { lstat } from "node:fs/promises";
 import path from "node:path";
-import type { ExecutionPolicy } from "agent-execution";
+import type { ExecutionPolicy, ScratchLeaseV1 } from "agent-execution";
 import type {
   ExecutionIntentV1,
   JsonValue,
@@ -17,6 +17,7 @@ import {
 } from "./execution-tool-values.js";
 import { processMutationContract, writePlanError } from "./process-mutation-contract.js";
 import type { PlannedToolExecutionContext } from "./registry.js";
+import { validationWorkspacePolicy } from "./execution-validation-workspace.js";
 
 function network(input: Record<string, JsonValue>, options: ExecutionToolOptions): "none" | "loopback" | "full" {
   const available = availableNetworkModes(options);
@@ -310,7 +311,9 @@ export function executionPolicy(
   plan: ToolCallPlan,
   options: ExecutionToolOptions,
   writeRoots: string[] = [],
-  skillResource?: LoadedSkillResourceAccess
+  skillResource?: LoadedSkillResourceAccess,
+  disposableValidation = false,
+  scratchLease?: ScratchLeaseV1
 ): ExecutionPolicy {
   const networkMode = plan.network;
   const workspaceRoot = path.resolve(context.workspacePath);
@@ -336,7 +339,9 @@ export function executionPolicy(
     // fail native root validation before the command can start.
     protectedPaths: [
       ...(skillResource ? [path.resolve(skillResource.readRoot)] : [])
-    ]
+    ],
+    ...validationWorkspacePolicy(disposableValidation, workspaceRoot, options),
+    ...(scratchLease ? { scratchLease } : {})
   };
 }
 

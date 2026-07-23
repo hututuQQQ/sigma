@@ -1,41 +1,33 @@
 import { z } from "zod";
-import type { JsonValue } from "./json.js";
-
-export const jsonValueSchema: z.ZodType<JsonValue> = z.lazy(() => z.union([
-  z.null(),
-  z.boolean(),
-  z.number(),
-  z.string(),
-  z.array(jsonValueSchema),
-  z.record(z.string(), jsonValueSchema)
-]));
-
-export const nonEmptyStringSchema = z.string().min(1);
-export const dateTimeSchema = z.string().refine(
-  (value) => Number.isFinite(Date.parse(value)),
-  "Expected an ISO-compatible date-time string"
-);
-export const nonNegativeIntegerSchema = z.number().int().nonnegative();
-
-export const evidenceKindSchema = z.enum([
-  "workspace_delta", "repository_delta", "command", "validation", "diagnostic",
-  "input_access", "review", "checkpoint", "child_outcome", "user_waiver"
-]);
-export const evidenceStatusSchema = z.enum(["passed", "failed", "warning", "informational"]);
-export const evidenceClaimSchema = z.enum([
-  "acceptance_met", "validation_executed", "validation_passed"
-]);
-export const evidenceAuthoritySchema = z.enum(["system", "developer", "user", "project", "runtime", "tool"]);
-export const evidenceProducerSchema = z.object({
-  authority: evidenceAuthoritySchema,
-  id: z.string().optional()
-}).strict();
-
-export const checkpointDeltaSchema = z.object({
-  added: z.array(z.string()),
-  modified: z.array(z.string()),
-  deleted: z.array(z.string())
-}).strict();
+import {
+  checkpointDeltaSchema,
+  dateTimeSchema,
+  digestSchema,
+  evidenceBaseShape,
+  evidenceClaimSchema,
+  evidenceKindSchema,
+  jsonValueSchema,
+  nonEmptyStringSchema,
+  nonNegativeIntegerSchema
+} from "./domain-schema-primitives.js";
+import {
+  repositoryDeltaEvidenceSchema,
+  repositoryAcceptanceEvidenceV1Schema,
+  repositoryRecoveryDecisionEvidenceV1Schema,
+  repositoryRecoverySelectionEvidenceV1Schema
+} from "./repository-evidence-schemas.js";
+export {
+  checkpointDeltaSchema,
+  dateTimeSchema,
+  evidenceAuthoritySchema,
+  evidenceClaimSchema,
+  evidenceKindSchema,
+  evidenceProducerSchema,
+  evidenceStatusSchema,
+  jsonValueSchema,
+  nonEmptyStringSchema,
+  nonNegativeIntegerSchema
+} from "./domain-schema-primitives.js";
 
 const opaqueArtifactIdentitySchema = z.object({
   digest: z.string().regex(/^[a-f0-9]{64}$/u),
@@ -51,16 +43,6 @@ export const opaqueArtifactEvidenceSchema = z.object({
   (value) => value.before !== undefined || value.after !== undefined,
   "Opaque artifact evidence must contain a before or after identity"
 );
-
-const evidenceBaseShape = {
-  evidenceId: nonEmptyStringSchema,
-  sessionId: nonEmptyStringSchema,
-  runId: nonEmptyStringSchema,
-  status: evidenceStatusSchema,
-  createdAt: dateTimeSchema,
-  producer: evidenceProducerSchema,
-  summary: nonEmptyStringSchema
-};
 
 export const workspaceDeltaEvidenceSchema = z.object({
   ...evidenceBaseShape,
@@ -81,8 +63,6 @@ export const workspaceDeltaEvidenceSchema = z.object({
   }).strict()
 }).strict();
 
-const digestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
-
 export const mutationFrontierSchema = z.object({
   revision: nonNegativeIntegerSchema,
   baselineManifestDigest: digestSchema,
@@ -90,25 +70,6 @@ export const mutationFrontierSchema = z.object({
   changedPaths: z.array(nonEmptyStringSchema),
   sourceCheckpointIds: z.array(nonEmptyStringSchema),
   repositoryStateDigest: digestSchema.optional()
-}).strict();
-
-export const repositoryDeltaEvidenceSchema = z.object({
-  ...evidenceBaseShape,
-  kind: z.literal("repository_delta"),
-  data: z.object({
-    operationCount: z.number().int().positive(),
-    operations: z.array(nonEmptyStringSchema),
-    beforeStateDigest: digestSchema,
-    afterStateDigest: digestSchema,
-    headBefore: z.string().nullable(),
-    headAfter: z.string().nullable(),
-    refsBeforeDigest: digestSchema,
-    refsAfterDigest: digestSchema,
-    indexBeforeDigest: digestSchema,
-    indexAfterDigest: digestSchema,
-    reachableObjectsBefore: nonNegativeIntegerSchema,
-    reachableObjectsAfter: nonNegativeIntegerSchema
-  }).strict()
 }).strict();
 
 export const commandEvidenceSchema = z.object({
@@ -193,8 +154,10 @@ export const reviewEvidenceSchema = z.object({
     stateDigest: digestSchema,
     reviewBasisDigest: digestSchema.optional(),
     validationEvidenceIds: z.array(z.string()).optional(),
-    failureKind: z.enum(["infrastructure", "interrupted"]).optional(),
-    failureCode: z.literal("review_scope_too_large").optional(),
+    failureKind: z.enum(["infrastructure", "interrupted", "protocol"]).optional(),
+    failureCode: z.enum([
+      "review_scope_too_large", "review_protocol_invalid", "review_unavailable"
+    ]).optional(),
     checkpointId: z.string().optional()
   }).strict()
 }).strict();
@@ -233,6 +196,31 @@ export const userWaiverEvidenceSchema = z.object({
   }).strict()
 }).strict();
 
+export const workspaceRestorationEvidenceV1Schema = z.object({
+  ...evidenceBaseShape,
+  kind: z.literal("restoration"),
+  data: z.object({
+    schemaVersion: z.literal(1),
+    goalEpoch: nonNegativeIntegerSchema,
+    frontierRevision: nonNegativeIntegerSchema,
+    frontierStateDigest: digestSchema,
+    baselineManifestDigest: digestSchema,
+    currentManifestDigest: digestSchema,
+    restoredCheckpointIds: z.array(nonEmptyStringSchema),
+    quiescence: z.object({
+      supersededExecutionStopped: z.literal(true),
+      noPendingMutations: z.literal(true),
+      noProcesses: z.literal(true),
+      noChildren: z.literal(true),
+      noOpenCheckpoint: z.literal(true)
+    }).strict(),
+    repository: z.object({
+      status: z.enum(["unchanged", "restored"]),
+      stateDigest: digestSchema.optional()
+    }).strict()
+  }).strict()
+}).strict();
+
 export const evidenceRecordSchema = z.discriminatedUnion("kind", [
   workspaceDeltaEvidenceSchema,
   repositoryDeltaEvidenceSchema,
@@ -243,8 +231,20 @@ export const evidenceRecordSchema = z.discriminatedUnion("kind", [
   reviewEvidenceSchema,
   checkpointEvidenceSchema,
   childOutcomeEvidenceSchema,
-  userWaiverEvidenceSchema
+  userWaiverEvidenceSchema,
+  workspaceRestorationEvidenceV1Schema
+  , repositoryRecoverySelectionEvidenceV1Schema
+  , repositoryRecoveryDecisionEvidenceV1Schema
+  , repositoryAcceptanceEvidenceV1Schema
 ]);
+
+export {
+  repositoryDeltaEvidenceSchema,
+  repositoryAcceptanceEvidenceV1Schema,
+  repositoryRecoveryDecisionEvidenceV1Schema,
+  repositoryRecoverySelectionEvidenceV1Schema,
+  repositorySemanticAssertionsV3Schema
+} from "./repository-evidence-schemas.js";
 
 export const modelExecutionRoleSchema = z.enum([
   "orchestrator", "planner", "reviewer", "child_analyze", "child_write", "summarizer"

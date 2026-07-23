@@ -34,14 +34,30 @@ export interface CompletionCoordinatorStateV1 {
   runCompleted: boolean;
 }
 
+function reviewedFailedValidation(
+  session: RuntimeSession,
+  validation: ReturnType<typeof frontierValidationReadiness>
+): boolean {
+  const failed = validation.latestFailed;
+  if (!failed || !validation.executionReady || assuranceRequirement(session).risk === "high") return false;
+  const candidateDigest = session.durable.state.taskControl.completionCandidate?.digest;
+  const review = currentFrontierReview(session, candidateDigest);
+  return review?.status === "passed"
+    && review.data.verdict === "approved"
+    && review.data.validationEvidenceIds?.includes(failed.evidenceId) === true;
+}
+
 /** Defense-in-depth projection used at the durable outcome boundary. A model
  * stop is only an intent; it cannot imply assurance, review, or completion. */
 export function completionCoordinatorState(session: RuntimeSession): CompletionCoordinatorStateV1 {
   const requirement = assuranceRequirement(session);
+  const validation = frontierValidationReadiness(session);
+  const candidateDigest = session.durable.state.taskControl.completionCandidate?.digest;
+  const review = currentFrontierReview(session, candidateDigest);
+  const reviewedFailedExecution = reviewedFailedValidation(session, validation);
   const assuranceSatisfied = session.durable.state.mutationFrontier.changedPaths.length === 0
-    || frontierValidationReadiness(session).ready;
+    || validation.ready || reviewedFailedExecution;
   const reviewRequired = reviewMode(session) === "required" || requirement.review === "required";
-  const review = currentFrontierReview(session);
   const reviewSatisfied = !reviewRequired
     || (review?.status === "passed" && review.data.verdict === "approved");
   const modelStopped = true;
@@ -144,21 +160,36 @@ function validationOrReviewFailure(
   const frontier = session.durable.state.mutationFrontier;
   const validation = frontierValidationReadiness(session);
   if (!validation.ready) {
+    if (validation.latestFailed && validation.executionReady) {
+      if (reviewedFailedValidation(session, validation)) {
+        return requiredReviewFailure(session, call, startedAt);
+      }
+      return failed(call, startedAt,
+        "The current validation exited unsuccessfully. An independent completion review must determine whether the goal required a passing result or an honest report of the observed failure.",
+        "validation_result_reporting_required",
+        {
+          status: "rejected",
+          code: "validation_result_reporting_required",
+          frontierRevision: frontier.revision,
+          stateDigest: frontier.currentStateDigest,
+          failedValidationEvidenceId: validation.latestFailed.evidenceId,
+          missingPaths: validation.missingExecutionPaths,
+          missingClaims: validation.missingExecutionClaims,
+          nextActions: [{ tool: "request_review", arguments: {} }]
+        }
+      );
+    }
     return failed(call, startedAt,
-      validation.latestFailed
-        ? `Current-state semantic validation failed; repair and validate again, or use report_blocked. Missing claims: ${validation.missingClaims.join(", ")}; missing coverage: ${validation.missingPaths.join(", ")}.`
-        : `Current-state semantic validation is required. Missing claims: ${validation.missingClaims.join(", ")}; paths: ${validation.missingPaths.join(", ")}.`,
-      validation.latestFailed ? "validation_failed" : "validation_evidence_required",
+      `Current-state semantic validation is required. Missing claims: ${validation.missingClaims.join(", ")}; paths: ${validation.missingPaths.join(", ")}.`,
+      "validation_evidence_required",
       {
         status: "rejected",
-        code: validation.latestFailed ? "validation_failed" : "validation_evidence_required",
+        code: "validation_evidence_required",
         frontierRevision: frontier.revision,
         stateDigest: frontier.currentStateDigest,
         missingPaths: validation.missingPaths,
         missingClaims: validation.missingClaims,
-        nextActions: validation.latestFailed
-          ? [{ tool: "report_blocked", when: "repair is exhausted" }, { tool: "validate", after: "repair" }]
-          : [{ tool: "validate", deriveCoverageFrom: ["semantic_command_adapter"] }]
+        nextActions: [{ tool: "validate", deriveCoverageFrom: ["semantic_command_adapter"] }]
       }
     );
   }
@@ -172,8 +203,24 @@ function requiredReviewFailure(
 ): ToolReceipt | null {
   if (reviewMode(session) !== "required" && assuranceRequirement(session).review !== "required") return null;
   const frontier = session.durable.state.mutationFrontier;
-  const review = currentFrontierReview(session);
+  const candidateDigest = session.durable.state.taskControl.completionCandidate?.digest;
+  const review = currentFrontierReview(session, candidateDigest);
   if (review?.status === "passed" && review.data.verdict === "approved") return null;
+  if (review?.data.failureKind === "protocol") {
+    const attempts = session.durable.state.evidence.filter((item) => item.kind === "review"
+      && item.data.reviewBasisDigest === review.data.reviewBasisDigest).length;
+    if (attempts >= 2) {
+      return failed(call, startedAt,
+        "Required independent review returned invalid protocol output twice for the same basis.",
+        "review_unavailable",
+        {
+          status: "rejected", code: "review_unavailable",
+          frontierRevision: frontier.revision, stateDigest: frontier.currentStateDigest,
+          nextActions: [{ tool: "report_blocked" }]
+        }
+      );
+    }
+  }
   if (review?.data.failureCode === "review_scope_too_large") {
     return failed(call, startedAt,
       `${review.data.findings.slice(0, 20).map(findingText).join("; ")}.`,
@@ -187,7 +234,7 @@ function requiredReviewFailure(
     );
   }
   return failed(call, startedAt,
-    review
+    review && !review.data.failureKind
       ? `Strict review requested changes: ${review.data.findings.slice(0, 20).map(findingText).join("; ")}.`
       : "Strict profile requires an approved review of the validated current state.",
     "review_evidence_required",

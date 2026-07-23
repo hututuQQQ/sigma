@@ -3,10 +3,25 @@ import type {
   BrokerRequestOptions,
   ExecutionRequest,
   ExecutionResult,
+  ManagedEnvironmentPrepareRequestV1,
+  ManagedEnvironmentPrepareResultV1,
+  ManagedSessionBindingRequestV1,
+  ManagedSessionBindingV1,
   ProcessLaunchFailureV1,
   ProcessHandle,
   ProcessHandoffResult,
-  ProcessPollResult
+  ProcessPollResult,
+  RepositoryMetadataLeaseRequestV1,
+  RepositoryMetadataLeaseV1,
+  RepositoryTransactionBeginRequestV2,
+  RepositoryTransactionBoundRequestV2,
+  RepositoryTransactionContinueRequestV2,
+  RepositoryTransactionLeaseRequestV2,
+  RepositoryTransactionLeaseV2,
+  RepositoryTransactionRecoverRequestV2,
+  RepositoryTransactionResultV2
+  , RepositoryRunBaselineRequestV1
+  , RepositoryRunBaselineResultV1
 } from "agent-execution";
 import { BrokerCancelledError } from "agent-execution";
 import type { ShellKind } from "./environment.js";
@@ -17,6 +32,43 @@ export interface ProcessExecutionPort {
   terminate?(handle: ProcessHandle, options?: BrokerRequestOptions): Promise<ProcessPollResult>;
   handoff?(handle: ProcessHandle, options?: BrokerRequestOptions): Promise<ProcessHandoffResult>;
   releaseOutputArtifacts?(artifactIds: string[]): Promise<void>;
+  /** Idempotently releases broker-owned scratch after every session process has settled. */
+  releaseScratchLease?(sessionId: string, options?: BrokerRequestOptions): Promise<void>;
+  bindManagedSession?(
+    request: ManagedSessionBindingRequestV1,
+    options?: BrokerRequestOptions
+  ): Promise<ManagedSessionBindingV1>;
+  prepareManagedEnvironment?(
+    request: ManagedEnvironmentPrepareRequestV1,
+    options?: BrokerRequestOptions
+  ): Promise<ManagedEnvironmentPrepareResultV1>;
+  acquireRepositoryMetadataLease?(
+    request: RepositoryMetadataLeaseRequestV1, options?: BrokerRequestOptions
+  ): Promise<RepositoryMetadataLeaseV1>;
+  acquireRepositoryTransactionLease?(
+    request: RepositoryTransactionLeaseRequestV2, options?: BrokerRequestOptions
+  ): Promise<RepositoryTransactionLeaseV2>;
+  beginRepositoryTransaction?(
+    request: RepositoryTransactionBeginRequestV2, options?: BrokerRequestOptions
+  ): Promise<RepositoryTransactionResultV2>;
+  continueRepositoryTransaction?(
+    request: RepositoryTransactionContinueRequestV2, options?: BrokerRequestOptions
+  ): Promise<RepositoryTransactionResultV2>;
+  abortRepositoryTransaction?(
+    request: RepositoryTransactionBoundRequestV2, options?: BrokerRequestOptions
+  ): Promise<RepositoryTransactionResultV2>;
+  recoverRepositoryTransactions?(
+    request: RepositoryTransactionRecoverRequestV2, options?: BrokerRequestOptions
+  ): Promise<RepositoryTransactionResultV2>;
+  sealRepositoryTransaction?(
+    request: RepositoryTransactionBoundRequestV2, options?: BrokerRequestOptions
+  ): Promise<RepositoryTransactionResultV2>;
+  restoreRepositoryRunBaseline?(
+    request: RepositoryRunBaselineRequestV1, options?: BrokerRequestOptions
+  ): Promise<RepositoryRunBaselineResultV1>;
+  releaseRepositoryRunBaseline?(
+    request: RepositoryRunBaselineRequestV1, options?: BrokerRequestOptions
+  ): Promise<RepositoryRunBaselineResultV1>;
 }
 
 export interface ProcessRequest {
@@ -35,6 +87,7 @@ export interface ProcessRequest {
   protectedPaths?: string[];
   network?: "none" | "full";
   networkApproved?: boolean;
+  repositoryMetadataLease?: RepositoryMetadataLeaseV1;
 }
 
 export interface ProcessResult {
@@ -90,7 +143,10 @@ function executionRequest(request: ProcessRequest): ExecutionRequest {
       networkApproved: network === "full" && request.networkApproved === true,
       readRoots,
       writeRoots,
-      protectedPaths: request.protectedPaths ?? [path.join(cwd, ".git"), path.join(cwd, ".agent")]
+      protectedPaths: request.protectedPaths ?? [path.join(cwd, ".git"), path.join(cwd, ".agent")],
+      ...(request.repositoryMetadataLease ? {
+        repositoryMetadataLease: request.repositoryMetadataLease
+      } : {})
     },
     timeoutMs: request.timeoutMs,
     idleTimeoutMs: request.idleTimeoutMs,
