@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { EventEmitter } from "node:events";
 import { describe, expect, it } from "vitest";
 import {
   assertUniqueHarborTaskExecutionIdentities,
@@ -31,6 +32,7 @@ import {
   resolveRunOptions,
   suggestedOwnerForFailureCategory,
   taskSelectionIdentitySha256,
+  terminateProcessTree,
   terminalBenchDataset
 } from "../scripts/bench-common.mjs";
 
@@ -47,6 +49,31 @@ async function writeHarborJobResult(jobDir: string, total: number, errored = 0, 
 }
 
 describe("Terminal-Bench command construction", () => {
+  it("rejects unknown options and positional arguments before a run is created", () => {
+    expect(() => resolveRunOptions(["--unknown-option"])).toThrow("Unknown option: --unknown-option");
+    expect(() => resolveRunOptions(["unexpected-task-name"])).toThrow("Unexpected positional argument");
+  });
+
+  it("uses taskkill tree termination on Windows", async () => {
+    const calls: Array<{ command: string; args: string[]; options: unknown }> = [];
+    const killer = new EventEmitter();
+    const child = { pid: 4321, kill: () => false };
+    const pending = terminateProcessTree(child, {
+      platform: "win32",
+      spawnProcess(command: string, args: string[], options: unknown) {
+        calls.push({ command, args, options });
+        queueMicrotask(() => killer.emit("close", 0));
+        return killer;
+      }
+    });
+    await pending;
+    expect(calls).toEqual([{
+      command: "taskkill.exe",
+      args: ["/PID", "4321", "/T", "/F"],
+      options: { stdio: "ignore", windowsHide: true }
+    }]);
+  });
+
   it("loads an exact pinned external task batch without losing Git provenance", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "sigma-batch-tasks-"));
     const tasksFile = path.join(directory, "tasks.json");

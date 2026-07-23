@@ -6,7 +6,8 @@ import { describe, expect, it } from "vitest";
 import {
   boundedBenchmarkRunId,
   portableHarborJobsDir,
-  runTerminalBenchCli
+  runTerminalBenchCli,
+  terminalBenchHelpText
 } from "../scripts/bench-terminal-bench.mjs";
 
 interface RunnerLogOptions {
@@ -106,6 +107,21 @@ async function removeRunArtifacts(runDir: string) {
 }
 
 describe("Terminal-Bench CLI verifier result handling", () => {
+  it("prints help without packaging or creating a benchmark run", async () => {
+    let output = "";
+    let packaged = false;
+    const result = await runTerminalBenchCli(["--help"], {
+      writeOutput(text: string) { output += text; },
+      packageAgentCli: async () => {
+        packaged = true;
+        throw new Error("help must not package");
+      }
+    });
+    expect(result).toEqual({ exitCode: 0, help: true });
+    expect(output).toBe(terminalBenchHelpText);
+    expect(packaged).toBe(false);
+  });
+
   it("keeps Windows Harbor workspaces and labeled run identifiers within a portable path budget", () => {
     const runId = boundedBenchmarkRunId(
       "20260723-120000-deepseek-deepseek-v4-pro",
