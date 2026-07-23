@@ -30,6 +30,8 @@ import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 import { reviewerWaivedDeltaIds } from "./review-waiver-policy.js";
 import { deadlineForecast } from "./convergence-policy.js";
 import { assuranceRequirement } from "./assurance-engine.js";
+import { goalReferencedWorkspaceReads } from "./reviewer-workspace-reads.js";
+export { goalReferencedWorkspaceReads } from "./reviewer-workspace-reads.js";
 
 function profileReviewMode(session: RuntimeSession): "off" | "advisory" | "required" {
   return session.services.profile?.profile.mutationPolicy.reviewMode ?? "advisory";
@@ -200,6 +202,7 @@ function reviewerInput(
     } : {}),
     workspaceDeltas: attempt.eligible,
     validations: attempt.relevantValidations,
+    goalReferencedWorkspaceReads: goalReferencedWorkspaceReads(session),
     inputAccesses: session.durable.state.evidence.filter((item): item is InputAccessEvidence =>
       item.kind === "input_access" && item.runId === session.durable.runId)
   };

@@ -88,14 +88,23 @@ export async function assertRepositoryConflictPlanAllowed(
   const allowed = (await Promise.all(scopePaths.map(async (item) =>
     await canonicalPlannedPath(session.identity.workspacePath, item))))
     .filter((item): item is string => Boolean(item));
-  const targets = await Promise.all(requested.map(async (item) => ({
+  const readTargets = await Promise.all(plan.readPaths.map(async (item) => ({
     item,
     canonical: await canonicalPlannedPath(session.identity.workspacePath, item)
   })));
-  const outside = targets.filter(({ canonical }) => !canonical
+  const writeTargets = await Promise.all(
+    [...plan.writePaths, ...plan.checkpointScope].map(async (item) => ({
+      item,
+      canonical: await canonicalPlannedPath(session.identity.workspacePath, item)
+    }))
+  );
+  const outsideReads = readTargets.filter(({ canonical }) => !canonical).map(({ item }) => item);
+  const outsideWrites = writeTargets.filter(({ canonical }) => !canonical
     || !allowed.some((scope) => isInside(scope, canonical))).map(({ item }) => item);
+  const outside = [...new Set([...outsideReads, ...outsideWrites])];
   if (allowed.length === scopePaths.length && outside.length === 0) return;
   throw Object.assign(new Error(
-    `Repository conflict repair is outside the broker-observed conflict paths: ${outside.join(", ") || "invalid scope"}.`
+    "Repository conflict repair is outside the workspace read boundary or "
+      + `broker-observed conflict write paths: ${outside.join(", ") || "invalid scope"}.`
   ), { code: "tool_unavailable_for_repair" });
 }

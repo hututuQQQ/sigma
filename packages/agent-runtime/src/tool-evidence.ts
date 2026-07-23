@@ -223,6 +223,12 @@ function sanitizeRepositorySelection(
   return {
     ...raw,
     ...evidenceBase(scope, receipt),
+    // This identifier is also the opaque key into the in-memory recovery
+    // capability store. Replacing it would sever a legitimate selection from
+    // that store. Retaining it cannot mint recovery authority: resolution
+    // still requires a live record plus matching session, run, goal,
+    // repository, and candidate bindings.
+    evidenceId: raw.evidenceId,
     producer: { authority: "runtime", id: receipt.callId },
     data: { ...raw.data }
   };

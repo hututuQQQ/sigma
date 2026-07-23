@@ -13,7 +13,8 @@ import {
   startActionBatch,
   taskControlAnswer,
   taskControlFailureMessage,
-  terminalResolutionObligation
+  terminalResolutionObligation,
+  toolPolicyCorrectionExhausted
 } from "./task-control.js";
 
 const TERMINAL_PROTOCOL_FAILURE_CODES = new Set([
@@ -92,6 +93,12 @@ export function blockedReport(receipt: ToolReceipt): { code: string; message: st
   } catch { return null; }
 }
 
+function reachedSemanticConvergence(taskControl: KernelState["taskControl"]): boolean {
+  return taskControl.obligation?.kind === "terminal_resolution"
+    && taskControl.obligation.failureCode === "action_convergence_no_progress"
+    && taskControl.episode.noProgressBatches >= 7;
+}
+
 export function failedTerminalRepairState(
   state: KernelState,
   repairPending: boolean,
@@ -112,7 +119,11 @@ export function failedTerminalRepairState(
         detail,
         state.revision
       );
-  if (taskControl.phase !== "terminal") {
+  // Let the semantic convergence transition report its own truthful failure
+  // instead of mislabelling the first rejected repair action as two rejected
+  // corrections.
+  if (reachedSemanticConvergence(taskControl) && !toolPolicyCorrectionExhausted(taskControl)) return null;
+  if (!toolPolicyCorrectionExhausted(taskControl)) {
     return {
       ...state,
       phase: "ready_model",
@@ -144,7 +155,7 @@ export function repairConflictingTerminalBatch(state: KernelState, messages: Mod
     "terminal_batch_conflict",
     state.revision
   );
-  return taskControl.phase === "terminal"
+  return toolPolicyCorrectionExhausted(taskControl)
     ? propose({ ...state, messages, taskControl }, {
         kind: "recoverable_failure",
         code: taskControl.obligation?.kind === "terminal_resolution"

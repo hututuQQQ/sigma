@@ -1,8 +1,9 @@
-import type { ToolDescriptor, ToolEffect } from "agent-protocol";
+import type { JsonValue, ToolDescriptor, ToolEffect } from "agent-protocol";
 import type { RuntimeSession } from "./types.js";
 
 export type CompletionRepairPhase =
   | "none"
+  | "protocol_repair"
   | "focused"
   | "generic_repair"
   | "completion_evidence"
@@ -51,6 +52,11 @@ export function completionRepairPhase(session: RuntimeSession): CompletionRepair
   const control = session.durable.state.taskControl;
   const obligationPhase = obligationRepairPhase(session);
   if (obligationPhase) return obligationPhase;
+  if (control.phase === "focused"
+    && control.episode.noProgressBatches < 2
+    && control.policyCorrection?.failureCode === "tool_arguments_invalid") {
+    return "protocol_repair";
+  }
   if (control.phase === "terminal") return "terminal";
   if (control.phase === "repair_only") return "generic_repair";
   return control.phase === "focused" ? "focused" : "none";
@@ -75,6 +81,7 @@ function baseDescriptorAllowedForRepair(
 ): boolean {
   switch (phase) {
     case "none":
+    case "protocol_repair":
     case "focused": return descriptor.name !== "environment_prepare";
     case "generic_repair": return descriptor.possibleEffects.some((effect) =>
       effect === "filesystem.write" || effect === "repository.write"
@@ -140,6 +147,7 @@ function baseEffectsAllowedForRepair(
 ): boolean {
   switch (phase) {
     case "none":
+    case "protocol_repair":
     case "focused": return true;
     case "generic_repair": return effects.some((effect) =>
       effect === "filesystem.write" || effect === "repository.write"
@@ -194,9 +202,75 @@ export function descriptorsAllowedForRepair(
   descriptors: readonly ToolDescriptor[],
   phase = completionRepairPhase(session)
 ): ToolDescriptor[] {
-  return descriptors.filter((descriptor) => descriptorAllowedForRepair(session, descriptor, phase));
+  return descriptors
+    .filter((descriptor) => descriptorAllowedForRepair(session, descriptor, phase))
+    .map((descriptor) => projectedDirectedDescriptor(session, descriptor, phase));
+}
+
+function schemaObject(value: JsonValue | undefined): Record<string, JsonValue> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, JsonValue> : null;
+}
+
+function projectedConflictMutationDescriptor(
+  descriptor: ToolDescriptor,
+  scopePaths: readonly string[]
+): ToolDescriptor {
+  if (!descriptor.possibleEffects.includes("filesystem.write")) return descriptor;
+  const description = `${descriptor.description} During repository conflict resolution, writes are limited to: ${scopePaths.join(", ")}.`;
+  const properties = schemaObject(descriptor.inputSchema.properties);
+  const pathSchema = schemaObject(properties?.path);
+  if (!properties || !pathSchema) return { ...descriptor, description };
+  const { const: _priorConst, enum: _priorEnum, ...basePathSchema } = pathSchema;
+  const projectedPath: Record<string, JsonValue> = scopePaths.length === 1
+    ? { ...basePathSchema, const: scopePaths[0]! }
+    : { ...basePathSchema, enum: [...scopePaths] };
+  return {
+    ...descriptor,
+    description,
+    inputSchema: {
+      ...descriptor.inputSchema,
+      properties: { ...properties, path: projectedPath }
+    }
+  };
+}
+
+function projectedDirectedDescriptor(
+  session: RuntimeSession,
+  descriptor: ToolDescriptor,
+  phase: CompletionRepairPhase
+): ToolDescriptor {
+  if (phase !== "repository_transact") return descriptor;
+  const obligation = session.durable.state.taskControl.obligation;
+  if (obligation?.kind !== "repository_recovery") return descriptor;
+  if (obligation.transactionId && obligation.scopePaths?.length) {
+    if (descriptor.name !== "git_transaction") {
+      return projectedConflictMutationDescriptor(descriptor, obligation.scopePaths);
+    }
+    return {
+      ...descriptor,
+      description: "Continue or abort only the active broker-journaled recovery transaction. Continue accepts add operations only for the broker-observed conflict paths; non-conflicting changes are already applied."
+    };
+  }
+  if (descriptor.name !== "git_transaction"
+    || !obligation.candidateId || !obligation.selectionEvidenceId) return descriptor;
+  return {
+    ...descriptor,
+    description: "Recover the runtime-selected Git candidate with its bound selection evidence. The action and evidence fields are fixed by task control; call git_transaction exactly as projected.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", const: "recover" },
+        candidateId: { type: "string", const: obligation.candidateId },
+        selectionEvidenceId: { type: "string", const: obligation.selectionEvidenceId }
+      },
+      required: ["action", "candidateId", "selectionEvidenceId"],
+      additionalProperties: false
+    }
+  };
 }
 
 export function maximumTaskControlCalls(session: RuntimeSession): number {
-  return completionRepairPhase(session) === "none" ? Number.MAX_SAFE_INTEGER : 1;
+  return ["none", "protocol_repair"].includes(completionRepairPhase(session))
+    ? Number.MAX_SAFE_INTEGER : 1;
 }

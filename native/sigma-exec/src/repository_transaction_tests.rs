@@ -127,6 +127,19 @@ fn conflict_repository(label: &str) -> PathBuf {
     root
 }
 
+fn non_conflicting_merge_repository(label: &str) -> PathBuf {
+    let root = repository(label);
+    git_ok(&root, &["switch", "-qc", "topic"]);
+    fs::write(root.join("topic.txt"), b"topic\n").unwrap();
+    git_ok(&root, &["add", "topic.txt"]);
+    git_ok(&root, &["commit", "-qm", "topic"]);
+    git_ok(&root, &["switch", "-q", "main"]);
+    fs::write(root.join("main.txt"), b"main\n").unwrap();
+    git_ok(&root, &["add", "main.txt"]);
+    git_ok(&root, &["commit", "-qm", "main"]);
+    root
+}
+
 fn begin_conflict(store: &RepositoryTransactions, root: &Path, session: &str, run: &str) -> String {
     let lease_id = acquire(store, root, session, run, None).unwrap();
     let result = store
@@ -207,6 +220,97 @@ fn conflict_begin_edit_continue_and_seal_is_broker_journaled() {
         })
         .unwrap_err();
     assert_eq!(reused.code, "repository_transaction_handle_invalid");
+    remove_any(&root).unwrap();
+}
+
+#[test]
+fn merge_uses_an_isolated_identity_fallback_when_local_identity_is_missing() {
+    let root = non_conflicting_merge_repository("identity-fallback");
+    git_ok(&root, &["config", "--unset", "user.name"]);
+    git_ok(&root, &["config", "--unset", "user.email"]);
+    git_ok(&root, &["config", "user.useConfigOnly", "true"]);
+    let store = test_store("test-identity-fallback");
+    let Some(lease_id) = acquire(&store, &root, "session-identity", "run-identity", None) else {
+        let _ = remove_any(&root);
+        return;
+    };
+    let result = store
+        .begin(
+            2,
+            BeginRepositoryTransactionParams {
+                protocol_version: 2,
+                lease_id,
+                expected_postconditions: None,
+                operations: vec![RepositoryOperationV2 {
+                    operation_class: "merge".into(),
+                    args: vec![
+                        "merge".into(),
+                        "--no-edit".into(),
+                        "--no-verify".into(),
+                        "topic".into(),
+                    ],
+                }],
+            },
+        )
+        .unwrap();
+    assert_eq!(result["status"], "completed_pending_seal");
+    let handle = result["transactionHandle"].as_str().unwrap().to_owned();
+    store
+        .seal(BoundRepositoryTransactionParams {
+            protocol_version: 2,
+            transaction_handle: handle,
+            session_id: "session-identity".into(),
+            run_id: "run-identity".into(),
+        })
+        .unwrap();
+    assert_eq!(
+        git_ok(&root, &["show", "-s", "--format=%an <%ae>", "HEAD"]),
+        "Sigma Repository Transaction <sigma-repository-transaction@example.invalid>"
+    );
+    remove_any(&root).unwrap();
+}
+
+#[test]
+fn merge_preserves_a_repository_local_identity_over_the_broker_fallback() {
+    let root = non_conflicting_merge_repository("identity-local");
+    let store = test_store("test-identity-local");
+    let Some(lease_id) = acquire(&store, &root, "session-local", "run-local", None) else {
+        let _ = remove_any(&root);
+        return;
+    };
+    let result = store
+        .begin(
+            3,
+            BeginRepositoryTransactionParams {
+                protocol_version: 2,
+                lease_id,
+                expected_postconditions: None,
+                operations: vec![RepositoryOperationV2 {
+                    operation_class: "merge".into(),
+                    args: vec![
+                        "merge".into(),
+                        "--no-edit".into(),
+                        "--no-verify".into(),
+                        "topic".into(),
+                    ],
+                }],
+            },
+        )
+        .unwrap();
+    assert_eq!(result["status"], "completed_pending_seal");
+    let handle = result["transactionHandle"].as_str().unwrap().to_owned();
+    store
+        .seal(BoundRepositoryTransactionParams {
+            protocol_version: 2,
+            transaction_handle: handle,
+            session_id: "session-local".into(),
+            run_id: "run-local".into(),
+        })
+        .unwrap();
+    assert_eq!(
+        git_ok(&root, &["show", "-s", "--format=%an <%ae>", "HEAD"]),
+        "Sigma <sigma@example.invalid>"
+    );
     remove_any(&root).unwrap();
 }
 

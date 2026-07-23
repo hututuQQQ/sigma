@@ -576,6 +576,7 @@ class SigmaCliHarborAgent(BaseAgent):
         provider: str = "deepseek",
         model: str | None = None,
         agent_profile: str = "standard",
+        permission_mode: str = "auto",
         network_mode: str = "full",
         execution_mode: str = "sandboxed",
         managed_environment_mode: str = "disabled",
@@ -608,6 +609,11 @@ class SigmaCliHarborAgent(BaseAgent):
         if agent_profile not in {"standard", "strict"}:
             raise ValueError("agent_profile must be one of: standard, strict")
         self.agent_profile = agent_profile
+        if permission_mode not in {"workspace-auto", "ask", "auto", "deny"}:
+            raise ValueError(
+                "permission_mode must be one of: workspace-auto, ask, auto, deny"
+            )
+        self.permission_mode = permission_mode
         if network_mode not in {"none", "loopback", "full"}:
             raise ValueError("network_mode must be one of: none, loopback, full")
         self.network_mode = network_mode
@@ -966,12 +972,12 @@ class SigmaCliHarborAgent(BaseAgent):
             raise RuntimeError(f"{failure_kind}: {error_message or 'agent exited unsuccessfully.'}")
 
     def _permission_mode(self) -> str:
-        # A required managed environment is disposable, isolated, and
-        # launcher-attested before the first model turn. Once its strict
-        # doctor contract has passed, asking a non-interactive Harbor process
-        # for human approval cannot add authority; it can only deadlock the
-        # run. Other topologies retain the narrower workspace-auto policy.
-        return "auto" if self._managed_environment_verified else "workspace-auto"
+        # Harbor evaluation is non-interactive and runs inside a disposable
+        # task environment. A human prompt cannot be answered there, so the
+        # adapter defaults to automatic approval while the configured sandbox,
+        # network policy, and broker-enforced transaction boundaries remain
+        # authoritative. Callers can still request a narrower mode explicitly.
+        return self.permission_mode
 
     def _agent_command(self, context: AgentContext | None = None) -> list[str]:
         if self._workspace is None:

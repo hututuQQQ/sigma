@@ -8,6 +8,7 @@ import type {
   EvidenceRecord,
   JsonValue,
   ModelToolCall,
+  RepositoryRecoverySelectionEvidenceV1,
   RepositoryDeltaEvidence,
   ReviewEvidence,
   ToolCallPlan,
@@ -371,6 +372,188 @@ describe("V5 assurance-coordinated mutation completion", () => {
       coveredPaths: ["native/sigma-exec/src/main.rs", "docs/readme.md"],
       claim: { kind: "acceptance" }
     });
+  });
+
+  it("binds direct compiler acceptance to the source files named by the command", () => {
+    const active = frontierSession();
+    active.durable.state.mutationFrontier.changedPaths = [
+      "proofs/theorem.v",
+      "proofs/.theorem.aux",
+      "proofs/theorem.glob",
+      "proofs/theorem.vo",
+      "proofs/theorem.vok",
+      "proofs/theorem.vos",
+      "legacy/program.cbl",
+      "program",
+      "docs/readme.md"
+    ];
+
+    expect(validationScope(active, {
+      id: "coq-compile", name: "validate",
+      arguments: { shell: "bash", command: "/usr/bin/coqc -q proofs/theorem.v 2>&1" }
+    }, validationPlan)).toMatchObject({
+      coveredPaths: [
+        "proofs/theorem.v",
+        "proofs/.theorem.aux",
+        "proofs/theorem.glob",
+        "proofs/theorem.vo",
+        "proofs/theorem.vok",
+        "proofs/theorem.vos"
+      ],
+      claim: {
+        kind: "acceptance",
+        subject: {
+          exactFiles: [
+            "proofs/.theorem.aux",
+            "proofs/theorem.glob",
+            "proofs/theorem.v",
+            "proofs/theorem.vo",
+            "proofs/theorem.vok",
+            "proofs/theorem.vos"
+          ]
+        }
+      }
+    });
+    expect(validationScope(active, {
+      id: "cobol-compile", name: "validate",
+      arguments: {
+        executable: "cobc",
+        args: ["-x", "-o", "program", "legacy/program.cbl"]
+      }
+    }, validationPlan)).toMatchObject({
+      coveredPaths: ["legacy/program.cbl", "program"],
+      claim: {
+        kind: "acceptance",
+        subject: { exactFiles: ["legacy/program.cbl", "program"] }
+      }
+    });
+    expect(validationScope(active, {
+      id: "compiler-version", name: "validate",
+      arguments: { executable: "coqc", args: ["--version"] }
+    }, validationPlan)).toMatchObject({
+      coveredPaths: [],
+      claim: { kind: "probe", subject: { exactFiles: [] } }
+    });
+  });
+
+  it("treats a transitive document build with environment prefixes as project acceptance", () => {
+    const active = frontierSession();
+    active.durable.state.mutationFrontier.changedPaths = [
+      "main.tex", "chapters/input.tex"
+    ];
+
+    expect(validationScope(active, {
+      id: "document-build", name: "validate",
+      arguments: {
+        shell: "bash",
+        command: "TEXMFVAR=/tmp/tex-var TEXMFCONFIG=/tmp/tex-config pdflatex -interaction=nonstopmode main.tex"
+      }
+    }, validationPlan)).toMatchObject({
+      coveredPaths: ["main.tex", "chapters/input.tex"],
+      claim: {
+        kind: "acceptance",
+        subject: { projectId: ".", exactFiles: [] }
+      }
+    });
+  });
+
+  it("binds strict shell comparison tests to the source programs they execute", () => {
+    const active = frontierSession();
+    active.durable.state.mutationFrontier.changedPaths = [
+      "program.py", "reference.py", "notes.txt"
+    ];
+
+    expect(validationScope(active, {
+      id: "behavior-comparison", name: "validate",
+      arguments: {
+        shell: "bash",
+        command: [
+          "cd .",
+          "python3 program.py > /tmp/actual",
+          "python3 reference.py > /tmp/expected",
+          "diff /tmp/actual /tmp/expected",
+          "echo PASS"
+        ].join(" && ")
+      }
+    }, validationPlan)).toMatchObject({
+      coveredPaths: ["program.py", "reference.py"],
+      claim: {
+        kind: "unit",
+        subject: { exactFiles: ["program.py", "reference.py"] }
+      }
+    });
+  });
+
+  it("does not trust shell comparisons whose failure is explicitly masked", () => {
+    const active = frontierSession();
+    active.durable.state.mutationFrontier.changedPaths = ["program.py"];
+
+    for (const command of [
+      "python3 program.py > /tmp/actual && diff /tmp/actual /tmp/expected || echo FAIL",
+      "python3 program.py > /tmp/actual && diff /tmp/actual /tmp/expected | cat"
+    ]) {
+      expect(validationScope(active, {
+        id: "masked-comparison", name: "validate",
+        arguments: { shell: "bash", command }
+      }, validationPlan)).toMatchObject({
+        coveredPaths: [],
+        claim: { kind: "probe", subject: { exactFiles: [] } }
+      });
+    }
+  });
+
+  it("does not infer tests from shell arguments or failure-masked commands", () => {
+    const active = frontierSession();
+    active.durable.state.mutationFrontier.changedPaths = ["program.py"];
+
+    for (const command of ["echo pytest", "pytest || true", "pytest | cat"]) {
+      expect(validationScope(active, {
+        id: "masked-test", name: "validate",
+        arguments: { shell: "bash", command }
+      }, validationPlan)).toMatchObject({
+        coveredPaths: [],
+        claim: { kind: "probe", subject: { exactFiles: [] } }
+      });
+    }
+    expect(validationScope(active, {
+      id: "strict-test", name: "validate",
+      arguments: { shell: "bash", command: "cd . && pytest tests/test_program.py && echo PASS" }
+    }, validationPlan)).toMatchObject({
+      coveredPaths: ["program.py"],
+      claim: { kind: "unit" }
+    });
+  });
+
+  it("recognizes structured Python syntax checks but not inline source text", () => {
+    const active = frontierSession();
+    active.durable.state.mutationFrontier.changedPaths = ["program.py"];
+
+    expect(validationScope(active, {
+      id: "python-syntax", name: "validate",
+      arguments: {
+        executable: "/usr/bin/python3",
+        args: ["-m", "py_compile", "program.py"]
+      }
+    }, validationPlan)).toMatchObject({
+      coveredPaths: ["program.py"],
+      claim: {
+        kind: "syntax",
+        subject: { exactFiles: ["program.py"] }
+      }
+    });
+    for (const script of [
+      "print('assert')",
+      "print(\"py_compile.compile('program.py')\")",
+      "# assert program behavior"
+    ]) {
+      expect(validationScope(active, {
+        id: "python-inline", name: "validate",
+        arguments: { executable: "/usr/bin/python3", args: ["-c", script] }
+      }, validationPlan)).toMatchObject({
+        coveredPaths: [],
+        claim: { kind: "probe", subject: { exactFiles: [] } }
+      });
+    }
   });
 
   it("recognizes direct Node test and check runners as semantic validation", () => {
@@ -1272,6 +1455,73 @@ describe.skip("V3 run-scoped completion evidence", () => {
     expect(normalized.evidence?.[0]?.evidenceId).not.toBe("attacker-id");
     expect(() => assertToolReceiptIdentity(receipt("forged-call"), "requested-call"))
       .toThrow("does not match requested callId");
+  });
+
+  it("preserves a repository selection capability key while restamping its runtime authority", () => {
+    const capabilityId = "repository-recovery-selection:capability";
+    const selection: RepositoryRecoverySelectionEvidenceV1 = {
+      evidenceId: capabilityId,
+      sessionId: "session",
+      runId: "run",
+      kind: "repository_recovery_selection",
+      status: "passed",
+      createdAt: now,
+      producer: { authority: "runtime", id: "inspect-call" },
+      summary: "selected",
+      data: {
+        schemaVersion: 1,
+        goalEpoch: 7,
+        repositoryRoot: ".",
+        candidateId: "c".repeat(64),
+        selectedObject: "d".repeat(40),
+        selectionKind: "unique",
+        inspectionBasisDigest: "1".repeat(64),
+        inspectedHead: "2".repeat(40),
+        inspectedSymbolicRef: "refs/heads/main",
+        statusDigest: "3".repeat(64),
+        refsDigest: "4".repeat(64),
+        reflogDigest: "5".repeat(64),
+        repositoryStateDigest: "6".repeat(64)
+      }
+    };
+    const plan: ToolCallPlan = {
+      exactEffects: ["filesystem.read", "process.spawn.readonly"],
+      readPaths: ["."], writePaths: [], network: "none", processMode: "pipe",
+      checkpointScope: [], idempotence: "read_only"
+    };
+    const inspection = {
+      ...receipt("inspect-call"),
+      observedEffects: ["filesystem.read", "process.spawn.readonly"] as const,
+      actualEffects: ["filesystem.read", "process.spawn.readonly"] as const,
+      evidence: [selection]
+    };
+    const normalized = normalizeReceiptEvidence(inspection, "repository_inspect", plan, {
+      sessionId: "session",
+      runId: "run",
+      workspaceDeltas: [],
+      repositoryScope: {
+        goalEpoch: 7,
+        frontier: {
+          revision: 0,
+          baselineManifestDigest: "0".repeat(64),
+          currentStateDigest: "0".repeat(64),
+          changedPaths: [],
+          sourceCheckpointIds: []
+        },
+        mutationEvidence: []
+      }
+    });
+    expect(normalized.evidence).toMatchObject([{
+      evidenceId: capabilityId,
+      sessionId: "session",
+      runId: "run",
+      kind: "repository_recovery_selection",
+      producer: { authority: "runtime", id: "inspect-call" }
+    }]);
+    const rejected = normalizeReceiptEvidence(inspection, "external_tool", plan, {
+      sessionId: "session", runId: "run", workspaceDeltas: []
+    });
+    expect(rejected.evidence?.some((item) => item.evidenceId === capabilityId)).toBe(false);
   });
 
   it("issues repository acceptance only for broker-proved recovery targets in the current goal epoch", () => {

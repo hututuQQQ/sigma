@@ -78,16 +78,23 @@ function object(value: unknown): Record<string, unknown> | null {
 }
 
 function semanticReadSubject(toolName: string, receipt: ToolReceipt): unknown | null {
-  if (!CONTENT_READ_TOOLS.has(toolName)) return null;
-  const result = object(receipt.result);
-  if (toolName === "read" && result?.status === "read"
-    && typeof result.path === "string" && typeof result.sha256 === "string") {
-    return { toolName, path: result.path, contentDigest: result.sha256 };
+  if (CONTENT_READ_TOOLS.has(toolName)) {
+    const result = object(receipt.result);
+    if (toolName === "read" && result?.status === "read"
+      && typeof result.path === "string" && typeof result.sha256 === "string") {
+      return { toolName, path: result.path, contentDigest: result.sha256 };
+    }
+    return {
+      toolName,
+      contentDigest: createHash("sha256").update(receipt.output, "utf8").digest("hex")
+    };
   }
-  return {
-    toolName,
-    contentDigest: createHash("sha256").update(receipt.output, "utf8").digest("hex")
-  };
+  // Process receipts describe an execution result, not a stable workspace
+  // subject. Their output may vary with clocks, progress reporting, entropy,
+  // or process state while the workspace is unchanged. Semantic validation
+  // and input-access evidence are recorded separately with authenticated
+  // frontier bindings; arbitrary process stdout must not reset convergence.
+  return null;
 }
 
 export function recordSemanticEvidenceProgress(state: KernelState, evidence: EvidenceRecord): KernelState {

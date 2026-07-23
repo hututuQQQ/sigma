@@ -5,6 +5,7 @@ import type {
   ToolEffect
 } from "../packages/agent-protocol/src/index.js";
 import { ToolApprovalCoordinator } from "../packages/agent-runtime/src/tool-approval-coordinator.js";
+import { repositoryRecoveryObligation } from "../packages/agent-kernel/src/index.js";
 import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
 import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
 import { describe, expect, it, vi } from "vitest";
@@ -121,6 +122,163 @@ describe("deny-mode internal terminal approval", () => {
 });
 
 describe("sensitive external-read and handoff approval", () => {
+  it("workspace-auto issues a bound automatic grant for an authenticated recovery transaction", async () => {
+    const emit = vi.fn(async () => ({}));
+    const coordinator = new ToolApprovalCoordinator({
+      runtime: { permissionMode: "workspace-auto", interactiveApprovals: false } as never,
+      emit: emit as never,
+      finish: vi.fn() as never
+    });
+    const session = runtimeSessionFixture();
+    const candidateId = "c".repeat(64);
+    const selectionEvidenceId = "repository-recovery-selection:selection";
+    session.durable.state.taskControl = repositoryRecoveryObligation(
+      session.durable.state.taskControl,
+      session.durable.state.revision,
+      "transact",
+      { candidateId, selectionEvidenceId },
+      { candidateId, selectionEvidenceId }
+    );
+    const recoveryCall: ModelToolCall = {
+      id: "recover",
+      name: "git_transaction",
+      arguments: { action: "recover", candidateId, selectionEvidenceId }
+    };
+    const recoveryDescriptor: ToolDescriptor = {
+      ...descriptor(["repository.write", "filesystem.write", "destructive"]),
+      name: "git_transaction",
+      brokerMutationAuthority: "repository_transaction_v2"
+    };
+    const recoveryPlan: ToolCallPlan = {
+      ...plan(["repository.write", "filesystem.write", "destructive"]),
+      mutationAuthority: "broker_repository_transaction_v2",
+      writePaths: ["."],
+      idempotence: "non_replayable"
+    };
+    const prepared = {
+      call: recoveryCall,
+      modelTurn: { turnId: 1, effectRevision: 1 },
+      descriptor: recoveryDescriptor,
+      plan: recoveryPlan
+    };
+
+    await expect(coordinator.decision(
+      session, prepared, new AbortController().signal
+    )).resolves.toBe("allow");
+    expect(coordinator.consume(session, prepared)).toMatchObject({ authority: "runtime" });
+    expect(emit).toHaveBeenCalledWith(
+      session,
+      "tool.approval_requested",
+      "runtime",
+      expect.objectContaining({ approvalMode: "automatic", toolName: "git_transaction" })
+    );
+  });
+
+  it("workspace-auto automatically continues only the bound recovery conflict paths", async () => {
+    const emit = vi.fn(async () => ({}));
+    const coordinator = new ToolApprovalCoordinator({
+      runtime: { permissionMode: "workspace-auto", interactiveApprovals: false } as never,
+      emit: emit as never,
+      finish: vi.fn() as never
+    });
+    const session = runtimeSessionFixture();
+    session.durable.state.taskControl = repositoryRecoveryObligation(
+      session.durable.state.taskControl,
+      session.durable.state.revision,
+      "transact",
+      { conflict: "pending" },
+      { transactionId: "bound-transaction", scopePaths: ["src/conflict.ts"] }
+    );
+    const continuationCall: ModelToolCall = {
+      id: "continue",
+      name: "git_transaction",
+      arguments: {
+        action: "continue",
+        transactionHandle: "bound-transaction",
+        operations: [{ op: "add", paths: ["src/conflict.ts"] }]
+      }
+    };
+    const continuationDescriptor: ToolDescriptor = {
+      ...descriptor(["repository.write", "filesystem.write"]),
+      name: "git_transaction",
+      brokerMutationAuthority: "repository_transaction_v2"
+    };
+    const continuationPlan: ToolCallPlan = {
+      ...plan(["repository.write", "filesystem.write"]),
+      mutationAuthority: "broker_repository_transaction_v2",
+      writePaths: ["."],
+      idempotence: "non_replayable"
+    };
+    const prepared = {
+      call: continuationCall,
+      modelTurn: { turnId: 1, effectRevision: 1 },
+      descriptor: continuationDescriptor,
+      plan: continuationPlan
+    };
+
+    await expect(coordinator.decision(
+      session, prepared, new AbortController().signal
+    )).resolves.toBe("allow");
+    expect(coordinator.consume(session, prepared)).toMatchObject({ authority: "runtime" });
+    expect(emit).toHaveBeenCalledWith(
+      session,
+      "tool.approval_requested",
+      "runtime",
+      expect.objectContaining({ approvalMode: "automatic", toolName: "git_transaction" })
+    );
+  });
+
+  it("workspace-auto does not auto-approve an off-scope recovery continuation", async () => {
+    const emit = vi.fn(async () => ({}));
+    const finish = vi.fn(async () => true);
+    const coordinator = new ToolApprovalCoordinator({
+      runtime: { permissionMode: "workspace-auto", interactiveApprovals: false } as never,
+      emit: emit as never,
+      finish: finish as never
+    });
+    const session = runtimeSessionFixture();
+    session.durable.state.taskControl = repositoryRecoveryObligation(
+      session.durable.state.taskControl,
+      session.durable.state.revision,
+      "transact",
+      { conflict: "pending" },
+      { transactionId: "bound-transaction", scopePaths: ["src/conflict.ts"] }
+    );
+    const prepared = {
+      call: {
+        id: "continue-off-scope",
+        name: "git_transaction",
+        arguments: {
+          action: "continue",
+          transactionHandle: "bound-transaction",
+          operations: [{ op: "add", paths: ["src/unrelated.ts"] }]
+        }
+      },
+      modelTurn: { turnId: 1, effectRevision: 1 },
+      descriptor: {
+        ...descriptor(["repository.write", "filesystem.write"]),
+        name: "git_transaction",
+        brokerMutationAuthority: "repository_transaction_v2" as const
+      },
+      plan: {
+        ...plan(["repository.write", "filesystem.write"]),
+        mutationAuthority: "broker_repository_transaction_v2" as const,
+        writePaths: ["."],
+        idempotence: "non_replayable" as const
+      }
+    };
+
+    await expect(coordinator.decision(
+      session, prepared, new AbortController().signal
+    )).rejects.toMatchObject({ code: "approval_needs_input" });
+    expect(finish).toHaveBeenCalledWith(
+      session,
+      expect.objectContaining({ kind: "needs_input" }),
+      undefined,
+      expect.any(Object)
+    );
+  });
+
   it("workspace-auto permits local writes but prompts for authority expansion", async () => {
     const emit = vi.fn(async () => ({}));
     const coordinator = new ToolApprovalCoordinator({

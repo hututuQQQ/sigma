@@ -118,6 +118,33 @@ describe("semantic fact ledger", () => {
     expect(state.taskControl.semanticFacts.entries).toEqual([]);
   });
 
+  it("does not count changing read-only process output as workspace progress", () => {
+    const diagnostic = (callId: string, output: string): ToolReceipt => receipt({
+      callId,
+      output,
+      observedEffects: ["process.spawn.readonly"],
+      actualEffects: ["process.spawn.readonly"]
+    });
+    let state = recordSemanticToolResult(initial(), diagnostic("one", "first observation"), "shell").state;
+    state = recordSemanticToolResult(state, diagnostic("two", "first observation"), "shell").state;
+    state = recordSemanticToolResult(state, diagnostic("three", "second observation"), "shell").state;
+    expect(state.taskControl.semanticFacts.entries).toEqual([]);
+  });
+
+  it("rejects failed or mutating process output as semantic progress", () => {
+    let state = recordSemanticToolResult(initial(), receipt({
+      ok: false,
+      observedEffects: ["process.spawn.readonly"],
+      actualEffects: ["process.spawn.readonly"]
+    }), "shell").state;
+    state = recordSemanticToolResult(state, receipt({
+      callId: "mutating",
+      observedEffects: ["process.spawn", "filesystem.write"],
+      actualEffects: ["process.spawn", "filesystem.write"]
+    }), "shell").state;
+    expect(state.taskControl.semanticFacts.entries).toEqual([]);
+  });
+
   it("deduplicates exact content facts while accepting a genuinely new content digest", () => {
     const read = (callId: string, sha256: string): ToolReceipt => receipt({
       callId,

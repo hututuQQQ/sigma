@@ -8,6 +8,7 @@ import {
   type JsonValue,
   type ToolReceipt
 } from "../packages/agent-protocol/src/index.js";
+import { failedTerminalRepairState } from "../packages/agent-kernel/src/model-convergence.js";
 import {
   advanceReviewRepair,
   advanceRepositoryEvidenceObligation,
@@ -35,10 +36,12 @@ import {
   taskControlAnswer,
   taskControlFailureMessage,
   terminalResolutionObligation,
+  toolPolicyCorrectionExhausted,
   userDecisionObligation,
   type KernelState,
   type TaskControlStateV1
 } from "../packages/agent-kernel/src/index.js";
+import { completedToolBatchProgress } from "../packages/agent-kernel/src/tool-batch-progress.js";
 
 const NOW = "2026-07-22T00:00:00.000Z";
 const DIGEST_A = "a".repeat(64);
@@ -232,6 +235,94 @@ describe("TaskControlStateV1", () => {
       phase: "terminal",
       obligation: { kind: "terminal_resolution", failureCode: "action_convergence_no_progress" }
     });
+  });
+
+  it("treats a compliant tool batch as acceptance of the pending policy correction", () => {
+    const state = initial();
+    const first = recordToolPolicyViolation(
+      state.taskControl,
+      "model_tool_policy_violation",
+      state.revision
+    );
+    const accepted = completedToolBatchProgress({
+      ...state,
+      taskControl: first,
+      messages: [{
+        role: "assistant",
+        content: "",
+        toolCalls: [{ id: "exec-call", name: "read", arguments: { path: "README.md" } }]
+      }],
+      receipts: [receipt("read succeeded")]
+    }).taskControl;
+
+    expect(accepted.policyCorrection).toBeUndefined();
+    const later = recordToolPolicyViolation(
+      accepted,
+      "tool_unavailable_for_repair",
+      state.revision + 1
+    );
+    expect(later.policyCorrection).toMatchObject({ attempts: 1 });
+    expect(later.obligation).toBeUndefined();
+  });
+
+  it("offers one real correction even when another obligation is already terminal", () => {
+    const state = initial();
+    const terminal = {
+      ...state,
+      taskControl: terminalResolutionObligation(
+        state.taskControl,
+        state.revision,
+        "action_convergence_no_progress"
+      )
+    };
+    const rejected: ToolReceipt = {
+      callId: "terminal-rejection",
+      ok: false,
+      output: "not offered",
+      outcome: {
+        status: "failed",
+        output: "not offered",
+        diagnosticCodes: ["tool_unavailable_for_repair"]
+      },
+      observedEffects: [],
+      actualEffects: [],
+      artifacts: [],
+      diagnostics: ["tool_unavailable_for_repair"],
+      startedAt: NOW,
+      completedAt: NOW
+    };
+
+    const correction = failedTerminalRepairState(terminal, true, true, rejected, 0);
+    expect(correction).toMatchObject({
+      phase: "ready_model",
+      taskControl: {
+        obligation: { kind: "terminal_resolution" },
+        policyCorrection: { attempts: 1 }
+      }
+    });
+    expect(correction?.proposedOutcome).toBeUndefined();
+  });
+
+  it("does not treat an initially terminal user decision as an exhausted correction", () => {
+    const decision = userDecisionObligation(
+      createTaskControlState(),
+      1,
+      "choose_recovery_candidate"
+    );
+    const first = recordToolPolicyViolation(decision, "model_tool_policy_violation", 2);
+    expect(first).toMatchObject({
+      phase: "terminal",
+      obligation: { kind: "user_decision" },
+      policyCorrection: { attempts: 1 }
+    });
+    expect(toolPolicyCorrectionExhausted(first)).toBe(false);
+
+    const second = recordToolPolicyViolation(first, "model_tool_policy_violation", 3);
+    expect(second).toMatchObject({
+      obligation: { kind: "terminal_resolution", failureCode: "user_decision_action_required" },
+      policyCorrection: { attempts: 2 }
+    });
+    expect(toolPolicyCorrectionExhausted(second)).toBe(true);
   });
 
   it("preserves the unresolved completion prerequisite when correction is exhausted", () => {

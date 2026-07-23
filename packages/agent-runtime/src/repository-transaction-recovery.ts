@@ -15,6 +15,7 @@ export interface RecoveryBinding {
   selectionEvidenceId: string;
   selectedObject: string;
   selectedSymbolicRef: string | null;
+  integrationMode: "exact_head" | "merge";
 }
 
 function requireRecoverySelection(
@@ -82,13 +83,23 @@ export async function recoveryOperation(
       "Repository state changed after recovery selection; inspect again before recovery."
     ), { code: "repository_recovery_selection_stale" });
   }
+  if (candidate.relationToHead !== "descendant_of_head"
+    && candidate.relationToHead !== "diverged") {
+    throw Object.assign(new Error(
+      "The selected recovery candidate has no safe integration relation to the current HEAD."
+    ), { code: "repository_recovery_relation_unsupported" });
+  }
+  const integrationMode = candidate.relationToHead === "diverged" ? "merge" : "exact_head";
   return {
-    operation: { op: "reset", mode: "hard", target: selected.selectedObject },
+    operation: integrationMode === "merge"
+      ? { op: "merge", target: selected.selectedObject }
+      : { op: "reset", mode: "hard", target: selected.selectedObject },
     binding: {
       candidateId: input.candidateId!,
       selectionEvidenceId: input.selectionEvidenceId!,
       selectedObject: selected.selectedObject,
-      selectedSymbolicRef: current.symbolicRef
+      selectedSymbolicRef: current.symbolicRef,
+      integrationMode
     }
   };
 }

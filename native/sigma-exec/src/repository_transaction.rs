@@ -20,6 +20,8 @@ const JOURNAL_VERSION: u32 = 2;
 const RUN_BASELINE_VERSION: u32 = 1;
 const DEFAULT_MAX_FILES: u64 = 200_000;
 const DEFAULT_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const BROKER_FALLBACK_USER_NAME: &str = "user.name=Sigma Repository Transaction";
+const BROKER_FALLBACK_USER_EMAIL: &str = "user.email=sigma-repository-transaction@example.invalid";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -2119,29 +2121,83 @@ fn run_git_bounded(
     args: &[String],
     cancelled: impl Fn() -> bool,
 ) -> Result<GitOutput, RpcError> {
+    let cancelled = &cancelled as &dyn Fn() -> bool;
+    let identity_fallbacks = if git_operation_may_create_commit(args) {
+        repository_identity_fallbacks(journal, cancelled)?
+    } else {
+        Vec::new()
+    };
+    run_git_bounded_inner(journal, args, cancelled, &identity_fallbacks)
+}
+
+fn git_operation_may_create_commit(args: &[String]) -> bool {
+    args.first().is_some_and(|command| {
+        matches!(
+            command.as_str(),
+            "commit" | "merge" | "rebase" | "cherry-pick" | "revert"
+        )
+    })
+}
+
+fn repository_identity_fallbacks(
+    journal: &RepositoryTransactionJournalV2,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<&'static str>, RpcError> {
+    let mut fallbacks = Vec::new();
+    for (key, fallback) in [
+        ("user.name", BROKER_FALLBACK_USER_NAME),
+        ("user.email", BROKER_FALLBACK_USER_EMAIL),
+    ] {
+        let output = run_git_bounded_inner(
+            journal,
+            &["config".into(), "--get".into(), key.into()],
+            cancelled,
+            &[],
+        )?;
+        match output.exit_code {
+            0 if !output.stdout.trim().is_empty() => {}
+            0 | 1 => fallbacks.push(fallback),
+            _ => {
+                return Err(RpcError::new(
+                    "repository_state_unavailable",
+                    format!("repository Git identity setting {key} could not be inspected"),
+                ));
+            }
+        }
+    }
+    Ok(fallbacks)
+}
+
+fn run_git_bounded_inner(
+    journal: &RepositoryTransactionJournalV2,
+    args: &[String],
+    cancelled: &dyn Fn() -> bool,
+    config_overrides: &[&str],
+) -> Result<GitOutput, RpcError> {
     repin_executable(&journal.executable, &journal.executable_sha256)?;
     validate_live_topology(journal)?;
     let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
     let mut command = Command::new(&journal.executable);
-    command
-        .current_dir(&journal.repository_root)
-        .args([
-            "-c",
-            &format!("core.hooksPath={null_device}"),
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "commit.gpgSign=false",
-            "-c",
-            "tag.gpgSign=false",
-            "-c",
-            "merge.gpgSign=false",
-            "-c",
-            "merge.verifySignatures=false",
-            "-c",
-            "rebase.gpgSign=false",
-        ])
-        .arg(format!("--git-dir={}", journal.git_dir.display()));
+    command.current_dir(&journal.repository_root).args([
+        "-c",
+        &format!("core.hooksPath={null_device}"),
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "commit.gpgSign=false",
+        "-c",
+        "tag.gpgSign=false",
+        "-c",
+        "merge.gpgSign=false",
+        "-c",
+        "merge.verifySignatures=false",
+        "-c",
+        "rebase.gpgSign=false",
+    ]);
+    for value in config_overrides {
+        command.args(["-c", value]);
+    }
+    command.arg(format!("--git-dir={}", journal.git_dir.display()));
     if journal.repository_root != journal.git_dir {
         command.arg(format!("--work-tree={}", journal.repository_root.display()));
     }
