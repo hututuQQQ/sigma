@@ -35,7 +35,7 @@ function targetDelta(session: RuntimeSession, command: ReviewerWaiverCommand): W
   const scope = requested ? `checkpoint '${requested}'` : "the current session";
   throw commandError(
     "reviewer_waiver_not_pending",
-    `No pending independent-review obligation exists for ${scope}.`
+    `No unreviewed mutation delta exists for ${scope}.`
   );
 }
 

@@ -26,7 +26,7 @@ const DEFAULT_SEGMENT_EVENTS = 10_000;
 export interface SessionMetaV5 {
   schemaVersion: typeof STORE_LAYOUT_VERSION;
   eventSchemaVersion: typeof EVENT_SCHEMA_VERSION;
-  snapshotSchemaVersion: typeof SNAPSHOT_SCHEMA_VERSION;
+  snapshotSchemaVersion: 5 | typeof SNAPSHOT_SCHEMA_VERSION;
   sessionId: string;
   createdAt: string;
   updatedAt: string;
@@ -40,9 +40,15 @@ interface StoredRecord {
   event: AnyTypedAgentEvent;
 }
 
+interface LegacySnapshotEnvelopeV5 {
+  schemaVersion: 5; storeLayoutVersion: typeof STORE_LAYOUT_VERSION;
+  sessionId: string; seq: number;
+  createdAt: string; state: unknown;
+}
+
 interface StoredSnapshot {
   checksum: string;
-  snapshot: SnapshotEnvelope;
+  snapshot: SnapshotEnvelope | LegacySnapshotEnvelopeV5;
 }
 
 interface EventCursor {
@@ -62,7 +68,7 @@ export function isSessionMetaV5(value: unknown, sessionId?: string): value is Se
   return [
     meta.schemaVersion === STORE_LAYOUT_VERSION,
     meta.eventSchemaVersion === EVENT_SCHEMA_VERSION,
-    meta.snapshotSchemaVersion === SNAPSHOT_SCHEMA_VERSION,
+    meta.snapshotSchemaVersion === 5 || meta.snapshotSchemaVersion === SNAPSHOT_SCHEMA_VERSION,
     typeof meta.sessionId === "string" && meta.sessionId.length > 0,
     sessionId === undefined || meta.sessionId === sessionId,
     typeof meta.createdAt === "string" && Number.isFinite(Date.parse(meta.createdAt)),
@@ -77,8 +83,19 @@ function checksum(event: AnyTypedAgentEvent): string {
   return createHash("sha256").update(JSON.stringify(event)).digest("hex");
 }
 
-function snapshotChecksum(snapshot: SnapshotEnvelope): string {
+function snapshotChecksum(snapshot: SnapshotEnvelope | LegacySnapshotEnvelopeV5): string {
   return createHash("sha256").update(JSON.stringify(snapshot)).digest("hex");
+}
+
+function isLegacySnapshotEnvelopeV5(value: unknown): value is LegacySnapshotEnvelopeV5 {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const snapshot = value as Record<string, unknown>;
+  return snapshot.schemaVersion === 5
+    && snapshot.storeLayoutVersion === STORE_LAYOUT_VERSION
+    && typeof snapshot.sessionId === "string" && snapshot.sessionId.length > 0
+    && Number.isSafeInteger(snapshot.seq) && Number(snapshot.seq) >= 0
+    && typeof snapshot.createdAt === "string" && Number.isFinite(Date.parse(snapshot.createdAt))
+    && snapshot.state !== undefined;
 }
 
 function storedLine(event: AnyTypedAgentEvent): string {
@@ -310,9 +327,13 @@ export class SegmentedJsonlStore implements RunStore {
     for (const file of files) {
       try {
         const stored = JSON.parse(await readFile(path.join(directory, file), "utf8")) as StoredSnapshot;
-        assertSnapshotEnvelope(stored.snapshot);
+        if (stored.snapshot?.schemaVersion === SNAPSHOT_SCHEMA_VERSION) {
+          assertSnapshotEnvelope(stored.snapshot);
+        } else if (!isLegacySnapshotEnvelopeV5(stored.snapshot)) {
+          continue;
+        }
         if (stored.snapshot.sessionId === sessionId && snapshotChecksum(stored.snapshot) === stored.checksum) {
-          return stored.snapshot;
+          return stored.snapshot as SnapshotEnvelope;
         }
       } catch {
         // A previous complete snapshot remains a valid recovery point.

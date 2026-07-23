@@ -22,7 +22,7 @@ import { runProcess, runtimeEnvironment, shellInvocation } from "../packages/age
 import {
   EffectToolRegistry,
   isToolAllowed,
-  parseCompletionProposal,
+  parseBlockedReport,
   registerBuiltinTools,
   registerCompletionTool,
   registerSupervisorTools,
@@ -55,19 +55,17 @@ function request(callId: string, name: string, args: JsonValue): ToolRequest {
 }
 
 describe("context, platform, and repository tool capabilities", () => {
-  it("accepts only the V5 runtime-owned completion shape", () => {
-    expect(parseCompletionProposal({
-      summary: "bypass",
-      criteria: [{
-        criterion: "The requested change is complete.",
-        status: "not_applicable",
-        evidence: [],
-        rationale: "claimed unnecessary"
-      }]
-    })).toBeNull();
-    expect(parseCompletionProposal({ summary: " verified ", warnings: ["review unavailable"] }))
-      .toEqual({ summary: "verified", warnings: ["review unavailable"] });
-    expect(parseCompletionProposal({ summary: "verified", unknown: true })).toBeNull();
+  it("accepts only the explicit blocked-report shape", () => {
+    expect(parseBlockedReport({
+      code: "dependency_missing",
+      summary: "A required external dependency is unavailable.",
+      recoveryAttempted: "Checked the configured runtime."
+    })).toEqual({
+      code: "dependency_missing",
+      summary: "A required external dependency is unavailable.",
+      recoveryAttempted: "Checked the configured runtime."
+    });
+    expect(parseBlockedReport({ code: "blocked", summary: "reason", unknown: true })).toBeNull();
   });
 
   it("exposes an ID-free internal review request without asking the user to re-authorize code", async () => {
@@ -78,7 +76,7 @@ describe("context, platform, and repository tool capabilities", () => {
       properties: {},
       required: []
     });
-    expect(review.description).toContain("internal review");
+    expect(review.description).toContain("independent review");
     expect(review.description).toContain("Supply no evidence IDs");
     const runtimeControl = {
       requestReview: async () => ({
@@ -104,24 +102,19 @@ describe("context, platform, and repository tool capabilities", () => {
     });
   });
 
-  it("keeps completion, blocked-report, and user-input terminal capabilities orthogonal", async () => {
+  it("keeps explicit blocked-report and user-input capabilities orthogonal", async () => {
     const tools = registerCompletionTool(new EffectToolRegistry());
-    const completion = tools.descriptor("runtime_finalize")!;
     const input = tools.descriptor("request_user_input")!;
     const blocked = tools.descriptor("report_blocked")!;
-    expect(completion.inputSchema).toMatchObject({
-      properties: { summary: { type: "string" }, warnings: { type: "array" } },
-      additionalProperties: false
-    });
-    expect(terminalProtocolAction(completion)).toBe("complete");
+    expect(tools.descriptor("runtime_finalize")).toBeUndefined();
     expect(terminalProtocolAction(blocked)).toBe("report_blocked");
     expect(terminalProtocolAction(input)).toBe("request_input");
     expect(terminalProtocolAction({
       possibleEffects: ["outcome.propose", "outcome.request_input"]
     })).toBeNull();
     expect(terminalProtocolAction({
-      possibleEffects: ["outcome.propose"],
-      maximumEffects: ["outcome.propose", "filesystem.write"]
+      possibleEffects: ["outcome.report_blocked"],
+      maximumEffects: ["outcome.report_blocked", "filesystem.write"]
     })).toBeNull();
 
     const requested = await tools.execute(request(
@@ -134,18 +127,18 @@ describe("context, platform, and repository tool capabilities", () => {
       observedEffects: ["outcome.request_input"],
       diagnostics: []
     });
-    const completed = await tools.execute(request(
-      "complete",
-      "runtime_finalize",
-      { summary: "done", warnings: ["advisory review was unavailable"] }
+    const reported = await tools.execute(request(
+      "blocked",
+      "report_blocked",
+      { code: "external_constraint", summary: "A real external constraint remains." }
     ), context("."));
-    expect(completed).toMatchObject({
+    expect(reported).toMatchObject({
       ok: true,
-      observedEffects: ["outcome.propose"],
+      observedEffects: ["outcome.report_blocked"],
       diagnostics: []
     });
-    expect(JSON.parse(completed.output)).toEqual({
-      summary: "done", warnings: ["advisory review was unavailable"]
+    expect(JSON.parse(reported.output)).toEqual({
+      code: "external_constraint", summary: "A real external constraint remains."
     });
   });
 
@@ -312,7 +305,7 @@ describe("context, platform, and repository tool capabilities", () => {
       repositoryStatistics: repositoryStatisticsJson,
       repositoryTextSearch: repositoryTextSearchJsonLines
     });
-    expect(tools.descriptors().map((item) => item.name)).toEqual(expect.arrayContaining(["runtime_finalize", "request_user_input"]));
+    expect(tools.descriptors().map((item) => item.name)).toEqual(expect.arrayContaining(["report_blocked", "request_user_input"]));
     expect(tools.modelDescriptors().map((item) => item.name)).not.toContain("runtime_finalize");
     expect(tools.descriptor("exec")).toMatchObject({ timeoutMs: 750_000 });
     expect(tools.descriptor("exec")?.idleTimeoutMs).toBeUndefined();

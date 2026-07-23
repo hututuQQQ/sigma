@@ -118,7 +118,7 @@ function requestReviewTool(): RegisteredEffectTool {
   return {
     descriptor: descriptor(
       "request_review",
-      "Eligible workspace changes receive internal review automatically after passed validation. Use this tool only when completion_status requests review or to retry a prior reviewer infrastructure/interruption failure. Supply no evidence IDs: the runtime selects the current frontier and validation. Genuine changes_requested findings must be addressed and revalidated first.",
+      "Request an independent review of the current mutation frontier. Supply no evidence IDs: the runtime binds the current frontier, structural validation records, and latest completion candidate. A failed or unavailable review is returned as an ordinary receipt; choose the next step yourself.",
       {}
     ),
     async execute(request, context) {

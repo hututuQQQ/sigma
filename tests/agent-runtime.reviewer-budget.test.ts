@@ -656,7 +656,7 @@ describe("independent reviewer budget accounting", () => {
     });
   });
 
-  it("caps explicit infrastructure retries at two per review basis", async () => {
+  it("runs one reviewer attempt per model request and leaves infrastructure retries to the model", async () => {
     const target = runtimeSession();
     let calls = 0;
     const reviewer: ReviewerPort = {
@@ -686,11 +686,12 @@ describe("independent reviewer budget accounting", () => {
     };
     const { emit } = harness(target);
     await new ReviewCoordinator(reviewer, emit).maybeReview(target, new AbortController().signal);
+    expect(calls).toBe(1);
     await new ReviewCoordinator(reviewer, emit).maybeReview(target, new AbortController().signal, true);
     await new ReviewCoordinator(reviewer, emit).maybeReview(target, new AbortController().signal, true);
     await new ReviewCoordinator(reviewer, emit).maybeReview(target, new AbortController().signal, true);
 
-    expect(calls).toBe(3);
+    expect(calls).toBe(4);
   });
 
   it("refreshes a rejected review only for substantively new validation evidence", async () => {

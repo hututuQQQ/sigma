@@ -10,10 +10,7 @@ import type { RuntimeSession } from "./types.js";
 import { failed } from "./tool-receipt.js";
 
 export {
-  completionFailure,
-  completionPlan,
-  completionPlanError,
-  currentRunEvidence
+  completionFailure
 } from "./completion-evidence-gate.js";
 export { failed } from "./tool-receipt.js";
 

@@ -6,7 +6,11 @@ import {
   type RunOutcome
 } from "agent-protocol";
 import type { KernelEffect } from "agent-kernel";
-import { RepositoryContextProvider, type ContextPlan } from "agent-context";
+import {
+  RepositoryContextProvider,
+  historyAfterArchive,
+  type ContextPlan
+} from "agent-context";
 import { isToolAllowed } from "agent-tools";
 import {
   sessionSkillProjectionCapabilities,
@@ -21,7 +25,6 @@ import {
 } from "./model-accounting.js";
 import { evidenceLedger } from "./model-evidence-ledger.js";
 import { profileAllowsTool } from "./profile-policy.js";
-import { completionRepairPhase, descriptorsAllowedForRepair } from "./tool-turn-policy.js";
 import {
   modelFailureCode,
   modelFailureDiagnostics,
@@ -30,15 +33,17 @@ import {
 } from "./model-effect-support.js";
 import { deadlineForecast, type DeadlineForecast } from "./convergence-policy.js";
 import {
-  deadlineBudgetStage,
   availableModelBudget,
   budgetFailure,
   fitPreparedBudget,
   prepareBudgetedModelTurn,
-  requestCapacity,
-  type BudgetStage,
-  type PreparedModelTurn
+  type PreparedModelTurn,
+  type TurnPreparationInput
 } from "./model-budget-convergence.js";
+import {
+  ModelSummarizer
+} from "./model-summarizer.js";
+import { refreshContextArchive } from "./context-archive-refresh.js";
 
 type RequestModelEffect = Extract<KernelEffect, { type: "request_model" }>;
 
@@ -56,21 +61,16 @@ function modelVisibleOutputTruncatedBytes(session: RuntimeSession): number {
     }, 0);
 }
 
-function takeUnloadedSummary(session: RuntimeSession, plan: ContextPlan): ContextItem | undefined {
-  const summary = plan.summary;
-  if (!summary || session.interaction.loadedContextIds.has(summary.id)) return undefined;
-  session.interaction.loadedContextIds.add(summary.id);
-  return summary;
-}
-
 export class ModelEffectRunner {
   private readonly repositoryContext: RepositoryContextProvider;
+  private readonly summarizer: ModelSummarizer;
 
   constructor(private readonly options: EffectRunnerOptions) {
     // Pre-model context is trusted, read-only runtime work. Keeping it on the
     // host filesystem prevents an indexing probe from consuming or closing the
     // shared sandbox broker used by model-requested tools and background work.
     this.repositoryContext = new RepositoryContextProvider();
+    this.summarizer = new ModelSummarizer(options);
   }
 
   async request(session: RuntimeSession, signal: AbortSignal, effect: RequestModelEffect): Promise<boolean> {
@@ -167,7 +167,8 @@ export class ModelEffectRunner {
       kind: "context.composition",
       ...plan.budget,
       latestHistoryBlockTokens: plan.latestHistoryBlockTokens,
-      omittedHistoryTurns: plan.omittedHistoryTurns,
+      omittedHistoryTurns: plan.omittedHistoryTurns
+        + (session.durable.state.contextArchive?.omittedHistoryTurns ?? 0),
       cacheMode: plan.cacheMode,
       historyTokenLimit: plan.historyTokenLimit,
       dynamicSuffixTokens: plan.dynamicSuffixTokens,
@@ -189,17 +190,12 @@ export class ModelEffectRunner {
       ?? this.options.runtime.tools.descriptors();
     const availableDescriptors = modelDescriptors.filter((item) =>
       isToolAllowed(item, session.durable.mode) && profileAllowsTool(session, item));
-    const repairPhase = completionRepairPhase(session);
-    // Every protocol-repair phase is a tool sub-turn, including recovery after
-    // a failed terminal action. Keeping the choice forced prevents a provider
-    // from silently switching modes between the repair call and its recovery.
-    const repairPending = repairPhase !== "none";
     const ledger = evidenceLedger(session);
-    const descriptors = descriptorsAllowedForRepair(session, availableDescriptors, repairPhase);
+    const descriptors = availableDescriptors;
     const query = [...session.durable.state.messages].reverse().find((message) => message.role === "user")?.content ?? "";
     const dynamic = await this.repositoryContext.collect(session.identity.workspacePath, query, signal);
     const forecast = deadlineForecast(session);
-    const available = availableModelBudget(session);
+    let available = availableModelBudget(session);
     const capabilities = sessionSkillProjectionCapabilities({
       frozenCustomization: session.durable.frozenCustomization,
       liveSkillDescriptors: this.options.runtime.skills?.descriptors,
@@ -207,24 +203,35 @@ export class ModelEffectRunner {
       profileSkillNames: session.services.profile?.profile.skills
     });
 
-    let budgetStage: BudgetStage = deadlineBudgetStage(forecast, descriptors);
-    const preparation = {
+    const archiveProjection = historyAfterArchive(
+      session.durable.state.messages,
+      session.durable.state.contextArchive
+    );
+    const preparation: TurnPreparationInput = {
       session, forecast, turnId, descriptors, capabilities, dynamic, hookContext,
-      ledger, available, repairPending, defaultOutputReserveTokens: this.options.outputReserveTokens
+      ledger, available, defaultOutputReserveTokens: this.options.outputReserveTokens,
+      history: archiveProjection.history,
+      archive: archiveProjection.archive?.item
     };
-    let prepared = await prepareBudgetedModelTurn({ ...preparation, budgetStage: "normal" });
-    const capacity = requestCapacity(available, prepared.turn.budget);
-    if (capacity <= 1) budgetStage = "terminal";
-    else if (capacity === 2 && budgetStage === "normal") budgetStage = "converge";
-    if (budgetStage !== "normal") prepared = await prepareBudgetedModelTurn({ ...preparation, budgetStage });
+    let prepared = await prepareBudgetedModelTurn(preparation);
+    ({ prepared, available } = await refreshContextArchive({
+      session,
+      preparation,
+      initial: prepared,
+      initialProjection: archiveProjection,
+      available,
+      signal,
+      summarizer: this.summarizer,
+      emit: this.options.emit
+    }));
     const fittedBudget = fitPreparedBudget(
       prepared.turn.budget,
       available,
-      budgetStage === "normal" ? Number.MAX_SAFE_INTEGER : 1
+      Number.MAX_SAFE_INTEGER
     );
     if (!fittedBudget) {
       return budgetFailure(
-        `The remaining budget cannot fund one ${budgetStage === "terminal" ? "terminal " : ""}model request after bounded context compaction.`
+        "The hard resource ledger cannot fund another model request after bounded context compaction."
       );
     }
     const turn: PreparedModelTurn = { ...prepared.turn, budget: fittedBudget };
@@ -232,19 +239,11 @@ export class ModelEffectRunner {
     await this.options.emit(session, "diagnostic", "runtime", {
       kind: "deadline.stage",
       stage: forecast.stage,
-      budgetStage,
       remainingMs: forecast.remainingMs,
       nextModelEstimateMs: forecast.nextModelEstimateMs,
       outputReserveTokens: turn.outputReserveTokens
     });
     await this.emitContextComposition(session, plan, forecast);
-    const summary = takeUnloadedSummary(session, plan);
-    if (summary) {
-      await this.options.emit(session, "context.compacted", "runtime", {
-        item: summary,
-        omittedHistoryTurns: plan.omittedHistoryTurns
-      });
-    }
     signal.throwIfAborted();
     const requestId = `${session.durable.runId}:${turnId}`;
     const reservationId = await this.options.budgets.reserve(session, `model:${requestId}`, turn.budget.reserved);

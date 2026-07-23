@@ -36,9 +36,6 @@ function assertLocalRestorationState(
   if (manualConfirmation && session.durable.state.mutationFrontier.repositoryStateDigest) {
     restorationFailure("Repository metadata must be restored and verified separately.", "repository_restoration_required");
   }
-  if (manualConfirmation && session.durable.state.taskControl.goalEpochSource !== "steer") {
-    restorationFailure("Manual restoration confirmation requires a current user steer.", "restoration_steer_required");
-  }
 }
 
 export class RuntimeRestorationControl {
@@ -91,7 +88,7 @@ export class RuntimeRestorationControl {
     const frontier = session.durable.state.mutationFrontier;
     const data: WorkspaceRestorationEvidenceV1["data"] = {
       schemaVersion: 1,
-      goalEpoch: session.durable.state.taskControl.goalEpoch,
+      goalEpoch: session.durable.state.messages.filter((message) => message.role === "user").length,
       frontierRevision: frontier.revision,
       frontierStateDigest: frontier.currentStateDigest,
       baselineManifestDigest: inspection.baselineManifestDigest,

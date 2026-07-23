@@ -121,7 +121,10 @@ describe("runtime exact no-change convergence", () => {
     const stored = await events(store, session.sessionId);
     expect(stored).toContainEqual(expect.objectContaining({
       type: "tool.failed",
-      payload: expect.objectContaining({ callId: "denied-write", diagnostics: ["mode_denied"] })
+      payload: expect.objectContaining({
+        callId: "denied-write",
+        diagnostics: ["model_tool_policy_violation"]
+      })
     }));
     expect(stored.some((event) => event.type.startsWith("checkpoint."))).toBe(false);
     expect(stored.some((event) => event.type === "tool.completed"

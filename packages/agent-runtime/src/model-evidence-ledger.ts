@@ -1,6 +1,10 @@
 import type { ContextItem } from "agent-protocol";
 import { approximateTokens } from "agent-context";
-import { currentFrontierReview, frontierValidationReadiness } from "./mutation-evidence.js";
+import {
+  currentFrontierValidationStatus,
+  frontierValidationReadiness,
+  latestFrontierReview
+} from "./mutation-evidence.js";
 import type { RuntimeSession } from "./types.js";
 
 function findingText(value: unknown): string {
@@ -8,28 +12,51 @@ function findingText(value: unknown): string {
   return rendered.length <= 1_000 ? rendered : `${rendered.slice(0, 1_000)}…`;
 }
 
-/** Model-visible V5 completion state. Internal evidence and checkpoint IDs are
- * deliberately absent: the runtime owns their association and final handoff. */
+/** Model-visible factual status. Evidence IDs and final policy decisions stay runtime-owned. */
 export function evidenceLedger(session: RuntimeSession): ContextItem {
   const frontier = session.durable.state.mutationFrontier;
-  const validation = frontierValidationReadiness(session);
-  const review = currentFrontierReview(session);
+  const validation = currentFrontierValidationStatus(session);
+  const coverageTelemetry = frontierValidationReadiness(session);
+  const review = latestFrontierReview(session);
   const reviewMode = session.services.profile?.profile.mutationPolicy.reviewMode ?? "advisory";
   const changed = frontier.changedPaths.slice(0, 200);
+  const validationStatus = frontier.changedPaths.length === 0
+    ? "not needed"
+    : !validation.hasRecord
+      ? "not run for the current frontier"
+      : validation.passed
+        ? "passed for the current frontier"
+        : validation.latestFailed
+          ? "failed for the current frontier"
+          : "recorded but incomplete for the current frontier";
   const lines = [
-    "Completion status (runtime-owned; do not supply evidence IDs):",
-    `- final mutation revision: ${frontier.revision}`,
+    "Current durable status (facts, not a prescribed next action):",
+    `- mutation frontier revision: ${frontier.revision}`,
     `- net changed paths (${frontier.changedPaths.length}): ${changed.length > 0 ? changed.join(", ") : "none"}`,
-    ...(changed.length < frontier.changedPaths.length ? [`- ${frontier.changedPaths.length - changed.length} additional paths omitted from this display`] : []),
-    `- semantic validation: ${frontier.changedPaths.length === 0 ? "not required" : validation.ready ? "passed for every net changed path" : "blocking"}`,
-    ...(validation.missingClaims.length > 0
-      ? [`- required validation claim kinds still missing/failed: ${validation.missingClaims.join(", ")}`] : []),
-    ...(validation.missingPaths.length > 0 ? [`- validation still missing/failed for: ${validation.missingPaths.join(", ")}`] : []),
-    ...(validation.latestFailed ? [`- latest failed validation: ${validation.latestFailed.summary}`] : []),
+    ...(changed.length < frontier.changedPaths.length
+      ? [`- ${frontier.changedPaths.length - changed.length} additional paths omitted from this display`]
+      : []),
+    `- validation: ${validationStatus}`,
+    ...(coverageTelemetry.missingClaims.length > 0
+      ? [`- telemetry-only inferred validation claim gaps: ${coverageTelemetry.missingClaims.join(", ")}`]
+      : []),
+    ...(coverageTelemetry.missingPaths.length > 0
+      ? [`- telemetry-only inferred validation path gaps: ${coverageTelemetry.missingPaths.join(", ")}`]
+      : []),
+    ...(validation.latestFailed
+      ? [`- latest failed validation: ${validation.latestFailed.summary}`]
+      : []),
     `- independent review mode: ${reviewMode}`,
-    ...(review ? [`- latest review: ${review.data.verdict} (${review.status})`,
-      ...review.data.findings.slice(0, 12).map((item) => `  - ${findingText(item)}`)] : []),
-    "When work is complete, stop naturally with the final user-facing summary. The runtime completion coordinator will evaluate assurance and review gates. If validation cannot be repaired after concrete attempts, call report_blocked. Use request_user_input only for a real user decision."
+    ...(review
+      ? [
+          `- latest review: ${review.data.verdict} (${review.status})`,
+          ...review.data.findings.slice(0, 12).map((item) => `  - ${findingText(item)}`)
+        ]
+      : []),
+    reviewMode === "required"
+      ? "- Strict completion requires successful current-frontier validation and reviewer approval of the same completion candidate."
+      : "- Standard completion may report failed or unverified validation honestly; a missing record produces one advisory.",
+    "When work is complete, stop naturally with the user-facing summary."
   ];
   const content = lines.join("\n");
   return {

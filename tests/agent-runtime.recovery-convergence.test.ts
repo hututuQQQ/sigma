@@ -1,4 +1,5 @@
-import { mkdtemp } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -12,10 +13,14 @@ import {
   type ValidationEvidence
 } from "../packages/agent-protocol/src/index.js";
 import { createKernelState } from "../packages/agent-kernel/src/index.js";
-import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
+import {
+  SegmentedJsonlStore,
+  sessionDirectory,
+  snapshotName
+} from "../packages/agent-store/src/index.js";
 import { restoreStoredSession } from "../packages/agent-runtime/src/restore-session.js";
 import { armRunDeadline } from "../packages/agent-runtime/src/run-deadline.js";
-import { convergedToolFailure } from "../packages/agent-runtime/src/capability-failure-convergence.js";
+import { ordinaryToolFailureReceipt } from "../packages/agent-runtime/src/tool-failure-receipt.js";
 import { resolveToolIdleWatchdogMs } from "../packages/agent-runtime/src/tool-execution-monitor.js";
 import type { RuntimeOptions } from "../packages/agent-runtime/src/types.js";
 import { completeAgentEventPayload } from "./testkit/agent-event-fixtures.js";
@@ -42,21 +47,46 @@ function runtime(toolIdleWatchdogMs?: number | false): RuntimeOptions {
   } as RuntimeOptions;
 }
 
+async function writeLegacyV5Snapshot(input: {
+  rootDir: string;
+  sessionId: string;
+  seq: number;
+  createdAt: string;
+  state: Record<string, JsonValue>;
+}): Promise<void> {
+  const snapshot = {
+    schemaVersion: 5,
+    storeLayoutVersion: STORE_LAYOUT_VERSION,
+    sessionId: input.sessionId,
+    seq: input.seq,
+    createdAt: input.createdAt,
+    state: input.state
+  };
+  const checksum = createHash("sha256").update(JSON.stringify(snapshot)).digest("hex");
+  const directory = path.join(sessionDirectory(input.rootDir, input.sessionId), "snapshots");
+  await mkdir(directory, { recursive: true });
+  await writeFile(
+    path.join(directory, snapshotName(input.seq)),
+    JSON.stringify({ checksum, snapshot }),
+    "utf8"
+  );
+}
+
 describe("runtime recovery convergence", () => {
-  it("leaves capability retry authority to the durable task-control reducer", () => {
+  it("returns every capability failure as an ordinary receipt without retry state", () => {
     const session = runtimeSessionFixture();
     const signal = new AbortController().signal;
     const failure = Object.assign(new Error("runtime unavailable"), { code: "toolchain_unavailable" });
     const first = { id: "first", name: "exec", arguments: { executable: "node", args: ["--version"] } };
     const different = { id: "different", name: "exec", arguments: { executable: "pnpm", args: ["test"] } };
-    expect(convergedToolFailure(
-      session, first, "2026-01-01T00:00:00.000Z", failure, signal
+    expect(ordinaryToolFailureReceipt(
+      first, "2026-01-01T00:00:00.000Z", failure, signal
     ).diagnostics).toContain("toolchain_unavailable");
-    expect(convergedToolFailure(
-      session, different, "2026-01-01T00:00:00.000Z", failure, signal
+    expect(ordinaryToolFailureReceipt(
+      different, "2026-01-01T00:00:00.000Z", failure, signal
     ).diagnostics).toContain("toolchain_unavailable");
-    expect(convergedToolFailure(
-      session, { ...first, id: "retry" }, "2026-01-01T00:00:00.000Z", failure, signal
+    expect(ordinaryToolFailureReceipt(
+      { ...first, id: "retry" }, "2026-01-01T00:00:00.000Z", failure, signal
     ).diagnostics).toContain("toolchain_unavailable");
     expect(session.interaction).not.toHaveProperty("capabilityFailures");
   });
@@ -89,7 +119,8 @@ describe("runtime recovery convergence", () => {
 
   it("migrates the published V5 task authorities and strips every legacy field", async () => {
     const workspacePath = await mkdtemp(path.join(os.tmpdir(), "sigma-semantic-restore-"));
-    const store = new SegmentedJsonlStore({ rootDir: path.join(workspacePath, ".agent") });
+    const storeRootDir = path.join(workspacePath, ".agent");
+    const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
     const sessionId = "legacy-semantic-session";
     const runId = "legacy-semantic-run";
     const startedAt = "2026-07-12T00:00:00.000Z";
@@ -112,17 +143,42 @@ describe("runtime recovery convergence", () => {
       deadlineAt: "2026-07-12T00:15:00.000Z"
     });
     const oldSnapshot = JSON.parse(JSON.stringify({ ...current, lastSeq: 1 })) as Record<string, JsonValue>;
-    delete oldSnapshot.taskControl;
     Object.assign(oldSnapshot, {
+      schemaVersion: 5,
+      taskControl: {
+        schemaVersion: 1,
+        goalEpoch: 3,
+        goalEpochSource: "submit",
+        phase: "repair_only",
+        semanticFacts: { entries: [] },
+        episode: {
+          basisDigest: "b".repeat(64),
+          startedRevision: 1,
+          noProgressBatches: 6,
+          observations: 7
+        },
+        obligation: {
+          kind: "terminal_resolution",
+          stage: "report",
+          basisDigest: "c".repeat(64),
+          openedRevision: 1,
+          attempts: 2,
+          failureCode: "legacy_no_progress"
+        },
+        completionCandidate: {
+          answer: "Preserved draft.",
+          digest: "d".repeat(64)
+        },
+        modelContinuationAttempts: 4
+      },
       completionRepairAttempts: 0,
       continuationAttempts: 0,
       repeatedToolBatchCount: 0,
       receiptCountAtLastUserInput: 0,
       semanticProgress: { workspaceChanges: 0, durableEvidence: 0, revision: 0 }
     });
-    await store.writeSnapshot({
-      schemaVersion: SNAPSHOT_SCHEMA_VERSION,
-      storeLayoutVersion: STORE_LAYOUT_VERSION,
+    await writeLegacyV5Snapshot({
+      rootDir: storeRootDir,
       sessionId,
       seq: 1,
       createdAt: startedAt,
@@ -130,16 +186,21 @@ describe("runtime recovery convergence", () => {
     });
 
     const restored = await restoreStoredSession(store, sessionId, 60_000);
-    expect(restored.state.taskControl).toMatchObject({
-      schemaVersion: 1,
-      phase: "normal",
-      semanticFacts: { entries: [] }
+    expect(restored.state.schemaVersion).toBe(6);
+    expect(restored.state).not.toHaveProperty("taskControl");
+    expect(restored.state.messages.at(-1)).toMatchObject({
+      role: "assistant",
+      content: "Preserved draft."
     });
     for (const key of [
       "completionRepairAttempts", "completionRepair", "continuationAttempts",
       "repeatedToolBatchCount", "receiptCountAtLastUserInput", "semanticProgress",
       "semanticFailureCluster", "lastToolBatchSignature", "lastToolBatchOutcomeSignature"
     ]) expect(restored.state).not.toHaveProperty(key);
+    await expect(store.latestSnapshot(sessionId)).resolves.toMatchObject({
+      schemaVersion: SNAPSHOT_SCHEMA_VERSION,
+      state: { schemaVersion: 6 }
+    });
   });
 
   it("preserves failed validation status, scope, and execution claim across snapshot restore", async () => {
@@ -207,5 +268,56 @@ describe("runtime recovery convergence", () => {
     const restored = await restoreStoredSession(store, sessionId, 60_000);
     expect(restored.state.evidence).toEqual([failed]);
     expect(isCompletionReferenceableEvidence(restored.state.evidence[0]!, sessionId, runId)).toBe(true);
+  });
+
+  it("restores the exact durable context archive and covered-prefix digest", async () => {
+    const workspacePath = await mkdtemp(path.join(os.tmpdir(), "sigma-context-archive-restore-"));
+    const store = new SegmentedJsonlStore({ rootDir: path.join(workspacePath, ".agent") });
+    const sessionId = "context-archive-session";
+    const runId = "context-archive-run";
+    const startedAt = "2026-07-12T00:00:00.000Z";
+    await store.append({
+      schemaVersion: EVENT_SCHEMA_VERSION,
+      seq: 1,
+      eventId: "context-archive-created",
+      sessionId,
+      runId,
+      occurredAt: startedAt,
+      type: "session.created",
+      authority: "runtime",
+      payload: completeAgentEventPayload("session.created", { workspacePath, mode: "change" })
+    }, 0);
+    const state = createKernelState({
+      sessionId,
+      runId,
+      mode: "change",
+      startedAt,
+      deadlineAt: "2026-07-12T00:15:00.000Z"
+    });
+    state.contextArchive = {
+      schemaVersion: 1,
+      item: {
+        id: "context:model-summary:archive",
+        authority: "tool",
+        provenance: "model-generated conversation archive",
+        content: "## Objective\nPreserve the original goal.",
+        tokenCount: 12,
+        priority: 600,
+        cacheKey: "e".repeat(64)
+      },
+      omittedHistoryTurns: 7,
+      sourceDigest: "e".repeat(64)
+    };
+    await store.writeSnapshot({
+      schemaVersion: SNAPSHOT_SCHEMA_VERSION,
+      storeLayoutVersion: STORE_LAYOUT_VERSION,
+      sessionId,
+      seq: 1,
+      createdAt: startedAt,
+      state: { ...state, lastSeq: 1 }
+    });
+
+    const restored = await restoreStoredSession(store, sessionId, 60_000);
+    expect(restored.state.contextArchive).toEqual(state.contextArchive);
   });
 });

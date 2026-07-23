@@ -1,4 +1,5 @@
-import type { ContextItem, ModelMessage } from "agent-protocol";
+import { createHash } from "node:crypto";
+import type { ContextArchiveV1, ContextItem, ModelMessage } from "agent-protocol";
 import {
   STABLE_SUMMARY_EPOCH_BLOCKS,
   summarizeHistory,
@@ -10,22 +11,9 @@ export interface HistoryBlock {
   messages: ModelMessage[];
   wireSafe: boolean;
 }
-export const RECENT_RAW_BLOCK_TOKEN_LIMIT = 8_192;
-export const MAXIMUM_RAW_HISTORY_BLOCKS = 12;
-export const CACHED_RAW_HISTORY_TOKEN_LIMIT = 96_000;
 export const MAXIMUM_HISTORY_SUMMARY_TOKENS = 16_000;
 
 const SUMMARY_DELTA_TOKEN_RESERVE = 2_048;
-
-/**
- * Replaying every tool turn that still fits the provider window makes the
- * cumulative request cost quadratic in long sessions. For providers without
- * prompt caching, keep a generous raw working set and summarize older blocks
- * even when the provider could technically accept them. Cache-capable
- * providers use a larger, but still bounded, raw tail so cached sessions do
- * not grow without limit.
- */
-export const PROACTIVE_HISTORY_TOKEN_LIMIT = 24_000;
 
 function messageTokens(message: ModelMessage): number {
   return approximateTokens(message.content)
@@ -75,6 +63,47 @@ export function historyBlocks(history: readonly ModelMessage[]): HistoryBlock[] 
     index = cursor;
   }
   return blocks;
+}
+
+export function stableHistoryDigest(blocks: readonly HistoryBlock[]): string {
+  return createHash("sha256").update(JSON.stringify(
+    blocks.map((block) => block.messages)
+  )).digest("hex");
+}
+
+export function historyAfterArchive(
+  history: readonly ModelMessage[],
+  archive: ContextArchiveV1 | undefined
+): {
+  archive?: ContextArchiveV1;
+  history: ModelMessage[];
+  coveredBlocks: HistoryBlock[];
+  /** Authority-bearing blocks replayed raw even though the archive covers
+   * them. Callers subtract these when extending the covered prefix. */
+  replayedCoveredBlocks: HistoryBlock[];
+} {
+  if (!archive || archive.omittedHistoryTurns <= 0) {
+    return { history: [...history], coveredBlocks: [], replayedCoveredBlocks: [] };
+  }
+  const blocks = historyBlocks(history);
+  const coveredBlocks = blocks.slice(0, archive.omittedHistoryTurns);
+  if (coveredBlocks.length !== archive.omittedHistoryTurns
+    || stableHistoryDigest(coveredBlocks) !== archive.sourceDigest) {
+    return { history: [...history], coveredBlocks: [], replayedCoveredBlocks: [] };
+  }
+  const newestUser = latestUserBlock(blocks);
+  const replayedCoveredBlocks = newestUser >= 0 && newestUser < archive.omittedHistoryTurns
+    ? [blocks[newestUser]!]
+    : [];
+  return {
+    archive,
+    coveredBlocks,
+    replayedCoveredBlocks,
+    history: [
+      ...replayedCoveredBlocks,
+      ...blocks.slice(archive.omittedHistoryTurns)
+    ].flatMap((block) => block.messages)
+  };
 }
 
 function fitPrefix(value: string, maximumTokens: number): string {

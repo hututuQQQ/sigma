@@ -1,36 +1,20 @@
 import {
   isCheckpointRef,
-  isCompletionEligibleEvidence,
-  isCompletionReferenceableEvidence,
   isEvidenceRecord,
   isPlanGraph,
   isUsageRecord,
   type AgentEventEnvelope,
   type AgentEventType,
+  type ContextItem,
   type EvidenceRecord,
   type JsonValue
 } from "agent-protocol";
-import type { KernelState } from "./state.js";
-import { frontierAfterCheckpoint, frontierAfterEvidence } from "./mutation-frontier.js";
-import { nextPhase } from "./terminal-reducer-helpers.js";
-import { recordSemanticEvidenceProgress, recordSemanticWorkspaceRestore } from "./semantic-failures.js";
 import { durableBudgetReducers } from "./durable-budget-reducers.js";
-import { reviewTaskControl } from "./review-task-control-reducer.js";
-import {
-  advanceReviewRepair,
-  completionEvidenceObligation,
-  recordSemanticFact,
-  resolveTaskObligation,
-  terminalResolutionObligation,
-  userDecisionObligation
-} from "./task-control.js";
-import { advanceRepositoryEvidenceObligation } from "./repository-task-control.js";
+import { frontierAfterCheckpoint, frontierAfterEvidence } from "./mutation-frontier.js";
+import type { KernelEventReducer } from "./durable-reducer-types.js";
+import type { KernelState, PendingTool } from "./state.js";
 
-export type KernelEventReducer = (
-  state: KernelState,
-  event: AgentEventEnvelope,
-  payload: Record<string, JsonValue>
-) => KernelState;
+export type { KernelEventReducer } from "./durable-reducer-types.js";
 
 const TOOL_EVIDENCE_KINDS = new Set([
   "workspace_delta", "repository_delta", "command", "validation", "diagnostic", "input_access"
@@ -40,22 +24,33 @@ const MUTATION_EVIDENCE_KINDS = new Set([
   "validation", "review", "user_waiver"
 ]);
 
-function evidenceAuthorityAllowed(event: AgentEventEnvelope, evidence: EvidenceRecord): boolean {
-  if (event.type === "review.completed") {
-    return event.authority === "runtime" && evidence.kind === "review" && evidence.producer.authority === "runtime";
-  }
-  if (event.type === "review.waived") {
-    return event.authority === "user" && evidence.kind === "user_waiver" && evidence.producer.authority === "user";
-  }
-  if (event.type !== "evidence.recorded") return false;
-  if (event.authority === "tool") return evidence.producer.authority === "tool" && TOOL_EVIDENCE_KINDS.has(evidence.kind);
-  return event.authority === "runtime" && evidence.producer.authority === "runtime"
-    && evidence.kind !== "review" && evidence.kind !== "user_waiver";
+function record(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
 }
 
-function isEvidenceAcquisitionRepair(state: KernelState): boolean {
-  return state.taskControl.obligation?.kind === "completion_evidence"
-    && state.taskControl.obligation.stage === "acquire";
+function nextPhase(pending: readonly PendingTool[]): KernelState["phase"] {
+  if (pending.some((item) => item.approval === "pending")) return "needs_input";
+  if (pending.some((item) => item.started)) return "tool_in_flight";
+  return pending.length > 0 ? "tool_pending" : "ready_model";
+}
+
+function evidenceAuthorityAllowed(event: AgentEventEnvelope, evidence: EvidenceRecord): boolean {
+  if (event.type === "review.completed") {
+    return event.authority === "runtime" && evidence.kind === "review"
+      && evidence.producer.authority === "runtime";
+  }
+  if (event.type === "review.waived") {
+    return event.authority === "user" && evidence.kind === "user_waiver"
+      && evidence.producer.authority === "user";
+  }
+  if (event.type !== "evidence.recorded") return false;
+  if (event.authority === "tool") {
+    return evidence.producer.authority === "tool" && TOOL_EVIDENCE_KINDS.has(evidence.kind);
+  }
+  return event.authority === "runtime" && evidence.producer.authority === "runtime"
+    && evidence.kind !== "review" && evidence.kind !== "user_waiver";
 }
 
 function canRecordEvidence(
@@ -63,84 +58,31 @@ function canRecordEvidence(
   event: AgentEventEnvelope,
   evidence: EvidenceRecord
 ): boolean {
-  return evidence.sessionId === state.sessionId && evidence.runId === state.runId
-    && event.runId === state.runId && evidenceAuthorityAllowed(event, evidence)
+  return evidence.sessionId === state.sessionId
+    && evidence.runId === state.runId
+    && event.runId === state.runId
+    && evidenceAuthorityAllowed(event, evidence)
     && !state.evidence.some((item) => item.evidenceId === evidence.evidenceId)
-    && !(evidence.kind === "user_waiver" && state.evidence.some((item) => item.kind === "user_waiver"));
+    && !(evidence.kind === "user_waiver"
+      && state.evidence.some((item) => item.kind === "user_waiver"));
 }
 
-function appendEvidence(state: KernelState, evidence: EvidenceRecord): KernelState {
-  const mutationEvidence = MUTATION_EVIDENCE_KINDS.has(evidence.kind)
-    && !state.mutationEvidence.some((item) => item.evidenceId === evidence.evidenceId)
-    ? [...state.mutationEvidence, evidence]
-    : state.mutationEvidence;
-  return applyWorkspaceRestorationEvidence(recordSemanticEvidenceProgress({
-    ...state,
-    evidence: [...state.evidence, evidence],
-    mutationEvidence,
-    mutationFrontier: frontierAfterEvidence(state.mutationFrontier, mutationEvidence, evidence)
-  }, evidence), evidence);
-}
-
-function settleFirstCompletionEvidence(
+function restoredFrontier(
   state: KernelState,
-  evidence: EvidenceRecord,
-  firstCompletionEvidence: boolean
+  evidence: Extract<EvidenceRecord, { kind: "restoration" }>
 ): KernelState {
-  if (!firstCompletionEvidence) return state;
-  if (isCompletionEligibleEvidence(evidence, state.sessionId, state.runId)) {
-    return { ...state, taskControl: resolveTaskObligation(state.taskControl) };
-  }
-  return {
-    ...state,
-    taskControl: completionEvidenceObligation(
-      state.taskControl,
-      state.revision,
-      "terminal",
-      currentReferenceableEvidenceCount(state)
-    )
-  };
-}
-
-const evidenceRecorded: KernelEventReducer = (state, event) => {
-  const evidence = event.payload;
-  if (!isEvidenceRecord(evidence) || !canRecordEvidence(state, event, evidence)) return state;
-  const evidenceCount = state.taskControl.obligation?.kind === "completion_evidence"
-    ? state.taskControl.obligation.evidenceCount : 0;
-  const firstCompletionEvidence = isEvidenceAcquisitionRepair(state)
-    && isCompletionReferenceableEvidence(evidence, state.sessionId, state.runId)
-    && currentReferenceableEvidenceCount(state) >= evidenceCount;
-  const repaired = settleFirstCompletionEvidence(appendEvidence(state, evidence), evidence, firstCompletionEvidence);
-  return advanceEvidenceObligation(
-    evidence.kind === "review" ? reviewTaskControl(repaired, evidence) : repaired,
-    evidence
-  );
-};
-
-function applyWorkspaceRestorationEvidence(state: KernelState, evidence: EvidenceRecord): KernelState {
-  if (evidence.kind !== "restoration" || evidence.status !== "passed") return state;
+  if (evidence.status !== "passed") return state;
   const data = evidence.data;
   const frontier = state.mutationFrontier;
-  const explicitRestore = data.restoredCheckpointIds.length > 0;
   const repositoryRestored = frontier.repositoryStateDigest === undefined
     ? data.repository.status === "unchanged"
     : data.repository.status === "restored" && data.repository.stateDigest !== undefined;
-  if (data.goalEpoch !== state.taskControl.goalEpoch
-    || data.frontierRevision !== frontier.revision
+  if (data.frontierRevision !== frontier.revision
     || data.frontierStateDigest !== frontier.currentStateDigest
     || data.baselineManifestDigest !== data.currentManifestDigest
-    || (!explicitRestore && state.taskControl.goalEpochSource !== "steer")
     || !repositoryRestored) return state;
   return {
     ...state,
-    taskControl: state.taskControl.obligation?.kind === "restoration"
-      && state.taskControl.obligation.nextDecisionCode
-      ? userDecisionObligation(
-          state.taskControl,
-          state.revision,
-          state.taskControl.obligation.nextDecisionCode
-        )
-      : resolveTaskObligation(state.taskControl),
     mutationEvidence: state.mutationEvidence.filter((item) =>
       item.runId !== evidence.runId
       || (item.kind !== "repository_delta" && item.kind !== "repository_acceptance")),
@@ -154,30 +96,20 @@ function applyWorkspaceRestorationEvidence(state: KernelState, evidence: Evidenc
   };
 }
 
-function advanceEvidenceObligation(state: KernelState, evidence: EvidenceRecord): KernelState {
-  const repository = advanceRepositoryEvidenceObligation(state, evidence);
-  if (repository) return repository;
-  const obligation = state.taskControl.obligation;
-  if (obligation?.kind !== "review_repair") return state;
-  if (obligation.stage === "mutate" && evidence.kind === "workspace_delta"
-    && isCompletionEligibleEvidence(evidence, state.sessionId, state.runId)) {
-    return { ...state, taskControl: advanceReviewRepair(state.taskControl, "validate", state.revision) };
-  }
-  if (obligation.stage === "validate" && evidence.kind === "validation") {
-    return {
-      ...state,
-      taskControl: evidence.status === "passed"
-        ? advanceReviewRepair(state.taskControl, "re_review", state.revision)
-        : terminalResolutionObligation(state.taskControl, state.revision, "validation_failed")
-    };
-  }
-  return state;
-}
-
-function currentReferenceableEvidenceCount(state: KernelState): number {
-  return state.evidence.filter((item) =>
-    isCompletionReferenceableEvidence(item, state.sessionId, state.runId)).length;
-}
+const evidenceRecorded: KernelEventReducer = (state, event) => {
+  const evidence = event.payload;
+  if (!isEvidenceRecord(evidence) || !canRecordEvidence(state, event, evidence)) return state;
+  const mutationEvidence = MUTATION_EVIDENCE_KINDS.has(evidence.kind)
+    ? [...state.mutationEvidence, evidence]
+    : state.mutationEvidence;
+  const next = {
+    ...state,
+    evidence: [...state.evidence, evidence],
+    mutationEvidence,
+    mutationFrontier: frontierAfterEvidence(state.mutationFrontier, mutationEvidence, evidence)
+  };
+  return evidence.kind === "restoration" ? restoredFrontier(next, evidence) : next;
+};
 
 const usageRecorded: KernelEventReducer = (state, event) => {
   const usage = event.payload;
@@ -188,13 +120,9 @@ const usageRecorded: KernelEventReducer = (state, event) => {
 
 const planUpdated: KernelEventReducer = (state, _event, payload) => {
   if (!isPlanGraph(payload.plan) || !Number.isSafeInteger(payload.previousRevision)
-    || payload.previousRevision !== state.plan.revision || payload.plan.revision !== state.plan.revision + 1) return state;
-  const fact = recordSemanticFact(state.taskControl, "plan", {
-    revision: payload.plan.revision,
-    activeNodeId: payload.plan.activeNodeId,
-    nodes: payload.plan.nodes.map((node) => ({ id: node.id, status: node.status }))
-  }, state.revision);
-  return { ...state, plan: payload.plan, taskControl: fact.control };
+    || payload.previousRevision !== state.plan.revision
+    || payload.plan.revision !== state.plan.revision + 1) return state;
+  return { ...state, plan: payload.plan };
 };
 
 function pruneRestoredCheckpointEvidence(
@@ -204,33 +132,10 @@ function pruneRestoredCheckpointEvidence(
   const records = [...state.mutationEvidence, ...state.evidence];
   const restoredDeltaIds = new Set(records.flatMap((item) => item.kind === "workspace_delta"
     && item.data.checkpointId === checkpointId ? [item.evidenceId] : []));
-  const prune = (items: readonly EvidenceRecord[]): EvidenceRecord[] => items.flatMap((item) => {
-    if (item.kind === "workspace_delta" && restoredDeltaIds.has(item.evidenceId)) return [];
-    if (item.kind === "user_waiver" && item.data.checkpointId === checkpointId) return [];
-    return [item];
-  });
-  return {
-    evidence: prune(state.evidence),
-    mutationEvidence: prune(state.mutationEvidence)
-  };
-}
-
-function checkpointRepairUpdate(
-  state: KernelState,
-  evidence: readonly EvidenceRecord[]
-): Partial<Pick<KernelState, "taskControl" | "messages">> {
-  const repair = state.taskControl.obligation;
-  const protectedOrTerminal = repair?.kind === "completion_evidence" && repair.stage === "terminal"
-    || repair?.kind === "terminal_resolution";
-  if (!protectedOrTerminal || evidence.some((item) =>
-    isCompletionReferenceableEvidence(item, state.sessionId, state.runId))) return {};
-  return {
-    taskControl: completionEvidenceObligation(state.taskControl, state.revision, "acquire", 0),
-    messages: [...state.messages, {
-      role: "developer",
-      content: "Checkpoint restoration removed the durable evidence for the pending terminal result. Obtain fresh current-run evidence before finalizing; request user input only if a concrete decision is genuinely required."
-    }]
-  };
+  const prune = (items: readonly EvidenceRecord[]): EvidenceRecord[] => items.filter((item) =>
+    !(item.kind === "workspace_delta" && restoredDeltaIds.has(item.evidenceId))
+    && !(item.kind === "user_waiver" && item.data.checkpointId === checkpointId));
+  return { evidence: prune(state.evidence), mutationEvidence: prune(state.mutationEvidence) };
 }
 
 const checkpointUpdated: KernelEventReducer = (state, event) => {
@@ -244,44 +149,43 @@ const checkpointUpdated: KernelEventReducer = (state, event) => {
     return {
       ...state,
       checkpointHead: event.payload,
-      ...(requiredStatus === "sealed" ? {
-        mutationFrontier: frontierAfterCheckpoint(
-          state.mutationFrontier,
-          event.payload,
-          state.mutationEvidence
-        )
-      } : {})
+      ...(requiredStatus === "sealed"
+        ? { mutationFrontier: frontierAfterCheckpoint(
+            state.mutationFrontier,
+            event.payload,
+            state.mutationEvidence
+          ) }
+        : {})
     };
   }
   if (event.authority !== "runtime" && event.authority !== "user") return state;
   const checkpointHead = event.payload.runId === state.runId
-    ? event.payload : { ...event.payload, runId: state.runId };
+    ? event.payload
+    : { ...event.payload, runId: state.runId };
   const pruned = pruneRestoredCheckpointEvidence(state, event.payload.checkpointId);
-  return recordSemanticWorkspaceRestore({
+  return {
     ...state,
     ...pruned,
-    ...checkpointRepairUpdate(state, pruned.evidence),
     checkpointHead,
     mutationFrontier: frontierAfterCheckpoint(
       state.mutationFrontier,
       checkpointHead,
       pruned.mutationEvidence
     )
-  });
+  };
 };
 
 const checkpointRecoveryResolved: KernelEventReducer = (state, event) => {
   if (event.authority !== "user" || state.phase !== "needs_input") return state;
-  const payload = event.payload && typeof event.payload === "object" && !Array.isArray(event.payload)
-    ? event.payload as Record<string, unknown> : {};
-  // Child decisions are recorded before applying a foreign checkpoint so a
-  // crash can replay them. They only unblock the parent after the apply step
-  // has durably completed.
-  if (payload.sourceSessionId !== undefined && payload.applied !== true) return state;
-  return { ...state, phase: nextPhase(state.pendingTools), outcome: undefined, proposedOutcome: undefined };
+  const payload = record(event.payload);
+  if (payload?.sourceSessionId !== undefined && payload.applied !== true) return state;
+  return {
+    ...state,
+    phase: nextPhase(state.pendingTools),
+    outcome: undefined,
+    proposedOutcome: undefined
+  };
 };
-
-const reviewEvidence: KernelEventReducer = (state, event, payload) => evidenceRecorded(state, event, payload);
 
 const profileResolved: KernelEventReducer = (state, event, payload) => {
   if (event.authority !== "runtime" || event.sessionId !== state.sessionId
@@ -318,18 +222,22 @@ function validSkillLoadedPayload(payload: Record<string, JsonValue>): payload is
 
 const skillLoaded: KernelEventReducer = (state, event, payload) => {
   if (event.authority !== "runtime" || event.sessionId !== state.sessionId
-    || !validSkillLoadedPayload(payload)) return state;
-  if (state.frozenSkills.some((item) => item.qualifiedName === payload.qualifiedName)) return state;
+    || !validSkillLoadedPayload(payload)
+    || state.frozenSkills.some((item) => item.qualifiedName === payload.qualifiedName)) return state;
   return { ...state, frozenSkills: [...state.frozenSkills, {
     artifactId: payload.artifactId,
     digest: payload.digest,
     source: payload.source,
     qualifiedName: payload.qualifiedName,
-    ...(typeof payload.executionManifestArtifactId === "string" && /^[a-f0-9]{64}$/u.test(payload.executionManifestArtifactId)
-      && typeof payload.executionManifestDigest === "string" && /^[a-f0-9]{64}$/u.test(payload.executionManifestDigest) ? {
-        executionManifestArtifactId: payload.executionManifestArtifactId,
-        executionManifestDigest: payload.executionManifestDigest
-      } : {})
+    ...(typeof payload.executionManifestArtifactId === "string"
+      && /^[a-f0-9]{64}$/u.test(payload.executionManifestArtifactId)
+      && typeof payload.executionManifestDigest === "string"
+      && /^[a-f0-9]{64}$/u.test(payload.executionManifestDigest)
+      ? {
+          executionManifestArtifactId: payload.executionManifestArtifactId,
+          executionManifestDigest: payload.executionManifestDigest
+        }
+      : {})
   }] };
 };
 
@@ -337,25 +245,32 @@ const processSpawned: KernelEventReducer = (state, event, payload) => {
   if (event.authority !== "runtime" || event.runId !== state.runId
     || typeof payload.processId !== "string" || !payload.processId
     || state.activeProcessIds.includes(payload.processId)) return state;
-  const fact = recordSemanticFact(state.taskControl, "process_lifecycle", {
-    processId: payload.processId, status: "spawned"
-  }, state.revision);
-  return {
-    ...state,
-    activeProcessIds: [...state.activeProcessIds, payload.processId],
-    taskControl: fact.control
-  };
+  return { ...state, activeProcessIds: [...state.activeProcessIds, payload.processId] };
 };
 
 const processSettled: KernelEventReducer = (state, event, payload) => {
   if (event.authority !== "runtime" || typeof payload.processId !== "string") return state;
-  const fact = recordSemanticFact(state.taskControl, "process_lifecycle", {
-    processId: payload.processId, status: event.type
-  }, state.revision);
   return {
     ...state,
-    activeProcessIds: state.activeProcessIds.filter((id) => id !== payload.processId),
-    taskControl: fact.control
+    activeProcessIds: state.activeProcessIds.filter((id) => id !== payload.processId)
+  };
+};
+
+const contextCompacted: KernelEventReducer = (state, event, payload) => {
+  if (event.authority !== "runtime") return state;
+  const item = record(payload.item);
+  const sourceDigest = typeof item?.cacheKey === "string" ? item.cacheKey : "";
+  if (!/^[a-f0-9]{64}$/u.test(sourceDigest)
+    || !Number.isSafeInteger(payload.omittedHistoryTurns)
+    || Number(payload.omittedHistoryTurns) < 0) return state;
+  return {
+    ...state,
+    contextArchive: {
+      schemaVersion: 1,
+      item: payload.item as unknown as ContextItem,
+      omittedHistoryTurns: Number(payload.omittedHistoryTurns),
+      sourceDigest
+    }
   };
 };
 
@@ -368,13 +283,14 @@ export const durableReducers: Partial<Record<AgentEventType, KernelEventReducer>
   "checkpoint.sealed": checkpointUpdated,
   "checkpoint.restored": checkpointUpdated,
   "checkpoint.recovery_resolved": checkpointRecoveryResolved,
-  "review.completed": reviewEvidence,
-  "review.waived": reviewEvidence,
+  "review.completed": evidenceRecorded,
+  "review.waived": evidenceRecorded,
   "profile.resolved": profileResolved,
   "customization.frozen": customizationFrozen,
   "skill.loaded": skillLoaded,
   "process.spawned": processSpawned,
   "process.exited": processSettled,
   "process.lost": processSettled,
-  "process.handed_off": processSettled
+  "process.handed_off": processSettled,
+  "context.compacted": contextCompacted
 };

@@ -124,7 +124,7 @@ function reopenRootPlan(): ModelResponse {
 }
 
 describe("Sigma architecture", () => {
-  it("uses explicit completion rather than mutation heuristics", () => {
+  it("uses a natural model stop rather than mutation heuristics", () => {
     let state = createKernelState({
       sessionId: "session",
       runId: "run",
@@ -137,16 +137,12 @@ describe("Sigma architecture", () => {
     state = evolve(state, event(3, "model.completed", {
       turnId: 1,
       effectRevision: 1,
-      message: { role: "assistant", content: "", toolCalls: [{ id: "complete", name: "runtime_finalize", arguments: {} }] },
-      toolCalls: [{ id: "complete", name: "runtime_finalize", arguments: {} }]
-    }));
-    state = evolve(state, event(4, "tool.completed", {
-      turnId: 1, effectRevision: 1,
-      callId: "complete", ok: true, output: JSON.stringify({ summary: "proposal" }),
-      observedEffects: ["outcome.propose"], artifacts: [], diagnostics: [], startedAt: "start", completedAt: "end"
+      message: { role: "assistant", content: "proposal" },
+      toolCalls: [],
+      finishReason: "stop"
     }));
     expect(state.phase).toBe("outcome_pending");
-    state = evolve(state, event(5, "run.completed", { message: "proposal", outcomeRevision: 4 }));
+    state = evolve(state, event(4, "run.completed", { message: "proposal", outcomeRevision: 3 }));
     expect(state.outcome).toMatchObject({ kind: "completed", message: "proposal" });
   });
 
@@ -286,21 +282,24 @@ describe("Sigma architecture", () => {
     const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "write result.txt" });
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
-      kind: "completed", message: "Wrote result.txt."
+      kind: "completed",
+      message: expect.stringContaining("Wrote result.txt.")
     });
     await expect(readFile(path.join(workspace, "result.txt"), "utf8")).resolves.toBe("done");
     expect(gateway.requests).toHaveLength(3);
-    const lifecycle: string[] = [];
+    const lifecycle: Array<{ type: string; seq: number; callId?: string }> = [];
     for await (const stored of store.events(session.sessionId)) {
-      if (stored.type.startsWith("tool.")) {
-        const payload = stored.payload as Record<string, unknown>;
-        lifecycle.push(`${stored.type}:${String(payload.callId)}`);
-      }
+      const payload = stored.payload as Record<string, unknown>;
+      lifecycle.push({
+        type: stored.type,
+        seq: stored.seq,
+        ...(typeof payload.callId === "string" ? { callId: payload.callId } : {})
+      });
     }
-    const completionRequest = lifecycle.findIndex((item) =>
-      item.startsWith("tool.requested:runtime_completion_intent_"));
-    expect(lifecycle.indexOf("tool.completed:validate-same-turn-result"))
-      .toBeLessThan(completionRequest);
+    const validationCompleted = lifecycle.find((item) =>
+      item.type === "tool.completed" && item.callId === "validate-same-turn-result");
+    const runCompleted = lifecycle.find((item) => item.type === "run.completed");
+    expect(validationCompleted?.seq).toBeLessThan(runCompleted?.seq ?? 0);
   });
 
   it("recovers after an evidence tool fails before completion", async () => {
@@ -343,7 +342,7 @@ describe("Sigma architecture", () => {
     for await (const stored of store.events(session.sessionId)) events.push(stored);
     expect(events.find((stored) => stored.type === "tool.failed"
       && (stored.payload as { callId?: string }).callId === "failed-evidence")?.payload)
-      .toMatchObject({ diagnostics: ["unknown_tool"] });
+      .toMatchObject({ diagnostics: ["model_tool_policy_violation"] });
     expect(events.filter((stored) => stored.type === "run.completed")).toHaveLength(1);
   });
 
@@ -477,18 +476,11 @@ describe("Sigma architecture", () => {
       event(3, "user.message", { text: "finish" }),
       event(4, "model.started", { turnId: 1, effectRevision: 3 }),
       event(5, "model.completed", {
-        turnId: 1, effectRevision: 3,
-        message: { role: "assistant", content: "", toolCalls: [{
-          id: "runtime_completion_intent_1_3", name: "runtime_finalize", arguments: { summary: "already generated" }
-        }] },
-        toolCalls: [{
-          id: "runtime_completion_intent_1_3", name: "runtime_finalize", arguments: { summary: "already generated" }
-        }], finishReason: "tool_calls"
-      }),
-      event(6, "tool.completed", {
-        turnId: 1, effectRevision: 3,
-        callId: "runtime_completion_intent_1_3", ok: true, output: JSON.stringify({ summary: "already generated" }),
-        observedEffects: ["outcome.propose"], artifacts: [], diagnostics: [], startedAt: "start", completedAt: "end"
+        turnId: 1,
+        effectRevision: 3,
+        message: { role: "assistant", content: "already generated" },
+        toolCalls: [],
+        finishReason: "stop"
       })
     ];
     for (const stored of pendingEvents) await pendingStore.append(stored, stored.seq - 1);
@@ -610,7 +602,10 @@ describe("Sigma architecture", () => {
     });
     await runtime.command({ type: "resume", sessionId: "session" });
     await runtime.command({ type: "approve", sessionId: "session", requestId: "restored-write", decision: "allow" });
-    await expect(runtime.waitForOutcome("session")).resolves.toMatchObject({ kind: "completed", message: "restored" });
+    await expect(runtime.waitForOutcome("session")).resolves.toMatchObject({
+      kind: "completed",
+      message: expect.stringContaining("restored")
+    });
     await expect(readFile(path.join(workspace, "restored.txt"), "utf8")).resolves.toBe("ok");
   });
 

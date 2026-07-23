@@ -11,7 +11,7 @@ import { mutatingPlan, turnPayload, type ToolAttempt } from "./effect-runner-hel
 import type { RuntimeSession } from "./types.js";
 import { assertToolReceiptIdentity, normalizeReceiptEvidence } from "./tool-evidence.js";
 import { assertReceiptWithinPlan } from "./tool-plan-enforcement.js";
-import { toolTaskControlContext } from "./repository-recovery-context.js";
+import { toolRuntimeContext } from "./repository-recovery-context.js";
 
 interface NoChangePreparedTool {
   call: ModelToolCall;
@@ -59,7 +59,7 @@ async function probeNoChange(
     runId: session.durable.runId,
     workspacePath: session.identity.workspacePath,
     runMode: session.durable.mode,
-    ...toolTaskControlContext(session),
+    ...toolRuntimeContext(session),
     runtimeControl: options.control.forSession(session),
     signal,
     callPlan: plan
@@ -104,7 +104,7 @@ export async function settleNoChangeProbe(
     runId: session.durable.runId,
     workspaceDeltas: []
     , repositoryScope: {
-      goalEpoch: session.durable.state.taskControl.goalEpoch,
+      goalEpoch: session.durable.state.messages.filter((message) => message.role === "user").length,
       frontier: session.durable.state.mutationFrontier,
       mutationEvidence: [...session.durable.state.mutationEvidence]
     }

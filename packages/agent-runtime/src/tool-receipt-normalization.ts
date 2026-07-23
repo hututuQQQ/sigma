@@ -19,7 +19,7 @@ export function normalizeToolTransactionReceipt(
     runId: session.durable.runId,
     workspaceDeltas: [],
     repositoryScope: {
-      goalEpoch: session.durable.state.taskControl.goalEpoch,
+      goalEpoch: session.durable.state.messages.filter((message) => message.role === "user").length,
       frontier: session.durable.state.mutationFrontier,
       mutationEvidence: [...session.durable.state.mutationEvidence]
     },

@@ -2,6 +2,7 @@ export * from "./unicode.js";
 export * from "./summary.js";
 export * from "./instructions.js";
 export * from "./planner.js";
+export * from "./history-planning.js";
 export * from "./cache.js";
 export * from "./repository-context.js";
 export * from "./repository-listing.js";

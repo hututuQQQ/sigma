@@ -36,6 +36,36 @@ function isCurrentValidation(session: RuntimeSession, item: EvidenceRecord): ite
     && item.data.stateDigest === frontier.currentStateDigest;
 }
 
+export interface CurrentFrontierValidationStatus {
+  validations: ValidationEvidence[];
+  latestPassed?: ValidationEvidence;
+  latestFailed?: ValidationEvidence;
+  hasRecord: boolean;
+  passed: boolean;
+}
+
+/**
+ * Completion authority is deliberately structural: a validation record must
+ * be bound to the exact current frontier, and Strict requires one such record
+ * to have passed. Command-name and claim classification remain available for
+ * telemetry and model context, but do not decide whether completion is valid.
+ */
+export function currentFrontierValidationStatus(
+  session: RuntimeSession
+): CurrentFrontierValidationStatus {
+  const validations = sessionMutationEvidence(session).filter((item) =>
+    isCurrentValidation(session, item));
+  const latestPassed = [...validations].reverse().find((item) => item.status === "passed");
+  const latestFailed = [...validations].reverse().find((item) => item.status === "failed");
+  return {
+    validations,
+    ...(latestPassed ? { latestPassed } : {}),
+    ...(latestFailed ? { latestFailed } : {}),
+    hasRecord: validations.length > 0,
+    passed: Boolean(latestPassed)
+  };
+}
+
 export interface FrontierValidationReadiness {
   validations: ValidationEvidence[];
   coveredPaths: string[];
@@ -60,11 +90,9 @@ export function currentRepositoryAcceptance(
   session: RuntimeSession
 ): RepositoryAcceptanceEvidenceV1 | undefined {
   const frontier = session.durable.state.mutationFrontier;
-  const goalEpoch = session.durable.state.taskControl.goalEpoch;
   return sessionMutationEvidence(session).filter((item): item is RepositoryAcceptanceEvidenceV1 =>
     item.kind === "repository_acceptance"
     && item.status === "passed"
-    && item.data.goalEpoch === goalEpoch
     && item.data.frontierRevision === frontier.revision
     && item.data.frontierStateDigest === frontier.currentStateDigest
     && item.data.repositoryStateDigest === frontier.repositoryStateDigest).at(-1);
@@ -142,7 +170,7 @@ function validationSemanticSignature(validation: ValidationEvidence): string {
 
 export function reviewBasisDigest(
   session: RuntimeSession,
-  validations = frontierValidationReadiness(session).validations,
+  validations = currentFrontierValidationStatus(session).validations,
   completionCandidateDigest?: string
 ): string {
   const frontier = session.durable.state.mutationFrontier;

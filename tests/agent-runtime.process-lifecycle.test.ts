@@ -3,11 +3,10 @@ import type {
   AgentEventType,
   ModelToolCall,
   ToolCallPlan,
-  ToolDescriptor,
   ToolReceipt
 } from "../packages/agent-protocol/src/index.js";
 import { createKernelState } from "../packages/agent-kernel/src/index.js";
-import { completionFailure } from "../packages/agent-runtime/src/effect-helpers.js";
+import { completionGateDecision } from "../packages/agent-runtime/src/completion-evidence-gate.js";
 import { terminateRunProcesses } from "../packages/agent-runtime/src/process-cleanup.js";
 import { finishRuntimeSession } from "../packages/agent-runtime/src/runtime-session-finish.js";
 import type { ProcessExecutionPort } from "../packages/agent-platform/src/index.js";
@@ -182,14 +181,10 @@ describe("durable process lifecycle events", () => {
       deadlineAt: "2026-01-01T01:00:00.000Z"
     });
     state.activeProcessIds.push("process-active");
-    const failure = completionFailure(
-      runtimeSessionFixture({ state }),
-      call("runtime_finalize"),
-      { possibleEffects: ["outcome.propose"] } as ToolDescriptor,
-      "2026-01-01T00:00:00.000Z"
-    );
-    expect(failure).toMatchObject({ ok: false, diagnostics: ["active_processes"] });
-    expect(failure?.output).toContain("process-active");
+    const decision = completionGateDecision(runtimeSessionFixture({ state }));
+    expect(decision).toMatchObject({ action: "continue" });
+    if (decision.action !== "continue") throw new Error("Expected a completion advisory.");
+    expect(decision.message).toContain("process-active");
   });
 
   it("directs deliverable processes to handoff and session processes to termination", () => {
@@ -207,24 +202,11 @@ describe("durable process lifecycle events", () => {
         ])
       }
     });
-    const failure = completionFailure(
-      target,
-      call("runtime_finalize"),
-      { possibleEffects: ["outcome.propose"] } as ToolDescriptor,
-      "2026-01-01T00:00:00.000Z"
-    );
-
-    expect(failure).toMatchObject({
-      diagnostics: ["active_processes"],
-      result: {
-        deliverableProcessIds: ["service"],
-        sessionProcessIds: ["helper"],
-        nextActions: [
-          { tool: "process_handoff", processIds: ["service"] },
-          { tool: "process_terminate", processIds: ["helper"] }
-        ]
-      }
-    });
+    const decision = completionGateDecision(target);
+    expect(decision).toMatchObject({ action: "continue" });
+    if (decision.action !== "continue") throw new Error("Expected a completion advisory.");
+    expect(decision.message).toContain("service");
+    expect(decision.message).toContain("helper");
   });
 
   it("terminates runtime-local process trees before a terminal outcome", async () => {

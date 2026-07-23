@@ -29,17 +29,19 @@ export type RepositoryHeadRelationV2 =
 export interface RepositoryRecoveryCandidateV2 extends RepositoryReflogEntryV2 {
   candidateId: string;
   relationToHead: RepositoryHeadRelationV2;
+  /** Runtime-issued, freshness-bound capability used if the model selects this candidate. */
+  selectionEvidenceId?: string;
 }
 
 export type RepositoryRecoverySelectionStatusV2 =
   | { status: "none" }
   | { status: "unavailable"; reason: string }
-  | { status: "user_decision_required"; candidateIds: string[] }
+  | { status: "model_choice_available"; candidateIds: string[] }
   | {
       status: "selected";
       candidateId: string;
       selectionEvidenceId: string;
-      selectionKind: "unique" | "user_selected";
+      selectionKind: "unique";
     };
 
 export interface RepositoryInspectionV2 {

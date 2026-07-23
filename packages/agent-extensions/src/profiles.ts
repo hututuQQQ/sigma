@@ -190,7 +190,7 @@ function parseMutationPolicy(value: unknown, label: string): ProfileMutationPoli
   }
   rejectUnknown(policy, MUTATION_KEYS, label);
   return {
-    requirePlanBeforeMutation: booleanValue(policy.require_plan_before_mutation, true, `${label}.require_plan_before_mutation`),
+    requirePlanBeforeMutation: booleanValue(policy.require_plan_before_mutation, false, `${label}.require_plan_before_mutation`),
     checkpointBeforeMutation: booleanValue(policy.checkpoint_before_mutation, true, `${label}.checkpoint_before_mutation`),
     reviewMode: enumValue(policy.review_mode ?? "advisory", ["off", "advisory", "required"], `${label}.review_mode`)
   };
@@ -198,7 +198,7 @@ function parseMutationPolicy(value: unknown, label: string): ProfileMutationPoli
 
 function defaultMutationPolicy(): ProfileMutationPolicy {
   return {
-    requirePlanBeforeMutation: true,
+    requirePlanBeforeMutation: false,
     checkpointBeforeMutation: true,
     reviewMode: "advisory"
   };

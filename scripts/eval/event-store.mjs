@@ -5,7 +5,8 @@ import path from "node:path";
 
 export const STORE_LAYOUT_VERSION = 5;
 const EVENT_SCHEMA_VERSION = 5;
-const SNAPSHOT_SCHEMA_VERSION = 5;
+const CURRENT_SNAPSHOT_SCHEMA_VERSION = 6;
+const SNAPSHOT_SCHEMA_VERSIONS = new Set([5, CURRENT_SNAPSHOT_SCHEMA_VERSION]);
 const EVENT_TYPES = new Set([
   "session.created", "run.started", "run.suspended", "run.completed", "run.cancelled", "run.failed",
   "user.message", "user.steer", "user.follow_up", "model.started", "model.delta", "model.reasoning_delta",
@@ -25,8 +26,8 @@ try {
   const protocol = await import("../../packages/agent-protocol/dist/index.js");
   if (protocol.STORE_LAYOUT_VERSION !== STORE_LAYOUT_VERSION
     || protocol.EVENT_SCHEMA_VERSION !== EVENT_SCHEMA_VERSION
-    || protocol.SNAPSHOT_SCHEMA_VERSION !== SNAPSHOT_SCHEMA_VERSION) {
-    throw new Error("Built agent-protocol versions do not match the V5 audit reader.");
+    || protocol.SNAPSHOT_SCHEMA_VERSION !== CURRENT_SNAPSHOT_SCHEMA_VERSION) {
+    throw new Error("Built agent-protocol versions do not match the V5 event-store audit reader.");
   }
   officialAssertAgentEventEnvelope = protocol.assertAgentEventEnvelope;
 } catch (error) {
@@ -100,7 +101,7 @@ function validateMeta(value, sessionId) {
   const valid = [
     value.schemaVersion === STORE_LAYOUT_VERSION,
     value.eventSchemaVersion === EVENT_SCHEMA_VERSION,
-    value.snapshotSchemaVersion === SNAPSHOT_SCHEMA_VERSION,
+    SNAPSHOT_SCHEMA_VERSIONS.has(value.snapshotSchemaVersion),
     value.sessionId === sessionId,
     validDate(value.createdAt),
     validDate(value.updatedAt),

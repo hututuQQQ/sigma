@@ -36,7 +36,7 @@ export type RunCommand =
     sessionId: string;
     increase: Partial<import("./domain.js").BudgetLimits>;
   }
-  /** User-only, one-shot waiver for one pending independent-review obligation. */
+  /** User-only, one-shot audit waiver for one unreviewed mutation delta. */
   | {
     type: "reviewer_waiver";
     sessionId: string;

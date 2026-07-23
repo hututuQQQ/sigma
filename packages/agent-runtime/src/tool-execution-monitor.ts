@@ -19,7 +19,7 @@ import type { RuntimeControlService } from "./runtime-control.js";
 import type { RuntimeOptions, RuntimeSession } from "./types.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 import { ACTION_SETTLEMENT_GRACE_MS } from "./convergence-policy.js";
-import { toolTaskControlContext } from "./repository-recovery-context.js";
+import { toolRuntimeContext } from "./repository-recovery-context.js";
 
 export interface ToolExecutionMonitorOptions {
   runtime: RuntimeOptions;
@@ -125,7 +125,7 @@ export class ToolExecutionMonitor {
         runId: session.durable.runId,
         workspacePath: session.identity.workspacePath,
         runMode: session.durable.mode,
-        ...toolTaskControlContext(session),
+        ...toolRuntimeContext(session),
         callPlan: plan,
         ...(approval ? { approval } : {}),
         signal: controller.signal,

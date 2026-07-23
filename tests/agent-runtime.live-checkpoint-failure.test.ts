@@ -75,19 +75,7 @@ async function fixture(writeBeforeFailure: boolean): Promise<{
   const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
   const gateway = new ScriptedGateway([
     toolTurn([
-      { id: "failing-mutation", name: "failing_mutation", arguments: { path: "target.txt" } },
-      {
-        id: "same-turn-completion",
-        name: "runtime_finalize",
-        arguments: {
-          summary: "must not complete over an open checkpoint",
-          criteria: [{
-            criterion: "The mutation completed safely.",
-            status: "met",
-            evidence: [{ evidenceId: "invented", kind: "diagnostic" }]
-          }]
-        }
-      }
+      { id: "failing-mutation", name: "failing_mutation", arguments: { path: "target.txt" } }
     ]),
     toolTurn([{
       id: "clean-failure-observed",
@@ -131,7 +119,7 @@ async function fixture(writeBeforeFailure: boolean): Promise<{
 }
 
 describe("live mutation checkpoint failure recovery", () => {
-  it("suspends immediately when a failed mutation leaves a workspace delta", async () => {
+  it("suspends on the hard checkpoint invariant after a partial mutation failure", async () => {
     const target = await fixture(true);
     const session = await target.runtime.createSession({ workspacePath: target.workspace, mode: "change" });
     await target.runtime.command({ type: "submit", sessionId: session.sessionId, text: "exercise a partial mutation" });
@@ -144,15 +132,6 @@ describe("live mutation checkpoint failure recovery", () => {
     await expect(readFile(path.join(target.workspace, "target.txt"), "utf8")).resolves.toBe("partial");
     expect((await target.manager.list(session.sessionId)).at(-1)).toMatchObject({ status: "open" });
     const stored = await events(target.store, session.sessionId);
-    expect(stored.some((event) => event.type === "tool.requested"
-      && (event.payload as { callId?: string }).callId === "same-turn-completion")).toBe(false);
-    expect(stored).toContainEqual(expect.objectContaining({
-      type: "tool.failed",
-      payload: expect.objectContaining({
-        callId: "same-turn-completion",
-        diagnostics: expect.arrayContaining(["checkpoint_recovery_required"])
-      })
-    }));
     expect(stored).toContainEqual(expect.objectContaining({
       type: "run.suspended",
       payload: expect.objectContaining({ requestId: expect.stringMatching(/^checkpoint:/u) })

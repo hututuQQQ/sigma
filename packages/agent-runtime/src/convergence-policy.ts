@@ -4,8 +4,6 @@ import type { RuntimeSession } from "./types.js";
 export const ACTION_SETTLEMENT_GRACE_MS = 10_000;
 const MODEL_MINIMUM_MS = 15_000;
 const MODEL_MAXIMUM_MS = 180_000;
-const TOOL_MINIMUM_MS = 250;
-const TOOL_MAXIMUM_MS = 30_000;
 
 export type ConvergenceAction =
   | { kind: "model" }
@@ -29,17 +27,6 @@ function modelEstimateMs(session: RuntimeSession): number {
   return clamp(Math.ceil(quantile(samples, 0.90, MODEL_MINIMUM_MS / 1.5) * 1.5), MODEL_MINIMUM_MS, MODEL_MAXIMUM_MS);
 }
 
-function toolEstimateMs(session: RuntimeSession, terminalOnly: boolean): number {
-  if (terminalOnly) return TOOL_MINIMUM_MS;
-  const samples = session.durable.state.receipts.slice(-8).flatMap((receipt) => {
-    const started = Date.parse(receipt.startedAt);
-    const completed = Date.parse(receipt.completedAt);
-    return Number.isFinite(started) && Number.isFinite(completed) && completed >= started
-      ? [completed - started] : [];
-  });
-  return clamp(Math.ceil(quantile(samples, 0.90, 500) * 1.5), TOOL_MINIMUM_MS, TOOL_MAXIMUM_MS);
-}
-
 export type DeadlineStage = "normal" | "converge" | "stop";
 
 export interface DeadlineForecast {
@@ -55,9 +42,7 @@ export function deadlineForecast(session: RuntimeSession, now = Date.now()): Dea
     ?? Date.parse(session.durable.state.deadlineAt) - now;
   const nextModelEstimateMs = modelEstimateMs(session);
   const usableMs = Math.max(0, remainingMs - ACTION_SETTLEMENT_GRACE_MS);
-  const stage: DeadlineStage = usableMs < nextModelEstimateMs
-    ? "stop"
-    : usableMs < nextModelEstimateMs * 3 ? "converge" : "normal";
+  const stage: DeadlineStage = remainingMs <= 0 ? "stop" : "normal";
   return {
     stage,
     remainingMs,
@@ -95,11 +80,9 @@ function hardBudgetFailure(session: RuntimeSession, action: ConvergenceAction): 
 }
 
 /**
- * Admit a model/tool action against the same durable budget and active-time
- * view. Hard reservations still perform exact accounting; this forecast only
- * prevents beginning work that cannot reasonably settle before the outer
- * deadline, so the run can commit a normal typed failure instead of crashing
- * in the deadline race.
+ * Admit only against facts the runtime can prove: the durable hard ledger and
+ * the absolute deadline. Latency forecasts remain telemetry and never end a
+ * run early or narrow the model's choices.
  */
 export function convergenceAdmissionFailure(
   session: RuntimeSession,
@@ -108,14 +91,10 @@ export function convergenceAdmissionFailure(
 ): RunOutcome | null {
   const hardFailure = hardBudgetFailure(session, action);
   if (hardFailure) return hardFailure;
-  const forecast = deadlineForecast(session, now);
-  const remainingMs = forecast.remainingMs;
-  const estimateMs = action.kind === "model"
-    ? forecast.nextModelEstimateMs
-    : toolEstimateMs(session, action.terminalOnly === true);
-  const requiredMs = estimateMs + ACTION_SETTLEMENT_GRACE_MS;
-  if (remainingMs > requiredMs) return null;
+  const remainingMs = session.durable.state.deadlineRemainingMs
+    ?? Date.parse(session.durable.state.deadlineAt) - now;
+  if (remainingMs > 0) return null;
   return budgetFailure(
-    `Only ${Math.max(0, Math.floor(remainingMs))}ms of active time remains; the next ${action.kind} action and durable settlement require approximately ${requiredMs}ms. Stopped before the hard deadline.`
+    `The absolute run deadline has elapsed; no further ${action.kind} action can be admitted.`
   );
 }

@@ -59,7 +59,6 @@ export interface ToolPreparationContext {
   workspacePath: string;
   runMode: RunMode;
   goalEpoch?: number;
-  repositoryRecoveryCandidateIds?: readonly string[];
   mutationFrontierRevision?: number;
   mutationFrontierStateDigest?: string;
   /** Read-only session authority used while dynamically planning resources
@@ -182,9 +181,6 @@ export interface ToolExecutionContext {
   /** Current reducer-owned goal epoch. Tools may bind evidence to it but may
    * never advance or reconstruct it. */
   goalEpoch?: number;
-  /** Runtime-matched candidate ids from the latest user decision. Model tool
-   * arguments cannot populate this capability. */
-  repositoryRecoveryCandidateIds?: readonly string[];
   mutationFrontierRevision?: number;
   mutationFrontierStateDigest?: string;
   /** Immutable runtime-approved plan for this exact call. Mutating tools must

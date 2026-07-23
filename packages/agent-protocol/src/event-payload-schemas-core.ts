@@ -158,7 +158,7 @@ const diagnosticSchema = z.discriminatedUnion("kind", [
     historyTokens: z.number().int().nonnegative(),
     latestHistoryBlockTokens: z.number().int().nonnegative(),
     omittedHistoryTurns: z.number().int().nonnegative(),
-    cacheMode: z.enum(["prefix_cache", "proactive_window"]),
+    cacheMode: z.enum(["prefix_cache", "proactive_window", "provider_window"]),
     historyTokenLimit: z.number().int().nonnegative(),
     dynamicSuffixTokens: z.number().int().nonnegative(),
     modelVisibleOutputTruncatedBytes: z.number().int().nonnegative(),

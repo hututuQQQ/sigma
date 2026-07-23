@@ -56,7 +56,16 @@ max_tool_calls = 512
 max_children = 4
 max_depth = 2
 `);
-    expect(profile).toMatchObject({ id: "safe", roleRoutes: { reviewer: "review" }, budget: { maxDepth: 2 } });
+    expect(profile).toMatchObject({
+      id: "safe",
+      roleRoutes: { reviewer: "review" },
+      budget: { maxDepth: 2 },
+      mutationPolicy: {
+        requirePlanBeforeMutation: false,
+        checkpointBeforeMutation: true,
+        reviewMode: "advisory"
+      }
+    });
     const first = freezeAgentProfile(profile);
     const second = freezeAgentProfile({ ...profile, roleRoutes: { reviewer: "review", orchestrator: "main" } });
     expect(first.digest).toBe(second.digest);
