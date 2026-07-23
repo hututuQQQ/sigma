@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -36,11 +37,69 @@ function context(workspacePath: string): ToolExecutionContext {
   };
 }
 
-function request(callId: string, name: "write" | "edit", argumentsValue: JsonValue): ToolRequest {
+function request(
+  callId: string,
+  name: "write" | "edit" | "write_chunk",
+  argumentsValue: JsonValue
+): ToolRequest {
   return { callId, name, arguments: argumentsValue };
 }
 
 describe("exact text no-change writes", () => {
+  it("appends a verified chunk atomically and treats an exact replay as no_change", async () => {
+    const root = await temporaryRoot();
+    const workspace = path.join(root, "workspace");
+    await mkdir(workspace);
+    await writeFile(path.join(workspace, "chunk.txt"), "alpha", "utf8");
+    const tools = registerBuiltinTools(new EffectToolRegistry(), {
+      atomicPatchStateRootDir: path.join(root, "state")
+    });
+    const expectedSha256 = createHash("sha256").update("alpha", "utf8").digest("hex");
+    const argumentsValue = {
+      path: "chunk.txt",
+      content: "\nbeta",
+      expectedByteLength: 5,
+      expectedSha256
+    };
+
+    const changed = await tools.execute(
+      request("chunk-first", "write_chunk", argumentsValue),
+      context(workspace)
+    );
+    expect(changed).toMatchObject({
+      ok: true,
+      result: {
+        status: "changed",
+        path: "chunk.txt",
+        byteLength: 10,
+        sha256: createHash("sha256").update("alpha\nbeta", "utf8").digest("hex")
+      }
+    });
+    // Reconstruct the registry to model a process/checkpoint recovery before
+    // replaying the durable call arguments.
+    const recoveredTools = registerBuiltinTools(new EffectToolRegistry(), {
+      atomicPatchStateRootDir: path.join(root, "state")
+    });
+    const replay = await recoveredTools.execute(
+      request("chunk-replay", "write_chunk", argumentsValue),
+      context(workspace)
+    );
+    expect(replay).toMatchObject({
+      ok: true,
+      result: { status: "no_change", path: "chunk.txt", byteLength: 10 },
+      actualEffects: ["filesystem.read"]
+    });
+    await expect(readFile(path.join(workspace, "chunk.txt"), "utf8"))
+      .resolves.toBe("alpha\nbeta");
+
+    await expect(recoveredTools.execute(request("chunk-stale", "write_chunk", {
+      ...argumentsValue,
+      expectedSha256: "0".repeat(64)
+    }), context(workspace))).rejects.toMatchObject({
+      code: "write_chunk_precondition_failed"
+    });
+  });
+
   it("short-circuits the atomic text replacement before journaled mutation", async () => {
     const root = await temporaryRoot();
     const workspace = path.join(root, "workspace");

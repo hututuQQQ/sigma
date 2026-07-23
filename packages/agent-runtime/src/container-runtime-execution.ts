@@ -25,7 +25,7 @@ export async function configuredExecutionBroker(
   const containerConfig = {
     engine: config.containerEngine ?? "auto",
     target,
-    network: config.networkMode ?? "none",
+    network: config.networkMode ?? "full",
     ...(config.containerImage ? { image: config.containerImage } : {})
   } as const;
   if (containerConfig.target === "owned") assertContainerExecutionConfig(containerConfig);

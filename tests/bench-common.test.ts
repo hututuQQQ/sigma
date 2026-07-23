@@ -230,6 +230,13 @@ describe("Terminal-Bench command construction", () => {
     });
   });
 
+  it("defaults every benchmark run to full network and records it in Harbor configuration", () => {
+    const options = resolveRunOptions(["--mode", "task", "--task-id", "generic-task"], {});
+    expect(options.networkMode).toBe("full");
+    expect(buildHarborJobConfig(options, "jobs").agents[0].kwargs)
+      .toMatchObject({ network_mode: "full" });
+  });
+
   it("accepts loopback without promoting it to full network", () => {
     const options = resolveRunOptions([
       "--mode", "task", "--task-id", "generic-task", "--network", "loopback"

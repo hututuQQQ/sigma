@@ -81,6 +81,17 @@ export const agentEventPayloadFixtures = {
   "user.steer": { text: "adjust" },
   "user.follow_up": { text: "continue", queueId: "queue", status: "queued" },
   "model.started": { provider: "provider", model: "model", ...turn },
+  "model.prompt_materialized": {
+    ...turn,
+    messages: [{
+      role: "developer",
+      content: "[runtime prompt frame; applies only to the immediately following assistant turn]"
+    }],
+    toolSchemaDigest: "a".repeat(64),
+    requestDigest: "b".repeat(64),
+    prefixMessageCount: 1,
+    cacheMode: "prefix_cache"
+  },
   "model.delta": { turnId: 1, delta: "text" },
   "model.reasoning_delta": { turnId: 1, delta: "reasoning" },
   "model.completed": {

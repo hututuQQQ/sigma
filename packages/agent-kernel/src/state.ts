@@ -15,6 +15,7 @@ import {
   type EvidenceRecord,
   type FrozenArtifactRef,
   type FrozenCustomizationRef,
+  type ModelFinishReason,
   type ModelMessage,
   type MutationFrontier,
   type PlanGraph,
@@ -63,6 +64,11 @@ export interface KernelState {
   activeModelTurn?: ActiveModelTurn;
   /** True once any content or reasoning from the active provider attempt is durable. */
   activeModelSemanticDelta?: boolean;
+  /** Durable completion state used to recover bounded output truncation. */
+  lastModelFinishReason?: ModelFinishReason;
+  consecutiveLengthFinishes: number;
+  consecutiveLengthNoAction: number;
+  lastModelHadToolCalls: boolean;
   messages: ModelMessage[];
   pendingTools: PendingTool[];
   toolCallIds: string[];
@@ -107,6 +113,9 @@ export function createKernelState(options: CreateKernelStateOptions): KernelStat
     lastSeq: 0,
     startedAt: options.startedAt,
     deadlineAt: options.deadlineAt,
+    consecutiveLengthFinishes: 0,
+    consecutiveLengthNoAction: 0,
+    lastModelHadToolCalls: false,
     messages: [],
     pendingTools: [],
     toolCallIds: [],
@@ -156,6 +165,18 @@ function validKernelCollections(state: Record<string, unknown>): boolean {
     && Array.isArray(state.childIds);
 }
 
+function validModelCompletionState(state: Record<string, unknown>): boolean {
+  const finishReason = state.lastModelFinishReason;
+  return (finishReason === undefined
+      || ["stop", "length", "tool_calls", "content_filter", "protocol_error"]
+        .includes(String(finishReason)))
+    && Number.isSafeInteger(state.consecutiveLengthFinishes)
+    && Number(state.consecutiveLengthFinishes) >= 0
+    && Number.isSafeInteger(state.consecutiveLengthNoAction)
+    && Number(state.consecutiveLengthNoAction) >= 0
+    && typeof state.lastModelHadToolCalls === "boolean";
+}
+
 function validKernelDomainState(state: Record<string, unknown>): boolean {
   return isMutationFrontier(state.mutationFrontier)
     && isPlanGraph(state.plan)
@@ -164,7 +185,8 @@ function validKernelDomainState(state: Record<string, unknown>): boolean {
     && validFrozenState(state)
     && (state.contextArchive === undefined || isContextArchiveV1(state.contextArchive))
     && (state.activeModelSemanticDelta === undefined
-      || typeof state.activeModelSemanticDelta === "boolean");
+      || typeof state.activeModelSemanticDelta === "boolean")
+    && validModelCompletionState(state);
 }
 
 export function isKernelState(value: unknown): value is KernelState {
@@ -213,7 +235,7 @@ function isFrozenCustomizationRef(value: unknown): value is FrozenCustomizationR
 }
 
 export function assertKernelState(value: unknown): asserts value is KernelState {
-  if (!isKernelState(value)) throw new Error("Invalid KernelState V6.");
+  if (!isKernelState(value)) throw new Error("Invalid KernelState V7.");
 }
 
 export function isTerminal(state: KernelState): boolean {

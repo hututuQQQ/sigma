@@ -32,7 +32,7 @@ export function createConfiguredTools(
   storeRootDir: string
 ): EffectToolRegistry {
   const recoverySelections = new RepositoryRecoverySelectionStore();
-  const network = verifiedNetworkPolicy(executionReport, config.networkMode ?? "none");
+  const network = verifiedNetworkPolicy(executionReport, config.networkMode ?? "full");
   const executionBackend = executionReport.container?.available === true ? "oci" : "native";
   const builtins = registerBuiltinTools(new EffectToolRegistry(), {
     broker: execution,

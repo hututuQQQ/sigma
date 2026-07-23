@@ -1,6 +1,8 @@
+import { createHash } from "node:crypto";
 import type {
   BudgetAmounts,
   ContextItem,
+  JsonValue,
   ModelMessage,
   ModelRequest,
   ModelToolDefinition,
@@ -27,6 +29,8 @@ export interface PreparedModelTurn {
   toolChoice?: ModelRequest["toolChoice"];
   budget: PreparedModelBudget;
   outputReserveTokens: number;
+  toolSchemaDigest: string;
+  requestDigest: string;
 }
 
 export interface TurnPreparationInput {
@@ -146,15 +150,38 @@ function budgetContext(input: TurnPreparationInput): ContextItem {
   };
 }
 
+function canonicalJson(value: JsonValue): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) =>
+      `${JSON.stringify(key)}:${canonicalJson(value[key] ?? null)}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function sha256(value: JsonValue): string {
+  return createHash("sha256").update(canonicalJson(value), "utf8").digest("hex");
+}
+
 function requestOutputTokens(input: TurnPreparationInput): number {
+  const escalation = input.session.durable.state.consecutiveLengthFinishes;
+  const desired = escalation <= 0
+    ? input.defaultOutputReserveTokens
+    : escalation === 1
+      ? Math.max(input.defaultOutputReserveTokens, 16_384)
+      : Math.max(input.defaultOutputReserveTokens, 32_768);
+  const providerCapped = Math.min(
+    desired,
+    input.session.services.gateway.capabilities.maxOutputTokens
+  );
   const affordable = Math.max(1, Math.floor(
     input.available.outputTokens / APPROXIMATE_TOKEN_RESERVATION_MARGIN
   ));
   if (input.available.modelTurns <= 1) {
-    return Math.min(input.defaultOutputReserveTokens, affordable);
+    return Math.min(providerCapped, affordable);
   }
   const withFinalReplyHeldBack = Math.max(1, affordable - FINAL_RESPONSE_OUTPUT_TOKENS);
-  return Math.min(input.defaultOutputReserveTokens, withFinalReplyHeldBack);
+  return Math.min(providerCapped, withFinalReplyHeldBack);
 }
 
 export async function prepareBudgetedModelTurn(
@@ -180,13 +207,21 @@ export async function prepareBudgetedModelTurn(
     outputReserveTokens,
     available.costMicroUsd
   );
+  const toolSchemaDigest = sha256(tools as unknown as JsonValue);
+  const requestDigest = sha256({
+    messages: plan.messages,
+    tools,
+    outputReserveTokens
+  } as unknown as JsonValue);
   return {
     plan,
     turn: {
       messages: plan.messages,
       tools,
       budget,
-      outputReserveTokens
+      outputReserveTokens,
+      toolSchemaDigest,
+      requestDigest
     }
   };
 }

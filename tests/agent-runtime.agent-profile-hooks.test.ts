@@ -159,6 +159,7 @@ function configured(workspace: string): RuntimeCompositionConfig {
     provider: "deepseek",
     model: "deepseek-v4-pro",
     permissionMode: "deny",
+    networkMode: "none",
     runDeadlineSec: 30,
     modelDeadlineSec: 10,
     streamIdleSec: 5,

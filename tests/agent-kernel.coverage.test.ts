@@ -108,7 +108,7 @@ function settle(
   });
 }
 
-describe("agent-kernel V6 protocol behavior", () => {
+describe("agent-kernel V7 protocol behavior", () => {
   it("records every call in a mixed batch without interpreting its semantics", () => {
     let state = apply(initial(), "user.message", { text: "Inspect or ask." });
     state = toolTurn(state, 1, [
@@ -121,7 +121,7 @@ describe("agent-kernel V6 protocol behavior", () => {
     assertKernelInvariants(state);
   });
 
-  it("proposes natural text directly and types empty/truncated responses", () => {
+  it("proposes natural text directly and bounds truncated-response continuation", () => {
     const prepared = apply(initial(), "user.message", { text: "Answer." });
     const natural = complete(start(prepared, 1), {
       message: { role: "assistant", content: "Done." },
@@ -141,8 +141,24 @@ describe("agent-kernel V6 protocol behavior", () => {
       kind: "recoverable_failure",
       code: "empty_assistant_response"
     });
-    const length = complete(start(prepared, 3), {
+    let length = complete(start(prepared, 3), {
       message: { role: "assistant", content: "partial" },
+      toolCalls: [],
+      finishReason: "length"
+    });
+    expect(length).toMatchObject({
+      phase: "ready_model",
+      consecutiveLengthFinishes: 1,
+      consecutiveLengthNoAction: 1
+    });
+    expect(length.messages.at(-1)?.content).toContain("action-oriented");
+    length = complete(start(length, 4), {
+      message: { role: "assistant", content: "still partial" },
+      toolCalls: [],
+      finishReason: "length"
+    });
+    length = complete(start(length, 5), {
+      message: { role: "assistant", content: "still truncated" },
       toolCalls: [],
       finishReason: "length"
     });

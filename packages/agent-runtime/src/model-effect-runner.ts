@@ -236,6 +236,15 @@ export class ModelEffectRunner {
     }
     const turn: PreparedModelTurn = { ...prepared.turn, budget: fittedBudget };
     const plan = prepared.plan;
+    await this.options.emit(session, "model.prompt_materialized", "runtime", {
+      turnId,
+      effectRevision,
+      messages: plan.promptFrameMessages,
+      toolSchemaDigest: turn.toolSchemaDigest,
+      requestDigest: turn.requestDigest,
+      prefixMessageCount: Math.max(0, turn.messages.length - plan.promptFrameMessages.length),
+      cacheMode: plan.cacheMode
+    });
     await this.options.emit(session, "diagnostic", "runtime", {
       kind: "deadline.stage",
       stage: forecast.stage,

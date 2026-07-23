@@ -2,11 +2,14 @@ import type {
   AgentEventEnvelope,
   AgentEventType,
   JsonValue,
-  ModelMessage,
   RunOutcome
 } from "agent-protocol";
 import { durableReducers, type KernelEventReducer } from "./durable-reducers.js";
-import { isCurrentModelTurn, modelMessage, modelToolCalls, modelTurn } from "./model-event-parsing.js";
+import {
+  lengthContinuationMessage,
+  modelReducers,
+  resetModelCompletion
+} from "./model-reducers.js";
 import { acceptMutationFrontier } from "./mutation-frontier.js";
 import { receiptContent, toolReceipt } from "./receipt-parsing.js";
 import {
@@ -15,7 +18,6 @@ import {
   nextPhase,
   objectPayload,
   pendingForEvent,
-  pendingFromCalls,
   proposedOutcomeState,
   supersededToolMessages,
   terminalOutcome,
@@ -35,6 +37,7 @@ const runStarted: EventReducer = (state, _event, payload) => ({
   deadlineRemainingMs: undefined,
   activeModelTurn: undefined,
   activeModelSemanticDelta: undefined,
+  ...resetModelCompletion,
   outcome: undefined,
   proposedOutcome: undefined
 });
@@ -44,6 +47,7 @@ const userInput: EventReducer = (state, _event, payload) => ({
   phase: "ready_model",
   activeModelTurn: undefined,
   activeModelSemanticDelta: undefined,
+  ...resetModelCompletion,
   messages: [...state.messages, { role: "user", content: text(payload.text) }],
   outcome: undefined,
   proposedOutcome: undefined
@@ -59,6 +63,7 @@ const steeringInput: EventReducer = (state, _event, payload) => ({
   phase: "ready_model",
   activeModelTurn: undefined,
   activeModelSemanticDelta: undefined,
+  ...resetModelCompletion,
   pendingTools: [],
   proposedOutcome: undefined,
   outcome: undefined
@@ -71,94 +76,11 @@ const followUpInput: EventReducer = (state, _event, payload) => payload.status =
       phase: "ready_model",
       activeModelTurn: undefined,
       activeModelSemanticDelta: undefined,
+      ...resetModelCompletion,
       messages: [...state.messages, { role: "user", content: text(payload.text) }],
       outcome: undefined,
       proposedOutcome: undefined
     };
-
-const modelStarted: EventReducer = (state, _event, payload) => {
-  const turn = modelTurn(payload);
-  if (state.phase !== "ready_model" || !turn || turn.effectRevision !== state.revision - 1) return state;
-  return { ...state, phase: "model_in_flight", activeModelTurn: turn, activeModelSemanticDelta: false };
-};
-
-const modelSemanticDelta: EventReducer = (state, _event, payload) => {
-  if (state.phase !== "model_in_flight" || !state.activeModelTurn
-    || payload.turnId !== state.activeModelTurn.turnId) return state;
-  return { ...state, activeModelSemanticDelta: true };
-};
-
-function stoppedOutcome(
-  state: KernelState,
-  payload: Record<string, JsonValue>,
-  messages: ModelMessage[],
-  message: ModelMessage | null
-): KernelState {
-  const finishReason = text(payload.finishReason);
-  const answer = message?.content.trim() ?? "";
-  if (finishReason !== "stop") {
-    return proposedOutcomeState({ ...state, messages }, {
-      kind: "recoverable_failure",
-      code: finishReason === "length" ? "model_output_truncated" : "model_protocol_error",
-      message: finishReason === "length"
-        ? "The model exhausted its output allowance before reaching a natural stop."
-        : `The model returned no tool calls with finish reason '${finishReason || "unknown"}'.`
-    });
-  }
-  if (!answer) {
-    return proposedOutcomeState({ ...state, messages }, {
-      kind: "recoverable_failure",
-      code: "empty_assistant_response",
-      message: "The model stopped without a user-visible response or a tool call."
-    });
-  }
-  return proposedOutcomeState({ ...state, messages }, {
-    kind: "completed",
-    message: answer,
-    evidence: state.evidence
-  });
-}
-
-const modelCompleted: EventReducer = (state, _event, payload) => {
-  if (state.phase !== "model_in_flight" || !isCurrentModelTurn(state, payload)) return state;
-  const message = modelMessage(payload.message);
-  const messages = message ? [...state.messages, message] : state.messages;
-  const calls = modelToolCalls(payload.toolCalls);
-  const turn = state.activeModelTurn!;
-  const completedState: KernelState = {
-    ...state,
-    activeModelTurn: undefined,
-    activeModelSemanticDelta: undefined
-  };
-  if (calls.length === 0) return stoppedOutcome(completedState, payload, messages, message);
-  const identifiers = calls.map((call) => call.id);
-  const seen = new Set(state.toolCallIds);
-  const duplicate = identifiers.find((id, index) =>
-    identifiers.indexOf(id) !== index || seen.has(id));
-  if (duplicate) {
-    return proposedOutcomeState({ ...completedState, messages }, {
-      kind: "recoverable_failure",
-      code: "protocol_error",
-      message: `Model reused tool call id '${duplicate}' within the current run.`
-    });
-  }
-  return {
-    ...completedState,
-    messages,
-    pendingTools: pendingFromCalls(calls, turn),
-    toolCallIds: [...state.toolCallIds, ...identifiers],
-    phase: "tool_pending"
-  };
-};
-
-const modelFailed: EventReducer = (state, _event, payload) => {
-  if (state.phase !== "model_in_flight" || !isCurrentModelTurn(state, payload)) return state;
-  return proposedOutcomeState(state, {
-    kind: "recoverable_failure",
-    code: text(payload.code) || "model_error",
-    message: text(payload.message) || "The model request failed."
-  });
-};
 
 const toolRequested: EventReducer = (state) => state;
 
@@ -216,7 +138,11 @@ const toolFinished: EventReducer = (state, event) => {
     item.role === "assistant" && (item.toolCalls?.length ?? 0) > 0);
   const terminal = terminalOutcome(pending, receipt, assistant?.toolCalls ?? []);
   if (terminal) return proposedOutcomeState(next, terminal);
-  return { ...next, messages: withDuplicateActionAdvisory(messages) };
+  const settledMessages = state.lastModelFinishReason === "length"
+    && state.lastModelHadToolCalls
+    ? [...messages, lengthContinuationMessage(true)]
+    : messages;
+  return { ...next, messages: withDuplicateActionAdvisory(settledMessages) };
 };
 
 function isApprovalSuspension(state: KernelState, payload: Record<string, JsonValue>): boolean {
@@ -352,11 +278,7 @@ const reducers: Partial<Record<AgentEventType, EventReducer>> = {
   "user.message": userInput,
   "user.steer": steeringInput,
   "user.follow_up": followUpInput,
-  "model.started": modelStarted,
-  "model.delta": modelSemanticDelta,
-  "model.reasoning_delta": modelSemanticDelta,
-  "model.completed": modelCompleted,
-  "model.failed": modelFailed,
+  ...modelReducers,
   "tool.requested": toolRequested,
   "tool.approval_requested": approvalRequested,
   "tool.approval_resolved": approvalResolved,

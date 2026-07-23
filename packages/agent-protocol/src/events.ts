@@ -9,7 +9,10 @@ import {
   type AgentEventType
 } from "./event-payload-schemas.js";
 import { type JsonValue } from "./json.js";
-import { EVENT_SCHEMA_VERSION } from "./versions.js";
+import {
+  EVENT_SCHEMA_VERSION,
+  LEGACY_EVENT_SCHEMA_VERSION_V5
+} from "./versions.js";
 
 export { AGENT_EVENT_TYPES, parseAgentEventPayload, type AgentEventPayloadMap, type AgentEventType };
 
@@ -74,7 +77,10 @@ export function isSolverVisibleAuthority(authority: ContextAuthority): boolean {
 }
 
 const eventMetadataSchema = z.object({
-  schemaVersion: z.literal(EVENT_SCHEMA_VERSION),
+  schemaVersion: z.union([
+    z.literal(LEGACY_EVENT_SCHEMA_VERSION_V5),
+    z.literal(EVENT_SCHEMA_VERSION)
+  ]),
   seq: z.number().int().positive(),
   eventId: z.string().min(1),
   sessionId: z.string().min(1),
@@ -125,6 +131,14 @@ function accountingScopeIssue(event: AgentEventEnvelope): ProtocolValidationIssu
 }
 
 function scopeIssues(event: AgentEventEnvelope): ProtocolValidationIssue[] {
+  if (Number(event.schemaVersion) === LEGACY_EVENT_SCHEMA_VERSION_V5
+    && event.type === "model.prompt_materialized") {
+    return [{
+      path: ["schemaVersion"],
+      code: "invalid_schema_version",
+      message: "model.prompt_materialized requires event schema V6"
+    }];
+  }
   const accountingIssue = accountingScopeIssue(event);
   if (accountingIssue) return [accountingIssue];
   if (event.type === "checkpoint.recovery_resolved" && event.authority !== "user") {

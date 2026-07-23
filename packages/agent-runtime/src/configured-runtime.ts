@@ -170,7 +170,7 @@ export async function createConfiguredRuntime(
       gatewayForRole: gateways.forRole,
       execution,
       managedEnvironmentMode: config.managedEnvironmentMode ?? "disabled",
-      managedNetworkMode: config.networkMode ?? "none",
+      managedNetworkMode: config.networkMode ?? "full",
       runtimeEnvironment: { ...brokerRuntimeEnvironment(executionReport), executionMode: config.executionMode ?? "sandboxed" },
       subjectAttestation,
       skills: customization.skills,

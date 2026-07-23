@@ -305,7 +305,7 @@ export interface SnapshotRebuildInput {
   events(): AsyncIterable<AgentEventEnvelope>;
 }
 
-/** Replays the durable event log through the kernel to rebuild a V6 snapshot. */
+/** Replays the durable event log through the kernel to rebuild a V7 snapshot. */
 export async function rebuildSnapshotFromEvents(
   input: SnapshotRebuildInput,
   runDeadlineMs = 30 * 60 * 1_000
@@ -328,15 +328,16 @@ export async function rebuildSnapshotFromEvents(
 
 export async function restoreStoredSession(store: RunStore, sessionId: string, runDeadlineMs: number): Promise<RestoredSessionData> {
   const snapshot = await store.latestSnapshot(sessionId);
-  const migratedV5Snapshot = Number(snapshot?.schemaVersion) === 5
-    || Number((snapshot?.state as { schemaVersion?: unknown } | undefined)?.schemaVersion) === 5;
+  const migratedLegacySnapshot = Number(snapshot?.schemaVersion) < SNAPSHOT_SCHEMA_VERSION
+    || Number((snapshot?.state as { schemaVersion?: unknown } | undefined)?.schemaVersion)
+      < KERNEL_STATE_VERSION;
   const restoredSnapshot = snapshotState(snapshot, sessionId);
   const accumulator = emptyAccumulator(restoredSnapshot);
   for await (const event of store.events(sessionId)) {
     replayEvent(accumulator, event, restoredSnapshot ? snapshot?.seq ?? 0 : 0, runDeadlineMs);
   }
   if (!accumulator.metadata || !accumulator.state) throw new Error(`Session '${sessionId}' was not found.`);
-  if (migratedV5Snapshot) {
+  if (migratedLegacySnapshot) {
     await store.writeSnapshot({
       schemaVersion: SNAPSHOT_SCHEMA_VERSION,
       storeLayoutVersion: STORE_LAYOUT_VERSION,

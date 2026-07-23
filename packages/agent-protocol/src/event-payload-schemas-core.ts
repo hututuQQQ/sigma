@@ -228,6 +228,14 @@ export const coreEventPayloadSchemas = {
   "model.started": z.object({
     provider: nonEmptyStringSchema, model: nonEmptyStringSchema, ...turnSchema
   }).strict(),
+  "model.prompt_materialized": z.object({
+    ...turnSchema,
+    messages: z.array(modelMessageSchema),
+    toolSchemaDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+    requestDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+    prefixMessageCount: z.number().int().nonnegative(),
+    cacheMode: z.enum(["prefix_cache", "provider_window"])
+  }).strict(),
   "model.delta": z.object({ turnId: z.number().int().positive(), delta: z.string() }).strict(),
   "model.reasoning_delta": z.object({ turnId: z.number().int().positive(), delta: z.string() }).strict(),
   "model.completed": z.object({

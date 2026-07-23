@@ -92,7 +92,7 @@ describe("model-owned recovery policy", () => {
     const input = preparation();
     const prepared = await prepareBudgetedModelTurn(input);
     expect(prepared.turn.tools.map((tool) => tool.name)).toEqual(
-      input.descriptors.map((tool) => tool.name)
+      input.descriptors.map((tool) => tool.name).sort((left, right) => left.localeCompare(right))
     );
     expect(prepared.turn.toolChoice).toBeUndefined();
   });

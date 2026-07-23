@@ -53,9 +53,10 @@ async function writeLegacyV5Snapshot(input: {
   seq: number;
   createdAt: string;
   state: Record<string, JsonValue>;
+  envelopeSchemaVersion?: 5 | 6;
 }): Promise<void> {
   const snapshot = {
-    schemaVersion: 5,
+    schemaVersion: input.envelopeSchemaVersion ?? 5,
     storeLayoutVersion: STORE_LAYOUT_VERSION,
     sessionId: input.sessionId,
     seq: input.seq,
@@ -186,7 +187,7 @@ describe("runtime recovery convergence", () => {
     });
 
     const restored = await restoreStoredSession(store, sessionId, 60_000);
-    expect(restored.state.schemaVersion).toBe(6);
+    expect(restored.state.schemaVersion).toBe(7);
     expect(restored.state).not.toHaveProperty("taskControl");
     expect(restored.state.messages.at(-1)).toMatchObject({
       role: "assistant",
@@ -199,7 +200,62 @@ describe("runtime recovery convergence", () => {
     ]) expect(restored.state).not.toHaveProperty(key);
     await expect(store.latestSnapshot(sessionId)).resolves.toMatchObject({
       schemaVersion: SNAPSHOT_SCHEMA_VERSION,
-      state: { schemaVersion: 6 }
+      state: { schemaVersion: 7 }
+    });
+  });
+
+  it("migrates a published V6 snapshot into the V7 truncation state", async () => {
+    const workspacePath = await mkdtemp(path.join(os.tmpdir(), "sigma-v6-restore-"));
+    const storeRootDir = path.join(workspacePath, ".agent");
+    const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
+    const sessionId = "legacy-v6-session";
+    const runId = "legacy-v6-run";
+    const startedAt = "2026-07-12T00:00:00.000Z";
+    await store.append({
+      schemaVersion: EVENT_SCHEMA_VERSION,
+      seq: 1,
+      eventId: "v6-created",
+      sessionId,
+      runId,
+      occurredAt: startedAt,
+      type: "session.created",
+      authority: "runtime",
+      payload: completeAgentEventPayload("session.created", {
+        workspacePath,
+        mode: "change"
+      })
+    }, 0);
+    const raw = JSON.parse(JSON.stringify(createKernelState({
+      sessionId,
+      runId,
+      mode: "change",
+      startedAt,
+      deadlineAt: "2026-07-12T00:15:00.000Z"
+    }))) as Record<string, JsonValue>;
+    raw.schemaVersion = 6;
+    delete raw.lastModelFinishReason;
+    delete raw.consecutiveLengthFinishes;
+    delete raw.consecutiveLengthNoAction;
+    delete raw.lastModelHadToolCalls;
+    await writeLegacyV5Snapshot({
+      rootDir: storeRootDir,
+      sessionId,
+      seq: 1,
+      createdAt: startedAt,
+      state: raw,
+      envelopeSchemaVersion: 6
+    });
+
+    const restored = await restoreStoredSession(store, sessionId, 60_000);
+    expect(restored.state).toMatchObject({
+      schemaVersion: 7,
+      consecutiveLengthFinishes: 0,
+      consecutiveLengthNoAction: 0,
+      lastModelHadToolCalls: false
+    });
+    await expect(store.latestSnapshot(sessionId)).resolves.toMatchObject({
+      schemaVersion: SNAPSHOT_SCHEMA_VERSION,
+      state: { schemaVersion: 7 }
     });
   });
 

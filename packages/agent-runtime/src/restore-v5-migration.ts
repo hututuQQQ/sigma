@@ -1,5 +1,6 @@
 import {
-  KERNEL_STATE_VERSION
+  KERNEL_STATE_VERSION,
+  LEGACY_KERNEL_STATE_VERSION_V6
 } from "agent-protocol";
 import {
   assertKernelInvariants,
@@ -141,6 +142,16 @@ export function migrateLegacySnapshot(
   raw: Record<string, unknown>,
   sessionId: string
 ): KernelState | undefined {
+  if (raw.schemaVersion === LEGACY_KERNEL_STATE_VERSION_V6) {
+    return validatedState({
+      ...raw,
+      schemaVersion: KERNEL_STATE_VERSION,
+      lastModelFinishReason: undefined,
+      consecutiveLengthFinishes: 0,
+      consecutiveLengthNoAction: 0,
+      lastModelHadToolCalls: false
+    } as unknown as KernelState, sessionId);
+  }
   const legacy = decodeLegacyKernelStateV5(raw);
   if (!legacy) return undefined;
   const completionCallIds = legacyCompletionCallIds(raw);
@@ -160,6 +171,10 @@ export function migrateLegacySnapshot(
     pendingTools,
     toolCallIds: migratedToolCallIds(raw, completionCallIds, pendingTools),
     activeProcessIds: Array.isArray(raw.activeProcessIds) ? raw.activeProcessIds : [],
+    lastModelFinishReason: undefined,
+    consecutiveLengthFinishes: 0,
+    consecutiveLengthNoAction: 0,
+    lastModelHadToolCalls: false,
     phase: phaseAfterLegacyCompletion(raw, pendingTools, hadProtectedCompletion),
     ...(terminal ? {} : {
       proposedOutcome: undefined,

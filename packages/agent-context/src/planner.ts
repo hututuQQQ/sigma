@@ -13,6 +13,8 @@ import {
 import { approximateTokens } from "./unicode.js";
 export interface ContextPlan {
   messages: ModelMessage[];
+  /** Exact scoped dynamic suffix made durable before the provider request. */
+  promptFrameMessages: ModelMessage[];
   included: ContextItem[];
   omitted: ContextItem[];
   budget: ContextBudget;
@@ -108,7 +110,7 @@ function arrangeMessages(
   summaryDelta: ContextItem | undefined,
   retainedHistory: readonly ModelMessage[],
   promptCache: boolean
-): { messages: ModelMessage[]; dynamicTokens: number } {
+): { messages: ModelMessage[]; promptFrameMessages: ModelMessage[]; dynamicTokens: number } {
   const dynamic = included.filter((item) =>
     !mandatory.includes(item) && item !== archive && item !== summary && item !== summaryDelta);
   const dynamicSuffix = [...dynamic]
@@ -118,17 +120,25 @@ function arrangeMessages(
       ? toArchiveMessage(item)
       : toContextMessage(item);
   const legacy = [...included.map(asMessage), ...retainedHistory];
+  const promptFrameMessages: ModelMessage[] = promptCache && dynamicSuffix.length > 0
+    ? [{
+        role: "developer",
+        content: "[runtime prompt frame; applies only to the immediately following assistant turn; a later frame supersedes it]"
+      }, ...dynamicSuffix.map(toContextMessage)]
+    : [];
   const cacheFirst = [
     ...mandatory.map(toContextMessage),
     ...(archive ? [toArchiveMessage(archive)] : []),
     ...(summary ? [toArchiveMessage(summary)] : []),
     ...(summaryDelta ? [toArchiveMessage(summaryDelta)] : []),
     ...retainedHistory,
-    ...dynamicSuffix.map(toContextMessage)
+    ...promptFrameMessages
   ];
   return {
     messages: promptCache ? cacheFirst : legacy,
+    promptFrameMessages,
     dynamicTokens: dynamic.reduce((total, item) => total + item.tokenCount, 0)
+      + (promptFrameMessages.length > 0 ? approximateTokens(promptFrameMessages[0]!.content) + 6 : 0)
   };
 }
 
@@ -244,6 +254,7 @@ export function planContext(options: PlanContextOptions): ContextPlan {
   );
   return {
     messages: layout.messages,
+    promptFrameMessages: layout.promptFrameMessages,
     included,
     omitted,
     ...(summary ? { summary } : {}),

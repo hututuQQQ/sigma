@@ -138,7 +138,7 @@ function builtinExecutionOptions(options: BuiltinToolOptions): ExecutionToolOpti
     sandboxMode: options.sandboxMode ?? "required",
     readScope: options.readScope ?? "workspace",
     processHandoff: options.processHandoff ?? "allow",
-    networkMode: options.networkMode ?? "none",
+    networkMode: options.networkMode ?? "full",
     // The platform-selected shell is a verified local runtime capability;
     // an explicitly connected broker may narrow it with options.shells.
     shells: options.shells ?? (defaultShell === "none" ? [] : [defaultShell]),

@@ -44,6 +44,31 @@ export function availableShells(options: ExecutionToolOptions): ShellKind[] {
   return [...new Set(options.shells ?? [])];
 }
 
+export function resolvedShell(
+  input: Record<string, JsonValue>,
+  options: ExecutionToolOptions
+): ShellKind {
+  const available = availableShells(options);
+  const explicit = input.shell;
+  if (explicit !== undefined) {
+    if (typeof explicit !== "string" || !available.includes(explicit as ShellKind)) {
+      throw Object.assign(new Error(
+        `Shell '${String(explicit)}' is not verified by the execution broker. Valid form: {"command":"...","shell":${JSON.stringify(available[0] ?? "bash")}}.`
+      ), { code: "shell_unavailable" });
+    }
+    return explicit as ShellKind;
+  }
+  const platform = options.executionPlatform ?? process.platform;
+  const preference: ShellKind[] = platform === "win32"
+    ? ["powershell", "cmd", "bash"]
+    : ["bash", "powershell", "cmd"];
+  const selected = preference.find((shell) => available.includes(shell));
+  if (selected) return selected;
+  throw Object.assign(new Error(
+    "No verified shell is available. Valid form requires {\"command\":\"...\"} and a broker-provided shell."
+  ), { code: "shell_unavailable" });
+}
+
 export function availableRuntimeCommands(options: ExecutionToolOptions): string[] {
   return [...new Set((options.runtimeCommands ?? [])
     .filter((command) => /^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/u.test(command)))]
@@ -106,11 +131,7 @@ export function availableNetworkModes(options: ExecutionToolOptions): Array<"non
 }
 
 export function assertAvailableShell(input: Record<string, JsonValue>, options: ExecutionToolOptions): void {
-  const requested = executionText(input, "shell");
-  if (availableShells(options).includes(requested as ShellKind)) return;
-  throw Object.assign(new Error(`Shell '${requested}' is not verified by the execution broker.`), {
-    code: "shell_unavailable"
-  });
+  resolvedShell(input, options);
 }
 
 export function executionToolSchema(

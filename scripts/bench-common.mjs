@@ -298,7 +298,7 @@ function asNonNegativeInt(value, fallback, name) {
   return parsed;
 }
 
-function networkMode(value, fallback = "none") {
+function networkMode(value, fallback = "full") {
   const mode = asString(value, fallback);
   if (mode !== "none" && mode !== "loopback" && mode !== "full") {
     throw new Error("network mode must be none, loopback, or full.");
@@ -672,7 +672,7 @@ function benchmarkAgentKwargs(options, timeoutPlan = null) {
     agent_cli_tarball: resolveAgentCliTarballPath(options, options.env ?? process.env),
     provider: options.provider,
     agent_profile: options.agentProfile ?? "standard",
-    network_mode: options.networkMode ?? "none",
+    network_mode: options.networkMode ?? "full",
     execution_mode: options.executionMode ?? "sandboxed",
     managed_environment_mode: options.managedEnvironmentMode ?? "disabled",
     harbor_topology: options.harborTopology ?? "main_only"

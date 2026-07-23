@@ -111,6 +111,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(module.SigmaCliHarborAgent(provider="glm").model, "glm-5.2")
         with self.assertRaisesRegex(ValueError, "execution_mode"):
             module.SigmaCliHarborAgent(execution_mode="host")
+        self.assertEqual(module.SigmaCliHarborAgent().network_mode, "full")
         self.assertEqual(module.SigmaCliHarborAgent(network_mode="loopback").network_mode, "loopback")
         with self.assertRaisesRegex(ValueError, "agent_profile"):
             module.SigmaCliHarborAgent(agent_profile="untrusted")

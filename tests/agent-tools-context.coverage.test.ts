@@ -392,9 +392,10 @@ describe("context, platform, and repository tool capabilities", () => {
     expect(validation).toMatchObject({ ok: true, observedEffects: validationPlan.exactEffects });
     expect(validation.output).toBe("validated");
     expect(validationPlan).toMatchObject({
-      exactEffects: ["process.spawn.readonly", "validation"],
+      exactEffects: ["process.spawn.readonly", "validation", "network"],
       writePaths: [],
-      checkpointScope: []
+      checkpointScope: [],
+      network: "full"
     });
     const scopedProcessPlan = await tools.prepare!(request("scoped-process", "exec", {
       executable: process.execPath, args: ["--version"], writePaths: ["src"]
@@ -402,13 +403,13 @@ describe("context, platform, and repository tool capabilities", () => {
       sessionId: "session", runId: "run", workspacePath: workspace, runMode: "change"
     });
     expect(scopedProcessPlan).toMatchObject({
-      exactEffects: ["process.spawn", "filesystem.write"],
+      exactEffects: ["process.spawn", "filesystem.write", "network"],
       writePaths: ["src"],
       checkpointScope: ["src"],
       executionIntent: {
         access: "write",
         expectedChanges: ["src"],
-        network: "none",
+        network: "full",
         purpose: "probe"
       },
       executionCapability: {
@@ -416,6 +417,7 @@ describe("context, platform, and repository tool capabilities", () => {
         workspaceReadRoots: ["."],
         dependencyRoots: ["node_modules"],
         writeRoots: ["src"],
+        network: "full",
         backend: "native"
       }
     });
@@ -432,18 +434,18 @@ describe("context, platform, and repository tool capabilities", () => {
       sessionId: "session", runId: "run", workspacePath: workspace, runMode: "change"
     });
     expect(packageTestPlan).toMatchObject({
-      network: "none",
+      network: "full",
       executionIntent: {
         invocation: { executable: pnpmExecutable, args: ["test"], cwd: "." },
         access: "readonly",
-        network: "none",
+        network: "full",
         purpose: "test"
       },
       executionCapability: {
         profileId: "node-typescript",
         workspaceReadRoots: ["."],
         dependencyRoots: ["node_modules"],
-        network: "none"
+        network: "full"
       }
     });
     await expect(tools.execute(request("missing", "missing", {}), context(workspace))).rejects.toThrow("Unknown tool");
@@ -454,7 +456,7 @@ describe("context, platform, and repository tool capabilities", () => {
     }), {
       sessionId: "session", runId: "run", workspacePath: workspace, runMode: "analyze"
     });
-    expect(analyzeValidationPlan.exactEffects).toEqual(["process.spawn.readonly", "validation"]);
+    expect(analyzeValidationPlan.exactEffects).toEqual(["process.spawn.readonly", "validation", "network"]);
     expect(analyzeValidationPlan.writePaths).toEqual([]);
     expect(isToolAllowed(tools.descriptor("read")!, "analyze")).toBe(true);
     expect(isToolAllowed({ ...tools.descriptor("read")!, approval: "deny" }, "change")).toBe(false);
