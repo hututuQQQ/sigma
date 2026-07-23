@@ -13,9 +13,8 @@ import { effectsOutsidePlan } from "./tool-evidence.js";
 import type { RuntimeSession } from "./types.js";
 import { assurancePathsForClaim } from "./assurance-engine.js";
 import {
-  assertRepositoryConflictPlanAllowed,
-  assertRepositoryRecoveryCallAllowed
-} from "./repository-task-control-policy.js";
+  assertRepositoryConflictPlanAllowed
+} from "./repository-conflict-policy.js";
 import { semanticValidationCommand } from "./semantic-validation-command.js";
 
 export interface FrozenValidationScope {
@@ -39,38 +38,6 @@ function coveredByProject(changedPath: string, root: string): boolean {
 function argumentObject(value: JsonValue): Record<string, JsonValue> {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, JsonValue> : {};
-}
-
-function requestedExecutable(call: ModelToolCall): string | undefined {
-  const input = argumentObject(call.arguments);
-  return typeof input.executable === "string" ? input.executable : undefined;
-}
-
-/** Bind a capability-recovery action to the runtime-issued opportunity. The
- * model may choose one package set, but cannot change the missing executable,
- * substitute another probe, or reuse the obligation for unrelated execution. */
-export function assertTaskControlCallAllowed(
-  session: RuntimeSession,
-  call: ModelToolCall
-): void {
-  const obligation = session.durable.state.taskControl.obligation;
-  if (obligation?.kind === "repository_recovery") {
-    assertRepositoryRecoveryCallAllowed(session, call);
-    return;
-  }
-  if (obligation?.kind !== "capability_recovery") return;
-  const executable = requestedExecutable(call);
-  const allowed = obligation.stage === "prepare"
-    ? call.name === "environment_prepare" && (() => {
-        const input = argumentObject(call.arguments);
-        return input.requestedExecutable === obligation.requestedExecutable;
-      })()
-    : call.name === obligation.probeToolName
-      && executable === obligation.requestedExecutable;
-  if (allowed) return;
-  throw Object.assign(new Error(
-    "The active capability recovery is bound to one broker-observed executable and probe."
-  ), { code: "tool_unavailable_for_repair" });
 }
 
 function shellWords(command: string): string[] {
@@ -203,59 +170,42 @@ async function canonicalWrittenObjectPath(
   return parent ? path.join(parent, path.basename(lexical)) : null;
 }
 
-/** Keep a review-directed mutation inside the runtime-authenticated finding
- * scope. The model may narrow the prepared write plan, but it cannot widen
- * the obligation by changing arguments, checkpoint roots, or call IDs. */
-export async function assertTaskControlPlanAllowed(
+function activeConflictScope(session: RuntimeSession): string[] | undefined {
+  const open = new Map<string, string[]>();
+  for (const receipt of session.durable.state.receipts) {
+    const result = receipt.result && typeof receipt.result === "object" && !Array.isArray(receipt.result)
+      ? receipt.result as Record<string, JsonValue>
+      : undefined;
+    const handle = typeof result?.transactionHandle === "string" ? result.transactionHandle : "";
+    if (!handle) continue;
+    if (result?.status === "conflicts_pending") {
+      const paths = Array.isArray(result.conflictPaths)
+        ? result.conflictPaths.filter((item): item is string => typeof item === "string")
+        : [];
+      open.set(handle, paths);
+    } else if (["completed", "aborted", "restored"].includes(String(result?.status))) {
+      open.delete(handle);
+    }
+  }
+  return [...open.values()].at(-1);
+}
+
+/** Preserve broker transaction path isolation without inferring semantic
+ * recovery state or narrowing the model-visible tool set. */
+export async function assertTransactionIsolationPlanAllowed(
   session: RuntimeSession,
   plan: ToolCallPlan
 ): Promise<void> {
-  const obligation = session.durable.state.taskControl.obligation;
-  if (obligation?.kind === "repository_recovery" && obligation.stage === "transact"
-    && obligation.transactionId && obligation.scopePaths?.length
+  const scope = activeConflictScope(session);
+  if (scope?.length && plan.exactEffects.includes("filesystem.write")
     && !plan.exactEffects.includes("repository.write")) {
-    await assertRepositoryConflictPlanAllowed(session, plan, obligation.scopePaths);
-    return;
-  }
-  if (obligation?.kind === "review_repair" && obligation.stage === "mutate") {
-    await assertReviewRepairPlanAllowed(session, plan, obligation.scopePaths);
+    await assertRepositoryConflictPlanAllowed(session, plan, scope);
   }
 }
 
-async function assertReviewRepairPlanAllowed(
-  session: RuntimeSession,
-  plan: ToolCallPlan,
-  scopePaths: string[]
-): Promise<void> {
-  if (!plan.exactEffects.includes("filesystem.write")) {
-    throw Object.assign(new Error(
-      "The active review repair requires one scoped workspace mutation."
-    ), { code: "tool_unavailable_for_repair" });
-  }
-  const requested = plan.writePaths.length > 0 ? plan.writePaths : plan.checkpointScope;
-  if (requested.length === 0) {
-    throw Object.assign(new Error(
-      "The review repair mutation did not declare any exact write path."
-    ), { code: "tool_unavailable_for_repair" });
-  }
-  const allowed = (await Promise.all(scopePaths.map(async (item) =>
-    await canonicalWrittenObjectPath(session.identity.workspacePath, item))))
-    .filter((item): item is string => Boolean(item));
-  const targets = await Promise.all(requested.map(async (item) => ({
-    item,
-    canonical: await canonicalWrittenObjectPath(session.identity.workspacePath, item)
-  })));
-  const outside = targets.filter(({ canonical }) => !canonical
-    || !allowed.some((scope) => isInside(scope, canonical))).map(({ item }) => item);
-  if (allowed.length === scopePaths.length && outside.length === 0) return;
-  throw Object.assign(new Error(
-    `Review repair write plan is outside the authenticated finding scope: ${outside.join(", ") || "invalid scope"}.`
-  ), { code: "tool_unavailable_for_repair" });
-}
-
-/** Freeze validation authority at preparation time. Coverage comes only from
- * a semantic command adapter and its selected project/files. Filesystem grants
- * and cwd traversal authority are deliberately irrelevant. */
+/** Freeze validation telemetry at preparation time. Command classification
+ * describes coverage to the model and evaluator; completion authority only
+ * checks the structurally bound validation record and its actual status. */
 export function validationScope(
   session: RuntimeSession,
   call: ModelToolCall,

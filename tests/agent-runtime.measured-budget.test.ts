@@ -1,4 +1,4 @@
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -69,7 +69,7 @@ class InspectableGateway implements ModelGateway {
   readonly requests: ModelRequest[] = [];
   readonly capabilities: ModelCapabilities = {
     contextWindowTokens: 128_000,
-    maxOutputTokens: 4_096,
+    maxOutputTokens: 32_768,
     tools: true,
     parallelTools: false,
     reasoning: true,
@@ -125,15 +125,63 @@ function replayBudget(events: AgentEventEnvelope[]): BudgetLedgerState {
 }
 
 describe("provider-measured model budget settlement", () => {
-  it("uses one transient forced-tool turn after a length finish", async () => {
+  it("materializes the exact prompt-cache frame so the next request extends the prior prefix", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-prompt-prefix-workspace-"));
+    const state = await mkdtemp(path.join(os.tmpdir(), "sigma-prompt-prefix-state-"));
+    await writeFile(path.join(workspace, "seed.txt"), "seed\n", "utf8");
+    const gateway = new InspectableGateway([{
+      message: {
+        role: "assistant",
+        content: "",
+        toolCalls: [{ id: "read-once", name: "read", arguments: { path: "seed.txt" } }]
+      },
+      finishReason: "tool_calls",
+      inputTokens: 100,
+      outputTokens: 10
+    }, requestInputResponse()]);
+    const store = new SegmentedJsonlStore({ rootDir: state });
+    const runtime = createRuntime({
+      gateway,
+      store,
+      storeRootDir: state,
+      tools: registerBuiltinTools(new EffectToolRegistry()),
+      permissionMode: "auto"
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "Read seed.txt." });
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "needs_input" });
+
+    expect(gateway.requests).toHaveLength(2);
+    const firstMessages = gateway.requests[0]!.messages;
+    const secondMessages = gateway.requests[1]!.messages;
+    expect(secondMessages.slice(0, firstMessages.length)).toEqual(firstMessages);
+    expect(firstMessages.at(-1)?.content).toContain("hard resource ledger");
+    expect(gateway.requests[1]!.tools).toEqual(gateway.requests[0]!.tools);
+
+    const promptEvents = (await storedEvents(store, session.sessionId))
+      .filter((event) => event.type === "model.prompt_materialized");
+    expect(promptEvents).toHaveLength(2);
+    expect(promptEvents[0]!.payload).toMatchObject({
+      cacheMode: "prefix_cache",
+      toolSchemaDigest: (promptEvents[1]!.payload as { toolSchemaDigest: string }).toolSchemaDigest
+    });
+    expect((promptEvents[0]!.payload as { requestDigest: string }).requestDigest)
+      .toMatch(/^[a-f0-9]{64}$/u);
+  });
+
+  it("continues length finishes as durable turns and fails only after the third no-action truncation", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-length-recovery-workspace-"));
     const state = await mkdtemp(path.join(os.tmpdir(), "sigma-length-recovery-state-"));
-    const gateway = new InspectableGateway([{
-      message: { role: "assistant", content: "partial", reasoningContent: "private truncated reasoning" },
+    const gateway = new InspectableGateway([1, 2, 3].map((attempt) => ({
+      message: {
+        role: "assistant",
+        content: `partial ${attempt}`,
+        reasoningContent: "private truncated reasoning"
+      },
       finishReason: "length",
       inputTokens: 100,
       outputTokens: 4_096
-    }, requestInputResponse()]);
+    })));
     const runtime = createRuntime({
       gateway,
       store: new SegmentedJsonlStore({ rootDir: state }),
@@ -145,21 +193,56 @@ describe("provider-measured model budget settlement", () => {
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect recovery" });
 
-    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "needs_input" });
-    expect(gateway.requests).toHaveLength(2);
-    expect(gateway.requests[0]).toMatchObject({ maxOutputTokens: 4_096 });
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "recoverable_failure",
+      code: "model_output_truncated"
+    });
+    expect(gateway.requests).toHaveLength(3);
+    expect(gateway.requests.map((request) => request.maxOutputTokens))
+      .toEqual([4_096, 16_384, 32_768]);
     expect(gateway.requests[0].toolChoice).toBeUndefined();
-    expect(gateway.requests[1]).toMatchObject({ maxOutputTokens: 2_048, toolChoice: "required" });
-    const recoveryPrompts = gateway.requests[1].messages.filter((message) =>
-      message.content.includes("private reasoning is not replayed"));
-    expect(recoveryPrompts).toHaveLength(1);
-    expect(gateway.requests[0].messages.some((message) => message.content.includes("private reasoning is not replayed")))
-      .toBe(false);
-    expect(gateway.requests[1].messages.some((message) => message.reasoningContent === "private truncated reasoning"))
-      .toBe(false);
+    expect(gateway.requests[1].messages.some((message) => message.content.includes("action-oriented")))
+      .toBe(true);
+    expect(gateway.requests[1].messages.some((message) =>
+      message.reasoningContent?.includes("private truncated reasoning") === true)).toBe(false);
   });
 
-  it("projects only terminal tools while preserving natural completion during deadline convergence", async () => {
+  it("executes tool calls from a length finish once and continues with the settled receipt", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-length-tool-workspace-"));
+    const state = await mkdtemp(path.join(os.tmpdir(), "sigma-length-tool-state-"));
+    await writeFile(path.join(workspace, "seed.txt"), "seed\n", "utf8");
+    const gateway = new InspectableGateway([{
+      message: {
+        role: "assistant",
+        content: "I will inspect the file.",
+        toolCalls: [{ id: "length-read", name: "read", arguments: { path: "seed.txt" } }]
+      },
+      finishReason: "length",
+      inputTokens: 100,
+      outputTokens: 4_096
+    }, requestInputResponse()]);
+    const store = new SegmentedJsonlStore({ rootDir: state });
+    const runtime = createRuntime({
+      gateway,
+      store,
+      storeRootDir: state,
+      tools: registerBuiltinTools(new EffectToolRegistry()),
+      permissionMode: "auto",
+      outputReserveTokens: 4_096
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "Inspect seed.txt." });
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "needs_input" });
+
+    expect(gateway.requests.map((request) => request.maxOutputTokens)).toEqual([4_096, 16_384]);
+    expect(gateway.requests[1]!.messages.some((message) =>
+      message.content.includes("executed exactly once"))).toBe(true);
+    const events = await storedEvents(store, session.sessionId);
+    expect(events.filter((event) => event.type === "tool.completed"
+      && (event.payload as { callId?: string }).callId === "length-read")).toHaveLength(1);
+  });
+
+  it("does not forecast a terminal budget stage while the hard ledger can fund a request", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-deadline-converge-workspace-"));
     const state = await mkdtemp(path.join(os.tmpdir(), "sigma-deadline-converge-state-"));
     const gateway = new InspectableGateway([requestInputResponse()]);
@@ -176,16 +259,13 @@ describe("provider-measured model budget settlement", () => {
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "finish promptly" });
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "needs_input" });
-    expect(gateway.requests[0]).toMatchObject({ maxOutputTokens: 2_048 });
+    expect(gateway.requests[0]).toMatchObject({ maxOutputTokens: 4_096 });
     expect(gateway.requests[0].toolChoice).toBeUndefined();
-    expect(gateway.requests[0].tools.map((tool) => tool.name).sort()).toEqual([
-      "report_blocked", "request_user_input"
-    ]);
+    expect(gateway.requests[0].tools.map((tool) => tool.name)).toEqual(
+      expect.arrayContaining(["read", "shell", "validate", "report_blocked", "request_user_input"])
+    );
     expect(gateway.requests[0].messages.some((message) => message.content.includes("Budget stage is terminal")))
-      .toBe(true);
-    expect(gateway.requests[0].messages.some((message) => message.content.includes(
-      "If the task is complete, stop naturally"
-    ))).toBe(true);
+      .toBe(false);
   });
 
   it("keeps a successful response when provider usage exceeds the admission reservation", async () => {
@@ -222,7 +302,7 @@ describe("provider-measured model budget settlement", () => {
     }));
   });
 
-  it("exposes only terminal tools when one model request fits", async () => {
+  it("keeps all permitted tools visible when one hard-ledger request fits", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-terminal-budget-workspace-"));
     const state = await mkdtemp(path.join(os.tmpdir(), "sigma-terminal-budget-state-"));
     const gateway = new InspectableGateway([requestInputResponse()]);
@@ -243,9 +323,12 @@ describe("provider-measured model budget settlement", () => {
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "needs_input" });
     expect(gateway.requests).toHaveLength(1);
     expect(gateway.requests[0].toolChoice).toBeUndefined();
-    expect(gateway.requests[0].tools.map((tool) => tool.name).sort()).toEqual([
-      "report_blocked", "request_user_input"
-    ]);
+    expect(gateway.requests[0].tools.map((tool) => tool.name)).toEqual(
+      expect.arrayContaining([
+        "read", "shell", "validate", "report_blocked", "request_user_input"
+      ])
+    );
+    expect(gateway.requests[0].tools.map((tool) => tool.name)).not.toContain("runtime_finalize");
   });
 
   it("returns typed budget exhaustion before an unfundable final request", async () => {

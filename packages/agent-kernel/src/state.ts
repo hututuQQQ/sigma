@@ -4,15 +4,18 @@ import {
   createEmptyPlan,
   isBudgetLedgerState,
   isCheckpointRef,
+  isContextArchiveV1,
   isEvidenceRecord,
   isMutationFrontier,
   isPlanGraph,
   isUsageRecord,
   type BudgetLedgerState,
   type CheckpointRef,
+  type ContextArchiveV1,
   type EvidenceRecord,
   type FrozenArtifactRef,
   type FrozenCustomizationRef,
+  type ModelFinishReason,
   type ModelMessage,
   type MutationFrontier,
   type PlanGraph,
@@ -23,8 +26,6 @@ import {
   type UsageRecord
 } from "agent-protocol";
 import { emptyMutationFrontier } from "./mutation-frontier.js";
-import { createTaskControlState, hasPublishedTaskControlLegacyFields } from "./task-control.js";
-import { isTaskControlStateV1, type TaskControlStateV1 } from "./task-control-state.js";
 
 export type KernelPhase =
   | "idle"
@@ -63,12 +64,17 @@ export interface KernelState {
   activeModelTurn?: ActiveModelTurn;
   /** True once any content or reasoning from the active provider attempt is durable. */
   activeModelSemanticDelta?: boolean;
+  /** Durable completion state used to recover bounded output truncation. */
+  lastModelFinishReason?: ModelFinishReason;
+  consecutiveLengthFinishes: number;
+  consecutiveLengthNoAction: number;
+  lastModelHadToolCalls: boolean;
   messages: ModelMessage[];
   pendingTools: PendingTool[];
   toolCallIds: string[];
   receipts: ToolReceipt[];
   /** Session-scoped mutation evidence retained across follow-up runs so
-   * validation/review obligations cannot be erased by a run boundary. */
+   * validation and review status remains bound to the actual frontier. */
   mutationEvidence: EvidenceRecord[];
   /** Runtime-owned identity of the unresolved baseline-to-current mutation. */
   mutationFrontier: MutationFrontier;
@@ -82,9 +88,8 @@ export interface KernelState {
   frozenSkills: FrozenArtifactRef[];
   activeProcessIds: string[];
   childIds: string[];
-  /** The sole authority for task obligations, action convergence, protocol
-   * correction, and completion delivery. Execution lifecycle remains in phase. */
-  taskControl: TaskControlStateV1;
+  /** Durable semantic projection of an omitted stable history prefix. */
+  contextArchive?: ContextArchiveV1;
   proposedOutcome?: RunOutcome;
   outcome?: RunOutcome;
 }
@@ -108,6 +113,9 @@ export function createKernelState(options: CreateKernelStateOptions): KernelStat
     lastSeq: 0,
     startedAt: options.startedAt,
     deadlineAt: options.deadlineAt,
+    consecutiveLengthFinishes: 0,
+    consecutiveLengthNoAction: 0,
+    lastModelHadToolCalls: false,
     messages: [],
     pendingTools: [],
     toolCallIds: [],
@@ -120,8 +128,7 @@ export function createKernelState(options: CreateKernelStateOptions): KernelStat
     budget: createBudgetLedger(),
     frozenSkills: [],
     activeProcessIds: [],
-    childIds: [],
-    taskControl: createTaskControlState()
+    childIds: []
   };
 }
 
@@ -134,36 +141,61 @@ function validDeadlineState(state: Record<string, unknown>): boolean {
     || (Number.isSafeInteger(state.deadlineRemainingMs) && Number(state.deadlineRemainingMs) >= 1));
 }
 
+function validKernelIdentity(state: Record<string, unknown>): boolean {
+  return typeof state.sessionId === "string" && state.sessionId.length > 0
+    && typeof state.runId === "string" && state.runId.length > 0
+    && (state.mode === "analyze" || state.mode === "change")
+    && typeof state.phase === "string"
+    && Number.isSafeInteger(state.revision) && Number(state.revision) >= 0
+    && Number.isSafeInteger(state.lastSeq) && Number(state.lastSeq) >= 0
+    && typeof state.startedAt === "string"
+    && validDeadlineState(state);
+}
+
+function validKernelCollections(state: Record<string, unknown>): boolean {
+  return Array.isArray(state.messages)
+    && Array.isArray(state.pendingTools)
+    && Array.isArray(state.toolCallIds)
+    && Array.isArray(state.receipts)
+    && Array.isArray(state.mutationEvidence) && state.mutationEvidence.every(isEvidenceRecord)
+    && Array.isArray(state.evidence) && state.evidence.every(isEvidenceRecord)
+    && Array.isArray(state.usage) && state.usage.every(isUsageRecord)
+    && Array.isArray(state.activeProcessIds)
+    && state.activeProcessIds.every((item) => typeof item === "string" && item.length > 0)
+    && Array.isArray(state.childIds);
+}
+
+function validModelCompletionState(state: Record<string, unknown>): boolean {
+  const finishReason = state.lastModelFinishReason;
+  return (finishReason === undefined
+      || ["stop", "length", "tool_calls", "content_filter", "protocol_error"]
+        .includes(String(finishReason)))
+    && Number.isSafeInteger(state.consecutiveLengthFinishes)
+    && Number(state.consecutiveLengthFinishes) >= 0
+    && Number.isSafeInteger(state.consecutiveLengthNoAction)
+    && Number(state.consecutiveLengthNoAction) >= 0
+    && typeof state.lastModelHadToolCalls === "boolean";
+}
+
+function validKernelDomainState(state: Record<string, unknown>): boolean {
+  return isMutationFrontier(state.mutationFrontier)
+    && isPlanGraph(state.plan)
+    && isBudgetLedgerState(state.budget)
+    && (state.checkpointHead === undefined || isCheckpointRef(state.checkpointHead))
+    && validFrozenState(state)
+    && (state.contextArchive === undefined || isContextArchiveV1(state.contextArchive))
+    && (state.activeModelSemanticDelta === undefined
+      || typeof state.activeModelSemanticDelta === "boolean")
+    && validModelCompletionState(state);
+}
+
 export function isKernelState(value: unknown): value is KernelState {
   const state = record(value);
   if (!state || state.schemaVersion !== KERNEL_STATE_VERSION
-    || hasPublishedTaskControlLegacyFields(state)) return false;
-  return [
-    typeof state.sessionId === "string" && state.sessionId.length > 0,
-    typeof state.runId === "string" && state.runId.length > 0,
-    state.mode === "analyze" || state.mode === "change",
-    typeof state.phase === "string",
-    Number.isSafeInteger(state.revision) && Number(state.revision) >= 0,
-    Number.isSafeInteger(state.lastSeq) && Number(state.lastSeq) >= 0,
-    typeof state.startedAt === "string",
-    validDeadlineState(state),
-    state.activeModelSemanticDelta === undefined || typeof state.activeModelSemanticDelta === "boolean",
-    Array.isArray(state.messages),
-    Array.isArray(state.pendingTools),
-    Array.isArray(state.toolCallIds),
-    Array.isArray(state.receipts),
-    Array.isArray(state.mutationEvidence) && state.mutationEvidence.every(isEvidenceRecord),
-    isMutationFrontier(state.mutationFrontier),
-    Array.isArray(state.evidence) && state.evidence.every(isEvidenceRecord),
-    Array.isArray(state.usage) && state.usage.every(isUsageRecord),
-    isPlanGraph(state.plan),
-    isBudgetLedgerState(state.budget),
-    state.checkpointHead === undefined || isCheckpointRef(state.checkpointHead),
-    validFrozenState(state),
-    Array.isArray(state.activeProcessIds) && state.activeProcessIds.every((item) => typeof item === "string" && item.length > 0),
-    Array.isArray(state.childIds),
-    isTaskControlStateV1(state.taskControl)
-  ].every(Boolean);
+    || Object.hasOwn(state, "taskControl")) return false;
+  return validKernelIdentity(state)
+    && validKernelCollections(state)
+    && validKernelDomainState(state);
 }
 
 function validFrozenState(state: Record<string, unknown>): boolean {
@@ -203,7 +235,7 @@ function isFrozenCustomizationRef(value: unknown): value is FrozenCustomizationR
 }
 
 export function assertKernelState(value: unknown): asserts value is KernelState {
-  if (!isKernelState(value)) throw new Error("Invalid KernelState V5.");
+  if (!isKernelState(value)) throw new Error("Invalid KernelState V7.");
 }
 
 export function isTerminal(state: KernelState): boolean {

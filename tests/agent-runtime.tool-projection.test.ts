@@ -1,12 +1,27 @@
 import { describe, expect, it } from "vitest";
 import { registerBuiltinTools, EffectToolRegistry } from "../packages/agent-tools/src/index.js";
 import {
+  modelTools,
   projectModelToolDescriptors,
   sessionSkillProjectionCapabilities
 } from "../packages/agent-runtime/src/effect-helpers.js";
 
 describe("session model-tool capability projection", () => {
   const descriptors = registerBuiltinTools(new EffectToolRegistry()).descriptors();
+
+  it("serializes model tool schemas deterministically regardless of registry order", () => {
+    const forward = modelTools(descriptors);
+    const reversed = modelTools([...descriptors].reverse());
+    expect(reversed).toEqual(forward);
+    expect(forward.map((item) => item.name))
+      .toEqual(forward.map((item) => item.name).toSorted());
+    for (const tool of forward) {
+      const properties = tool.inputSchema.properties;
+      if (properties && typeof properties === "object" && !Array.isArray(properties)) {
+        expect(Object.keys(properties)).toEqual(Object.keys(properties).toSorted());
+      }
+    }
+  });
 
   it("hides skill discovery and execution fields when no skill exists", () => {
     const projected = projectModelToolDescriptors(descriptors, {

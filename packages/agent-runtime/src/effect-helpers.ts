@@ -10,15 +10,28 @@ import type { RuntimeSession } from "./types.js";
 import { failed } from "./tool-receipt.js";
 
 export {
-  completionFailure,
-  completionPlan,
-  completionPlanError,
-  currentRunEvidence
+  completionFailure
 } from "./completion-evidence-gate.js";
 export { failed } from "./tool-receipt.js";
 
+function canonicalJsonValue(value: JsonValue): JsonValue {
+  if (Array.isArray(value)) return value.map(canonicalJsonValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => [key, canonicalJsonValue(item)]));
+  }
+  return value;
+}
+
 export function modelTools(descriptors: readonly ToolDescriptor[]): ModelToolDefinition[] {
-  return descriptors.map((item) => ({ name: item.name, description: item.description, inputSchema: item.inputSchema }));
+  return [...descriptors]
+    .sort((left, right) => left.name.localeCompare(right.name))
+    .map((item) => ({
+      name: item.name,
+      description: item.description,
+      inputSchema: canonicalJsonValue(item.inputSchema) as ModelToolDefinition["inputSchema"]
+    }));
 }
 
 export interface ModelToolProjectionCapabilities {

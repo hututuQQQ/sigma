@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type {
   JsonValue,
-  RepositoryRecoveryDecisionEvidenceV1,
   RepositoryRecoverySelectionEvidenceV1,
   ToolExecutionContext,
   ToolReceipt,
@@ -52,7 +51,7 @@ function selectionEvidence(
   topology: RepositoryWorktreeTopology,
   inspection: RepositoryInspectionV2,
   candidate: RepositoryRecoveryCandidateV2,
-  selectionKind: "unique" | "user_selected"
+  selectionKind: "unique" | "model_selectable"
 ): RepositoryRecoverySelectionEvidenceV1 | undefined {
   const goalEpoch = context.goalEpoch;
   if (goalEpoch === undefined) return undefined;
@@ -66,7 +65,7 @@ function selectionEvidence(
     producer: { authority: "runtime", id: request.callId },
     summary: selectionKind === "unique"
       ? "The runtime proved one current repository recovery candidate."
-      : "The runtime matched one current recovery candidate to the latest user-owned goal text.",
+      : "The runtime issued a freshness-bound capability for one model-selectable recovery candidate.",
     data: {
       schemaVersion: 1,
       goalEpoch,
@@ -85,88 +84,54 @@ function selectionEvidence(
   };
 }
 
-function decisionObligation(
-  request: ToolRequest,
-  context: ToolExecutionContext,
-  topology: RepositoryWorktreeTopology,
-  inspection: RepositoryInspectionV2
-): RepositoryRecoveryDecisionEvidenceV1 | undefined {
-  const goalEpoch = context.goalEpoch;
-  if (goalEpoch === undefined || inspection.recoveryCandidates.length < 2) return undefined;
-  const candidates = inspection.recoveryCandidates.map((candidate) => ({
-    candidateId: candidate.candidateId,
-    timestamp: candidate.timestamp,
-    relationToHead: candidate.relationToHead,
-    action: candidate.action,
-    subject: candidate.subject,
-    subjectTrusted: false as const
-  }));
-  return {
-    evidenceId: `repository-recovery-decision:${randomUUID()}`,
-    sessionId: context.sessionId,
-    runId: context.runId,
-    kind: "repository_recovery_decision",
-    status: "passed",
-    createdAt: new Date().toISOString(),
-    producer: { authority: "runtime", id: request.callId },
-    summary: "Repository recovery has multiple current candidates and requires an explicit user choice.",
-    data: {
-      schemaVersion: 1,
-      goalEpoch,
-      repositoryRoot: ".",
-      inspectionBasisDigest: inspection.basisDigest,
-      candidateSetDigest: repositoryInspectionDigest(candidates.map((item) => item.candidateId).sort()),
-      repositoryStateDigest: inspectionRepositoryStateDigest(topology, inspection),
-      candidates
-    }
-  };
-}
-
 function applySelection(
   request: ToolRequest,
   context: ToolExecutionContext,
   topology: RepositoryWorktreeTopology,
   inspection: RepositoryInspectionV2,
   store?: RepositoryRecoverySelectionStore
-): RepositoryRecoverySelectionEvidenceV1 | RepositoryRecoveryDecisionEvidenceV1 | undefined {
+): RepositoryRecoverySelectionEvidenceV1[] {
   if (!inspection.complete) {
     inspection.selectionStatus = { status: "unavailable", reason: "inspection_incomplete" };
-    return undefined;
+    return [];
   }
   if (inspection.recoveryCandidates.length === 0) {
     inspection.selectionStatus = { status: "none" };
-    return undefined;
-  }
-  const requested = new Set(context.repositoryRecoveryCandidateIds ?? []);
-  const requestedCandidates = inspection.recoveryCandidates.filter((item) => requested.has(item.candidateId));
-  const candidate = inspection.recoveryCandidates.length === 1
-    ? inspection.recoveryCandidates[0]
-    : requestedCandidates.length === 1 ? requestedCandidates[0] : undefined;
-  const selectionKind = inspection.recoveryCandidates.length === 1 ? "unique" : "user_selected";
-  if (!candidate) {
-    inspection.selectionStatus = {
-      status: "user_decision_required",
-      candidateIds: inspection.recoveryCandidates.map((item) => item.candidateId)
-    };
-    return decisionObligation(request, context, topology, inspection);
+    return [];
   }
   if (!store) {
     inspection.selectionStatus = { status: "unavailable", reason: "selection_store_unavailable" };
-    return undefined;
+    return [];
   }
-  const evidence = selectionEvidence(request, context, topology, inspection, candidate, selectionKind);
-  if (!evidence) {
+  const selectionKind = inspection.recoveryCandidates.length === 1
+    ? "unique" as const
+    : "model_selectable" as const;
+  const selections = inspection.recoveryCandidates.flatMap((candidate) => {
+    const evidence = selectionEvidence(
+      request, context, topology, inspection, candidate, selectionKind
+    );
+    if (!evidence) return [];
+    store.record({ evidence, repositoryRoot: topology.worktreeRoot, selectedObject: candidate.object });
+    candidate.selectionEvidenceId = evidence.evidenceId;
+    return [evidence];
+  });
+  if (selections.length !== inspection.recoveryCandidates.length) {
     inspection.selectionStatus = { status: "unavailable", reason: "goal_epoch_unavailable" };
-    return undefined;
+    return [];
   }
-  store.record({ evidence, repositoryRoot: topology.worktreeRoot, selectedObject: candidate.object });
-  inspection.selectionStatus = {
+  const only = inspection.recoveryCandidates.length === 1
+    ? inspection.recoveryCandidates[0]
+    : undefined;
+  inspection.selectionStatus = only ? {
     status: "selected",
-    candidateId: candidate.candidateId,
-    selectionEvidenceId: evidence.evidenceId,
-    selectionKind
+    candidateId: only.candidateId,
+    selectionEvidenceId: only.selectionEvidenceId!,
+    selectionKind: "unique"
+  } : {
+    status: "model_choice_available",
+    candidateIds: inspection.recoveryCandidates.map((item) => item.candidateId)
   };
-  return evidence;
+  return selections;
 }
 
 function repositoryInspectionReceipt(
@@ -174,7 +139,7 @@ function repositoryInspectionReceipt(
   context: ToolExecutionContext,
   startedAt: string,
   value: RepositoryInspectionV2,
-  selection?: RepositoryRecoverySelectionEvidenceV1 | RepositoryRecoveryDecisionEvidenceV1
+  selections: readonly RepositoryRecoverySelectionEvidenceV1[]
 ): ToolReceipt {
   const output = JSON.stringify(value);
   const readEvidence = structuredReadEvidence(
@@ -193,7 +158,7 @@ function repositoryInspectionReceipt(
     ),
     observedEffects: ["filesystem.read", "process.spawn.readonly"],
     actualEffects: ["filesystem.read", "process.spawn.readonly"],
-    evidence: [readEvidence, ...(selection ? [selection] : [])]
+    evidence: [readEvidence, ...selections]
   };
 }
 
@@ -212,8 +177,8 @@ async function executeRepositoryInspection(
   try {
     const topology = await repositoryInspectionTopologyCandidate(context);
     const value = await collectRepositoryInspectionV2(execution, topology, context.signal);
-    const selectionOrDecision = applySelection(request, context, topology, value, store);
-    return repositoryInspectionReceipt(request, context, startedAt, value, selectionOrDecision);
+    const selections = applySelection(request, context, topology, value, store);
+    return repositoryInspectionReceipt(request, context, startedAt, value, selections);
   } catch (error) {
     const code = typeof (error as { code?: unknown }).code === "string"
       ? (error as { code: string }).code : "repository_probe_failed";
@@ -230,7 +195,7 @@ export function repositoryInspectTool(
   return {
     descriptor: repositoryToolSchema({
       name: "repository_inspect",
-      description: "Inspect bounded Git HEAD, status, refs, newest-first reflog identities, and unreachable objects. Recovery candidates are runtime-derived; multiple candidates require an explicit later user selection before any recovery transaction is authorized.",
+      description: "Inspect bounded Git HEAD, status, refs, newest-first reflog identities, and unreachable objects. Each current recovery candidate receives a freshness-bound selectionEvidenceId; choose a candidate yourself and pass both IDs to git_transaction.",
       properties: {},
       possibleEffects: ["filesystem.read", "process.spawn.readonly"],
       executionMode: "parallel",

@@ -11,6 +11,12 @@ export type OpenAIToolChoicePolicy = "always" | "non_thinking_only" | "never";
 
 export interface OpenAIWireProfile {
   developerRole: "developer" | "system";
+  /** Some OpenAI-compatible providers only accept developer instructions
+   * after conversation history through a provider-specific append-only role.
+   * Keeping those instructions in place is required for prompt-prefix cache
+   * stability; mapping them back to `system` can cause the provider to hoist
+   * them ahead of the conversation on every request. */
+  trailingInstructionRole?: "developer" | "system" | "latest_reminder";
   toolChoicePolicy: OpenAIToolChoicePolicy;
   /** @deprecated Use toolChoicePolicy. */
   supportsToolChoice?: boolean;
@@ -58,6 +64,9 @@ function resolvedToolChoicePolicy(profile: Partial<OpenAIWireProfile> | undefine
 export function resolveWireProfile(profile: Partial<OpenAIWireProfile> | undefined): OpenAIWireProfile {
   return {
     developerRole: profile?.developerRole ?? defaultWireProfile.developerRole,
+    ...(profile?.trailingInstructionRole
+      ? { trailingInstructionRole: profile.trailingInstructionRole }
+      : {}),
     toolChoicePolicy: resolvedToolChoicePolicy(profile),
     ...(profile?.thinking ? { thinking: profile.thinking } : {}),
     retryableFinishReasons: profile?.retryableFinishReasons ?? defaultWireProfile.retryableFinishReasons
@@ -65,19 +74,28 @@ export function resolveWireProfile(profile: Partial<OpenAIWireProfile> | undefin
 }
 
 function openAiMessages(messages: ModelMessage[], profile: OpenAIWireProfile): JsonValue[] {
-  return messages.map((message) => ({
-    role: message.role === "developer" ? profile.developerRole : message.role,
-    content: message.content,
-    ...(message.role === "assistant" && message.reasoningContent !== undefined
-      ? { reasoning_content: message.reasoningContent }
-      : {}),
-    ...(message.toolCallId ? { tool_call_id: message.toolCallId } : {}),
-    ...(message.toolCalls ? { tool_calls: message.toolCalls.map((call) => ({
-      id: call.id,
-      type: "function",
-      function: { name: call.name, arguments: JSON.stringify(call.arguments) }
-    })) } : {})
-  }));
+  let conversationStarted = false;
+  return messages.map((message) => {
+    const trailingInstruction = conversationStarted
+      && (message.role === "system" || message.role === "developer")
+      && profile.trailingInstructionRole;
+    const role = trailingInstruction
+      || (message.role === "developer" ? profile.developerRole : message.role);
+    if (message.role !== "system" && message.role !== "developer") conversationStarted = true;
+    return {
+      role,
+      content: message.content,
+      ...(message.role === "assistant" && message.reasoningContent !== undefined
+        ? { reasoning_content: message.reasoningContent }
+        : {}),
+      ...(message.toolCallId ? { tool_call_id: message.toolCallId } : {}),
+      ...(message.toolCalls ? { tool_calls: message.toolCalls.map((call) => ({
+        id: call.id,
+        type: "function",
+        function: { name: call.name, arguments: JSON.stringify(call.arguments) }
+      })) } : {})
+    };
+  });
 }
 
 function openAiTools(tools: ModelToolDefinition[] | undefined): JsonValue[] | undefined {

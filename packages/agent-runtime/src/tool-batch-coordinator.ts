@@ -6,17 +6,11 @@ import { failed, requestTargets, requiresInstructionReplan, steeringRestart } fr
 import { turnPayload, type ToolAttempt } from "./effect-runner-helpers.js";
 import type { EffectRunnerOptions } from "./effect-runner.js";
 import { currentFrontierReview, reviewBasisDigest } from "./mutation-evidence.js";
+import { completionCandidate } from "./completion-evidence-gate.js";
 import { profileAllowsTool } from "./profile-policy.js";
 import type { ReviewCoordinator } from "./review-coordinator.js";
-import {
-  completionRepairPhase,
-  descriptorAllowedForRepair,
-  maximumTaskControlCalls,
-  type CompletionRepairPhase
-} from "./tool-turn-policy.js";
 import type { ToolTransactionRunner } from "./tool-transaction-runner.js";
 import type { RuntimeSession } from "./types.js";
-import { emitRuntimeDependencyOutcome } from "./runtime-dependency-outcome.js";
 
 type DurableToolReceipt = ToolReceipt & { outcome: ToolOutcome };
 
@@ -45,13 +39,8 @@ function receiptToolName(
     && item.modelTurn.effectRevision === modelTurn.effectRevision)?.request.name ?? "tool";
 }
 
-function shouldReviewReceipt(name: string, reviewMode: "off" | "advisory" | "required"): boolean {
-  if (name === "runtime_finalize") return reviewMode !== "off";
-  return reviewMode === "required" && name === "validate";
-}
-
 function settledReviewRequestReceipt(session: RuntimeSession, receipt: ToolReceipt): ToolReceipt {
-  const candidateDigest = session.durable.state.taskControl.completionCandidate?.digest;
+  const candidateDigest = completionCandidate(session)?.digest;
   const review = currentFrontierReview(session, candidateDigest);
   const basis = reviewBasisDigest(session, undefined, candidateDigest);
   if (review?.status === "passed" && review.data.verdict === "approved") {
@@ -89,36 +78,22 @@ function settledReviewRequestReceipt(session: RuntimeSession, receipt: ToolRecei
 
 function projectedToolNames(
   session: RuntimeSession,
-  descriptors: readonly ToolDescriptor[],
-  phase: CompletionRepairPhase
+  descriptors: readonly ToolDescriptor[]
 ): Set<string> {
   return new Set(descriptors.filter((descriptor) => isToolAllowed(descriptor, session.durable.mode)
-    && profileAllowsTool(session, descriptor)
-    && descriptorAllowedForRepair(session, descriptor, phase)).map((descriptor) => descriptor.name));
+    && profileAllowsTool(session, descriptor)).map((descriptor) => descriptor.name));
 }
 
-function internalCompletion(attempt: ToolAttempt): boolean {
-  return attempt.call.name === "runtime_finalize" && attempt.call.id.startsWith("runtime_completion_intent_");
-}
-
-const TERMINAL_TOOL_NAMES = new Set(["runtime_finalize", "report_blocked", "request_user_input"]);
+const TERMINAL_TOOL_NAMES = new Set(["report_blocked", "request_user_input"]);
 
 function violatesToolProjection(
-  session: RuntimeSession,
   attempts: readonly ToolAttempt[],
-  offeredNames: ReadonlySet<string>,
-  phase: CompletionRepairPhase
+  offeredNames: ReadonlySet<string>
 ): boolean {
   const terminalCount = attempts.filter(({ call }) => TERMINAL_TOOL_NAMES.has(call.name)).length;
   const conflictingTerminalBatch = attempts.length > 1 && terminalCount > 0;
-  // An ordinary turn may pair work with one terminal intent. The coordinator
-  // executes ordinary work first and checks checkpoint recovery before the
-  // terminal intent is allowed to run. Multiple terminal intents remain an
-  // unambiguous protocol conflict. Single-call task control is otherwise
-  // imposed only after an obligation has been opened.
-  if (phase === "none") return terminalCount > 1;
-  return conflictingTerminalBatch || attempts.length > maximumTaskControlCalls(session)
-    || attempts.some((attempt) => !internalCompletion(attempt) && !offeredNames.has(attempt.call.name));
+  return terminalCount > 1 || conflictingTerminalBatch
+    || attempts.some((attempt) => !offeredNames.has(attempt.call.name));
 }
 
 function terminalAttempt(attempt: ToolAttempt): boolean {
@@ -143,16 +118,13 @@ export class ToolBatchCoordinator {
     const turnSignal = AbortSignal.any([signal, turnController.signal]);
     if (steeringRestart(turnSignal)) return;
     try {
-      const phase = completionRepairPhase(session);
       const descriptors = new Map(this.options.runtime.tools.descriptors().map((item) => [item.name, item]));
       const modelDescriptors = this.options.runtime.tools.modelDescriptors?.() ?? [...descriptors.values()];
       if (violatesToolProjection(
-        session,
         attempts,
-        projectedToolNames(session, modelDescriptors, phase),
-        phase
+        projectedToolNames(session, modelDescriptors)
       )) {
-        await this.rejectProjection(session, attempts, phase);
+        await this.rejectProjection(session, attempts);
         return;
       }
       const instructions = await this.prepareInstructions(session, attempts, descriptors);
@@ -170,14 +142,14 @@ export class ToolBatchCoordinator {
 
   private async rejectProjection(
     session: RuntimeSession,
-    attempts: readonly ToolAttempt[],
-    phase: CompletionRepairPhase
+    attempts: readonly ToolAttempt[]
   ): Promise<void> {
     for (const { call, modelTurn } of attempts) {
       await this.emitReceipt(session, failed(
         call,
         new Date().toISOString(),
-        `Tool batch is outside the active task-control projection (${phase}). Use one currently offered action.`,
+        "Tool batch contains an unavailable tool or combines an explicit terminal action with another call. "
+          + "Use currently offered tool names and schemas, and issue terminal actions alone.",
         "model_tool_policy_violation"
       ), modelTurn);
     }
@@ -268,7 +240,7 @@ export class ToolBatchCoordinator {
         session,
         signal,
         true,
-        session.durable.state.taskControl.completionCandidate ? "completion" : "workspace"
+        completionCandidate(session) ? "completion" : "workspace"
       );
       receipt = settledReviewRequestReceipt(session, receipt);
     }
@@ -322,23 +294,10 @@ export class ToolBatchCoordinator {
     receipt: ToolReceipt,
     modelTurn: ActiveModelTurn
   ): Promise<void> {
-    const pendingRequest = session.durable.state.pendingTools.find((item) =>
-      item.request.callId === receipt.callId
-      && item.modelTurn.turnId === modelTurn.turnId
-      && item.modelTurn.effectRevision === modelTurn.effectRevision)?.request;
-    const capabilityObligation = session.durable.state.taskControl.obligation;
     const name = receiptToolName(session, receipt, modelTurn);
     await this.emitDurableReceipt(session, receipt, modelTurn, name);
-    await emitRuntimeDependencyOutcome({
-      emit: this.options.emit,
-      session,
-      receipt,
-      ...(pendingRequest ? { request: pendingRequest } : {}),
-      ...(capabilityObligation ? { obligation: capabilityObligation } : {})
-    });
     try {
       await this.dispatchPostTool(session, receipt, name);
-      await this.reviewAfterReceipt(session, name);
     } finally {
       await this.transactions.settleBudgetsAfterReceipt(session);
     }
@@ -382,17 +341,5 @@ export class ToolBatchCoordinator {
       evidenceIds: (receipt.evidence ?? []).map((item) => item.evidenceId),
       artifactRefs: receipt.artifactRefs ?? []
     }, session.execution.controller?.signal ?? new AbortController().signal);
-  }
-
-  private async reviewAfterReceipt(session: RuntimeSession, name: string): Promise<void> {
-    if (session.recovery.openCheckpointRecovery) return;
-    const reviewMode = session.services.profile?.profile.mutationPolicy.reviewMode ?? "advisory";
-    if (!shouldReviewReceipt(name, reviewMode)) return;
-    await this.reviews.maybeReview(
-      session,
-      session.execution.controller?.signal ?? new AbortController().signal,
-      name === "request_review",
-      name === "runtime_finalize" ? "completion" : "workspace"
-    );
   }
 }

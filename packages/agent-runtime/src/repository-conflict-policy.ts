@@ -1,62 +1,8 @@
 import { lstat } from "node:fs/promises";
 import path from "node:path";
-import type { ModelToolCall, ToolCallPlan } from "agent-protocol";
+import type { ToolCallPlan } from "agent-protocol";
 import { canonicalWorkspacePath, isInside } from "agent-platform";
 import type { RuntimeSession } from "./types.js";
-
-const REPOSITORY_CONFLICT_CALLS = new Set([
-  "read", "write", "edit", "apply_patch", "delete_file"
-]);
-type RepositoryObligation = Extract<
-  NonNullable<RuntimeSession["durable"]["state"]["taskControl"]["obligation"]>,
-  { kind: "repository_recovery" }
->;
-
-function argumentsObject(call: ModelToolCall): Record<string, unknown> {
-  return call.arguments && typeof call.arguments === "object" && !Array.isArray(call.arguments)
-    ? call.arguments as Record<string, unknown> : {};
-}
-
-function repositoryTransactCallAllowed(
-  obligation: RepositoryObligation,
-  call: ModelToolCall
-): boolean {
-  const input = argumentsObject(call);
-  if (call.name !== "git_transaction") {
-    return Boolean(obligation.transactionId && obligation.scopePaths?.length)
-      && REPOSITORY_CONFLICT_CALLS.has(call.name);
-  }
-  if (obligation.transactionId) {
-    return (input.action === "continue" || input.action === "abort")
-      && input.transactionHandle === obligation.transactionId;
-  }
-  return input.action === "recover" && input.candidateId === obligation.candidateId
-    && input.selectionEvidenceId === obligation.selectionEvidenceId;
-}
-
-function repositoryCallAllowed(
-  obligation: RepositoryObligation,
-  call: ModelToolCall
-): boolean {
-  if (obligation.stage === "inspect" || obligation.stage === "select") {
-    return call.name === "repository_inspect";
-  }
-  if (obligation.stage === "validate") {
-    return call.name === "repository_inspect" || call.name === "validate";
-  }
-  return repositoryTransactCallAllowed(obligation, call);
-}
-
-export function assertRepositoryRecoveryCallAllowed(
-  session: RuntimeSession,
-  call: ModelToolCall
-): void {
-  const obligation = session.durable.state.taskControl.obligation;
-  if (obligation?.kind !== "repository_recovery" || repositoryCallAllowed(obligation, call)) return;
-  throw Object.assign(new Error(
-    "The active repository recovery call is outside its runtime-issued stage or transaction binding."
-  ), { code: "tool_unavailable_for_repair" });
-}
 
 async function canonicalPlannedPath(
   workspacePath: string,

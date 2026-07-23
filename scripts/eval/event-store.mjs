@@ -4,12 +4,15 @@ import os from "node:os";
 import path from "node:path";
 
 export const STORE_LAYOUT_VERSION = 5;
-const EVENT_SCHEMA_VERSION = 5;
-const SNAPSHOT_SCHEMA_VERSION = 5;
+const CURRENT_EVENT_SCHEMA_VERSION = 6;
+const EVENT_SCHEMA_VERSIONS = new Set([5, CURRENT_EVENT_SCHEMA_VERSION]);
+const CURRENT_SNAPSHOT_SCHEMA_VERSION = 7;
+const SNAPSHOT_SCHEMA_VERSIONS = new Set([5, 6, CURRENT_SNAPSHOT_SCHEMA_VERSION]);
 const EVENT_TYPES = new Set([
   "session.created", "run.started", "run.suspended", "run.completed", "run.cancelled", "run.failed",
-  "user.message", "user.steer", "user.follow_up", "model.started", "model.delta", "model.reasoning_delta",
-  "model.completed", "model.failed", "tool.requested", "tool.approval_requested", "tool.approval_resolved",
+  "user.message", "user.steer", "user.follow_up", "model.started", "model.prompt_materialized",
+  "model.delta", "model.reasoning_delta", "model.completed", "model.failed", "tool.requested",
+  "tool.approval_requested", "tool.approval_resolved",
   "tool.started", "tool.progress", "tool.completed", "tool.failed", "context.compacted", "child.spawned",
   "child.message", "child.completed", "diagnostic", "execution.planned", "execution.started", "execution.completed",
   "execution.failed", "process.spawned", "process.output", "process.exited", "process.lost", "evidence.recorded",
@@ -24,14 +27,14 @@ let officialAssertAgentEventEnvelope = null;
 try {
   const protocol = await import("../../packages/agent-protocol/dist/index.js");
   if (protocol.STORE_LAYOUT_VERSION !== STORE_LAYOUT_VERSION
-    || protocol.EVENT_SCHEMA_VERSION !== EVENT_SCHEMA_VERSION
-    || protocol.SNAPSHOT_SCHEMA_VERSION !== SNAPSHOT_SCHEMA_VERSION) {
-    throw new Error("Built agent-protocol versions do not match the V5 audit reader.");
+    || protocol.EVENT_SCHEMA_VERSION !== CURRENT_EVENT_SCHEMA_VERSION
+    || protocol.SNAPSHOT_SCHEMA_VERSION !== CURRENT_SNAPSHOT_SCHEMA_VERSION) {
+    throw new Error("Built agent-protocol versions do not match the event-store audit reader.");
   }
   officialAssertAgentEventEnvelope = protocol.assertAgentEventEnvelope;
 } catch (error) {
   if (error?.code !== "ERR_MODULE_NOT_FOUND") throw error;
-  // Audit remains usable before a build; the complete V5 envelope
+  // Audit remains usable before a build; the complete supported envelope
   // boundary below still rejects unknown types, authorities, non-JSON payloads,
   // invalid identities, dates, and sequences. A normal built tree additionally
   // runs the production payload validator above.
@@ -51,12 +54,13 @@ function jsonValue(value, seen = new Set()) {
 
 export function assertV5EventEnvelope(event) {
   const valid = event && typeof event === "object" && !Array.isArray(event)
-    && event.schemaVersion === EVENT_SCHEMA_VERSION
+    && EVENT_SCHEMA_VERSIONS.has(event.schemaVersion)
     && Number.isSafeInteger(event.seq) && event.seq >= 1
     && [event.eventId, event.sessionId, event.runId].every((item) => typeof item === "string" && item.length > 0)
     && validDate(event.occurredAt) && EVENT_TYPES.has(event.type) && AUTHORITIES.has(event.authority)
+    && !(event.schemaVersion === 5 && event.type === "model.prompt_materialized")
     && jsonValue(event.payload);
-  if (!valid) throw new Error("Invalid AgentEventEnvelope V5.");
+  if (!valid) throw new Error("Invalid supported AgentEventEnvelope.");
   officialAssertAgentEventEnvelope?.(event);
 }
 
@@ -99,8 +103,8 @@ function validateMeta(value, sessionId) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid V5 session metadata.");
   const valid = [
     value.schemaVersion === STORE_LAYOUT_VERSION,
-    value.eventSchemaVersion === EVENT_SCHEMA_VERSION,
-    value.snapshotSchemaVersion === SNAPSHOT_SCHEMA_VERSION,
+    EVENT_SCHEMA_VERSIONS.has(value.eventSchemaVersion),
+    SNAPSHOT_SCHEMA_VERSIONS.has(value.snapshotSchemaVersion),
     value.sessionId === sessionId,
     validDate(value.createdAt),
     validDate(value.updatedAt),

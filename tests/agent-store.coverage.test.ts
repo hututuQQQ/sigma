@@ -116,6 +116,41 @@ describe("agent-store V5 durability", () => {
     await recovered.append(event("crash", 3) as never, 2);
   });
 
+  it("replays V5 events and upgrades legacy metadata on the next append", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-event-v5-upgrade-"));
+    const store = new SegmentedJsonlStore({ rootDir: root });
+    await store.append(event("event-v5", 1, "session.created") as never, 0);
+    const directory = sessionDirectory(root, "event-v5");
+    const eventPath = path.join(directory, "events", "000001.jsonl");
+    const stored = JSON.parse((await readFile(eventPath, "utf8")).trim()) as {
+      event: AgentEventEnvelope;
+    };
+    const legacyEvent = { ...stored.event, schemaVersion: 5 };
+    await writeFile(eventPath, `${JSON.stringify({
+      checksum: createHash("sha256").update(JSON.stringify(legacyEvent)).digest("hex"),
+      event: legacyEvent
+    })}\n`, "utf8");
+    const metaPath = path.join(directory, "meta.json");
+    const meta = JSON.parse(await readFile(metaPath, "utf8")) as Record<string, unknown>;
+    await writeFile(metaPath, `${JSON.stringify({
+      ...meta,
+      eventSchemaVersion: 5,
+      snapshotSchemaVersion: 6
+    })}\n`, "utf8");
+
+    const recovered = new SegmentedJsonlStore({ rootDir: root });
+    const replayed: number[] = [];
+    for await (const item of recovered.events("event-v5")) replayed.push(item.seq);
+    expect(replayed).toEqual([1]);
+    await recovered.append(event("event-v5", 2) as never, 1);
+    await expect(readFile(metaPath, "utf8").then((value) => JSON.parse(value)))
+      .resolves.toMatchObject({
+        eventSchemaVersion: EVENT_SCHEMA_VERSION,
+        snapshotSchemaVersion: SNAPSHOT_SCHEMA_VERSION,
+        lastSeq: 2
+      });
+  });
+
   it("rejects checksummed event corruption through the shared V5 schema", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-corruption-"));
     const store = new SegmentedJsonlStore({ rootDir: root });

@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { createKernelState, reviewRepairObligation } from "../packages/agent-kernel/src/index.js";
+import { createKernelState } from "../packages/agent-kernel/src/index.js";
 import type {
   AgentEventEnvelope,
   EvidenceRecord,
@@ -25,14 +25,14 @@ import { RuntimeControlService } from "../packages/agent-runtime/src/runtime-con
 import type { RuntimeControlServiceOptions } from "../packages/agent-runtime/src/runtime-control-contracts.js";
 import { assertToolReceiptIdentity, normalizeReceiptEvidence } from "../packages/agent-runtime/src/tool-evidence.js";
 import {
-  assertTaskControlPlanAllowed,
+  assertTransactionIsolationPlanAllowed,
   assertReceiptWithinPlan,
   validationScope
 } from "../packages/agent-runtime/src/tool-plan-enforcement.js";
 import { ReviewCoordinator, reviewReadiness } from "../packages/agent-runtime/src/review-coordinator.js";
 import {
+  currentFrontierValidationStatus,
   frontierValidationReadiness,
-  reviewBasisDigest,
   unresolvedWorkspaceDeltas
 } from "../packages/agent-runtime/src/mutation-evidence.js";
 import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
@@ -628,7 +628,7 @@ describe("V5 assurance-coordinated mutation completion", () => {
     });
   });
 
-  it("keeps an explicitly requested direct Node check as an acceptance obligation", () => {
+  it("reports an explicitly requested direct Node check as telemetry without making it completion authority", () => {
     const active = frontierSession();
     active.durable.state.plan = {
       ...active.durable.state.plan,
@@ -638,7 +638,7 @@ describe("V5 assurance-coordinated mutation completion", () => {
 
     expect(assuranceRequirement(active)).toMatchObject({ requiredClaims: ["acceptance"] });
     expect(evidenceLedger(active).content).toContain(
-      "required validation claim kinds still missing/failed: acceptance"
+      "telemetry-only inferred validation claim gaps: acceptance"
     );
 
     active.durable.state.plan = {
@@ -683,7 +683,7 @@ describe("V5 assurance-coordinated mutation completion", () => {
     });
   });
 
-  it("requires completion review before accepting an honestly reported failed check", () => {
+  it("keeps failed validation as current-frontier status without a hidden completion tool", () => {
     const active = frontierSession();
     active.durable.state.plan = {
       ...active.durable.state.plan,
@@ -735,75 +735,16 @@ describe("V5 assurance-coordinated mutation completion", () => {
       missingClaims: ["acceptance"],
       latestFailed: { evidenceId: "node-check-failed" }
     });
+    expect(currentFrontierValidationStatus(active)).toMatchObject({
+      hasRecord: true,
+      passed: false,
+      latestFailed: { evidenceId: "node-check-failed" }
+    });
     expect(completionFailure(active, call, {
       possibleEffects: ["outcome.propose"]
     } as ToolDescriptor, now)).toMatchObject({
       ok: false,
-      diagnostics: ["validation_result_reporting_required"],
-      result: { nextActions: [{ tool: "request_review", arguments: {} }] }
-    });
-
-    const candidateDigest = "c".repeat(64);
-    active.durable.state.taskControl.completionCandidate = {
-      answer: "The requested check failed.",
-      digest: candidateDigest
-    };
-    active.durable.state.evidence.push({
-      evidenceId: "completion-review",
-      sessionId: "session",
-      runId: "run",
-      kind: "review",
-      status: "passed",
-      createdAt: now,
-      producer: { authority: "runtime", id: "reviewer" },
-      summary: "The requested failed check was reported honestly.",
-      data: {
-        reviewerId: "reviewer",
-        verdict: "approved",
-        findings: [],
-        frontierRevision: active.durable.state.mutationFrontier.revision,
-        stateDigest: active.durable.state.mutationFrontier.currentStateDigest,
-        reviewBasisDigest: reviewBasisDigest(active, undefined, candidateDigest),
-        validationEvidenceIds: ["node-check-failed"]
-      }
-    });
-    expect(completionFailure(active, call, {
-      possibleEffects: ["outcome.propose"]
-    } as ToolDescriptor, now)).toBeNull();
-
-    active.durable.state.mutationFrontier.changedPaths = ["packages/agent-runtime/service.mjs"];
-    const failedEvidence = active.durable.state.evidence.find(
-      (item): item is ValidationEvidence => item.evidenceId === "node-check-failed"
-    )!;
-    failedEvidence.data.coveredPaths = ["packages/agent-runtime/service.mjs"];
-    active.durable.state.evidence = active.durable.state.evidence.filter(
-      (item) => item.evidenceId !== "completion-review"
-    );
-    active.durable.state.evidence.push({
-      evidenceId: "high-risk-completion-review",
-      sessionId: "session",
-      runId: "run",
-      kind: "review",
-      status: "passed",
-      createdAt: now,
-      producer: { authority: "runtime", id: "reviewer" },
-      summary: "The failed check was reported, but high-risk validation remains required.",
-      data: {
-        reviewerId: "reviewer",
-        verdict: "approved",
-        findings: [],
-        frontierRevision: active.durable.state.mutationFrontier.revision,
-        stateDigest: active.durable.state.mutationFrontier.currentStateDigest,
-        reviewBasisDigest: reviewBasisDigest(active, undefined, candidateDigest),
-        validationEvidenceIds: ["node-check-failed"]
-      }
-    });
-    expect(assuranceRequirement(active).risk).toBe("high");
-    expect(completionFailure(active, call, {
-      possibleEffects: ["outcome.propose"]
-    } as ToolDescriptor, now)).toMatchObject({
-      ok: false,
-      diagnostics: ["validation_result_reporting_required"]
+      diagnostics: ["internal_tool_denied"]
     });
   });
 
@@ -876,22 +817,25 @@ describe("V5 assurance-coordinated mutation completion", () => {
     });
   });
 
-  it("keeps semantic validation hard while advisory review does not block", () => {
+  it("never re-enables the removed completion tool based on validation state", () => {
     const active = frontierSession();
     const call: ModelToolCall = { id: "runtime_completion_intent_test", name: "runtime_finalize", arguments: { summary: "done" } };
     const descriptor = { possibleEffects: ["outcome.propose"] } as ToolDescriptor;
     expect(completionFailure(active, call, descriptor, now)).toMatchObject({
       ok: false,
-      diagnostics: ["validation_evidence_required"]
+      diagnostics: ["internal_tool_denied"]
     });
     active.durable.state.evidence.push(
       frontierValidation("code", ["src/code.ts"]),
       frontierValidation("docs", ["docs/readme.md"])
     );
-    expect(completionFailure(active, call, descriptor, now)).toBeNull();
+    expect(completionFailure(active, call, descriptor, now)).toMatchObject({
+      ok: false,
+      diagnostics: ["internal_tool_denied"]
+    });
   });
 
-  it("keeps failed goal input obligations open until that same external path is read", () => {
+  it("keeps input-access evidence as facts without creating a completion obligation", () => {
     const requiredPath = pathForInputObligation();
     const inputAccess = (
       evidenceId: string,
@@ -916,11 +860,13 @@ describe("V5 assurance-coordinated mutation completion", () => {
 
     expect(completionFailure(target, call, descriptor, now)).toMatchObject({
       ok: false,
-      diagnostics: ["input_access_unresolved"],
-      result: { paths: [requiredPath] }
+      diagnostics: ["internal_tool_denied"]
     });
     target.durable.state.evidence.push(inputAccess("required-passed", "passed", requiredPath, "external"));
-    expect(completionFailure(target, call, descriptor, now)).toBeNull();
+    expect(completionFailure(target, call, descriptor, now)).toMatchObject({
+      ok: false,
+      diagnostics: ["internal_tool_denied"]
+    });
     expect(completionFailure(target, {
       id: "blocked", name: "report_blocked", arguments: { summary: "input inaccessible" }
     }, { possibleEffects: ["outcome.report_blocked"] } as ToolDescriptor, now)).toBeNull();
@@ -954,7 +900,7 @@ describe("leaf-aware effect-plan enforcement", () => {
   });
 });
 
-describe("review repair plan enforcement", () => {
+describe("model-owned review repair planning", () => {
   function repairPlan(writePaths: string[]): ToolCallPlan {
     return {
       exactEffects: ["filesystem.write"], readPaths: [], writePaths,
@@ -963,34 +909,21 @@ describe("review repair plan enforcement", () => {
     };
   }
 
-  it("allows only writes inside the runtime-authenticated finding scope", async () => {
+  it("does not turn reviewer findings into a runtime write-scope obligation", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-review-repair-plan-"));
     await mkdir(path.join(workspace, "src"));
     const active = runtimeSessionFixture({ workspacePath: workspace });
-    active.durable.state.taskControl = reviewRepairObligation(
-      active.durable.state.taskControl,
-      active.durable.state.revision,
-      "a".repeat(64),
-      ["src/target.ts"]
-    );
-
-    await expect(assertTaskControlPlanAllowed(active, repairPlan(["src/target.ts"])))
+    await expect(assertTransactionIsolationPlanAllowed(active, repairPlan(["src/target.ts"])))
       .resolves.toBeUndefined();
-    await expect(assertTaskControlPlanAllowed(active, repairPlan(["src/other.ts"])))
-      .rejects.toMatchObject({ code: "tool_unavailable_for_repair" });
+    await expect(assertTransactionIsolationPlanAllowed(active, repairPlan(["src/other.ts"])))
+      .resolves.toBeUndefined();
   });
 
-  it("rejects mutation plans without an exact write target", async () => {
+  it("does not require a synthetic repair target in the effect plan", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-review-repair-empty-plan-"));
     const active = runtimeSessionFixture({ workspacePath: workspace });
-    active.durable.state.taskControl = reviewRepairObligation(
-      active.durable.state.taskControl,
-      active.durable.state.revision,
-      "b".repeat(64),
-      ["target.ts"]
-    );
-    await expect(assertTaskControlPlanAllowed(active, repairPlan([])))
-      .rejects.toMatchObject({ code: "tool_unavailable_for_repair" });
+    await expect(assertTransactionIsolationPlanAllowed(active, repairPlan([])))
+      .resolves.toBeUndefined();
   });
 });
 

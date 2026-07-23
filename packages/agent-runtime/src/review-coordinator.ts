@@ -11,11 +11,12 @@ import type { BudgetController } from "./budget-controller.js";
 import { consumedBudget } from "./model-accounting.js";
 import {
   currentFrontierReview,
-  frontierValidationReadiness,
+  currentFrontierValidationStatus,
   reviewBasisDigest,
   sessionMutationEvidence,
   unresolvedWorkspaceDeltas
 } from "./mutation-evidence.js";
+import { completionCandidate } from "./completion-evidence-gate.js";
 import type { RuntimeSession } from "./types.js";
 import {
   isAccountableReviewer,
@@ -28,8 +29,6 @@ import {
 } from "./reviewer.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 import { reviewerWaivedDeltaIds } from "./review-waiver-policy.js";
-import { deadlineForecast } from "./convergence-policy.js";
-import { assuranceRequirement } from "./assurance-engine.js";
 import { goalReferencedWorkspaceReads } from "./reviewer-workspace-reads.js";
 export { goalReferencedWorkspaceReads } from "./reviewer-workspace-reads.js";
 
@@ -95,7 +94,7 @@ export function reviewReadiness(
   session: RuntimeSession,
   reviewMode: ReviewerInput["reviewMode"] = "workspace"
 ): ReviewReadiness {
-  const validation = frontierValidationReadiness(session);
+  const validation = currentFrontierValidationStatus(session);
   const unresolved = unresolvedWorkspaceDeltas(session);
   const waived = reviewerWaivedDeltaIds(sessionMutationEvidence(session));
   // A user waiver suppresses optional reviewer work (and its cost), while the
@@ -105,11 +104,12 @@ export function reviewReadiness(
     : unresolved.filter((item) => !waived.has(item.evidenceId));
   const latest = currentFrontierReview(session);
   const executedFailureReviewable = reviewMode === "completion"
-    && validation.executionReady
-    && assuranceRequirement(session).risk !== "high";
+    && validation.validations.some((item) => item.status === "failed"
+      && item.data.termination?.processStarted === true
+      && item.data.termination.state === "exited");
   return {
     pending,
-    eligible: validation.ready || executedFailureReviewable
+    eligible: validation.passed || executedFailureReviewable
       ? pending : [],
     validations: validation.validations,
     relevantValidations: validation.validations,
@@ -155,14 +155,11 @@ interface ReviewAttempt {
 
 function reviewAttemptAllowed(
   existing: ReviewEvidence | undefined,
-  explicitlyRequested: boolean,
-  attemptCount: number
+  explicitlyRequested: boolean
 ): boolean {
   if (existing?.status === "passed") return false;
   if (existing?.status === "failed" && !existing.data.failureKind) return false;
-  if (existing?.data.failureKind !== "protocol" && existing && !explicitlyRequested) return false;
-  const attemptLimit = existing?.data.failureKind === "protocol" ? 2 : 3;
-  return attemptCount < attemptLimit;
+  return !existing || explicitlyRequested;
 }
 
 function eligibleReviewAttempt(
@@ -172,13 +169,13 @@ function eligibleReviewAttempt(
 ): ReviewAttempt | null {
   const { eligible, relevantValidations } = reviewReadiness(session, reviewMode);
   if (eligible.length === 0) return null;
-  const candidate = reviewMode === "completion" ? session.durable.state.taskControl.completionCandidate : undefined;
+  const candidate = reviewMode === "completion" ? completionCandidate(session) : undefined;
   const basisDigest = reviewBasisDigest(session, relevantValidations, candidate?.digest);
   const reviews = session.durable.state.evidence.filter((item): item is ReviewEvidence => item.kind === "review"
     && item.sessionId === session.identity.sessionId && item.runId === session.durable.runId
     && item.data.reviewBasisDigest === basisDigest);
   const existing = reviews.at(-1);
-  if (!reviewAttemptAllowed(existing, explicitlyRequested, reviews.length)) return null;
+  if (!reviewAttemptAllowed(existing, explicitlyRequested)) return null;
   return { eligible, relevantValidations, basisDigest, basisAttempts: reviews.length, ...(candidate ? { candidate } : {}) };
 }
 
@@ -227,7 +224,6 @@ export class ReviewCoordinator {
     reviewMode: ReviewerInput["reviewMode"] = "workspace"
   ): Promise<void> {
     if (profileReviewMode(session) === "off") return;
-    if (deadlineForecast(session).stage === "stop") return;
     const existing = this.active.get(session.identity.sessionId);
     if (existing) return await existing;
     const task = this.reviewEligibleChange(session, signal, explicitlyRequested, reviewMode);
@@ -257,11 +253,10 @@ export class ReviewCoordinator {
       ));
       return;
     }
-    const normalized = this.budgets && isAccountableReviewer(reviewer)
-      ? await this.reviewAccounted(session, reviewer, reviewerId, input, requestId, signal)
-      : await this.reviewUnaccounted(session, reviewer, reviewerId, input, requestId, signal);
-    if (normalized.data.failureKind === "protocol" && attempt.basisAttempts + 1 < 2) {
-      await this.reviewEligibleChange(session, signal, true, reviewMode);
+    if (this.budgets && isAccountableReviewer(reviewer)) {
+      await this.reviewAccounted(session, reviewer, reviewerId, input, requestId, signal);
+    } else {
+      await this.reviewUnaccounted(session, reviewer, reviewerId, input, requestId, signal);
     }
   }
 
@@ -307,8 +302,7 @@ export class ReviewCoordinator {
     const remaining = Math.max(0, session.durable.state.budget.limits.costMicroUsd
       - session.durable.state.budget.consumed.costMicroUsd
       - session.durable.state.budget.reserved.costMicroUsd);
-    const outputLimit = deadlineForecast(session).stage === "converge" ? 2_048 : undefined;
-    const prepared = await reviewer.prepareReview(input, remaining, outputLimit);
+    const prepared = await reviewer.prepareReview(input, remaining);
     const reservationId = await this.budgets!.reserve(session, `reviewer:${requestId}`, prepared.budget.reserved);
     await this.emit(session, "review.started", "runtime", {
       reviewerId, requestId,

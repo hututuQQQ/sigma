@@ -81,13 +81,15 @@ export function foregroundExecutionSchema(
     timeoutMs: { type: "integer", minimum: 1, maximum: 600000 },
     ...writeContractProperties()
   };
-  const required = validation ? [] : kind === "shell" ? ["shell", "command"] : ["executable"];
+  const required = validation ? [] : kind === "shell" ? ["command"] : ["executable"];
   const effects: ToolDescriptor["possibleEffects"] = validation
     ? ["process.spawn", "process.spawn.readonly", "filesystem.read", "filesystem.read.external", "filesystem.write", "validation", "network", "open_world"]
     : ["process.spawn", "process.spawn.readonly", "filesystem.read", "filesystem.read.external", "filesystem.write", "network", "open_world"];
   const description = validation
     ? "Run a sandboxed validation using exactly one form: {executable,args} or {shell,command}. The runtime classifies semantic assurance from the command adapter and its exact subjects; working-directory and filesystem permissions never imply validation coverage."
-    : `Run a sandboxed ${kind} command. With skill and skillScript, the frozen script is prepended to interpreter args.`;
+    : kind === "shell"
+      ? "Run a sandboxed shell command. shell is optional; when omitted, the runtime chooses a deterministic broker-verified shell."
+      : `Run a sandboxed ${kind} command. With skill and skillScript, the frozen script is prepended to interpreter args.`;
   const base = executionToolSchema(kind, description, properties, required, effects);
   const schema = validation
     ? { ...base, inputSchema: validationSchema(base, availableShells(options).length > 0) }

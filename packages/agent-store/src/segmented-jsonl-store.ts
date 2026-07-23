@@ -20,29 +20,23 @@ import type {
 import { atomicJson, type AtomicReplace } from "./durable-file.js";
 import { inspectDurableEventTail } from "./durable-tail.js";
 import { segmentName, sessionDirectory, sessionsDirectory, snapshotName } from "./paths.js";
+import {
+  isLegacySnapshotEnvelopeV5,
+  isLegacySnapshotEnvelopeV6,
+  isSessionMetaV5,
+  snapshotChecksum,
+  type SessionMetaV5,
+  type StoredSnapshot
+} from "./segmented-store-formats.js";
+export { isSessionMetaV5 } from "./segmented-store-formats.js";
+export type { SessionMetaV5 } from "./segmented-store-formats.js";
 
 const DEFAULT_SEGMENT_BYTES = 8 * 1024 * 1024;
 const DEFAULT_SEGMENT_EVENTS = 10_000;
-export interface SessionMetaV5 {
-  schemaVersion: typeof STORE_LAYOUT_VERSION;
-  eventSchemaVersion: typeof EVENT_SCHEMA_VERSION;
-  snapshotSchemaVersion: typeof SNAPSHOT_SCHEMA_VERSION;
-  sessionId: string;
-  createdAt: string;
-  updatedAt: string;
-  lastSeq: number;
-  segment: number;
-  segmentEvents: number;
-}
 
 interface StoredRecord {
   checksum: string;
   event: AnyTypedAgentEvent;
-}
-
-interface StoredSnapshot {
-  checksum: string;
-  snapshot: SnapshotEnvelope;
 }
 
 interface EventCursor {
@@ -56,29 +50,8 @@ export interface SegmentedJsonlStoreOptions {
   replaceFile?: AtomicReplace;
 }
 
-export function isSessionMetaV5(value: unknown, sessionId?: string): value is SessionMetaV5 {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const meta = value as Record<string, unknown>;
-  return [
-    meta.schemaVersion === STORE_LAYOUT_VERSION,
-    meta.eventSchemaVersion === EVENT_SCHEMA_VERSION,
-    meta.snapshotSchemaVersion === SNAPSHOT_SCHEMA_VERSION,
-    typeof meta.sessionId === "string" && meta.sessionId.length > 0,
-    sessionId === undefined || meta.sessionId === sessionId,
-    typeof meta.createdAt === "string" && Number.isFinite(Date.parse(meta.createdAt)),
-    typeof meta.updatedAt === "string" && Number.isFinite(Date.parse(meta.updatedAt)),
-    Number.isSafeInteger(meta.lastSeq) && Number(meta.lastSeq) >= 0,
-    Number.isSafeInteger(meta.segment) && Number(meta.segment) >= 1,
-    Number.isSafeInteger(meta.segmentEvents) && Number(meta.segmentEvents) >= 0
-  ].every(Boolean);
-}
-
 function checksum(event: AnyTypedAgentEvent): string {
   return createHash("sha256").update(JSON.stringify(event)).digest("hex");
-}
-
-function snapshotChecksum(snapshot: SnapshotEnvelope): string {
-  return createHash("sha256").update(JSON.stringify(snapshot)).digest("hex");
 }
 
 function storedLine(event: AnyTypedAgentEvent): string {
@@ -167,6 +140,8 @@ export class SegmentedJsonlStore implements RunStore {
     }
     await atomicJson(path.join(directory, "meta.json"), {
       ...meta,
+      eventSchemaVersion: EVENT_SCHEMA_VERSION,
+      snapshotSchemaVersion: SNAPSHOT_SCHEMA_VERSION,
       updatedAt: event.occurredAt,
       lastSeq: event.seq,
       segment,
@@ -310,9 +285,14 @@ export class SegmentedJsonlStore implements RunStore {
     for (const file of files) {
       try {
         const stored = JSON.parse(await readFile(path.join(directory, file), "utf8")) as StoredSnapshot;
-        assertSnapshotEnvelope(stored.snapshot);
+        if (stored.snapshot?.schemaVersion === SNAPSHOT_SCHEMA_VERSION) {
+          assertSnapshotEnvelope(stored.snapshot);
+        } else if (!isLegacySnapshotEnvelopeV5(stored.snapshot)
+          && !isLegacySnapshotEnvelopeV6(stored.snapshot)) {
+          continue;
+        }
         if (stored.snapshot.sessionId === sessionId && snapshotChecksum(stored.snapshot) === stored.checksum) {
-          return stored.snapshot;
+          return stored.snapshot as SnapshotEnvelope;
         }
       } catch {
         // A previous complete snapshot remains a valid recovery point.

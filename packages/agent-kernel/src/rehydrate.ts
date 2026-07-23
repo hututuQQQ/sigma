@@ -2,6 +2,7 @@ import {
   KERNEL_STATE_VERSION,
   isBudgetLedgerState,
   isCheckpointRef,
+  isContextArchiveV1,
   isEvidenceRecord,
   isPlanGraph,
   isUsageRecord,
@@ -9,8 +10,6 @@ import {
 } from "agent-protocol";
 import { evolve } from "./reducer.js";
 import type { KernelState } from "./state.js";
-import { isTaskControlStateV1 } from "./task-control-state.js";
-import { hasPublishedTaskControlLegacyFields } from "./task-control.js";
 
 export function rehydrate(initial: KernelState, events: Iterable<AgentEventEnvelope>): KernelState {
   let state = initial;
@@ -34,7 +33,9 @@ function assertDurableLedgers(state: KernelState): void {
   if (new Set(state.budget.reservations.map((item) => item.reservationId)).size !== state.budget.reservations.length) {
     throw new Error("Duplicate budget reservation IDs.");
   }
-  assertTaskControlState(state);
+  if (state.contextArchive && !isContextArchiveV1(state.contextArchive)) {
+    throw new Error("Kernel context archive is invalid.");
+  }
 }
 
 function assertEvidenceLedgers(state: KernelState): void {
@@ -89,18 +90,6 @@ function assertToolLedger(state: KernelState): void {
   }
 }
 
-function assertTaskControlState(state: KernelState): void {
-  if (hasPublishedTaskControlLegacyFields(state)) {
-    throw new Error("Kernel state contains superseded task-control authorities.");
-  }
-  if (!isTaskControlStateV1(state.taskControl)) throw new Error("Kernel task-control state is invalid.");
-  if (state.taskControl.episode.startedRevision > state.revision
-    || state.taskControl.semanticFacts.entries.some((fact) => fact.revision > state.revision)
-    || (state.taskControl.obligation?.openedRevision ?? 0) > state.revision) {
-    throw new Error("Task-control facts or obligation exceed the current kernel revision.");
-  }
-}
-
 function assertPhaseState(state: KernelState): void {
   if ((state.phase === "model_in_flight") !== Boolean(state.activeModelTurn)) {
     throw new Error("Model-in-flight state and active model turn must agree.");
@@ -112,7 +101,9 @@ function assertPhaseState(state: KernelState): void {
   if (state.phase !== "terminal" && state.outcome?.kind !== "needs_input") {
     if (state.outcome) throw new Error("Non-terminal kernel state cannot have a terminal outcome.");
   }
-  assertTaskControlState(state);
+  if ((state.phase === "outcome_pending") !== Boolean(state.proposedOutcome)) {
+    throw new Error("Outcome-pending state and proposed outcome must agree.");
+  }
 }
 
 export function assertKernelInvariants(state: KernelState): void {

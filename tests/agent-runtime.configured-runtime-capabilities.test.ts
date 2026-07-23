@@ -264,8 +264,9 @@ function configured(workspace: string): RuntimeCompositionConfig {
     provider: "deepseek",
     model: "deepseek-v4-pro",
     permissionMode: "deny",
-    // Capability projection is the subject of these tests; keep the first
-    // turn outside the deadline-convergence window.
+    networkMode: "none",
+    // Capability projection is the subject of these tests; keep a generous
+    // first-turn deadline so timing does not affect the fixture.
     runDeadlineSec: 60,
     modelDeadlineSec: 10,
     streamIdleSec: 5,

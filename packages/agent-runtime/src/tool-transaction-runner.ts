@@ -1,11 +1,7 @@
-import { randomUUID } from "node:crypto";
 import type { CheckpointRef, ModelToolCall, ToolCallPlan, ToolDescriptor, ToolReceipt } from "agent-protocol";
 import { isToolAllowed, prepareToolCallPlan, ResourceLockManager } from "agent-tools";
 import {
   completionFailure,
-  completionPlan,
-  completionPlanError,
-  currentRunEvidence,
   failed,
   lockKeys,
   mergeDelta,
@@ -18,8 +14,7 @@ import { profileAllowsTool } from "./profile-policy.js";
 import { assertToolReceiptIdentity } from "./tool-evidence.js";
 import {
   assertCheckpointActionAllowed,
-  assertTaskControlCallAllowed,
-  assertTaskControlPlanAllowed,
+  assertTransactionIsolationPlanAllowed,
   assertReceiptWithinPlan,
   validationScope
 } from "./tool-plan-enforcement.js";
@@ -29,7 +24,6 @@ import { WorkspaceMutationLease } from "./workspace-mutation-lease.js";
 import { recordLostProcess, recordProcessReceipt } from "./process-lifecycle.js";
 import { ToolApprovalCoordinator } from "./tool-approval-coordinator.js";
 import { settleEligibleToolBudgets } from "./mutation-budget.js";
-import { completionRepairPhase, descriptorAllowedForRepair, effectsAllowedForRepair } from "./tool-turn-policy.js";
 import { failedExternalInputReceipt } from "./failed-input-evidence.js";
 import {
   createMutationCheckpoint,
@@ -39,10 +33,10 @@ import {
   isToolReceipt,
   settleNoChangeProbe
 } from "./tool-transaction-support.js";
-import { convergedToolFailure } from "./capability-failure-convergence.js";
+import { ordinaryToolFailureReceipt } from "./tool-failure-receipt.js";
 import type { PreparedTool, TransactionState } from "./tool-transaction-types.js";
 import { recordRuntimeDependencyFailure } from "./runtime-dependency-observation.js";
-import { toolTaskControlContext } from "./repository-recovery-context.js";
+import { toolRuntimeContext } from "./repository-recovery-context.js";
 import { normalizeToolTransactionReceipt } from "./tool-receipt-normalization.js";
 export class ToolTransactionRunner {
   private readonly locks = new ResourceLockManager();
@@ -62,11 +56,11 @@ export class ToolTransactionRunner {
   async execute(session: RuntimeSession, attempt: ToolAttempt, signal: AbortSignal): Promise<ToolReceipt> {
     const startedAt = new Date().toISOString();
     try {
-      const prepared = await this.prepare(session, attempt, startedAt, signal);
+      const prepared = await this.prepare(session, attempt, startedAt);
       if (isToolReceipt(prepared)) return prepared;
       return await this.executePrepared(session, prepared, signal);
     } catch (error) {
-      return convergedToolFailure(session, attempt.call, startedAt, error, signal);
+      return ordinaryToolFailureReceipt(attempt.call, startedAt, error, signal);
     }
   }
 
@@ -85,8 +79,7 @@ export class ToolTransactionRunner {
   private async prepare(
     session: RuntimeSession,
     attempt: ToolAttempt,
-    startedAt: string,
-    signal: AbortSignal
+    startedAt: string
   ): Promise<PreparedTool | ToolReceipt> {
     const { call, modelTurn } = attempt;
     const descriptor = this.options.runtime.tools.descriptors().find((item) => item.name === call.name);
@@ -100,22 +93,12 @@ export class ToolTransactionRunner {
     if (!profileAllowsTool(session, descriptor)) {
       return failed(call, startedAt, `Tool '${call.name}' is denied by the frozen Agent Profile.`, "profile_denied");
     }
-    const repairPhase = completionRepairPhase(session);
-    if (!descriptorAllowedForRepair(session, descriptor, repairPhase)) {
-      return failed(
-        call,
-        startedAt,
-        `Tool '${call.name}' was not offered for the active protocol-repair turn.`,
-        "tool_unavailable_for_repair"
-      );
-    }
-    assertTaskControlCallAllowed(session, call);
     const context = {
       sessionId: session.identity.sessionId,
       runId: session.durable.runId,
       workspacePath: session.identity.workspacePath,
       runMode: session.durable.mode,
-      ...toolTaskControlContext(session),
+      ...toolRuntimeContext(session),
       runtimeControl: this.options.control.forSession(session)
     } as const;
     const plan = this.options.runtime.tools.prepare
@@ -123,19 +106,11 @@ export class ToolTransactionRunner {
         callId: call.id, name: call.name, arguments: call.arguments
       }, context)
       : await prepareToolCallPlan(descriptor, call.arguments, context);
-    if (!effectsAllowedForRepair(session, plan.exactEffects, repairPhase)) {
-      return failed(
-        call,
-        startedAt,
-        `Tool '${call.name}' planned effects that were not offered for the active protocol-repair turn.`,
-        "tool_unavailable_for_repair"
-      );
-    }
     const selectedValidationScope = validationScope(session, call, plan);
     await this.options.emit(session, "execution.planned", "runtime", {
       executionId: call.id, toolCallId: call.id, plan
     });
-    const gateFailure = await this.preflight(session, call, descriptor, plan, startedAt, signal);
+    const gateFailure = await this.preflight(session, call, descriptor, plan, startedAt);
     return gateFailure ?? {
       ...attempt, descriptor, plan, startedAt,
       ...(selectedValidationScope ? { validationScope: selectedValidationScope } : {})
@@ -147,8 +122,7 @@ export class ToolTransactionRunner {
     call: ModelToolCall,
     descriptor: ToolDescriptor,
     plan: ToolCallPlan,
-    startedAt: string,
-    signal: AbortSignal
+    startedAt: string
   ): Promise<ToolReceipt | undefined> {
     if (session.durable.mode === "analyze" && mutatingPlan(plan)) {
       return failed(
@@ -158,7 +132,9 @@ export class ToolTransactionRunner {
         "mode_denied"
       );
     }
-    if (session.durable.mode === "change" && mutatingPlan(plan) && !planAllowsMutation(session)) {
+    const requirePlan = session.services.profile?.profile.mutationPolicy.requirePlanBeforeMutation === true;
+    if (session.durable.mode === "change" && mutatingPlan(plan)
+      && requirePlan && !planAllowsMutation(session)) {
       return failed(
         call,
         startedAt,
@@ -166,53 +142,10 @@ export class ToolTransactionRunner {
         "plan_required"
       );
     }
-    await assertTaskControlPlanAllowed(session, plan);
+    await assertTransactionIsolationPlanAllowed(session, plan);
     const scopeError = await writeScopeFailure(session, call, descriptor, startedAt, plan);
     if (scopeError) return scopeError;
-    const completionError = completionFailure(session, call, descriptor, startedAt);
-    if (completionError) return completionError;
-    return await this.completionGate(session, call, descriptor, startedAt, signal);
-  }
-
-  private async completionGate(
-    session: RuntimeSession,
-    call: ModelToolCall,
-    descriptor: ToolDescriptor,
-    startedAt: string,
-    signal: AbortSignal
-  ): Promise<ToolReceipt | undefined> {
-    if (!descriptor.possibleEffects.includes("outcome.propose")) return undefined;
-    const pending = session.durable.state.plan.nodes.filter((node) =>
-      node.status !== "completed" && node.status !== "cancelled");
-    if (currentRunEvidence(session).length === 0
-      && session.durable.state.mutationFrontier.changedPaths.length === 0
-      && pending.length === 1
-      && pending[0]?.id === "root"
-      && pending[0].status === "in_progress") {
-      await this.options.emit(session, "evidence.recorded", "runtime", {
-        evidenceId: randomUUID(),
-        sessionId: session.identity.sessionId,
-        runId: session.durable.runId,
-        kind: "diagnostic",
-        status: "passed",
-        createdAt: startedAt,
-        producer: { authority: "runtime", id: "completion" },
-        summary: "The runtime accepted a completion intent with no net workspace changes.",
-        data: {
-          source: "runtime_completion_intent",
-          diagnostic: { callId: call.id, noNetWorkspaceChanges: true }
-        }
-      });
-    }
-    const completed = completionPlan(session);
-    if (completed) {
-      const previousRevision = session.durable.state.plan.revision;
-      await this.options.emit(session, "plan.updated", "runtime", { previousRevision, plan: completed });
-      await this.options.hooks.dispatch(session, "plan_changed", {
-        previousRevision, plan: completed, source: "completion"
-      }, signal);
-    }
-    return completionPlanError(session, call, startedAt) ?? undefined;
+    return completionFailure(session, call, descriptor, startedAt) ?? undefined;
   }
 
   private async executePrepared(

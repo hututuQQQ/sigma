@@ -67,7 +67,7 @@ describe("runtime exact no-change convergence", () => {
       type: "tool.completed",
       payload: expect.objectContaining({
         callId: `same-${toolName}`,
-        result: { status: "no_change", path: "same.txt" },
+        result: expect.objectContaining({ status: "no_change", path: "same.txt" }),
         actualEffects: ["filesystem.read"]
       })
     }));
@@ -90,7 +90,7 @@ describe("runtime exact no-change convergence", () => {
     expect(restored.state.mutationEvidence).toEqual([]);
     expect(restored.state.receipts).toContainEqual(expect.objectContaining({
       callId: `same-${toolName}`,
-      result: { status: "no_change", path: "same.txt" },
+      result: expect.objectContaining({ status: "no_change", path: "same.txt" }),
       actualEffects: ["filesystem.read"]
     }));
   });
@@ -121,7 +121,10 @@ describe("runtime exact no-change convergence", () => {
     const stored = await events(store, session.sessionId);
     expect(stored).toContainEqual(expect.objectContaining({
       type: "tool.failed",
-      payload: expect.objectContaining({ callId: "denied-write", diagnostics: ["mode_denied"] })
+      payload: expect.objectContaining({
+        callId: "denied-write",
+        diagnostics: ["model_tool_policy_violation"]
+      })
     }));
     expect(stored.some((event) => event.type.startsWith("checkpoint."))).toBe(false);
     expect(stored.some((event) => event.type === "tool.completed"

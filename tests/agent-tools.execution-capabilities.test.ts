@@ -231,7 +231,9 @@ describe("execution tool capability closure", () => {
 
   it("keeps the shell schema aligned with verified capabilities and rejects unsupported arguments", async () => {
     const root = await workspace();
+    const fixture = brokerFixture();
     const tools = registerBuiltinTools(new EffectToolRegistry(), {
+      broker: fixture.broker,
       foreground: true,
       background: false,
       networkMode: "none",
@@ -242,6 +244,16 @@ describe("execution tool capability closure", () => {
     expect(tools.descriptor("shell")?.inputSchema).toMatchObject({
       properties: { shell: { enum: ["bash"] }, timeoutMs: { maximum: 600000 } }
     });
+    const commandOnly = request("shell", { command: "printf ok" });
+    const plan = await tools.prepare(commandOnly, preparation(root));
+    await expect(tools.execute(commandOnly, { ...execution(root), callPlan: plan }))
+      .resolves.toMatchObject({ ok: true });
+    expect(fixture.execute).toHaveBeenCalledWith(expect.objectContaining({
+      command: expect.objectContaining({
+        executable: "bash",
+        args: ["-lc", "printf ok"]
+      })
+    }), expect.anything());
     await expect(tools.prepare(
       request("shell", { shell: "bash", command: "printf ok", unsupported: true }),
       preparation(root)

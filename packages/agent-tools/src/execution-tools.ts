@@ -27,6 +27,7 @@ import {
   executionText,
   executionToolSchema,
   normalizeWindowsShellInvocation,
+  resolvedShell,
   shellInvocation
 } from "./execution-tool-values.js";
 import type { PlannedToolExecutionContext, RegisteredEffectTool } from "./registry.js";
@@ -147,7 +148,7 @@ async function executeForegroundCommand(
   let skillResource = await loadedSkillResource(input, context.runtimeControl, "execute");
   let approvedPlan = await approvedProcessPlan(input, context, options, skillResource, validation);
   const invocation = shellCommand
-    ? shellInvocation(executionText(input, "shell"), executionText(input, "command"))
+    ? shellInvocation(resolvedShell(input, options), executionText(input, "command"))
     : normalizeWindowsShellInvocation(
       executionText(input, "executable"),
       [...(skillResource ? [skillResource.absolutePath] : []), ...executionStrings(input, "args")]

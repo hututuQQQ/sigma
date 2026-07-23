@@ -113,23 +113,19 @@ function expectedReviewHeader(path: string, kind: ChangeKind): string {
 }
 
 function hasPassedValidation(
-  delta: WorkspaceDeltaEvidence,
+  _delta: WorkspaceDeltaEvidence,
   validations: readonly ValidationEvidence[]
 ): boolean {
-  const paths = [...delta.data.delta.added, ...delta.data.delta.modified, ...delta.data.delta.deleted];
-  return validations.some((item) => item.status === "passed"
-    && paths.some((path) => item.data.coveredPaths.includes(path)));
+  return validations.some((item) => item.status === "passed");
 }
 
 function hasExecutedValidation(
-  delta: WorkspaceDeltaEvidence,
+  _delta: WorkspaceDeltaEvidence,
   validations: readonly ValidationEvidence[]
 ): boolean {
-  const paths = [...delta.data.delta.added, ...delta.data.delta.modified, ...delta.data.delta.deleted];
   return validations.some((item) => item.status === "failed"
     && item.data.termination?.processStarted === true
-    && item.data.termination.state === "exited"
-    && paths.some((path) => item.data.coveredPaths.includes(path)));
+    && item.data.termination.state === "exited");
 }
 
 type EvidenceIndex<T> = { value: T } | { failure: string };

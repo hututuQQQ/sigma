@@ -4,7 +4,7 @@ import type { RuntimeSession } from "./types.js";
 import type { RuntimeEventLog } from "./runtime-event-log.js";
 import type { RuntimeHookCoordinator } from "./runtime-hooks.js";
 import type { SessionCommandBus } from "./session-command-bus.js";
-import { completionCoordinatorState } from "./completion-evidence-gate.js";
+import { completionGateDecision } from "./completion-evidence-gate.js";
 
 export type RunSuspensionContext =
   | { processIds: string[] }
@@ -86,12 +86,7 @@ async function emitOutcome(
 ): Promise<AgentEventEnvelope | undefined> {
   const type = outcomeEventType(outcome);
   const payload = outcome.kind === "completed"
-    ? { ...outcome, coordinator: {
-        modelStopped: true as const,
-        assuranceSatisfied: true as const,
-        reviewSatisfied: true as const,
-        runCompleted: true as const
-      } }
+    ? outcome
     : outcome.kind === "needs_input" && suspensionContext
       ? { ...outcome, ...suspensionContext }
       : outcome;
@@ -171,12 +166,29 @@ export async function finishRuntimeSession(
   suspensionContext?: RunSuspensionContext
 ): Promise<boolean> {
   if (!isCurrentOutcomeRevision(session, outcomeRevision)) return false;
-  const coordinator = outcome.kind === "completed" ? completionCoordinatorState(session) : undefined;
-  const coordinatedOutcome = coordinator && !coordinator.runCompleted ? {
-    kind: "recoverable_failure" as const,
-    code: "completion_coordinator_rejected",
-    message: `Model stopped, but completion gates remain unsatisfied (assurance=${coordinator.assuranceSatisfied}, review=${coordinator.reviewSatisfied}).`
-  } : outcome;
+  let coordinatedOutcome = outcome;
+  if (outcome.kind === "completed") {
+    const decision = completionGateDecision(session);
+    if (decision.action === "continue") {
+      await options.events.emit(session, "diagnostic", "runtime", {
+        kind: "recovery.retry_model",
+        message: decision.message
+      });
+      return false;
+    }
+    coordinatedOutcome = decision.action === "fail"
+      ? {
+          kind: "recoverable_failure",
+          code: decision.code,
+          message: decision.message
+        }
+      : {
+          ...outcome,
+          ...(decision.statusNote
+            ? { message: `${outcome.message}\n\n${decision.statusNote}` }
+            : {})
+        };
+  }
   const hookedOutcome = await applyFinishHooks(options.hooks, session, coordinatedOutcome);
   if (outcomeRevision !== undefined && session.durable.state.phase !== "outcome_pending") return false;
   const finalOutcome = await settleBeforeTerminalEvent(options, session, hookedOutcome);

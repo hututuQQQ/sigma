@@ -25,7 +25,7 @@ function planEvent(plan: Record<string, unknown>) {
   return event("plan.updated", { payload: { previousRevision: 0, plan } });
 }
 
-describe("strict V5 validation boundaries", () => {
+describe("strict V7 validation boundaries", () => {
   it("reports root and nested paths in structured event and snapshot errors", () => {
     expect(() => assertAgentEventEnvelope(null)).toThrow(AgentEventValidationError);
     expect(validateAgentEventEnvelope(null)).toEqual(expect.arrayContaining([
@@ -84,10 +84,14 @@ describe("strict V5 validation boundaries", () => {
     expect(() => assertMcpWriteRootsEmpty("server", [])).not.toThrow();
   });
 
-  it("accepts a complete strict V5 snapshot", () => {
+  it("accepts a complete strict V7 snapshot and rejects legacy snapshots at the public boundary", () => {
     expect(isSnapshotEnvelope({
-      schemaVersion: 5, storeLayoutVersion: 5, sessionId: "session", seq: 0,
+      schemaVersion: 7, storeLayoutVersion: 5, sessionId: "session", seq: 0,
       createdAt: fixtureOccurredAt, state: { ok: true }
     })).toBe(true);
+    expect(isSnapshotEnvelope({
+      schemaVersion: 6, storeLayoutVersion: 5, sessionId: "session", seq: 0,
+      createdAt: fixtureOccurredAt, state: { ok: true }
+    })).toBe(false);
   });
 });

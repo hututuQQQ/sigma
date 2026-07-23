@@ -49,6 +49,34 @@ export const defaultAgentTimeoutLeniencyMinExtraSec = 600;
 export const defaultBenchmarkTurnCadenceSec = 5;
 export const defaultBenchmarkMaxTurnsCap = 1000;
 export const defaultConcurrentTrials = 5;
+export const terminalBenchCliFlags = Object.freeze([
+  "agent-profile",
+  "agent-timeout-grace-sec",
+  "attempts",
+  "benchmark-class",
+  "command-timeout-sec",
+  "concurrency",
+  "dataset",
+  "execution-mode",
+  "expected-archive-sha256",
+  "harbor-topology",
+  "help",
+  "k",
+  "managed-environment-mode",
+  "max-turns",
+  "mode",
+  "model",
+  "network",
+  "provider",
+  "retries",
+  "reuse-package",
+  "run-label",
+  "smoke",
+  "task-id",
+  "tasks-file",
+  "timeout-leniency-min-extra-sec",
+  "timeout-leniency-multiplier"
+]);
 
 const COUNT_KEYS = [
   "passed", "failed", "infra_failed", "structured_blocker", "timeout", "api_error",
@@ -148,6 +176,21 @@ export function parseArgs(argv) {
     } else {
       flags[name] = true;
     }
+  }
+  return flags;
+}
+
+export function parseTerminalBenchArgs(argv) {
+  const flags = parseArgs(argv);
+  if (flags._.length > 0) {
+    throw new Error(`Unexpected positional argument${flags._.length === 1 ? "" : "s"}: ${flags._.join(", ")}`);
+  }
+  const allowed = new Set(terminalBenchCliFlags);
+  const unknown = Object.keys(flags)
+    .filter((name) => name !== "_" && !allowed.has(name))
+    .sort();
+  if (unknown.length > 0) {
+    throw new Error(`Unknown option${unknown.length === 1 ? "" : "s"}: ${unknown.map((name) => `--${name}`).join(", ")}`);
   }
   return flags;
 }
@@ -255,7 +298,7 @@ function asNonNegativeInt(value, fallback, name) {
   return parsed;
 }
 
-function networkMode(value, fallback = "none") {
+function networkMode(value, fallback = "full") {
   const mode = asString(value, fallback);
   if (mode !== "none" && mode !== "loopback" && mode !== "full") {
     throw new Error("network mode must be none, loopback, or full.");
@@ -315,7 +358,7 @@ export function readTaskSelectionFile(filePath) {
 }
 
 export function resolveRunOptions(argv, env = process.env) {
-  const flags = parseArgs(argv);
+  const flags = parseTerminalBenchArgs(argv);
   const mode = flags.smoke ? "smoke" : asString(flags.mode, "k");
   if (!["smoke", "k", "task", "batch"].includes(mode)) {
     throw new Error(`Unsupported benchmark mode: ${mode}`);
@@ -629,7 +672,7 @@ function benchmarkAgentKwargs(options, timeoutPlan = null) {
     agent_cli_tarball: resolveAgentCliTarballPath(options, options.env ?? process.env),
     provider: options.provider,
     agent_profile: options.agentProfile ?? "standard",
-    network_mode: options.networkMode ?? "none",
+    network_mode: options.networkMode ?? "full",
     execution_mode: options.executionMode ?? "sandboxed",
     managed_environment_mode: options.managedEnvironmentMode ?? "disabled",
     harbor_topology: options.harborTopology ?? "main_only"
@@ -935,7 +978,42 @@ export async function runProcess(command, args, options = {}) {
 
   const result = await new Promise((resolve) => {
     let settled = false;
+    let terminationRequested = false;
+    let timeout;
     let child;
+    const settle = (value) => {
+      if (settled) return;
+      settled = true;
+      if (timeout) clearTimeout(timeout);
+      options.signal?.removeEventListener("abort", abort);
+      resolve(value);
+    };
+    const abort = () => {
+      if (terminationRequested || !child) return;
+      terminationRequested = true;
+      const reason = options.signal?.reason;
+      const detail = reason instanceof Error ? reason.message : String(reason ?? "cancelled");
+      stderr += `${stderr ? "\n" : ""}Process cancelled: ${detail}`;
+      void terminateProcessTree(child, options).catch(() => {
+        try {
+          child.kill();
+        } catch {
+          // The child may already have exited.
+        }
+      });
+    };
+    if (options.signal?.aborted) {
+      settle({
+        command,
+        args,
+        cwd,
+        exitCode: 1,
+        stdout,
+        stderr: `Process cancelled before start: ${String(options.signal.reason ?? "cancelled")}`,
+        cancelled: true
+      });
+      return;
+    }
     try {
       child = spawn(command, args, {
         cwd,
@@ -944,7 +1022,7 @@ export async function runProcess(command, args, options = {}) {
         windowsHide: true
       });
     } catch (error) {
-      resolve({
+      settle({
         command,
         args,
         cwd,
@@ -954,6 +1032,22 @@ export async function runProcess(command, args, options = {}) {
         error
       });
       return;
+    }
+    options.signal?.addEventListener("abort", abort, { once: true });
+    if (Number.isFinite(options.timeoutMs) && options.timeoutMs > 0) {
+      timeout = setTimeout(() => {
+        if (terminationRequested) return;
+        terminationRequested = true;
+        stderr += `${stderr ? "\n" : ""}Process timed out after ${options.timeoutMs}ms.`;
+        void terminateProcessTree(child, options).catch(() => {
+          try {
+            child.kill();
+          } catch {
+            // The child may already have exited.
+          }
+        });
+      }, options.timeoutMs);
+      timeout.unref?.();
     }
 
     child.stdout?.on("data", (chunk) => {
@@ -968,9 +1062,7 @@ export async function runProcess(command, args, options = {}) {
     });
 
     child.on("error", (error) => {
-      if (settled) return;
-      settled = true;
-      resolve({
+      settle({
         command,
         args,
         cwd,
@@ -982,15 +1074,14 @@ export async function runProcess(command, args, options = {}) {
     });
 
     child.on("close", (code) => {
-      if (settled) return;
-      settled = true;
-      resolve({
+      settle({
         command,
         args,
         cwd,
         exitCode: code ?? 1,
         stdout,
-        stderr
+        stderr,
+        ...(terminationRequested ? { cancelled: true } : {})
       });
     });
   });
@@ -1014,6 +1105,55 @@ export async function runProcess(command, args, options = {}) {
   }
 
   return result;
+}
+
+export async function terminateProcessTree(child, options = {}) {
+  const pid = child?.pid;
+  if (!Number.isSafeInteger(pid) || pid <= 0) return;
+  const platform = options.platform ?? process.platform;
+  if (platform !== "win32") {
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      // The child may already have exited.
+    }
+    return;
+  }
+
+  const spawnProcess = options.spawnProcess ?? spawn;
+  await new Promise((resolve) => {
+    let killer;
+    try {
+      killer = spawnProcess(
+        "taskkill.exe",
+        ["/PID", String(pid), "/T", "/F"],
+        { stdio: "ignore", windowsHide: true }
+      );
+    } catch {
+      try {
+        child.kill();
+      } catch {
+        // The child may already have exited.
+      }
+      resolve();
+      return;
+    }
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      resolve();
+    };
+    killer.once("error", () => {
+      try {
+        child.kill();
+      } catch {
+        // The child may already have exited.
+      }
+      finish();
+    });
+    killer.once("close", finish);
+  });
 }
 
 export async function packageAgentCli(options = {}) {

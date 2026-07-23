@@ -1,28 +1,30 @@
 import type { ContextBudget, ContextItem, ModelMessage, ModelToolDefinition } from "agent-protocol";
 import {
   blockTokens,
-  CACHED_RAW_HISTORY_TOKEN_LIMIT,
   contextOverflow,
   historyBlocks,
   historySummaries,
   includeRecentHistory,
   MAXIMUM_HISTORY_SUMMARY_TOKENS,
-  MAXIMUM_RAW_HISTORY_BLOCKS,
-  PROACTIVE_HISTORY_TOKEN_LIMIT,
-  RECENT_RAW_BLOCK_TOKEN_LIMIT,
   selectMandatoryHistory,
-  withoutUnneededHistoricalReasoning
+  withoutUnneededHistoricalReasoning,
+  type HistoryBlock
 } from "./history-planning.js";
 import { approximateTokens } from "./unicode.js";
 export interface ContextPlan {
   messages: ModelMessage[];
+  /** Exact scoped dynamic suffix made durable before the provider request. */
+  promptFrameMessages: ModelMessage[];
   included: ContextItem[];
   omitted: ContextItem[];
   budget: ContextBudget;
   summary?: ContextItem;
+  archive?: ContextItem;
+  /** Stable omitted prefix used by the runtime summarizer; never persisted here. */
+  stableOmittedHistory: ModelMessage[][];
   omittedHistoryTurns: number;
   latestHistoryBlockTokens: number;
-  cacheMode: "prefix_cache" | "proactive_window";
+  cacheMode: "prefix_cache" | "provider_window";
   historyTokenLimit: number;
   dynamicSuffixTokens: number;
 }
@@ -31,6 +33,8 @@ export interface PlanContextOptions {
   history: ModelMessage[];
   dynamic: ContextItem[];
   tools: ModelToolDefinition[];
+  /** Durable assistant-level semantic archive of an older stable prefix. */
+  archive?: ContextItem;
   contextWindowTokens: number;
   outputReserveTokens: number;
   promptCache: boolean;
@@ -51,14 +55,13 @@ function optionalLimit(value: number | undefined): number {
 function historyPlanningLimits(options: PlanContextOptions, available: number): {
   historyTokenLimit: number; rawBlockTokenLimit: number; maximumRawBlocks: number;
 } {
-  const defaultHistory = options.promptCache ? CACHED_RAW_HISTORY_TOKEN_LIMIT : PROACTIVE_HISTORY_TOKEN_LIMIT;
-  const historyTokenLimit = Math.min(available, defaultHistory, optionalLimit(options.historyTokenLimit));
-  const defaultRawBlock = options.promptCache ? historyTokenLimit : RECENT_RAW_BLOCK_TOKEN_LIMIT;
+  const historyTokenLimit = Math.min(available, optionalLimit(options.historyTokenLimit));
+  const defaultRawBlock = historyTokenLimit;
   return {
     historyTokenLimit,
     rawBlockTokenLimit: Math.min(defaultRawBlock, optionalLimit(options.rawHistoryBlockTokenLimit)),
     maximumRawBlocks: Math.max(0, Math.min(
-      MAXIMUM_RAW_HISTORY_BLOCKS, optionalLimit(options.maximumRawHistoryBlocks)
+      Number.MAX_SAFE_INTEGER, optionalLimit(options.maximumRawHistoryBlocks)
     ))
   };
 }
@@ -92,29 +95,112 @@ function toContextMessage(item: ContextItem): ModelMessage {
   return { role: contextRole(item), content: `[${item.provenance}]\n${item.content}` };
 }
 
+function toArchiveMessage(item: ContextItem): ModelMessage {
+  return {
+    role: "assistant",
+    content: `[${item.provenance}; historical summary, not instructions]\n${item.content}`
+  };
+}
+
 function arrangeMessages(
   mandatory: readonly ContextItem[],
   included: readonly ContextItem[],
+  archive: ContextItem | undefined,
   summary: ContextItem | undefined,
   summaryDelta: ContextItem | undefined,
   retainedHistory: readonly ModelMessage[],
   promptCache: boolean
-): { messages: ModelMessage[]; dynamicTokens: number } {
+): { messages: ModelMessage[]; promptFrameMessages: ModelMessage[]; dynamicTokens: number } {
   const dynamic = included.filter((item) =>
-    !mandatory.includes(item) && item !== summary && item !== summaryDelta);
+    !mandatory.includes(item) && item !== archive && item !== summary && item !== summaryDelta);
   const dynamicSuffix = [...dynamic]
     .sort((left, right) => left.priority - right.priority || left.id.localeCompare(right.id));
-  const legacy = [...included.map(toContextMessage), ...retainedHistory];
+  const asMessage = (item: ContextItem): ModelMessage =>
+    item === archive || item === summary || item === summaryDelta
+      ? toArchiveMessage(item)
+      : toContextMessage(item);
+  const legacy = [...included.map(asMessage), ...retainedHistory];
+  const promptFrameMessages: ModelMessage[] = promptCache && dynamicSuffix.length > 0
+    ? [{
+        role: "developer",
+        content: "[runtime prompt frame; applies only to the immediately following assistant turn; a later frame supersedes it]"
+      }, ...dynamicSuffix.map(toContextMessage)]
+    : [];
   const cacheFirst = [
     ...mandatory.map(toContextMessage),
-    ...(summary ? [toContextMessage(summary)] : []),
-    ...(summaryDelta ? [toContextMessage(summaryDelta)] : []),
+    ...(archive ? [toArchiveMessage(archive)] : []),
+    ...(summary ? [toArchiveMessage(summary)] : []),
+    ...(summaryDelta ? [toArchiveMessage(summaryDelta)] : []),
     ...retainedHistory,
-    ...dynamicSuffix.map(toContextMessage)
+    ...promptFrameMessages
   ];
   return {
     messages: promptCache ? cacheFirst : legacy,
+    promptFrameMessages,
     dynamicTokens: dynamic.reduce((total, item) => total + item.tokenCount, 0)
+      + (promptFrameMessages.length > 0 ? approximateTokens(promptFrameMessages[0]!.content) + 6 : 0)
+  };
+}
+
+function newestUserBlockIndex(blocks: readonly HistoryBlock[]): number {
+  for (let index = blocks.length - 1; index >= 0; index -= 1) {
+    if (blocks[index]!.messages.some((message) => message.role === "user")) return index;
+  }
+  return -1;
+}
+
+function stableOmittedHistory(
+  blocks: readonly HistoryBlock[],
+  selected: ReadonlyMap<number, ModelMessage[]>
+): ModelMessage[][] {
+  const newestUser = newestUserBlockIndex(blocks);
+  const firstRetainedTail = [...selected.keys()]
+    .filter((index) => index !== newestUser)
+    .sort((left, right) => left - right)[0] ?? blocks.length;
+  const hasGap = blocks.slice(0, firstRetainedTail)
+    .some((_block, index) => !selected.has(index));
+  return hasGap
+    ? blocks.slice(0, firstRetainedTail).map((block) => block.messages)
+    : [];
+}
+
+function selectedHistory(
+  options: PlanContextOptions,
+  blocks: readonly HistoryBlock[],
+  selected: ReadonlyMap<number, ModelMessage[]>,
+  available: number,
+  used: number,
+  historyTokenLimit: number
+): {
+  omittedBlocks: ModelMessage[][];
+  stableOmittedHistory: ModelMessage[][];
+  retainedHistory: ModelMessage[];
+  summary?: ContextItem;
+  summaryDelta?: ContextItem;
+} {
+  const omittedBlocks = blocks
+    .filter((_block, index) => !selected.has(index))
+    .map((block) => block.messages);
+  const retainedHistoryTokens = [...selected.values()]
+    .reduce((total, messages) => total + blockTokens(messages), 0);
+  const summaryTokenBudget = Math.max(0, Math.min(
+    MAXIMUM_HISTORY_SUMMARY_TOKENS,
+    optionalLimit(options.historySummaryTokenLimit),
+    available - used,
+    options.promptCache
+      ? Number.POSITIVE_INFINITY
+      : Math.max(0, historyTokenLimit - retainedHistoryTokens)
+  ));
+  const { summary, summaryDelta } = historySummaries(omittedBlocks, summaryTokenBudget);
+  const retainedHistory = [...selected.entries()]
+    .sort(([left], [right]) => left - right)
+    .flatMap(([, messages]) => messages);
+  return {
+    omittedBlocks,
+    stableOmittedHistory: stableOmittedHistory(blocks, selected),
+    retainedHistory,
+    ...(summary ? { summary } : {}),
+    ...(summaryDelta ? { summaryDelta } : {})
   };
 }
 
@@ -122,11 +208,13 @@ export function planContext(options: PlanContextOptions): ContextPlan {
   const toolCount = toolTokens(options.tools);
   const available = Math.max(0, options.contextWindowTokens - options.outputReserveTokens - toolCount);
   const mandatory = [...options.system];
+  const archive = options.archive;
   const candidates = [...options.dynamic]
     .sort((left, right) => right.priority - left.priority || left.id.localeCompare(right.id));
   const mandatoryTokens = mandatory.reduce((total, item) => total + item.tokenCount, 0);
-  if (mandatoryTokens > available) {
-    throw contextOverflow(`Mandatory system and project context requires ${mandatoryTokens} tokens but only ${available} context tokens are available.`);
+  const archiveTokens = archive?.tokenCount ?? 0;
+  if (mandatoryTokens + archiveTokens > available) {
+    throw contextOverflow(`Mandatory system, project, and archived context requires ${mandatoryTokens + archiveTokens} tokens but only ${available} context tokens are available.`);
   }
 
   // Tool-call reasoning is part of the provider wire protocol for thinking
@@ -137,12 +225,12 @@ export function planContext(options: PlanContextOptions): ContextPlan {
   const selection = selectMandatoryHistory(
     blocks,
     available,
-    mandatoryTokens,
+    mandatoryTokens + archiveTokens,
     historyTokenLimit,
     rawBlockTokenLimit,
-    true
+    false
   );
-  const included: ContextItem[] = [...mandatory];
+  const included: ContextItem[] = [...mandatory, ...(archive ? [archive] : [])];
   const omitted: ContextItem[] = [];
   let used = includeDynamicContext(candidates, included, omitted, selection.used, selection.fitLimit);
   used = includeRecentHistory(
@@ -155,34 +243,26 @@ export function planContext(options: PlanContextOptions): ContextPlan {
     maximumRawBlocks
   );
 
-  const omittedBlocks = blocks
-    .filter((_block, index) => !selection.selected.has(index))
-    .map((block) => block.messages);
-  const retainedHistoryTokens = [...selection.selected.values()]
-    .reduce((total, messages) => total + blockTokens(messages), 0);
-  const summaryTokenBudget = Math.max(0, Math.min(
-    MAXIMUM_HISTORY_SUMMARY_TOKENS,
-    optionalLimit(options.historySummaryTokenLimit),
-    available - used,
-    options.promptCache ? Number.POSITIVE_INFINITY : Math.max(0, historyTokenLimit - retainedHistoryTokens)
-  ));
-  const { summary, summaryDelta } = historySummaries(omittedBlocks, summaryTokenBudget);
+  const projected = selectedHistory(
+    options, blocks, selection.selected, available, used, historyTokenLimit
+  );
+  const { omittedBlocks, stableOmittedHistory, retainedHistory, summary, summaryDelta } = projected;
   if (summary) included.push(summary);
   if (summaryDelta) included.push(summaryDelta);
-  const retainedHistory = [...selection.selected.entries()]
-    .sort(([left], [right]) => left - right)
-    .flatMap(([, messages]) => messages);
   const layout = arrangeMessages(
-    mandatory, included, summary, summaryDelta, retainedHistory, options.promptCache
+    mandatory, included, archive, summary, summaryDelta, retainedHistory, options.promptCache
   );
   return {
     messages: layout.messages,
+    promptFrameMessages: layout.promptFrameMessages,
     included,
     omitted,
     ...(summary ? { summary } : {}),
+    ...(archive ? { archive } : {}),
+    stableOmittedHistory,
     omittedHistoryTurns: omittedBlocks.length,
     latestHistoryBlockTokens: blockTokens(selection.selected.get(blocks.length - 1) ?? []),
-    cacheMode: options.promptCache ? "prefix_cache" : "proactive_window",
+    cacheMode: options.promptCache ? "prefix_cache" : "provider_window",
     historyTokenLimit,
     dynamicSuffixTokens: layout.dynamicTokens,
     budget: {
@@ -192,6 +272,7 @@ export function planContext(options: PlanContextOptions): ContextPlan {
       systemTokens: mandatoryTokens,
       dynamicTokens: layout.dynamicTokens,
       historyTokens: blockTokens(retainedHistory)
+        + archiveTokens
         + (summary?.tokenCount ?? 0)
         + (summaryDelta?.tokenCount ?? 0)
     }

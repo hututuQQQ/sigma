@@ -23,10 +23,12 @@ import { RuntimeSkillControl } from "./runtime-skill-control.js";
 import { reviewReadiness } from "./review-coordinator.js";
 import {
   currentFrontierReview,
+  currentFrontierValidationStatus,
   frontierValidationReadiness,
   latestFrontierReview,
   reviewBasisDigest
 } from "./mutation-evidence.js";
+import { completionCandidate } from "./completion-evidence-gate.js";
 
 export { DEFAULT_CHILD_BUDGET } from "./child-budget-control.js";
 
@@ -68,24 +70,25 @@ export class RuntimeControlService {
   }
 
   private requestReview(session: RuntimeSession): ReviewRequestResult {
-    const candidateDigest = session.durable.state.taskControl.completionCandidate?.digest;
+    const candidateDigest = completionCandidate(session)?.digest;
     const reviewMode = candidateDigest ? "completion" as const : "workspace" as const;
     const readiness = reviewReadiness(session, reviewMode);
-    const validation = frontierValidationReadiness(session);
+    const validation = currentFrontierValidationStatus(session);
+    const validationTelemetry = frontierValidationReadiness(session);
     const frontier = session.durable.state.mutationFrontier;
     const currentReview = currentFrontierReview(session, candidateDigest);
     const latestReview = latestFrontierReview(session);
     return {
       status: readiness.pending.length === 0
         ? "not_required"
-        : readiness.eligible.length === 0 ? "validation_required"
+        : !validation.passed ? "validation_required"
           : readiness.blockedReview ? "changes_required" : "review_requested",
       reviewState: currentReview ? "current" : latestReview ? "stale" : "none",
       reviewBasisDigest: reviewBasisDigest(session, undefined, candidateDigest),
       frontierRevision: frontier.revision,
       stateDigest: frontier.currentStateDigest,
       changedPaths: [...frontier.changedPaths],
-      missingValidationPaths: validation.missingPaths,
+      missingValidationPaths: validationTelemetry.missingPaths,
       ...(readiness.blockedReview ? {
         findings: [...readiness.blockedReview.data.findings]
       } : {}),
