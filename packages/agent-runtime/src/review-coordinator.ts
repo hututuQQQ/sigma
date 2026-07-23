@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-import path from "node:path";
 import type {
   BudgetReservation,
   InputAccessEvidence,
@@ -25,113 +24,17 @@ import {
   reviewInputFailureEvidence,
   type AccountableReviewerPort,
   type ReviewerInput,
-  type ReviewerPort,
-  type ReviewerWorkspaceRead
+  type ReviewerPort
 } from "./reviewer.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 import { reviewerWaivedDeltaIds } from "./review-waiver-policy.js";
 import { deadlineForecast } from "./convergence-policy.js";
 import { assuranceRequirement } from "./assurance-engine.js";
-
-const MAX_REVIEW_WORKSPACE_READS = 8;
-const MAX_REVIEW_WORKSPACE_READ_CHARS = 64_000;
-const MAX_REVIEW_WORKSPACE_READ_CHARS_PER_FILE = 24_000;
+import { goalReferencedWorkspaceReads } from "./reviewer-workspace-reads.js";
+export { goalReferencedWorkspaceReads } from "./reviewer-workspace-reads.js";
 
 function profileReviewMode(session: RuntimeSession): "off" | "advisory" | "required" {
   return session.services.profile?.profile.mutationPolicy.reviewMode ?? "advisory";
-}
-
-function record(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? value as Record<string, unknown> : null;
-}
-
-function normalizedWorkspacePath(value: string): string {
-  return value.replaceAll("\\", "/").replace(/^(?:\.\/)+/u, "");
-}
-
-function goalMentionsPath(goal: string, candidate: string): boolean {
-  const normalizedGoal = goal.replaceAll("\\", "/").toLowerCase();
-  const normalized = normalizedWorkspacePath(candidate).toLowerCase();
-  const basename = path.posix.basename(normalized);
-  return normalized.length >= 3 && normalizedGoal.includes(normalized)
-    || basename.length >= 3 && normalizedGoal.includes(basename);
-}
-
-function safeInteger(value: unknown): number | undefined {
-  return Number.isSafeInteger(value) ? Number(value) : undefined;
-}
-
-function workspaceReadMetadata(
-  result: Record<string, unknown>,
-  requestedPath: string
-): Omit<ReviewerWorkspaceRead, "content"> {
-  const offset = safeInteger(result.offset);
-  const returnedLines = safeInteger(result.returnedLines);
-  const totalLines = safeInteger(result.totalLines);
-  const metadata: Omit<ReviewerWorkspaceRead, "content"> = {
-    path: normalizedWorkspacePath(typeof result.path === "string" ? result.path : requestedPath),
-    complete: offset === 0 && returnedLines !== undefined
-      && totalLines !== undefined && returnedLines === totalLines
-  };
-  if (typeof result.sha256 === "string") metadata.sha256 = result.sha256;
-  const byteLength = safeInteger(result.byteLength);
-  if (byteLength !== undefined) metadata.byteLength = byteLength;
-  if (offset !== undefined) metadata.offset = offset;
-  if (returnedLines !== undefined) metadata.returnedLines = returnedLines;
-  if (totalLines !== undefined) metadata.totalLines = totalLines;
-  return metadata;
-}
-
-function workspaceReadSnapshot(
-  session: RuntimeSession,
-  callId: string,
-  requestedPath: string,
-  remainingChars: number
-): ReviewerWorkspaceRead | null {
-  const receipt = session.durable.state.receipts.find((item) => item.callId === callId);
-  const result = record(receipt?.result);
-  if (!receipt?.ok || !result || result.status !== "read" || result.scope !== "workspace") return null;
-  const available = Math.min(
-    MAX_REVIEW_WORKSPACE_READ_CHARS_PER_FILE,
-    Math.max(0, remainingChars)
-  );
-  if (available === 0) return null;
-  const content = receipt.output.slice(0, available);
-  const metadata = workspaceReadMetadata(result, requestedPath);
-  return {
-    ...metadata,
-    complete: metadata.complete && content.length === receipt.output.length,
-    content
-  };
-}
-
-export function goalReferencedWorkspaceReads(session: RuntimeSession): ReviewerWorkspaceRead[] {
-  const goal = session.durable.state.plan.goal;
-  const snapshots: ReviewerWorkspaceRead[] = [];
-  const seen = new Set<string>();
-  let characters = 0;
-  for (const message of session.durable.state.messages) {
-    if (message.role !== "assistant") continue;
-    for (const call of message.toolCalls ?? []) {
-      if (call.name !== "read" || snapshots.length >= MAX_REVIEW_WORKSPACE_READS) continue;
-      const argumentsValue = record(call.arguments);
-      const requestedPath = typeof argumentsValue?.path === "string" ? argumentsValue.path : "";
-      const normalized = normalizedWorkspacePath(requestedPath);
-      if (!normalized || seen.has(normalized.toLowerCase()) || !goalMentionsPath(goal, normalized)) continue;
-      const snapshot = workspaceReadSnapshot(
-        session,
-        call.id,
-        normalized,
-        MAX_REVIEW_WORKSPACE_READ_CHARS - characters
-      );
-      if (!snapshot) continue;
-      snapshots.push(snapshot);
-      seen.add(normalized.toLowerCase());
-      characters += snapshot.content.length;
-    }
-  }
-  return snapshots;
 }
 
 function normalizeReview(session: RuntimeSession, raw: ReviewEvidence, basisDigest: string): ReviewEvidence {

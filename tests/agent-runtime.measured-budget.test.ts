@@ -159,7 +159,7 @@ describe("provider-measured model budget settlement", () => {
       .toBe(false);
   });
 
-  it("projects only terminal tools during deadline convergence", async () => {
+  it("projects only terminal tools while preserving natural completion during deadline convergence", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-deadline-converge-workspace-"));
     const state = await mkdtemp(path.join(os.tmpdir(), "sigma-deadline-converge-state-"));
     const gateway = new InspectableGateway([requestInputResponse()]);
@@ -176,12 +176,16 @@ describe("provider-measured model budget settlement", () => {
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "finish promptly" });
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "needs_input" });
-    expect(gateway.requests[0]).toMatchObject({ maxOutputTokens: 2_048, toolChoice: "required" });
+    expect(gateway.requests[0]).toMatchObject({ maxOutputTokens: 2_048 });
+    expect(gateway.requests[0].toolChoice).toBeUndefined();
     expect(gateway.requests[0].tools.map((tool) => tool.name).sort()).toEqual([
       "report_blocked", "request_user_input"
     ]);
     expect(gateway.requests[0].messages.some((message) => message.content.includes("Budget stage is terminal")))
       .toBe(true);
+    expect(gateway.requests[0].messages.some((message) => message.content.includes(
+      "If the task is complete, stop naturally"
+    ))).toBe(true);
   });
 
   it("keeps a successful response when provider usage exceeds the admission reservation", async () => {
@@ -238,7 +242,7 @@ describe("provider-measured model budget settlement", () => {
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "needs_input" });
     expect(gateway.requests).toHaveLength(1);
-    expect(gateway.requests[0].toolChoice).toBe("required");
+    expect(gateway.requests[0].toolChoice).toBeUndefined();
     expect(gateway.requests[0].tools.map((tool) => tool.name).sort()).toEqual([
       "report_blocked", "request_user_input"
     ]);

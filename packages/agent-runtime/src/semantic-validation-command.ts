@@ -1,5 +1,6 @@
 import path from "node:path";
 import type { ValidationClaimKindV1 } from "agent-protocol";
+import { shellSemanticValidation } from "./semantic-validation-shell.js";
 
 export interface SemanticValidationCommand {
   executable: string;
@@ -216,83 +217,23 @@ function inlinePythonScript(args: string[]): string | undefined {
   return index >= 0 ? args[index + 1] : undefined;
 }
 
-function pythonLiteralPathCandidates(script: string): string[] {
-  const candidates: string[] = [];
-  const patterns = [
-    /\b(?:open|Path|compile)\s*\(\s*(["'])((?:\\.|(?!\1)[^\\])*?)\1/gu,
-    /\bpy_compile\.compile\s*\(\s*(["'])((?:\\.|(?!\1)[^\\])*?)\1/gu
-  ];
-  for (const pattern of patterns) {
-    for (const match of script.matchAll(pattern)) {
-      const quote = match[1];
-      const raw = match[2];
-      if (!quote || raw === undefined) continue;
-      const value = decodeLiteralPath(raw, quote);
-      if (value !== undefined && /\.(?:py|pyw)$/iu.test(value)) candidates.push(value);
-    }
-  }
-  return [...new Set(candidates)].sort();
-}
-
 function pythonClaimKind(args: string[]): ValidationClaimKindV1 | undefined {
+  // Inline Python is an open-ended program. A text scan cannot distinguish
+  // executable assertions from comments or string literals, nor prove that a
+  // caught exception affects the process exit status. Structured module and
+  // file invocations remain classifiable below.
+  if (inlinePythonScript(args) !== undefined) return undefined;
   const moduleIndex = args.findIndex((item) => item === "-m");
   const moduleName = moduleIndex >= 0 ? args[moduleIndex + 1]?.toLowerCase() : undefined;
   if (moduleName === "pytest" || moduleName === "unittest") return "unit";
   if (moduleName === "py_compile" || moduleName === "compileall") return "syntax";
-  const inline = inlinePythonScript(args);
-  if (inline !== undefined) {
-    if (/\b(?:assert|raise)\b|\bsys\.exit\s*\(\s*(?!0\b)/u.test(inline)) return "unit";
-    if (/\b(?:py_compile\.compile|compileall\.compile_(?:file|dir))\b/u.test(inline)) return "syntax";
-    return undefined;
-  }
   const script = args.find((item) => !item.startsWith("-") && /\.(?:py|pyw)$/iu.test(item));
   return script ? nodeScriptClaimKind(script) : undefined;
 }
 
 function pythonExactPathCandidates(args: string[]): string[] {
-  const inline = inlinePythonScript(args);
-  if (inline !== undefined) return pythonLiteralPathCandidates(inline);
+  if (inlinePythonScript(args) !== undefined) return [];
   return args.filter((item) => !item.startsWith("-") && /\.(?:py|pyw)$/iu.test(item));
-}
-
-function shellWorkingDirectory(script: string): string | undefined {
-  const match = script.match(/^\s*cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))\s*&&/u);
-  return match?.[1] ?? match?.[2] ?? match?.[3];
-}
-
-function shellExecutedSourceCandidates(script: string): string[] {
-  const directory = shellWorkingDirectory(script);
-  const candidates: string[] = [];
-  const invocation = /\b(?:python(?:\d+(?:\.\d+)*)?|node|ruby|perl|php)\s+(?:-[A-Za-z]+\s+)*(?:"([^"]+)"|'([^']+)'|([^\s;&|()<>]+))/gu;
-  for (const match of script.matchAll(invocation)) {
-    const candidate = match[1] ?? match[2] ?? match[3];
-    if (!candidate || !/\.(?:py|pyw|[cm]?js|mjs|cjs|rb|pl|php)$/iu.test(candidate)) continue;
-    candidates.push(directory && !path.isAbsolute(candidate) ? path.join(directory, candidate) : candidate);
-  }
-  return [...new Set(candidates)].sort();
-}
-
-function shellRunsUnitFramework(script: string): boolean {
-  return /(?:^|[;&|()]\s*|\s)(?:pytest|python(?:\d+(?:\.\d+)*)?\s+-m\s+(?:pytest|unittest)|node\s+--test|vitest|jest|mocha)(?:\s|$)/iu
-    .test(script);
-}
-
-function strictShellComparison(script: string): boolean {
-  if (script.includes("||") || script.includes(";")) return false;
-  return script.includes("&&")
-    && /(?:^|&&|\|)\s*(?:diff|cmp)(?:\s|$)/u.test(script);
-}
-
-function shellSemanticValidation(script: string): {
-  kind?: ValidationClaimKindV1;
-  exactPathCandidates: string[];
-} {
-  const exactPathCandidates = shellExecutedSourceCandidates(script);
-  if (shellRunsUnitFramework(script)) return { kind: "unit", exactPathCandidates };
-  if (exactPathCandidates.length > 0 && strictShellComparison(script)) {
-    return { kind: "unit", exactPathCandidates };
-  }
-  return { exactPathCandidates: [] };
 }
 
 function nodeClaimKind(args: string[]): ValidationClaimKindV1 | undefined {

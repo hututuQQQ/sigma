@@ -488,19 +488,43 @@ describe("V5 assurance-coordinated mutation completion", () => {
     const active = frontierSession();
     active.durable.state.mutationFrontier.changedPaths = ["program.py"];
 
+    for (const command of [
+      "python3 program.py > /tmp/actual && diff /tmp/actual /tmp/expected || echo FAIL",
+      "python3 program.py > /tmp/actual && diff /tmp/actual /tmp/expected | cat"
+    ]) {
+      expect(validationScope(active, {
+        id: "masked-comparison", name: "validate",
+        arguments: { shell: "bash", command }
+      }, validationPlan)).toMatchObject({
+        coveredPaths: [],
+        claim: { kind: "probe", subject: { exactFiles: [] } }
+      });
+    }
+  });
+
+  it("does not infer tests from shell arguments or failure-masked commands", () => {
+    const active = frontierSession();
+    active.durable.state.mutationFrontier.changedPaths = ["program.py"];
+
+    for (const command of ["echo pytest", "pytest || true", "pytest | cat"]) {
+      expect(validationScope(active, {
+        id: "masked-test", name: "validate",
+        arguments: { shell: "bash", command }
+      }, validationPlan)).toMatchObject({
+        coveredPaths: [],
+        claim: { kind: "probe", subject: { exactFiles: [] } }
+      });
+    }
     expect(validationScope(active, {
-      id: "masked-comparison", name: "validate",
-      arguments: {
-        shell: "bash",
-        command: "python3 program.py > /tmp/actual && diff /tmp/actual /tmp/expected || echo FAIL"
-      }
+      id: "strict-test", name: "validate",
+      arguments: { shell: "bash", command: "cd . && pytest tests/test_program.py && echo PASS" }
     }, validationPlan)).toMatchObject({
-      coveredPaths: [],
-      claim: { kind: "probe", subject: { exactFiles: [] } }
+      coveredPaths: ["program.py"],
+      claim: { kind: "unit" }
     });
   });
 
-  it("recognizes direct Python syntax checks without upgrading them to unit evidence", () => {
+  it("recognizes structured Python syntax checks but not inline source text", () => {
     const active = frontierSession();
     active.durable.state.mutationFrontier.changedPaths = ["program.py"];
 
@@ -508,7 +532,7 @@ describe("V5 assurance-coordinated mutation completion", () => {
       id: "python-syntax", name: "validate",
       arguments: {
         executable: "/usr/bin/python3",
-        args: ["-c", "import py_compile; py_compile.compile('program.py', doraise=True)"]
+        args: ["-m", "py_compile", "program.py"]
       }
     }, validationPlan)).toMatchObject({
       coveredPaths: ["program.py"],
@@ -517,6 +541,19 @@ describe("V5 assurance-coordinated mutation completion", () => {
         subject: { exactFiles: ["program.py"] }
       }
     });
+    for (const script of [
+      "print('assert')",
+      "print(\"py_compile.compile('program.py')\")",
+      "# assert program behavior"
+    ]) {
+      expect(validationScope(active, {
+        id: "python-inline", name: "validate",
+        arguments: { executable: "/usr/bin/python3", args: ["-c", script] }
+      }, validationPlan)).toMatchObject({
+        coveredPaths: [],
+        claim: { kind: "probe", subject: { exactFiles: [] } }
+      });
+    }
   });
 
   it("recognizes direct Node test and check runners as semantic validation", () => {

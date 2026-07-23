@@ -118,7 +118,7 @@ describe("semantic fact ledger", () => {
     expect(state.taskControl.semanticFacts.entries).toEqual([]);
   });
 
-  it("deduplicates new output from successful runtime-confirmed read-only processes", () => {
+  it("does not count changing read-only process output as workspace progress", () => {
     const diagnostic = (callId: string, output: string): ToolReceipt => receipt({
       callId,
       output,
@@ -127,10 +127,8 @@ describe("semantic fact ledger", () => {
     });
     let state = recordSemanticToolResult(initial(), diagnostic("one", "first observation"), "shell").state;
     state = recordSemanticToolResult(state, diagnostic("two", "first observation"), "shell").state;
-    expect(state.taskControl.semanticFacts.entries).toHaveLength(1);
-
     state = recordSemanticToolResult(state, diagnostic("three", "second observation"), "shell").state;
-    expect(state.taskControl.semanticFacts.entries).toHaveLength(2);
+    expect(state.taskControl.semanticFacts.entries).toEqual([]);
   });
 
   it("rejects failed or mutating process output as semantic progress", () => {

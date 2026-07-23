@@ -264,7 +264,9 @@ function configured(workspace: string): RuntimeCompositionConfig {
     provider: "deepseek",
     model: "deepseek-v4-pro",
     permissionMode: "deny",
-    runDeadlineSec: 30,
+    // Capability projection is the subject of these tests; keep the first
+    // turn outside the deadline-convergence window.
+    runDeadlineSec: 60,
     modelDeadlineSec: 10,
     streamIdleSec: 5,
     maxParallelTools: 1,

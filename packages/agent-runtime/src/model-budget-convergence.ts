@@ -136,10 +136,14 @@ function actionPolicy(
   const outputReserveTokens = required ? Math.min(2_048, defaultOutputReserveTokens) : defaultOutputReserveTokens;
   const projectedAction = taskControlActionContext(input, descriptors);
   if (!required) return { required, outputReserveTokens, context: projectedAction };
+  const naturalCompletion = !input.repairPending && budgetStage === "terminal"
+    && !descriptors.some(visibleCompletionDescriptor);
   const content = lengthRecovery
     ? "The previous response reached its output limit, and its private reasoning is not replayed. Do not reconstruct or continue that reasoning. Choose one concrete tool action now, based on the durable conversation and evidence."
     : budgetStage === "terminal"
-      ? "Budget stage is terminal. Use one available terminal tool now. Do not start or describe additional work."
+      ? naturalCompletion
+        ? "Budget stage is terminal. If the task is complete, stop naturally with the final user-facing summary now. Otherwise use one available terminal tool. Do not start or describe additional work."
+        : "Budget stage is terminal. Use one available terminal tool now. Do not start or describe additional work."
       : forecast.stage === "converge"
         ? "Deadline stage is converge. Resolve the active prerequisite with one focused tool action now. Do not start exploratory work."
         : budgetStage === "converge"
@@ -172,6 +176,10 @@ function terminalDescriptor(descriptor: ToolDescriptor): boolean {
     || effect === "outcome.report_blocked" || effect === "outcome.request_input");
 }
 
+function visibleCompletionDescriptor(descriptor: ToolDescriptor): boolean {
+  return descriptor.possibleEffects.includes("outcome.propose");
+}
+
 export function deadlineBudgetStage(
   forecast: DeadlineForecast,
   descriptors: readonly ToolDescriptor[]
@@ -182,6 +190,20 @@ export function deadlineBudgetStage(
   // preserve one focused prerequisite/repair action so task control can make
   // a terminal action available on the following turn.
   return descriptors.some(terminalDescriptor) ? "terminal" : "converge";
+}
+
+function forceToolChoice(
+  input: TurnPreparationInput,
+  descriptors: readonly ToolDescriptor[],
+  policy: ActionPolicy
+): boolean {
+  if (input.repairPending) return true;
+  if (!policy.required) return false;
+  // Successful completion is represented by a natural model stop because
+  // runtime_finalize is intentionally not model-visible. A final projection
+  // containing only failure/input actions must leave that stop available.
+  return input.budgetStage !== "terminal"
+    || descriptors.some(visibleCompletionDescriptor);
 }
 
 function firstAttemptBudget(prepared: PreparedModelBudget): Partial<BudgetAmounts> {
@@ -248,7 +270,7 @@ export async function prepareBudgetedModelTurn(
 ): Promise<{ turn: PreparedModelTurn; plan: ContextPlan }> {
   const {
     session, descriptors, capabilities, dynamic, hookContext, ledger,
-    available, repairPending, budgetStage
+    available, budgetStage
   } = input;
   const stageDescriptors = budgetStage === "terminal" ? descriptors.filter(terminalDescriptor) : descriptors;
   if (budgetStage === "terminal" && stageDescriptors.length === 0) {
@@ -294,7 +316,8 @@ export async function prepareBudgetedModelTurn(
     turn: {
       messages: plan.messages,
       tools,
-      ...(tools.length > 0 && (repairPending || policy.required) ? { toolChoice: "required" as const } : {}),
+      ...(tools.length > 0 && forceToolChoice(input, stageDescriptors, policy)
+        ? { toolChoice: "required" as const } : {}),
       budget,
       outputReserveTokens
     }

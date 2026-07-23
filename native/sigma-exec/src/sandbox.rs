@@ -1794,8 +1794,8 @@ const LINUX_SYSTEM_ROOT_CANDIDATES: &[&str] = &[
     "/lib",
     "/lib64",
     "/etc",
-    "/var/lib",
-    "/var/cache",
+    "/var/lib/texmf",
+    "/var/cache/fontconfig",
 ];
 
 #[cfg(target_os = "linux")]
@@ -1810,13 +1810,25 @@ fn linux_system_roots() -> Vec<PathBuf> {
 
 #[cfg(any(target_os = "linux", test))]
 fn linux_system_mount_parents(roots: &[PathBuf]) -> Vec<PathBuf> {
-    let mut parents = roots
-        .iter()
-        .filter_map(|root| root.parent())
-        .filter(|parent| *parent != Path::new("/") && !roots.iter().any(|root| root == *parent))
-        .map(Path::to_owned)
-        .collect::<Vec<_>>();
-    parents.sort();
+    let mut parents = Vec::new();
+    for root in roots {
+        let mut ancestor = root.parent();
+        while let Some(parent) = ancestor {
+            if parent == Path::new("/") {
+                break;
+            }
+            if !roots.iter().any(|root| root == parent) {
+                parents.push(parent.to_owned());
+            }
+            ancestor = parent.parent();
+        }
+    }
+    parents.sort_by(|left, right| {
+        left.components()
+            .count()
+            .cmp(&right.components().count())
+            .then_with(|| left.cmp(right))
+    });
     parents.dedup();
     parents
 }
@@ -2041,16 +2053,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn standard_linux_runtime_state_is_read_only_system_data() {
-        assert!(LINUX_SYSTEM_ROOT_CANDIDATES.contains(&"/var/lib"));
-        assert!(LINUX_SYSTEM_ROOT_CANDIDATES.contains(&"/var/cache"));
+    fn selected_linux_toolchain_state_is_read_only_system_data() {
+        assert!(!LINUX_SYSTEM_ROOT_CANDIDATES.contains(&"/var/lib"));
+        assert!(!LINUX_SYSTEM_ROOT_CANDIDATES.contains(&"/var/cache"));
+        assert!(LINUX_SYSTEM_ROOT_CANDIDATES.contains(&"/var/lib/texmf"));
+        assert!(LINUX_SYSTEM_ROOT_CANDIDATES.contains(&"/var/cache/fontconfig"));
         assert_eq!(
             linux_system_mount_parents(&[
                 PathBuf::from("/usr"),
-                PathBuf::from("/var/lib"),
-                PathBuf::from("/var/cache"),
+                PathBuf::from("/var/lib/texmf"),
+                PathBuf::from("/var/cache/fontconfig"),
             ]),
-            vec![PathBuf::from("/var")]
+            vec![
+                PathBuf::from("/var"),
+                PathBuf::from("/var/cache"),
+                PathBuf::from("/var/lib"),
+            ]
         );
     }
 

@@ -71,6 +71,56 @@ describe("repository recovery task-control projection", () => {
     expect(deadlineBudgetStage(forecast, [transaction])).toBe("converge");
   });
 
+  it("leaves natural completion available when terminal tools only report failure or request input", async () => {
+    const session = runtimeSessionFixture();
+    const reportBlocked = descriptor("report_blocked", ["outcome.report_blocked"]);
+    const requestInput = descriptor("request_user_input", ["outcome.request_input"]);
+    const input = {
+      session,
+      forecast: {
+        stage: "converge" as const,
+        remainingMs: 40_000,
+        usableMs: 30_000,
+        nextModelEstimateMs: 15_000,
+        settlementReserveMs: 10_000
+      },
+      turnId: 1,
+      descriptors: [read, reportBlocked, requestInput],
+      capabilities: { skillsAvailable: false, executableSkillResourcesLoaded: false },
+      dynamic: [],
+      hookContext: [],
+      ledger: {
+        id: "ledger", authority: "runtime" as const, provenance: "test ledger",
+        content: "{}", tokenCount: 1, priority: 1
+      },
+      available: {
+        inputTokens: 100_000, outputTokens: 100_000, costMicroUsd: 10_000_000,
+        modelTurns: 10, toolCalls: 10, children: 10
+      },
+      repairPending: false,
+      budgetStage: "terminal" as const,
+      defaultOutputReserveTokens: 4_096
+    };
+
+    const prepared = await prepareBudgetedModelTurn(input);
+    expect(prepared.turn.tools.map((tool) => tool.name))
+      .toEqual(["report_blocked", "request_user_input"]);
+    expect(prepared.turn.toolChoice).toBeUndefined();
+    expect(prepared.turn.messages.some((message) =>
+      message.content.includes("If the task is complete, stop naturally")
+    )).toBe(true);
+
+    const repair = await prepareBudgetedModelTurn({
+      ...input,
+      turnId: 2,
+      repairPending: true
+    });
+    expect(repair.turn.toolChoice).toBe("required");
+    expect(repair.turn.messages.some((message) =>
+      message.content.includes("If the task is complete, stop naturally")
+    )).toBe(false);
+  });
+
   it("binds and projects a selected recovery candidate as one exact transaction", async () => {
     const session = runtimeSessionFixture();
     const candidateId = "c".repeat(64);
