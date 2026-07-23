@@ -1,6 +1,7 @@
 import {
   type BudgetAmounts,
   type ContextItem,
+  type JsonValue,
   type ModelRequest,
   type ModelToolDefinition,
   type RunOutcome,
@@ -34,6 +35,82 @@ interface ActionPolicy {
   context: ContextItem[];
 }
 
+function jsonObject(value: JsonValue | undefined): Record<string, JsonValue> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, JsonValue> : null;
+}
+
+function exactProjectedArguments(descriptor: ToolDescriptor): Record<string, JsonValue> | null {
+  const properties = jsonObject(descriptor.inputSchema.properties);
+  const required = Array.isArray(descriptor.inputSchema.required)
+    ? descriptor.inputSchema.required.filter((item): item is string => typeof item === "string") : [];
+  if (!properties || required.length === 0) return null;
+  const entries: Array<[string, JsonValue]> = [];
+  for (const name of required) {
+    const property = jsonObject(properties[name]);
+    if (!property || property.const === undefined) return null;
+    entries.push([name, property.const]);
+  }
+  return Object.fromEntries(entries);
+}
+
+function repositoryConflictActionContext(session: RuntimeSession, names: readonly string[]): string | null {
+  const obligation = session.durable.state.taskControl.obligation;
+  if (obligation?.kind !== "repository_recovery" || obligation.stage !== "transact"
+    || !obligation.transactionId || !obligation.scopePaths?.length) return null;
+  return "Task control permits exactly one tool call. A broker-journaled merge conflict is active. "
+    + `You may read other workspace files for context, but may modify only these conflict paths: ${JSON.stringify(obligation.scopePaths)}. `
+    + "The merge already applied non-conflicting changes; do not rewrite other files during conflict resolution. "
+    + `After resolving conflict markers, call git_transaction continue with transactionHandle ${JSON.stringify(obligation.transactionId)} and add only listed conflict paths; abort only if safe resolution is impossible. `
+    + `Available action names: ${names.join(", ")}.`;
+}
+
+function noProgressActionGuidance(
+  session: RuntimeSession,
+  descriptors: readonly ToolDescriptor[]
+): string {
+  const count = session.durable.state.taskControl.episode.noProgressBatches;
+  if (count <= 0) return "";
+  const completionActions = descriptors
+    .filter((descriptor) => descriptor.possibleEffects.includes("outcome.propose"))
+    .map((descriptor) => descriptor.name);
+  const completion = completionActions.length > 0
+    ? ` If the user's task is already complete and the current mutation frontier has successful semantic validation, use a completion action now (${completionActions.join(", ")}).`
+    : "";
+  return ` The last ${count} completed tool ${count === 1 ? "batch produced" : "batches produced"} no new trusted task facts. Do not repeat a read or command whose result is already known. Otherwise, choose one action that changes the current workspace frontier or semantically validates it.${completion}`;
+}
+
+function toolArgumentRepairContext(session: RuntimeSession, names: readonly string[]): string | null {
+  const control = session.durable.state.taskControl;
+  if (control.obligation || control.episode.noProgressBatches >= 2
+    || control.policyCorrection?.failureCode !== "tool_arguments_invalid") return null;
+  return "The previous tool arguments were rejected. Retry each intended call with a direct JSON object "
+    + "that matches the displayed schema; do not JSON-encode the arguments object. "
+    + `Independent corrected calls may be submitted together. Available action names: ${names.join(", ")}.`;
+}
+
+function taskControlActionContext(
+  input: TurnPreparationInput,
+  descriptors: readonly ToolDescriptor[]
+): ContextItem[] {
+  if (!input.repairPending || descriptors.length === 0) return [];
+  const names = descriptors.map((descriptor) => descriptor.name);
+  const exact = descriptors.length === 1 ? exactProjectedArguments(descriptors[0]!) : null;
+  const argumentRepair = toolArgumentRepairContext(input.session, names);
+  const conflict = repositoryConflictActionContext(input.session, names);
+  const content = argumentRepair ?? conflict ?? (exact
+    ? `Task control permits exactly one tool call. Call ${names[0]} with exactly these arguments: ${JSON.stringify(exact)}. Do not invent an alias or omit a field.`
+    : `Task control permits exactly one tool call. Available action names: ${names.join(", ")}. Use one displayed name and follow its schema exactly; do not invent an alias.${noProgressActionGuidance(input.session, descriptors)}`);
+  return [{
+    id: `runtime:task-control-action:${input.session.durable.runId}:${input.turnId}`,
+    authority: "runtime",
+    provenance: "task-control projection",
+    content,
+    tokenCount: Math.max(32, Math.ceil(content.length / 3)),
+    priority: 20_000
+  }];
+}
+
 export interface TurnPreparationInput {
   session: RuntimeSession;
   forecast: DeadlineForecast;
@@ -49,22 +126,26 @@ export interface TurnPreparationInput {
   defaultOutputReserveTokens: number;
 }
 
-function actionPolicy(input: TurnPreparationInput): ActionPolicy {
+function actionPolicy(
+  input: TurnPreparationInput,
+  descriptors: readonly ToolDescriptor[]
+): ActionPolicy {
   const { session, forecast, turnId, defaultOutputReserveTokens, budgetStage } = input;
   const lengthRecovery = session.durable.state.taskControl.modelContinuationAttempts > 0;
   const required = lengthRecovery || forecast.stage === "converge" || budgetStage !== "normal";
   const outputReserveTokens = required ? Math.min(2_048, defaultOutputReserveTokens) : defaultOutputReserveTokens;
-  if (!required) return { required, outputReserveTokens, context: [] };
+  const projectedAction = taskControlActionContext(input, descriptors);
+  if (!required) return { required, outputReserveTokens, context: projectedAction };
   const content = lengthRecovery
     ? "The previous response reached its output limit, and its private reasoning is not replayed. Do not reconstruct or continue that reasoning. Choose one concrete tool action now, based on the durable conversation and evidence."
     : budgetStage === "terminal"
       ? "Budget stage is terminal. Use one available terminal tool now. Do not start or describe additional work."
       : forecast.stage === "converge"
-        ? "Deadline stage is converge. Choose one focused tool action now, then immediately use the appropriate terminal tool. Do not start exploratory work."
+        ? "Deadline stage is converge. Resolve the active prerequisite with one focused tool action now. Do not start exploratory work."
         : budgetStage === "converge"
           ? "Budget stage is converge. Choose one focused action now and preserve the next model turn for a terminal outcome. Do not start exploratory work."
           : "Convergence requires one focused tool action now, followed immediately by the appropriate terminal tool.";
-  return { required, outputReserveTokens, context: [{
+  return { required, outputReserveTokens, context: [...projectedAction, {
     id: `runtime:action-required:${session.durable.runId}:${turnId}`,
     authority: "runtime",
     provenance: lengthRecovery ? "length recovery" : "deadline stage",
@@ -89,6 +170,18 @@ export function availableModelBudget(session: RuntimeSession): BudgetAmounts {
 function terminalDescriptor(descriptor: ToolDescriptor): boolean {
   return descriptor.possibleEffects.some((effect) => effect === "outcome.propose"
     || effect === "outcome.report_blocked" || effect === "outcome.request_input");
+}
+
+export function deadlineBudgetStage(
+  forecast: DeadlineForecast,
+  descriptors: readonly ToolDescriptor[]
+): BudgetStage {
+  if (forecast.stage !== "converge") return "normal";
+  // A deadline convergence turn must be enforceable, not merely advisory.
+  // Project terminal actions immediately when one is available; otherwise
+  // preserve one focused prerequisite/repair action so task control can make
+  // a terminal action available on the following turn.
+  return descriptors.some(terminalDescriptor) ? "terminal" : "converge";
 }
 
 function firstAttemptBudget(prepared: PreparedModelBudget): Partial<BudgetAmounts> {
@@ -164,7 +257,7 @@ export async function prepareBudgetedModelTurn(
     });
   }
   const tools = modelTools(projectModelToolDescriptors(stageDescriptors, capabilities));
-  const policy = actionPolicy(input);
+  const policy = actionPolicy(input, stageDescriptors);
   const outputReserveTokens = budgetStage === "normal" ? policy.outputReserveTokens : Math.max(1, Math.min(
     policy.outputReserveTokens,
     Math.floor(available.outputTokens / APPROXIMATE_TOKEN_RESERVATION_MARGIN)

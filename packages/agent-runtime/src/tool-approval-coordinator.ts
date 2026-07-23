@@ -88,6 +88,62 @@ function containsOnlyInternalTerminalEffects(
   return effects.length > 0 && effects.every((effect) => internalTerminalEffects.has(effect));
 }
 
+function callArguments(call: ModelToolCall): Record<string, unknown> {
+  return call.arguments && typeof call.arguments === "object" && !Array.isArray(call.arguments)
+    ? call.arguments as Record<string, unknown> : {};
+}
+
+function boundConflictContinuation(
+  input: Record<string, unknown>,
+  scopePaths: readonly string[]
+): boolean {
+  if (!Array.isArray(input.operations) || input.operations.length === 0) return false;
+  const allowed = new Set(scopePaths);
+  return input.operations.every((value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const operation = value as Record<string, unknown>;
+    return operation.op === "add" && Array.isArray(operation.paths)
+      && operation.paths.length > 0
+      && operation.paths.every((item) => typeof item === "string" && allowed.has(item));
+  });
+}
+
+function brokerBoundLocalRepositoryPlan(
+  descriptor: ToolDescriptor,
+  effects: readonly ToolEffect[],
+  plan: ToolCallPlan
+): boolean {
+  return descriptor.name === "git_transaction"
+    && descriptor.brokerMutationAuthority === "repository_transaction_v2"
+    && plan.mutationAuthority === "broker_repository_transaction_v2"
+    && plan.network === "none"
+    && !effects.some((effect) => effect === "filesystem.read.external"
+      || effect === "open_world" || effect === "process.handoff");
+}
+
+function runtimeBoundRepositoryRecovery(
+  session: RuntimeSession,
+  call: ModelToolCall,
+  descriptor: ToolDescriptor,
+  effects: readonly ToolEffect[],
+  plan: ToolCallPlan
+): boolean {
+  const obligation = session.durable.state.taskControl.obligation;
+  const input = callArguments(call);
+  if (!brokerBoundLocalRepositoryPlan(descriptor, effects, plan)
+    || obligation?.kind !== "repository_recovery"
+    || obligation.stage !== "transact") return false;
+  if (!obligation.transactionId) {
+    return input.action === "recover"
+      && input.candidateId === obligation.candidateId
+      && input.selectionEvidenceId === obligation.selectionEvidenceId;
+  }
+  if (input.transactionHandle !== obligation.transactionId) return false;
+  if (input.action === "abort") return true;
+  return input.action === "continue" && Boolean(obligation.scopePaths?.length)
+    && boundConflictContinuation(input, obligation.scopePaths!);
+}
+
 function mandatoryApprovalDecision(
   descriptor: ToolDescriptor,
   effects: ToolDescriptor["possibleEffects"],
@@ -105,6 +161,7 @@ function mandatoryApprovalDecision(
 
 function immediateApprovalDecision(
   session: RuntimeSession,
+  call: ModelToolCall,
   descriptor: ToolDescriptor,
   effects: ToolDescriptor["possibleEffects"],
   permissionMode: ReturnType<typeof profilePermissionMode>,
@@ -115,6 +172,8 @@ function immediateApprovalDecision(
   const perCall = requiresPerCallApproval(plan);
   const effectGrant = effects.slice().sort().join("\0");
   if (permissionMode === "auto" && !effects.includes("open_world")) return "allow";
+  if (permissionMode === "workspace-auto"
+    && runtimeBoundRepositoryRecovery(session, call, descriptor, effects, plan)) return "allow";
   if (permissionMode === "workspace-auto" && !perCall) return "allow";
   return !perCall && (descriptor.approval === "auto"
     || session.interaction.alwaysAllowedEffects.has(effectGrant)) ? "allow" : undefined;
@@ -250,7 +309,7 @@ export class ToolApprovalCoordinator {
     const immediate = forcePrompt
       ? undefined
       : immediateApprovalDecision(
-          session, descriptor, effects, permissionMode, plan
+          session, request, descriptor, effects, permissionMode, plan
         );
     if (immediate) {
       return requiresPerCallApproval(plan)

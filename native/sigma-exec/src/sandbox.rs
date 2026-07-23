@@ -1213,6 +1213,9 @@ fn build_sandboxed_command(
     let executable =
         authorize_linux_executable(params, &system_roots, &execution_roots, &runtime_cwd_source)?;
     let executable_destination = executable.source.destination().to_owned();
+    for parent in linux_system_mount_parents(&system_roots) {
+        command.arg("--dir").arg(parent);
+    }
     for root in &system_roots {
         let value = root.to_string_lossy();
         command.args(["--ro-bind", value.as_ref(), value.as_ref()]);
@@ -1783,13 +1786,39 @@ fn trusted_bwrap_from(candidates: &[PathBuf]) -> Result<PathBuf, String> {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
+const LINUX_SYSTEM_ROOT_CANDIDATES: &[&str] = &[
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/etc",
+    "/var/lib",
+    "/var/cache",
+];
+
 #[cfg(target_os = "linux")]
 fn linux_system_roots() -> Vec<PathBuf> {
-    ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"]
-        .into_iter()
+    LINUX_SYSTEM_ROOT_CANDIDATES
+        .iter()
+        .copied()
         .map(PathBuf::from)
         .filter(|root| root.exists())
         .collect()
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_system_mount_parents(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut parents = roots
+        .iter()
+        .filter_map(|root| root.parent())
+        .filter(|parent| *parent != Path::new("/") && !roots.iter().any(|root| root == *parent))
+        .map(Path::to_owned)
+        .collect::<Vec<_>>();
+    parents.sort();
+    parents.dedup();
+    parents
 }
 
 #[cfg(target_os = "linux")]
@@ -2010,6 +2039,20 @@ fn detect_sandbox() -> SandboxStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standard_linux_runtime_state_is_read_only_system_data() {
+        assert!(LINUX_SYSTEM_ROOT_CANDIDATES.contains(&"/var/lib"));
+        assert!(LINUX_SYSTEM_ROOT_CANDIDATES.contains(&"/var/cache"));
+        assert_eq!(
+            linux_system_mount_parents(&[
+                PathBuf::from("/usr"),
+                PathBuf::from("/var/lib"),
+                PathBuf::from("/var/cache"),
+            ]),
+            vec![PathBuf::from("/var")]
+        );
+    }
 
     fn non_git_params(root: &Path) -> ProcessParams {
         ProcessParams {

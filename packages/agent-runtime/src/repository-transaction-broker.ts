@@ -31,6 +31,8 @@ export interface PendingRepositoryTransaction {
     candidateId: string;
     selectionEvidenceId: string;
     selectedObject: string;
+    selectedSymbolicRef: string | null;
+    integrationMode: "exact_head" | "merge";
   };
 }
 

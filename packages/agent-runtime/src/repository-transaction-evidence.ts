@@ -16,6 +16,7 @@ import {
 } from "./repository-transaction-broker.js";
 import {
   collectRepositoryEvidenceState,
+  repositoryObjectIsAncestor,
   repositoryRevisionDelta
 } from "./repository-transaction-state.js";
 import type { RepositoryTransactionResultV2 } from "agent-execution";
@@ -24,11 +25,89 @@ function assertionDigest(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value), "utf8").digest("hex");
 }
 
-function assertRuntimeAndBrokerState(
+type CompletedAssertions = ReturnType<typeof requireCompletedAssertions>;
+type RepositoryEvidenceState = Awaited<ReturnType<typeof collectRepositoryEvidenceState>>;
+type RecoverySelection = NonNullable<PendingRepositoryTransaction["recoverySelection"]>;
+
+function recoveryPostconditionFailed(): Error {
+  return Object.assign(new Error(
+    "Repository recovery did not preserve the current history and integrate the runtime-authorized target."
+  ), { code: "repository_postcondition_failed" });
+}
+
+function exactRecoverySatisfied(
+  assertions: CompletedAssertions,
+  recovery: RecoverySelection
+): boolean {
+  return recovery.integrationMode === "exact_head"
+    && assertions.targetAssertions?.satisfied === true
+    && assertions.targetAssertions.selectedHead === recovery.selectedObject
+    && assertions.head === recovery.selectedObject
+    && assertions.targetAssertions.requiredReachableObjects.includes(recovery.selectedObject);
+}
+
+async function mergedRecoverySatisfied(
+  execution: RepositoryTransactionPort,
+  context: PlannedToolExecutionContext,
   transaction: PendingRepositoryTransaction,
-  after: Awaited<ReturnType<typeof collectRepositoryEvidenceState>>,
+  after: RepositoryEvidenceState,
+  recovery: RecoverySelection
+): Promise<boolean> {
+  if (recovery.integrationMode !== "merge" || !after.head) return false;
+  const selectedObjectPreserved = await repositoryObjectIsAncestor(
+    execution, transaction.topology, recovery.selectedObject, after.head, context.signal
+  );
+  if (!selectedObjectPreserved || !transaction.before.head) return selectedObjectPreserved;
+  return await repositoryObjectIsAncestor(
+    execution, transaction.topology, transaction.before.head, after.head, context.signal
+  );
+}
+
+async function assertRecoveryState(
+  execution: RepositoryTransactionPort,
+  context: PlannedToolExecutionContext,
+  transaction: PendingRepositoryTransaction,
+  after: RepositoryEvidenceState,
+  assertions: CompletedAssertions
+): Promise<CompletedAssertions> {
+  const recovery = transaction.recoverySelection;
+  if (!recovery) return assertions;
+  if (assertions.symbolicRef !== recovery.selectedSymbolicRef) {
+    throw recoveryPostconditionFailed();
+  }
+  if (exactRecoverySatisfied(assertions, recovery)) return assertions;
+  if (!await mergedRecoverySatisfied(execution, context, transaction, after, recovery)) {
+    throw recoveryPostconditionFailed();
+  }
+  // A merge cannot declare the selected object as the final HEAD before Git
+  // creates the merge commit, so the broker has no exact target assertion to
+  // return. The runtime has now independently established that both the
+  // selected object and the pre-transaction HEAD are ancestors of the leased
+  // post-transaction HEAD. Preserve that verified recovery target in the same
+  // assertion shape used by exact recovery so evidence normalization can issue
+  // repository acceptance without trusting model- or tool-authored claims.
+  return {
+    ...assertions,
+    targetAssertions: {
+      schemaVersion: 3,
+      selectedHead: recovery.selectedObject,
+      selectedSymbolicRef: recovery.selectedSymbolicRef,
+      requiredReachableObjects: [...new Set([
+        recovery.selectedObject,
+        ...(transaction.before.head ? [transaction.before.head] : [])
+      ])],
+      satisfied: true
+    }
+  };
+}
+
+async function assertRuntimeAndBrokerState(
+  execution: RepositoryTransactionPort,
+  context: PlannedToolExecutionContext,
+  transaction: PendingRepositoryTransaction,
+  after: RepositoryEvidenceState,
   result: RepositoryTransactionResultV2
-) {
+): Promise<CompletedAssertions> {
   const assertions = requireCompletedAssertions(result);
   if (after.head !== assertions.head
     || after.refsDigest !== assertions.refsDigest
@@ -38,18 +117,7 @@ function assertRuntimeAndBrokerState(
       "Broker and independently leased repository observations disagree."
     ), { code: "repository_postcondition_failed" });
   }
-  if (transaction.recoverySelection) {
-    const target = assertions.targetAssertions;
-    if (!target || target.satisfied !== true
-      || target.selectedHead !== transaction.recoverySelection.selectedObject
-      || assertions.head !== transaction.recoverySelection.selectedObject
-      || !target.requiredReachableObjects.includes(transaction.recoverySelection.selectedObject)) {
-      throw Object.assign(new Error(
-        "Repository recovery did not reach the runtime-authorized target."
-      ), { code: "repository_postcondition_failed" });
-    }
-  }
-  return assertions;
+  return await assertRecoveryState(execution, context, transaction, after, assertions);
 }
 
 async function abortAfterFailure(
@@ -129,7 +197,9 @@ export async function completedRepositoryReceipt(
     const after = await collectRepositoryEvidenceState(
       execution, transaction.topology, context.signal
     );
-    const assertions = assertRuntimeAndBrokerState(transaction, after, result);
+    const assertions = await assertRuntimeAndBrokerState(
+      execution, context, transaction, after, result
+    );
     const revisionDelta = await repositoryRevisionDelta(
       execution, transaction.topology, transaction.before.head, after.head, context.signal
     );

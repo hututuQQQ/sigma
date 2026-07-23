@@ -175,12 +175,14 @@ async function beginTransaction(
     );
     operations = [recovery.operation];
     recoverySelection = recovery.binding;
-    expectedPostconditions = {
-      schemaVersion: 3 as const,
-      selectedHead: recovery.binding.selectedObject,
-      selectedSymbolicRef: recovery.binding.selectedSymbolicRef,
-      requiredReachableObjects: [recovery.binding.selectedObject]
-    };
+    if (recovery.binding.integrationMode === "exact_head") {
+      expectedPostconditions = {
+        schemaVersion: 3 as const,
+        selectedHead: recovery.binding.selectedObject,
+        selectedSymbolicRef: recovery.binding.selectedSymbolicRef,
+        requiredReachableObjects: [recovery.binding.selectedObject]
+      };
+    }
   }
   operations.forEach(gitOperationArgs);
   const before = await collectRepositoryEvidenceState(execution, topology, context.signal);

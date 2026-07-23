@@ -36,6 +36,18 @@ export interface ReviewerInput {
   workspaceDeltas: WorkspaceDeltaEvidence[];
   validations: ValidationEvidence[];
   inputAccesses?: InputAccessEvidence[];
+  goalReferencedWorkspaceReads?: ReviewerWorkspaceRead[];
+}
+
+export interface ReviewerWorkspaceRead {
+  path: string;
+  sha256?: string;
+  byteLength?: number;
+  offset?: number;
+  returnedLines?: number;
+  totalLines?: number;
+  complete: boolean;
+  content: string;
 }
 
 export interface ReviewerPort {
@@ -223,7 +235,7 @@ export class ModelReviewer implements ReviewerPort {
 function reviewMessages(input: ReviewerInput): ModelMessage[] {
   return [{
     role: "system",
-    content: "You are Sigma's independent read-only code reviewer. Review only the supplied goal, durable workspace delta, input-access evidence, validation evidence, and optional completion candidate. Evaluate every explicit goal dimension in one pass, including correctness, performance, format, and delivery behavior when the goal mentions them; do not stop after the first missing proof. A failed validation is a real correctness signal: never describe it as passed or treat review approval as validation_passed. In completion mode, an exited failed validation may prove that a user-requested check was executed and honestly reported; approve only when the goal is satisfied by observing/reporting that result and the completion candidate accurately states the failure. If the goal requires working behavior or a passing check, request repair instead. Absence of input-access evidence is not itself a failure; only a recorded failed access to a required user-declared input is actionable. Never accept a run-created sample or fixture as a substitute for a user-declared external input whose access failed. A user-visible configuration or policy value that was neither specified by the goal nor supported by supplied workspace evidence is an actionable error with code user_decision_required; direct the agent to restore speculative changes and ask one focused question. Check that each validation command plausibly exercises every workspace delta linked to it; a file-specific syntax check cannot establish unrelated files or runtime behavior. Complete opaque or content-omitted artifacts are reviewable by workspace path, SHA-256, size, checkpoint-bound delta, and passed validation, but their hidden content must not be claimed as inspected. Return strict JSON: {\"verdict\":\"approved\"|\"changes_requested\",\"findings\":[{\"actionable\":boolean,\"severity\":\"error\"|\"warning\"|\"info\",\"summary\":string,\"code\":string optional}]}. Set changes_requested only when at least one finding is both actionable=true and severity=error. Positive observations must be non-actionable info findings. Never claim to have edited files."
+    content: "You are Sigma's independent read-only code reviewer. Review only the supplied goal, durable workspace delta, input-access evidence, goal-referenced workspace read snapshots, validation evidence, and optional completion candidate. Evaluate every explicit goal dimension in one pass, including correctness, performance, format, and delivery behavior when the goal mentions them; do not stop after the first missing proof. When the goal constrains changes by another workspace file, use complete goal-referenced read snapshots to verify the final delta against that file; if required snapshot evidence is absent or incomplete, request a focused validation instead of assuming compliance. In completion mode, compare factual claims in the completion candidate with the full supplied delta; materially omitting or understating changes is actionable. A failed validation is a real correctness signal: never describe it as passed or treat review approval as validation_passed. In completion mode, an exited failed validation may prove that a user-requested check was executed and honestly reported; approve only when the goal is satisfied by observing/reporting that result and the completion candidate accurately states the failure. If the goal requires working behavior or a passing check, request repair instead. Absence of input-access evidence is not itself a failure; only a recorded failed access to a required user-declared input is actionable. Never accept a run-created sample or fixture as a substitute for a user-declared external input whose access failed. A user-visible configuration or policy value that was neither specified by the goal nor supported by supplied workspace evidence is an actionable error with code user_decision_required; direct the agent to restore speculative changes and ask one focused question. Check that each validation command plausibly exercises every workspace delta linked to it; a file-specific syntax check cannot establish unrelated files or runtime behavior. Complete opaque or content-omitted artifacts are reviewable by workspace path, SHA-256, size, checkpoint-bound delta, and passed validation, but their hidden content must not be claimed as inspected. Return strict JSON: {\"verdict\":\"approved\"|\"changes_requested\",\"findings\":[{\"actionable\":boolean,\"severity\":\"error\"|\"warning\"|\"info\",\"summary\":string,\"code\":string optional}]}. Set changes_requested only when at least one finding is both actionable=true and severity=error. Positive observations must be non-actionable info findings. Never claim to have edited files."
   }, {
     role: "user",
     content: JSON.stringify({
@@ -239,6 +251,7 @@ function reviewMessages(input: ReviewerInput): ModelMessage[] {
           }
         : {}),
       inputAccesses: input.inputAccesses ?? [],
+      goalReferencedWorkspaceReads: input.goalReferencedWorkspaceReads ?? [],
       workspaceDeltas: input.workspaceDeltas.map((item) => ({
         evidenceId: item.evidenceId,
         checkpointId: item.data.checkpointId,

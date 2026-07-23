@@ -290,7 +290,18 @@ export function recordToolPolicyViolation(
     policyCorrection: { basisDigest, attempts, failureCode }
   };
   const resolutionCode = policyExhaustionCode(control);
-  return attempts >= 2 ? terminalResolutionObligation(updated, revision, resolutionCode) : updated;
+  if (attempts < 2) return updated;
+  return {
+    ...terminalResolutionObligation(updated, revision, resolutionCode),
+    // Preserve the exhausted counter until the terminal outcome is proposed.
+    // Callers must not infer exhaustion from phase="terminal" because some
+    // obligations (notably user decisions) are terminal from their first turn.
+    policyCorrection: updated.policyCorrection
+  };
+}
+
+export function toolPolicyCorrectionExhausted(control: TaskControlStateV1): boolean {
+  return (control.policyCorrection?.attempts ?? 0) >= 2;
 }
 
 export function taskControlFailureMessage(control: TaskControlStateV1, detail: string): string {

@@ -21,5 +21,10 @@ network access, and ConPTY for interactive background processes. Run
 `agent sandbox setup` once per Windows user to create and verify the base
 profile. A failed setup or self-test is never replaced with host execution.
 
+Linux system executables receive read-only views of the standard executable,
+configuration, shared-state, and cache roots. Session HOME and temporary
+directories remain broker-owned writable scratch, while other filesystem
+locations stay absent unless the execution policy explicitly grants them.
+
 V5 has no unsafe host-execution switch. Commands must use the native sandbox;
 an OCI execution mode must be backed by a real container runtime or fail closed.

@@ -60,6 +60,24 @@ export async function collectRepositoryEvidenceState(
   return { ...value, stateDigest: sha256(JSON.stringify(value)) };
 }
 
+export async function repositoryObjectIsAncestor(
+  execution: ProcessExecutionPort,
+  topology: RepositoryWorktreeTopology,
+  ancestor: string,
+  descendant: string,
+  signal: AbortSignal
+): Promise<boolean> {
+  const result = await runLeasedRepositoryGit(execution, topology, [
+    "merge-base", "--is-ancestor", ancestor, descendant
+  ], signal, 64 * 1024);
+  if (result.outputTruncated || (result.exitCode !== 0 && result.exitCode !== 1)) {
+    throw Object.assign(new Error("Repository ancestry postcondition could not be verified."), {
+      code: "repository_postcondition_failed"
+    });
+  }
+  return result.exitCode === 0;
+}
+
 /** Return only bounded, repository-relative unmerged paths. The broker-owned
  * transaction remains the mutation authority; this probe merely gives the
  * repair state machine an exact workspace scope. */

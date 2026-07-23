@@ -80,7 +80,26 @@ function shellWords(command: string): string[] {
   return words.filter(Boolean);
 }
 
-function invocation(call: ModelToolCall): { executable: string; args: string[]; display: string } {
+function shellExecutableIndex(words: readonly string[]): number {
+  let executableIndex = 0;
+  while (/^[A-Za-z_][A-Za-z0-9_]*=/u.test(words[executableIndex] ?? "")) executableIndex += 1;
+  if (path.basename(words[executableIndex] ?? "").toLowerCase() === "env") {
+    executableIndex += 1;
+    while ((words[executableIndex] ?? "").startsWith("-")
+      || /^[A-Za-z_][A-Za-z0-9_]*=/u.test(words[executableIndex] ?? "")) executableIndex += 1;
+  } else if ((words[executableIndex] ?? "") === "command") {
+    executableIndex += 1;
+    while ((words[executableIndex] ?? "").startsWith("-")) executableIndex += 1;
+  }
+  return executableIndex;
+}
+
+function invocation(call: ModelToolCall): {
+  executable: string;
+  args: string[];
+  display: string;
+  shellScript?: string;
+} {
   const input = argumentObject(call.arguments);
   if (typeof input.executable === "string") {
     const args = Array.isArray(input.args)
@@ -89,10 +108,16 @@ function invocation(call: ModelToolCall): { executable: string; args: string[]; 
   }
   const command = typeof input.command === "string" ? input.command : "";
   const words = shellWords(command);
-  return { executable: words[0] ?? "", args: words.slice(1), display: command };
+  const executableIndex = shellExecutableIndex(words);
+  return {
+    executable: words[executableIndex] ?? "",
+    args: words.slice(executableIndex + 1),
+    display: command,
+    shellScript: command
+  };
 }
 
-function inlineNodeExactFiles(
+function exactCandidateFiles(
   workspaceRoot: string,
   projectRoot: string,
   candidates: readonly string[]
@@ -120,21 +145,24 @@ function validationClaim(
   call: ModelToolCall
 ): Omit<ValidationClaimV1, "status"> {
   const command = invocation(call);
-  const semantic = semanticValidationCommand(command.executable, command.args);
+  const semantic = semanticValidationCommand(command.executable, command.args, command.shellScript);
   const executable = semantic.executable;
   // Registered non-process validators are trusted semantic adapters. Process
   // tools still derive their exact strength from the executable and args.
   const adaptedKind = !executable && call.name !== "validate"
     ? "acceptance" as const : semantic.kind;
   const project = projectRootForCall(workspaceRoot, call);
-  const inlineExactFiles = executable === "node"
-    ? inlineNodeExactFiles(workspaceRoot, project.absolute, semantic.inlineExactPathCandidates) : [];
-  const kind = adaptedKind === "probe" && inlineExactFiles.length > 0
-    ? inlineExactFiles.some((item) => assurancePathsForClaim([item], "unit").includes(item))
+  const exactFiles = exactCandidateFiles(
+    workspaceRoot,
+    project.absolute,
+    semantic.exactPathCandidates
+  );
+  const kind = adaptedKind === "probe" && exactFiles.length > 0
+    ? exactFiles.some((item) => assurancePathsForClaim([item], "unit").includes(item))
       ? "unit" as const : "acceptance" as const
     : adaptedKind;
-  const exactFiles = inlineExactFiles.length > 0
-    ? inlineExactFiles
+  const scopedExactFiles = exactFiles.length > 0
+    ? exactFiles
     : kind === "syntax"
     ? command.args.slice(1, 2).flatMap((item) => workspaceSubjectPath(workspaceRoot, project.absolute, item) ?? [])
     : [];
@@ -156,7 +184,7 @@ function validationClaim(
       projectId: project.portable,
       configPaths,
       selectedTests,
-      exactFiles
+      exactFiles: scopedExactFiles
     }
   };
 }

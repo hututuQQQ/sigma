@@ -15,12 +15,16 @@ import {
   type ModelStreamEvent,
   type ModelToolDefinition,
   type ReviewEvidence,
+  type ToolReceipt,
   type ValidationEvidence,
   type WorkspaceDeltaEvidence
 } from "../packages/agent-protocol/src/index.js";
 import type { ModelRouteConstraints } from "../packages/agent-model/src/index.js";
 import { BudgetController, BudgetExceededError } from "../packages/agent-runtime/src/budget-controller.js";
-import { ReviewCoordinator } from "../packages/agent-runtime/src/review-coordinator.js";
+import {
+  goalReferencedWorkspaceReads,
+  ReviewCoordinator
+} from "../packages/agent-runtime/src/review-coordinator.js";
 import { ModelReviewer, type ReviewerPort } from "../packages/agent-runtime/src/reviewer.js";
 import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
 import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
@@ -288,6 +292,86 @@ function harness(target: RuntimeSession, crashBeforeUsage = false): {
 }
 
 describe("independent reviewer budget accounting", () => {
+  it("supplies bounded snapshots only for workspace reads named in the goal", () => {
+    const target = runtimeSessionFixture();
+    target.durable.state.plan.goal = "Update config.txt according to rules.txt.";
+    target.durable.state.messages = [{
+      role: "assistant",
+      content: "",
+      toolCalls: [
+        { id: "rules-read", name: "read", arguments: { path: "rules.txt" } },
+        { id: "notes-read", name: "read", arguments: { path: "notes.txt" } }
+      ]
+    }];
+    const readReceipt = (callId: string, requestedPath: string, output: string): ToolReceipt => ({
+      callId,
+      ok: true,
+      output,
+      result: {
+        status: "read",
+        path: requestedPath,
+        scope: "workspace",
+        sha256: "a".repeat(64),
+        byteLength: output.length,
+        offset: 0,
+        returnedLines: 1,
+        totalLines: 1
+      },
+      outcome: { status: "succeeded", output, diagnosticCodes: [] },
+      observedEffects: ["filesystem.read"],
+      actualEffects: ["filesystem.read"],
+      artifacts: [],
+      diagnostics: [],
+      startedAt: now,
+      completedAt: now
+    });
+    target.durable.state.receipts = [
+      readReceipt("rules-read", "rules.txt", "1: allowed"),
+      readReceipt("notes-read", "notes.txt", "1: unrelated")
+    ];
+
+    expect(goalReferencedWorkspaceReads(target)).toEqual([expect.objectContaining({
+      path: "rules.txt",
+      complete: true,
+      content: "1: allowed"
+    })]);
+  });
+
+  it("places goal-referenced workspace snapshots in the independent review request", async () => {
+    const gateway = new ReviewerGateway();
+    await new ModelReviewer(gateway).review({
+      sessionId: "session",
+      runId: "run",
+      goal: "Constrain the change with rules.txt.",
+      frontierRevision: 1,
+      stateDigest: "a".repeat(64),
+      reviewBasisDigest: "b".repeat(64),
+      workspaceDeltas: [delta()],
+      validations: [validation()],
+      goalReferencedWorkspaceReads: [{
+        path: "rules.txt",
+        sha256: "c".repeat(64),
+        byteLength: 9,
+        offset: 0,
+        returnedLines: 1,
+        totalLines: 1,
+        complete: true,
+        content: "1: allowed"
+      }]
+    }, new AbortController().signal);
+
+    const request = gateway.requests[0]!;
+    const payload = JSON.parse(request.messages[1]!.content) as {
+      goalReferencedWorkspaceReads: Array<{ path: string; complete: boolean; content: string }>;
+    };
+    expect(request.messages[0]!.content).toContain("goal-referenced workspace read snapshots");
+    expect(payload.goalReferencedWorkspaceReads).toEqual([expect.objectContaining({
+      path: "rules.txt",
+      complete: true,
+      content: "1: allowed"
+    })]);
+  });
+
   it("rejects exhausted reviewer budget before invoking the model", async () => {
     const target = runtimeSession(limits({ inputTokens: 119 }));
     const gateway = new ReviewerGateway();

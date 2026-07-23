@@ -258,7 +258,12 @@ async function recoveryCandidates(
   }));
   const seen = new Set<string>();
   const selected = entries.filter((entry) => {
-    if (!unreachableCommits.has(entry.object) || entry.object === head || seen.has(entry.object)) return false;
+    // A clone reflog entry records repository bootstrap state, not work
+    // created in the local repository. If that bootstrap ref later becomes
+    // unreachable (for example after a branch reset and remote removal),
+    // presenting it as lost local work creates a false recovery ambiguity.
+    if (entry.action.trim().toLowerCase() === "clone"
+      || !unreachableCommits.has(entry.object) || entry.object === head || seen.has(entry.object)) return false;
     seen.add(entry.object);
     return true;
   }).slice(0, MAX_RECOVERY_CANDIDATES);

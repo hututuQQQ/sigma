@@ -72,20 +72,39 @@ const CONTENT_READ_TOOLS = new Set([
   "repository_inspect", "lsp"
 ]);
 
+const READ_ONLY_PROCESS_EFFECTS = new Set([
+  "filesystem.read",
+  "process.spawn.readonly"
+]);
+
 function object(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown> : null;
 }
 
 function semanticReadSubject(toolName: string, receipt: ToolReceipt): unknown | null {
-  if (!CONTENT_READ_TOOLS.has(toolName)) return null;
-  const result = object(receipt.result);
-  if (toolName === "read" && result?.status === "read"
-    && typeof result.path === "string" && typeof result.sha256 === "string") {
-    return { toolName, path: result.path, contentDigest: result.sha256 };
+  if (CONTENT_READ_TOOLS.has(toolName)) {
+    const result = object(receipt.result);
+    if (toolName === "read" && result?.status === "read"
+      && typeof result.path === "string" && typeof result.sha256 === "string") {
+      return { toolName, path: result.path, contentDigest: result.sha256 };
+    }
+    return {
+      toolName,
+      contentDigest: createHash("sha256").update(receipt.output, "utf8").digest("hex")
+    };
   }
+
+  // A successful, runtime-confirmed read-only process can reveal the same
+  // kind of new workspace fact as a structured grep/list adapter. Require
+  // actualEffects rather than the requested/observed projection so failed,
+  // mutating, or open-world process calls cannot reset convergence.
+  const effects = receipt.actualEffects;
+  if (!effects?.includes("process.spawn.readonly")
+    || effects.some((effect) => !READ_ONLY_PROCESS_EFFECTS.has(effect))) return null;
   return {
     toolName,
+    source: "readonly_process",
     contentDigest: createHash("sha256").update(receipt.output, "utf8").digest("hex")
   };
 }

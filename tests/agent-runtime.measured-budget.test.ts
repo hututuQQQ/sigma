@@ -159,7 +159,7 @@ describe("provider-measured model budget settlement", () => {
       .toBe(false);
   });
 
-  it("forces a bounded tool action during deadline convergence", async () => {
+  it("projects only terminal tools during deadline convergence", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-deadline-converge-workspace-"));
     const state = await mkdtemp(path.join(os.tmpdir(), "sigma-deadline-converge-state-"));
     const gateway = new InspectableGateway([requestInputResponse()]);
@@ -177,7 +177,10 @@ describe("provider-measured model budget settlement", () => {
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "needs_input" });
     expect(gateway.requests[0]).toMatchObject({ maxOutputTokens: 2_048, toolChoice: "required" });
-    expect(gateway.requests[0].messages.some((message) => message.content.includes("Deadline stage is converge")))
+    expect(gateway.requests[0].tools.map((tool) => tool.name).sort()).toEqual([
+      "report_blocked", "request_user_input"
+    ]);
+    expect(gateway.requests[0].messages.some((message) => message.content.includes("Budget stage is terminal")))
       .toBe(true);
   });
 

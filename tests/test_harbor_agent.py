@@ -114,6 +114,13 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(module.SigmaCliHarborAgent(network_mode="loopback").network_mode, "loopback")
         with self.assertRaisesRegex(ValueError, "agent_profile"):
             module.SigmaCliHarborAgent(agent_profile="untrusted")
+        with self.assertRaisesRegex(ValueError, "permission_mode"):
+            module.SigmaCliHarborAgent(permission_mode="untrusted")
+        self.assertEqual(module.SigmaCliHarborAgent()._permission_mode(), "auto")
+        self.assertEqual(
+            module.SigmaCliHarborAgent(permission_mode="workspace-auto")._permission_mode(),
+            "workspace-auto",
+        )
         with self.assertRaisesRegex(ValueError, "managed_environment_mode"):
             module.SigmaCliHarborAgent(managed_environment_mode="optional")
         with self.assertRaisesRegex(ValueError, "harbor_topology"):
@@ -165,11 +172,11 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("required", session_command)
             self.assertIn("--agent-profile", session_command)
             self.assertIn("standard", session_command)
-            self.assertIn("workspace-auto", command)
-            self.assertIn("workspace-auto", session_command)
+            self.assertIn("auto", command)
+            self.assertIn("auto", session_command)
             self.assertNotIn("HOME=/tmp/agent/disposable-home", command)
 
-    async def test_verified_managed_environment_uses_noninteractive_auto_approval(self):
+    async def test_managed_environment_keeps_noninteractive_auto_approval(self):
         module = import_portable_agent_module()
         with TemporaryDirectory() as tmp:
             agent = module.SigmaCliHarborAgent(
@@ -181,9 +188,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             )
             agent._workspace = "/app"
 
-            # Configuration alone is not authority. The strict managed doctor
-            # contract must have succeeded before Harbor can remove prompts.
-            self.assertEqual(agent._permission_mode(), "workspace-auto")
+            self.assertEqual(agent._permission_mode(), "auto")
             agent._managed_environment_verified = True
 
             command = agent._agent_command()
@@ -547,7 +552,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             command, kwargs = main_commands[0]
             self.assertIn("--prompt-file /tmp/agent/instruction.md", command)
             self.assertIn("--run-deadline-sec 600", command)
-            self.assertIn("--permission-mode workspace-auto", command)
+            self.assertIn("--permission-mode auto", command)
             self.assertIn("--agent-profile standard", command)
             self.assertIn("--output-format stream-json", command)
             self.assertIn("--output-schema 3", command)

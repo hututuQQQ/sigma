@@ -16,7 +16,8 @@ import type { KernelState, PendingTool } from "./state.js";
 import {
   completionEvidenceObligation,
   protectCompletionCandidate,
-  recordToolPolicyViolation
+  recordToolPolicyViolation,
+  toolPolicyCorrectionExhausted
 } from "./task-control.js";
 
 export function nextPhase(pending: readonly PendingTool[]): KernelState["phase"] {
@@ -169,7 +170,7 @@ function invalidBlockedReportState(state: KernelState, progressed: KernelState):
     "invalid_blocked_report",
     progressed.revision
   );
-  if (taskControl.phase === "terminal") {
+  if (toolPolicyCorrectionExhausted(taskControl)) {
     return proposedOutcomeState({ ...progressed, taskControl }, {
       kind: "recoverable_failure",
       code: "invalid_blocked_report",

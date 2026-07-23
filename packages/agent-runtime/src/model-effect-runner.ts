@@ -30,6 +30,7 @@ import {
 } from "./model-effect-support.js";
 import { deadlineForecast, type DeadlineForecast } from "./convergence-policy.js";
 import {
+  deadlineBudgetStage,
   availableModelBudget,
   budgetFailure,
   fitPreparedBudget,
@@ -206,7 +207,7 @@ export class ModelEffectRunner {
       profileSkillNames: session.services.profile?.profile.skills
     });
 
-    let budgetStage: BudgetStage = forecast.stage === "converge" ? "converge" : "normal";
+    let budgetStage: BudgetStage = deadlineBudgetStage(forecast, descriptors);
     const preparation = {
       session, forecast, turnId, descriptors, capabilities, dynamic, hookContext,
       ledger, available, repairPending, defaultOutputReserveTokens: this.options.outputReserveTokens
@@ -214,7 +215,7 @@ export class ModelEffectRunner {
     let prepared = await prepareBudgetedModelTurn({ ...preparation, budgetStage: "normal" });
     const capacity = requestCapacity(available, prepared.turn.budget);
     if (capacity <= 1) budgetStage = "terminal";
-    else if (capacity === 2) budgetStage = "converge";
+    else if (capacity === 2 && budgetStage === "normal") budgetStage = "converge";
     if (budgetStage !== "normal") prepared = await prepareBudgetedModelTurn({ ...preparation, budgetStage });
     const fittedBudget = fitPreparedBudget(
       prepared.turn.budget,
