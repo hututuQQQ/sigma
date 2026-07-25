@@ -62,7 +62,7 @@ function environmentProcessArguments(
   value: JsonValue,
   workspacePath: string
 ): Record<string, JsonValue> {
-  const input = executionArgs(value);
+  const { target: _target, ...input } = executionArgs(value);
   const root = path.parse(path.resolve(workspacePath)).root;
   return {
     ...input,
@@ -70,6 +70,45 @@ function environmentProcessArguments(
     writeRoots: [root],
     expectedChanges: [root]
   };
+}
+
+function resolvedSpawnArguments(
+  value: JsonValue,
+  workspacePath: string,
+  environmentAvailable: boolean
+): { input: Record<string, JsonValue>; environment: boolean } {
+  const input = executionArgs(value);
+  if (input.target === "environment") {
+    if (!environmentAvailable) {
+      throw Object.assign(new Error(
+        "The broker-attested disposable outer environment is unavailable."
+      ), { code: "policy_denied" });
+    }
+    return {
+      input: environmentProcessArguments(input, workspacePath),
+      environment: true
+    };
+  }
+  if (input.target !== undefined && input.target !== "workspace") {
+    throw Object.assign(new Error(
+      "Process target must be 'workspace' or 'environment'."
+    ), { code: "tool_arguments_invalid" });
+  }
+  const { target: _target, ...workspaceInput } = input;
+  return { input: workspaceInput, environment: false };
+}
+
+function spawnTargetProperties(
+  environmentAvailable: boolean
+): Record<string, JsonValue> {
+  return environmentAvailable ? {
+    target: {
+      type: "string",
+      enum: ["workspace", "environment"],
+      description:
+        "Execution boundary. Defaults to workspace. Use environment only for system-level changes in the broker-attested disposable outer environment."
+    }
+  } : {};
 }
 
 function environmentProcessTool(
@@ -85,6 +124,9 @@ function environmentProcessTool(
     }
   } : {};
   return {
+    // Keep the legacy name registered for durable recovery. New model turns
+    // use process_spawn(target=environment), so they see one spawn surface.
+    modelVisible: false,
     descriptor: {
       ...executionToolSchema(
         "environment_process_spawn",
@@ -137,6 +179,7 @@ function spawnTool(
   options: ExecutionToolOptions,
   executeBackground: BackgroundProcessExecutor
 ): RegisteredEffectTool {
+  const environmentAvailable = environmentProcessAvailable(options);
   const enclosing = options.writeScope === "enclosing-container"
     && options.enclosingContainerRoot === true;
   const effects: ToolDescriptor["possibleEffects"] = [
@@ -151,10 +194,13 @@ function spawnTool(
     descriptor: {
       ...executionToolSchema(
         "process_spawn",
-        "Start a sandboxed background process and return an in-session handle.",
+        environmentAvailable
+          ? "Start a sandboxed background process and return an in-session handle. Set target=environment only for a service that needs system-level changes in the broker-attested disposable outer environment."
+          : "Start a sandboxed background process and return an in-session handle.",
         {
           executable: executableCapabilitySchema(options),
           args: { type: "array", items: { type: "string" } },
+          ...spawnTargetProperties(environmentAvailable),
           cwd: { type: "string" },
           network: networkProperty(options),
           env: { type: "object", additionalProperties: { type: "string" } },
@@ -181,11 +227,27 @@ function spawnTool(
         ? { brokerMutationAuthority: "disposable_enclosing_container" as const }
         : {}),
       prepare(value, context) {
-        return prepareExecutionCallPlan(value, context, options, false, true);
+        const resolved = resolvedSpawnArguments(
+          value, context.workspacePath, environmentAvailable
+        );
+        return prepareExecutionCallPlan(
+          resolved.input,
+          context,
+          options,
+          false,
+          true,
+          resolved.environment
+        );
       }
     },
     async execute(request, context) {
-      return await executeBackground(options, request, context);
+      const resolved = resolvedSpawnArguments(
+        request.arguments, context.workspacePath, environmentAvailable
+      );
+      return await executeBackground(options, {
+        ...request,
+        arguments: resolved.input
+      }, context, resolved.environment);
     }
   };
 }

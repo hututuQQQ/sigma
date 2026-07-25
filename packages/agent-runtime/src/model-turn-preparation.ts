@@ -11,7 +11,7 @@ import {
 import { isToolAllowed } from "agent-tools";
 import { refreshContextArchive } from "./context-archive-refresh.js";
 import { deadlineForecast, type DeadlineForecast } from "./convergence-policy.js";
-import { sessionSkillProjectionCapabilities } from "./effect-helpers.js";
+import { sessionModelToolProjectionCapabilities } from "./effect-helpers.js";
 import type { EffectRunnerOptions } from "./effect-runner.js";
 import {
   budgetFailure,
@@ -135,14 +135,7 @@ export async function prepareModelAttempt(
       `Session '${session.identity.sessionId}' is missing its schema 1 customization bundle.`
     ), { code: "unsupported_schema_version" });
   }
-  const capabilities = {
-    ...sessionSkillProjectionCapabilities({
-      frozenCustomization: session.durable.frozenCustomization,
-      loadedSkills: session.durable.state.frozenSkills,
-      profileSkillNames: session.services.profile?.profile.skills
-    }),
-    environmentMutationAvailable: session.durable.mode === "change"
-  };
+  const capabilities = sessionModelToolProjectionCapabilities(session);
   const projected = await projectedModelHistory(options, session);
   const preparation: TurnPreparationInput = {
     session,

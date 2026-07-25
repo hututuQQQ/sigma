@@ -144,7 +144,7 @@ function networkExecutionRequest(): ModelResponse {
       content: "",
       toolCalls: [{
         id: "network-exec",
-        name: "exec",
+        name: "shell",
         arguments: {
           executable: "node",
           args: ["-e", "process.stdout.write('network-auto-ok')"],
@@ -281,7 +281,7 @@ describe("run command branch coverage", () => {
       .toMatchObject({ decision: "allow" });
     expect(records.some((record) => record.type === "tool.completed")).toBe(true);
     expect(records.some((record) => record.type === "run.completed")).toBe(true);
-    expect(stderr.text()).not.toContain("Allow exec");
+    expect(stderr.text()).not.toContain("Allow shell");
   });
 
   it("emits one coherent NeedsInput terminal for a headless workspace-auto sensitive call", async () => {

@@ -149,7 +149,7 @@ describe("effect-plan recovery", () => {
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
     const runtime = createRuntime({
       gateway: new SmokeFakeGateway([
-        fakeToolTurn([fakeToolCall("write", "exec", {
+        fakeToolTurn([fakeToolCall("write", "shell", {
           executable: "fixture",
           access: "write",
           writeRoots: ["src"],
@@ -209,7 +209,7 @@ describe("effect-plan recovery", () => {
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
     const runtime = createRuntime({
       gateway: new SmokeFakeGateway([
-        fakeToolTurn([fakeToolCall("write", "exec", {
+        fakeToolTurn([fakeToolCall("write", "shell", {
           executable: "fixture",
           access: "write",
           writeRoots: ["src"],
@@ -259,7 +259,7 @@ describe("effect-plan recovery", () => {
     const storeRootDir = path.join(root, "state");
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
     const gateway = new SmokeFakeGateway([
-      fakeToolTurn([fakeToolCall("write", "exec", {
+      fakeToolTurn([fakeToolCall("write", "shell", {
         executable: "fixture",
         access: "write",
         writeRoots: ["src"],

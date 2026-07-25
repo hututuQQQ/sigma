@@ -248,6 +248,13 @@ describe("execution tool capability closure", () => {
       protectedPaths: [path.join(root, ".runtime")]
     });
     const environment = tools.descriptor("environment_process_spawn");
+    expect(tools.modelDescriptors().find((descriptor) =>
+      descriptor.name === "environment_process_spawn")).toBeUndefined();
+    expect(tools.descriptor("process_spawn")?.inputSchema).toMatchObject({
+      properties: {
+        target: { enum: ["workspace", "environment"] }
+      }
+    });
     expect(environment).toMatchObject({
       brokerMutationAuthority: "disposable_enclosing_container",
       inputSchema: {
@@ -298,6 +305,29 @@ describe("execution tool capability closure", () => {
       })
     }), expect.anything());
 
+    const unified = request("process_spawn", {
+      executable: "runtime",
+      target: "environment",
+      lifecycle: "deliverable"
+    });
+    const unifiedPlan = await tools.prepare(unified, preparation(root));
+    expect(unifiedPlan).toMatchObject({
+      mutationAuthority: "disposable_enclosing_container",
+      checkpointScope: [path.parse(path.resolve(root)).root]
+    });
+    await expect(tools.execute(unified, {
+      ...execution(root),
+      callPlan: unifiedPlan,
+      approval: {
+        callId: unified.callId,
+        authority: "runtime",
+        networkApproved: false,
+        externalReadApproved: true,
+        processHandoffApproved: false,
+        openWorldApproved: true
+      }
+    })).resolves.toMatchObject({ ok: true });
+
     const ordinary = request("process_spawn", {
       executable: "runtime",
       lifecycle: "deliverable",
@@ -347,6 +377,20 @@ describe("execution tool capability closure", () => {
         args: ["-lc", "printf ok"]
       })
     }), expect.anything());
+    const direct = request("shell", {
+      executable: process.execPath,
+      args: ["--version"]
+    });
+    const directPlan = await tools.prepare(direct, preparation(root));
+    await expect(tools.execute(direct, { ...execution(root), callPlan: directPlan }))
+      .resolves.toMatchObject({ ok: true });
+    expect(fixture.execute).toHaveBeenLastCalledWith(expect.objectContaining({
+      command: expect.objectContaining({ executable: process.execPath, args: ["--version"] })
+    }), expect.anything());
+    await expect(tools.prepare(
+      request("shell", { command: "printf ok", args: ["ignored"] }),
+      preparation(root)
+    )).rejects.toMatchObject({ code: "tool_arguments_invalid" });
     await expect(tools.prepare(
       request("shell", { shell: "bash", command: "printf ok", unsupported: true }),
       preparation(root)

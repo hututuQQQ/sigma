@@ -220,18 +220,33 @@ describe("Terminal-Bench command construction", () => {
     })).toEqual(expect.arrayContaining([
       "network_mode:str=full",
       "execution_mode:str=sandboxed",
+      "write_scope:str=auto",
       "agent_profile:str=standard"
     ]));
     expect(buildHarborJobConfig(options, "jobs").agents[0].kwargs).toMatchObject({
       network_mode: "full",
       execution_mode: "sandboxed",
+      write_scope: "auto",
       agent_profile: "standard"
     });
+  });
+
+  it("freezes write-scope capability negotiation without assuming outer-container authority", () => {
+    const options = resolveRunOptions([
+      "--mode", "task", "--task-id", "generic-task", "--write-scope", "workspace"
+    ]);
+    expect(options.writeScope).toBe("workspace");
+    expect(buildHarborJobConfig(options, "jobs").agents[0].kwargs)
+      .toMatchObject({ write_scope: "workspace" });
+    expect(() => resolveRunOptions([
+      "--mode", "task", "--task-id", "generic-task", "--write-scope", "host"
+    ])).toThrow(/write scope/iu);
   });
 
   it("defaults every benchmark run to full network and records it in Harbor configuration", () => {
     const options = resolveRunOptions(["--mode", "task", "--task-id", "generic-task"], {});
     expect(options.networkMode).toBe("full");
+    expect(options.writeScope).toBe("auto");
     expect(buildHarborJobConfig(options, "jobs").agents[0].kwargs)
       .toMatchObject({ network_mode: "full" });
   });

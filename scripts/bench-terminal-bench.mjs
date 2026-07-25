@@ -80,6 +80,7 @@ Execution:
   --retries <count>                 Harness retries (default: 0)
   --network <none|loopback|full>    Network policy
   --execution-mode <mode>           sandboxed or container
+  --write-scope <scope>             auto, workspace, or enclosing-container
   --run-label <label>               Artifact label
   --reuse-package                   Reuse a frozen CLI archive
   --expected-archive-sha256 <hash>  Required digest for archive reuse
@@ -237,6 +238,7 @@ async function runTerminalBenchCliImpl(argv, deps, signal) {
     evaluation_lane: evaluationLane(options.agentProfile),
     network_mode: options.networkMode,
     execution_mode: options.executionMode,
+    write_scope: options.writeScope,
     managed_environment_mode: options.managedEnvironmentMode,
     harbor_topology: options.harborTopology,
     provider: options.provider,

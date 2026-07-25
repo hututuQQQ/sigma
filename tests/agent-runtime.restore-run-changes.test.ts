@@ -321,7 +321,7 @@ describe("restore_run_changes transaction control", () => {
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
     const runtime = createRuntime({
       gateway: new SmokeFakeGateway([
-        fakeToolTurn([fakeToolCall("invalid-write-plan", "exec", {
+        fakeToolTurn([fakeToolCall("invalid-write-plan", "shell", {
           executable: "fixture",
           access: "write",
           writeRoots: ["src"]

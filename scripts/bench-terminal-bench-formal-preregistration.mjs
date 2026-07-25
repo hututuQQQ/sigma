@@ -266,13 +266,18 @@ function normalizedBatches(value, tasks) {
 function normalizedExecution(value, tasks) {
   const execution = record(value, "execution");
   exactKeys(execution, [
-    "network_mode", "execution_mode", "managed_environment_mode", "harbor_topology",
+    "network_mode", "execution_mode", "write_scope", "managed_environment_mode", "harbor_topology",
     "concurrency", "attempts_per_task", "retries", "package_mode", "batches"
   ], "execution");
   const normalized = {
     network_mode: enumValue(execution.network_mode, ["none", "loopback", "full"], "execution.network_mode"),
     execution_mode: enumValue(
       execution.execution_mode, ["sandboxed", "container"], "execution.execution_mode"
+    ),
+    write_scope: enumValue(
+      execution.write_scope,
+      ["auto", "workspace", "enclosing-container"],
+      "execution.write_scope"
     ),
     managed_environment_mode: enumValue(
       execution.managed_environment_mode, ["disabled", "required"], "execution.managed_environment_mode"
@@ -331,7 +336,7 @@ export function sigmaFormalRunPreregistration(draft, options = {}) {
   }
   const executionDraft = record(input.execution, "execution");
   exactKeys(executionDraft, [
-    "network_mode", "execution_mode", "managed_environment_mode", "harbor_topology",
+    "network_mode", "execution_mode", "write_scope", "managed_environment_mode", "harbor_topology",
     "concurrency", "attempts_per_task", "retries", "package_mode", "batches"
   ], "execution");
   if (!Array.isArray(executionDraft.batches)) throw new Error("execution.batches must be an array.");
@@ -484,6 +489,7 @@ export function assertFrozenBatchControls(manifest, batch, context) {
     || options.agentTimeoutGraceSec !== solver.cleanup_grace_sec
     || options.networkMode !== execution.network_mode
     || options.executionMode !== execution.execution_mode
+    || options.writeScope !== execution.write_scope
     || options.managedEnvironmentMode !== execution.managed_environment_mode
     || options.harborTopology !== execution.harbor_topology
     || options.nConcurrentTrials !== execution.concurrency

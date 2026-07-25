@@ -2,7 +2,14 @@ import type { ModelToolCall, ToolDescriptor, ToolOutcome, ToolReceipt } from "ag
 import type { ActiveModelTurn } from "agent-kernel";
 import { loadNestedInstructions } from "agent-context";
 import { isToolAllowed } from "agent-tools";
-import { failed, requestTargets, requiresInstructionReplan, steeringRestart } from "./effect-helpers.js";
+import {
+  failed,
+  projectModelToolDescriptors,
+  requestTargets,
+  requiresInstructionReplan,
+  sessionModelToolProjectionCapabilities,
+  steeringRestart
+} from "./effect-helpers.js";
 import { turnPayload, type ToolAttempt } from "./effect-runner-helpers.js";
 import type { EffectRunnerOptions } from "./effect-runner.js";
 import { currentFrontierReview, reviewBasisDigest } from "./mutation-evidence.js";
@@ -94,8 +101,13 @@ function projectedToolNames(
   session: RuntimeSession,
   descriptors: readonly ToolDescriptor[]
 ): Set<string> {
-  return new Set(descriptors.filter((descriptor) => isToolAllowed(descriptor, session.durable.mode)
-    && profileAllowsTool(session, descriptor)).map((descriptor) => descriptor.name));
+  const allowed = descriptors.filter((descriptor) =>
+    isToolAllowed(descriptor, session.durable.mode)
+    && profileAllowsTool(session, descriptor));
+  return new Set(projectModelToolDescriptors(
+    allowed,
+    sessionModelToolProjectionCapabilities(session)
+  ).map((descriptor) => descriptor.name));
 }
 
 const TERMINAL_TOOL_NAMES = new Set(["report_blocked", "request_user_input"]);

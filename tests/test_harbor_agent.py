@@ -334,6 +334,8 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(record["classification"], "passed")
             self.assertEqual(record["execution_mode"], "container")
             self.assertEqual(record["agent_profile"], "standard")
+            self.assertEqual(record["write_scope_requested"], "auto")
+            self.assertEqual(record["write_scope_effective"], "workspace")
             self.assertEqual(
                 [check["stage"] for check in record["checks"]],
                 ["help", "strict_doctor"],
@@ -412,7 +414,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                     "/usr/local/bin/agent --help",
                     "/usr/local/bin/agent doctor --workspace /app --json --strict "
                     "--execution-mode sandboxed --network full --read-scope host "
-                    "--write-scope enclosing-container "
+                    "--write-scope workspace "
                     "--managed-environment-mode disabled --check-api",
                 ],
             )
@@ -497,7 +499,65 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(record["classification"], "passed")
             self.assertEqual(record["network_mode_effective"], "full")
             self.assertEqual(record["read_scope_effective"], "host")
+            self.assertEqual(record["write_scope_requested"], "auto")
+            self.assertEqual(record["write_scope_effective"], "enclosing-container")
             self.assertTrue(record["process_handoff_available"])
+
+    async def test_auto_write_scope_falls_back_to_workspace_without_native_attestation(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            payload = json.loads(current_doctor_payload())
+            payload["capabilities"]["enclosingContainerRoot"] = {
+                "available": False,
+                "rootKind": "none",
+            }
+            env = SimpleNamespace(exec=AsyncMock(side_effect=[
+                SimpleNamespace(return_code=0, stdout="usage", stderr=""),
+                SimpleNamespace(return_code=0, stdout=json.dumps(payload), stderr=""),
+            ]))
+            agent = module.SigmaCliHarborAgent(logs_dir=Path(tmp) / "logs")
+            agent._workspace = "/app"
+
+            await agent._verify_agent_ready(env)
+
+            self.assertEqual(agent.write_scope, "auto")
+            self.assertEqual(agent.effective_write_scope, "workspace")
+            self.assertIn("--write-scope workspace", env.exec.await_args_list[1].args[0])
+            command = agent._agent_command()
+            self.assertEqual(command[command.index("--write-scope") + 1], "workspace")
+            record = json.loads((Path(tmp) / "logs" / "setup-check.json").read_text(encoding="utf-8"))
+            self.assertEqual(record["write_scope_requested"], "auto")
+            self.assertEqual(record["write_scope_effective"], "workspace")
+            self.assertEqual(
+                record["checks"][1]["write_scope_negotiation"]["doctor"],
+                "workspace",
+            )
+
+    async def test_explicit_enclosing_write_scope_still_requires_native_attestation(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            payload = json.loads(current_doctor_payload())
+            payload["capabilities"]["enclosingContainerRoot"] = {
+                "available": False,
+                "rootKind": "none",
+            }
+            env = SimpleNamespace(exec=AsyncMock(side_effect=[
+                SimpleNamespace(return_code=0, stdout="usage", stderr=""),
+                SimpleNamespace(return_code=0, stdout=json.dumps(payload), stderr=""),
+            ]))
+            agent = module.SigmaCliHarborAgent(
+                logs_dir=Path(tmp) / "logs",
+                write_scope="enclosing-container",
+            )
+            agent._workspace = "/app"
+
+            with self.assertRaisesRegex(RuntimeError, "strict_doctor_contract"):
+                await agent._verify_agent_ready(env)
+
+            self.assertIn(
+                "--write-scope enclosing-container",
+                env.exec.await_args_list[1].args[0],
+            )
 
     async def test_setup_help_failure_includes_stdout_and_stderr(self):
         module = import_portable_agent_module()

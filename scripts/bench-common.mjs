@@ -75,7 +75,8 @@ export const terminalBenchCliFlags = Object.freeze([
   "task-id",
   "tasks-file",
   "timeout-leniency-min-extra-sec",
-  "timeout-leniency-multiplier"
+  "timeout-leniency-multiplier",
+  "write-scope"
 ]);
 
 const COUNT_KEYS = [
@@ -314,6 +315,14 @@ function executionMode(value, fallback = "sandboxed") {
   return mode;
 }
 
+function writeScope(value, fallback = "auto") {
+  const scope = asString(value, fallback);
+  if (scope !== "auto" && scope !== "workspace" && scope !== "enclosing-container") {
+    throw new Error("write scope must be auto, workspace, or enclosing-container.");
+  }
+  return scope;
+}
+
 function managedEnvironmentMode(value, fallback = "disabled") {
   const mode = asString(value, fallback);
   if (mode !== "disabled" && mode !== "required") {
@@ -387,6 +396,7 @@ export function resolveRunOptions(argv, env = process.env) {
   }
   const resolvedNetworkMode = networkMode(flags.network ?? env.SIGMA_NETWORK);
   const resolvedExecutionMode = executionMode(flags["execution-mode"] ?? env.SIGMA_EXECUTION_MODE);
+  const resolvedWriteScope = writeScope(flags["write-scope"] ?? env.SIGMA_WRITE_SCOPE);
   const resolvedManagedEnvironmentMode = managedEnvironmentMode(
     flags["managed-environment-mode"] ?? env.SIGMA_MANAGED_ENVIRONMENT_MODE
   );
@@ -414,6 +424,7 @@ export function resolveRunOptions(argv, env = process.env) {
     agentProfile: asString(flags["agent-profile"], env.SIGMA_AGENT_PROFILE ?? "standard"),
     networkMode: resolvedNetworkMode,
     executionMode: resolvedExecutionMode,
+    writeScope: resolvedWriteScope,
     managedEnvironmentMode: resolvedManagedEnvironmentMode,
     harborTopology: resolvedHarborTopology,
     runLabel: asString(flags["run-label"]),
@@ -674,6 +685,7 @@ function benchmarkAgentKwargs(options, timeoutPlan = null) {
     agent_profile: options.agentProfile ?? "standard",
     network_mode: options.networkMode ?? "full",
     execution_mode: options.executionMode ?? "sandboxed",
+    write_scope: options.writeScope ?? "auto",
     managed_environment_mode: options.managedEnvironmentMode ?? "disabled",
     harbor_topology: options.harborTopology ?? "main_only"
   };
@@ -914,6 +926,9 @@ export function buildHarborArgs(options) {
   }
   if (options.executionMode !== undefined) {
     args.push("--ak", formatAgentKwarg("execution_mode", "str", options.executionMode, capabilities));
+  }
+  if (options.writeScope !== undefined) {
+    args.push("--ak", formatAgentKwarg("write_scope", "str", options.writeScope, capabilities));
   }
   if (options.managedEnvironmentMode !== undefined) {
     args.push("--ak", formatAgentKwarg(
@@ -1789,6 +1804,7 @@ async function runSlotIntegrityReasons(runDir, config) {
       const frozenControls = {
         network_mode: config.network_mode,
         execution_mode: config.execution_mode,
+        write_scope: config.write_scope,
         managed_environment_mode: config.managed_environment_mode,
         harbor_topology: config.harbor_topology
       };
@@ -2835,6 +2851,7 @@ export async function generateBenchReport(runDir) {
     infra_status: infraStatus,
     network_mode: config.network_mode ?? null,
     execution_mode: config.execution_mode ?? "sandboxed",
+    write_scope: config.write_scope ?? "auto",
     managed_environment_mode: config.managed_environment_mode ?? "disabled",
     harbor_topology: config.harbor_topology ?? "main_only",
     score_mode: config.score_mode ?? (config.benchmark_class === "diagnostic" ? "diagnostic" : "standard_benchmark"),

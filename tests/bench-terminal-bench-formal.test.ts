@@ -48,6 +48,7 @@ function draft(overrides: Record<string, unknown> = {}) {
     execution: {
       network_mode: "full",
       execution_mode: "sandboxed",
+      write_scope: "auto",
       managed_environment_mode: "disabled",
       harbor_topology: "main_only",
       concurrency: 2,
@@ -228,6 +229,7 @@ describe("formal benchmark preregistration", () => {
       agentTimeoutGraceSec: 17,
       networkMode: "full",
       executionMode: "sandboxed",
+      writeScope: "auto",
       managedEnvironmentMode: "disabled",
       harborTopology: "main_only",
       nConcurrentTrials: 2,

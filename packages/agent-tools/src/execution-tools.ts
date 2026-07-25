@@ -16,7 +16,6 @@ import {
 import type { ExecutionToolOptions } from "./execution-tool-types.js";
 import {
   assertAvailableExecutable,
-  assertAvailableShell,
   availableNetworkModes,
   availableShells,
   executionArgs,
@@ -33,6 +32,7 @@ import {
   pinProcessReadRoots
 } from "./windows-mutation-lock.js";
 import {
+  assertForegroundInvocation,
   foregroundExecutionSchema
 } from "./execution-foreground-schema.js";
 import { simpleExecutionReceipt } from "./execution-tool-receipts.js";
@@ -116,25 +116,6 @@ async function releaseRejectedResultArtifacts(
     );
   }
   throw primary;
-}
-
-function assertForegroundInvocation(
-  kind: "exec" | "shell" | "validate",
-  input: Record<string, JsonValue>,
-  options: ExecutionToolOptions
-): boolean {
-  const validation = kind === "validate";
-  const shellCommand = kind === "shell" || (validation && input.shell !== undefined);
-  if (validation) {
-    const hasExecutable = input.executable !== undefined;
-    const hasShell = input.shell !== undefined || input.command !== undefined;
-    if (hasExecutable === hasShell || (hasShell && (input.shell === undefined || input.command === undefined))) {
-      throw new Error("validate requires exactly one invocation form: {executable,args} or {shell,command}.");
-    }
-  }
-  if (shellCommand) assertAvailableShell(input, options);
-  else assertAvailableExecutable(input, options);
-  return shellCommand;
 }
 
 function foregroundArguments(
@@ -253,7 +234,7 @@ function foregroundTool(kind: "exec" | "shell" | "validate", options: ExecutionT
         const input = foregroundArguments(
           kind, value, options, context.workspacePath
         );
-        if (kind === "shell" || (validation && input.shell !== undefined)) assertAvailableShell(input, options);
+        assertForegroundInvocation(kind, input, options);
         return prepareExecutionCallPlan(input, context, options, validation);
       }
     },

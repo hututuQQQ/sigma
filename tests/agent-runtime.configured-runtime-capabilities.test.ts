@@ -416,7 +416,9 @@ describe("configured runtime execution capabilities", () => {
       expect(runtimeContext).toContain(
         "use shell with target=environment for foreground system-level changes"
       );
-      expect(runtimeContext).toContain("environment_process_spawn for a background service");
+      expect(runtimeContext).toContain(
+        "process_spawn with target=environment for a background service"
+      );
 
       const analyzeSession = await configuredRuntime.runtime.createSession({
         workspacePath: root,
@@ -676,11 +678,11 @@ describe("configured runtime execution capabilities", () => {
         } else {
           expect(spawn?.inputSchema).not.toMatchObject({ properties: { pty: expect.anything() } });
         }
-        if (processCapabilities.stdin) {
-          expect(request.tools?.find((tool) => tool.name === "process_write")).toBeDefined();
-        } else {
-          expect(request.tools?.find((tool) => tool.name === "process_write")).toBeUndefined();
-        }
+        // Lifecycle controls are offered only after a durable process handle
+        // exists, independently of whether stdin is supported.
+        expect(request.tools?.find((tool) => tool.name === "process_write")).toBeUndefined();
+        expect(request.tools?.find((tool) => tool.name === "process_poll")).toBeUndefined();
+        expect(request.tools?.find((tool) => tool.name === "process_terminate")).toBeUndefined();
       }
       const codeIntelAvailable = backgroundAvailable
         && processCapabilities.stdin

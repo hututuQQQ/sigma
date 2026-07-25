@@ -48,6 +48,7 @@ function preregistration(tasks: Array<ReturnType<typeof task>>) {
     execution: {
       network_mode: "full",
       execution_mode: "sandboxed",
+      write_scope: "auto",
       managed_environment_mode: "disabled",
       harbor_topology: "main_only",
       concurrency: 1,

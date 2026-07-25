@@ -36,8 +36,13 @@ export function modelTools(descriptors: readonly ToolDescriptor[]): ModelToolDef
 
 export interface ModelToolProjectionCapabilities {
   skillsAvailable: boolean;
+  /** Retained for schema-1 recovery compatibility. Loading a skill no longer
+   * swaps the foreground tool surface within a session. */
   executableSkillResourcesLoaded: boolean;
   environmentMutationAvailable?: boolean;
+  processControlsAvailable?: boolean;
+  childControlsAvailable?: boolean;
+  planReadRequired?: boolean;
 }
 
 /** Frozen sessions never acquire capabilities from changed live state. */
@@ -62,6 +67,40 @@ export function sessionSkillProjectionCapabilities(input: {
   };
 }
 
+/** Derive one durable capability projection for both model preparation and
+ * tool-call admission. Runtime-only handles never widen a restored session. */
+export function sessionModelToolProjectionCapabilities(
+  session: RuntimeSession
+): ModelToolProjectionCapabilities {
+  const skillCapabilities = session.durable.frozenCustomization
+    ? sessionSkillProjectionCapabilities({
+        frozenCustomization: session.durable.frozenCustomization,
+        loadedSkills: session.durable.state.frozenSkills,
+        profileSkillNames: session.services.profile?.profile.skills
+      })
+    : { skillsAvailable: false, executableSkillResourcesLoaded: false };
+  const state = session.durable.state;
+  const childControlsAvailable = state.childIds.length > 0
+    || state.plan.nodes.some((node) => node.owner.kind === "child")
+    || state.budget.reservations.some((reservation) =>
+      reservation.ownerId.startsWith("child:"))
+    || state.evidence.some((item) => item.kind === "child_outcome");
+  return {
+    ...skillCapabilities,
+    environmentMutationAvailable: session.durable.mode === "change",
+    processControlsAvailable: state.activeProcessIds.length > 0,
+    childControlsAvailable,
+    planReadRequired: state.plan.nodes.length > 32
+  };
+}
+
+const PROCESS_CONTROL_TOOLS = new Set([
+  "process_poll", "process_write", "process_terminate", "process_handoff"
+]);
+const CHILD_CONTROL_TOOLS = new Set([
+  "message_agent", "join_agent", "list_agents", "integrate_agent"
+]);
+
 /** Present only session-real capabilities to the model while leaving the
  * authoritative registry unchanged for durable recovery and stale-call denial. */
 export function projectModelToolDescriptors(
@@ -72,20 +111,24 @@ export function projectModelToolDescriptors(
     descriptor.name === "shell");
   const visible = descriptors.filter((descriptor) =>
     (capabilities.skillsAvailable || descriptor.name !== "load_skill")
-    && !(descriptor.name === "exec"
-      && shellAvailable
-      && !capabilities.executableSkillResourcesLoaded));
+    && !(descriptor.name === "exec" && shellAvailable)
+    && !(PROCESS_CONTROL_TOOLS.has(descriptor.name)
+      && capabilities.processControlsAvailable === false)
+    && !(CHILD_CONTROL_TOOLS.has(descriptor.name)
+      && capabilities.childControlsAvailable === false)
+    && !(descriptor.name === "read_plan"
+      && capabilities.planReadRequired === false));
   return visible.map((descriptor) => {
-    const foregroundExecution = descriptor.name === "exec" || descriptor.name === "validate";
-    const unavailable = descriptor.name === "process_spawn"
-      || (foregroundExecution && !capabilities.executableSkillResourcesLoaded);
-    const environmentUnavailable = descriptor.name === "shell"
+    const skillFieldsUnavailable = !capabilities.skillsAvailable
+      && ["exec", "shell", "validate", "process_spawn"].includes(descriptor.name);
+    const environmentUnavailable = (descriptor.name === "shell"
+      || descriptor.name === "process_spawn")
       && capabilities.environmentMutationAvailable === false;
-    if (!unavailable && !environmentUnavailable) return descriptor;
+    if (!skillFieldsUnavailable && !environmentUnavailable) return descriptor;
     const rawProperties = descriptor.inputSchema.properties;
     if (!rawProperties || typeof rawProperties !== "object" || Array.isArray(rawProperties)) return descriptor;
     const properties = { ...(rawProperties as Record<string, JsonValue>) };
-    if (unavailable) {
+    if (skillFieldsUnavailable) {
       delete properties.skill;
       delete properties.skillScript;
     }
@@ -102,6 +145,10 @@ export function projectModelToolDescriptors(
         )
         .replace(
           " Set target=environment only for system-level changes in the broker-attested disposable outer environment.",
+          ""
+        )
+        .replace(
+          " Set target=environment only for a service that needs system-level changes in the broker-attested disposable outer environment.",
           ""
         ),
       inputSchema: {

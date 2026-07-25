@@ -37,24 +37,67 @@ describe("session model-tool capability projection", () => {
     }
   });
 
-  it("exposes only the skill capabilities that are actually usable in this session", () => {
+  it("keeps one stable foreground surface while skills are discovered and loaded", () => {
     const discoverable = projectModelToolDescriptors(descriptors, {
       skillsAvailable: true,
       executableSkillResourcesLoaded: false
     });
     expect(discoverable.some((item) => item.name === "load_skill")).toBe(true);
     expect(discoverable.some((item) => item.name === "exec")).toBe(false);
+    expect(discoverable.find((item) => item.name === "shell")?.inputSchema.properties)
+      .toHaveProperty("skill");
 
     const loaded = projectModelToolDescriptors(descriptors, {
       skillsAvailable: true,
       executableSkillResourcesLoaded: true
     });
-    expect(loaded.find((item) => item.name === "exec")?.inputSchema.properties)
+    expect(loaded.some((item) => item.name === "exec")).toBe(false);
+    expect(loaded.find((item) => item.name === "shell")?.inputSchema.properties)
       .toHaveProperty("skill");
-    expect(loaded.find((item) => item.name === "exec")?.inputSchema.properties)
+    expect(loaded.find((item) => item.name === "shell")?.inputSchema.properties)
       .toHaveProperty("skillScript");
     expect(loaded.find((item) => item.name === "process_spawn")?.inputSchema.properties)
       .not.toHaveProperty("skill");
+  });
+
+  it("defers lifecycle controls until durable process or child state exists", () => {
+    const template = descriptors.find((item) => item.name === "read_plan")!;
+    const childNames = [
+      "spawn_agent", "message_agent", "join_agent", "list_agents", "integrate_agent"
+    ];
+    const lifecycleDescriptors = [
+      ...descriptors,
+      ...childNames.map((name) => ({ ...template, name }))
+    ];
+    const unavailable = projectModelToolDescriptors(lifecycleDescriptors, {
+      skillsAvailable: false,
+      executableSkillResourcesLoaded: false,
+      processControlsAvailable: false,
+      childControlsAvailable: false,
+      planReadRequired: false
+    });
+    for (const name of [
+      "process_poll", "process_write", "process_terminate", "process_handoff",
+      "message_agent", "join_agent", "list_agents", "integrate_agent", "read_plan"
+    ]) {
+      expect(unavailable.some((item) => item.name === name)).toBe(false);
+    }
+    expect(unavailable.some((item) => item.name === "process_spawn")).toBe(true);
+    expect(unavailable.some((item) => item.name === "spawn_agent")).toBe(true);
+
+    const available = projectModelToolDescriptors(lifecycleDescriptors, {
+      skillsAvailable: false,
+      executableSkillResourcesLoaded: false,
+      processControlsAvailable: true,
+      childControlsAvailable: true,
+      planReadRequired: true
+    });
+    for (const name of [
+      "process_poll", "process_write", "process_terminate",
+      "message_agent", "join_agent", "list_agents", "integrate_agent", "read_plan"
+    ]) {
+      expect(available.some((item) => item.name === name)).toBe(true);
+    }
   });
 
   it("retains direct execution when no shell exists", () => {
