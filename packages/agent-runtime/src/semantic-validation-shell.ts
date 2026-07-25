@@ -1,5 +1,5 @@
 import path from "node:path";
-import type { ValidationClaimKindV1 } from "agent-protocol";
+import type { ValidationClaimKind } from "agent-protocol";
 
 type ShellQuote = "'" | "\"" | null;
 
@@ -194,7 +194,7 @@ function strictShellComparison(segments: readonly string[]): boolean {
 }
 
 export function shellSemanticValidation(script: string): {
-  kind?: ValidationClaimKindV1;
+  kind?: ValidationClaimKind;
   exactPathCandidates: string[];
 } {
   const segments = strictAndShellSegments(script);

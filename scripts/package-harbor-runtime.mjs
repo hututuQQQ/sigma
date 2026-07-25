@@ -54,7 +54,7 @@ ${agentCliTarball}
 ## Run
 
 Formal runs create source-free per-task JobConfig files from their SHA-bound
-\`SigmaFormalRunPreregistrationV1\`. This portable package deliberately contains
+\`SigmaFormalRunPreregistration\`. This portable package deliberately contains
 no dataset, provider, model, task count, retry, or score-threshold defaults.
 
 \`\`\`bash

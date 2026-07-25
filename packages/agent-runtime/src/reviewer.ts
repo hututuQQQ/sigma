@@ -20,7 +20,7 @@ import type {
   PreparedReviewerCall,
   ReviewerInput,
   ReviewerPort,
-  ReviewerToolCheckV1,
+  ReviewerToolCheck,
   ReviewerToolEnvironment,
   ReviewerToolSessionPort
 } from "./reviewer-contracts.js";
@@ -237,7 +237,7 @@ export class ModelReviewer implements ReviewerPort {
     toolSession: ReviewerToolSessionPort | undefined,
     signal: AbortSignal
   ): Promise<ReviewerTurnLoopResult> {
-    const checks: ReviewerToolCheckV1[] = [];
+    const checks: ReviewerToolCheck[] = [];
     const usages: UsageRecord[] = [];
     let toolCalls = 0;
     let verdictOnly = false;

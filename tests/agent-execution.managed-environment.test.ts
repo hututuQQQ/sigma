@@ -1,15 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   AttestedContainerExecutionBroker,
-  MANAGED_ENVIRONMENT_PROTECTED_PATHS_V1,
+  MANAGED_ENVIRONMENT_PROTECTED_PATHS,
   managedContainerAttestationDigest,
   managedEnvironmentProofDigest,
   type BrokerDoctorReport,
   type ExecutionBroker,
   type ExecutionRequest,
   type ExecutionResult,
-  type ManagedEnvironmentPrepareRequestV1,
-  type TrustedManagedContainerAttestationV1
+  type ManagedEnvironmentPrepareRequest,
+  type TrustedManagedContainerAttestation
 } from "../packages/agent-execution/src/index.js";
 import {
   containerIdentity,
@@ -31,7 +31,7 @@ const baseAttestation = {
 };
 const attestationDigest = managedContainerAttestationDigest(baseAttestation);
 
-function attestation(withEnvironment: boolean): TrustedManagedContainerAttestationV1 {
+function attestation(withEnvironment: boolean): TrustedManagedContainerAttestation {
   if (!withEnvironment) return { ...baseAttestation, attestationDigest };
   const proof = {
     protocolVersion: 1 as const,
@@ -41,7 +41,7 @@ function attestation(withEnvironment: boolean): TrustedManagedContainerAttestati
     rootKind: "container_cow" as const,
     effectiveNetwork: "full" as const,
     disposable: true as const,
-    protectedPaths: [...MANAGED_ENVIRONMENT_PROTECTED_PATHS_V1]
+    protectedPaths: [...MANAGED_ENVIRONMENT_PROTECTED_PATHS]
   };
   return {
     ...baseAttestation,
@@ -117,7 +117,7 @@ function fixtureBroker(managedEnvironment = true): ExecutionBroker & {
   const execute = vi.fn(async (request: ExecutionRequest): Promise<ExecutionResult> => {
     return terminal(request.command.executable === "new-tool" ? "new-tool 1.0" : "ok");
   });
-  const prepareManagedEnvironment = vi.fn(async (request: ManagedEnvironmentPrepareRequestV1) => {
+  const prepareManagedEnvironment = vi.fn(async (request: ManagedEnvironmentPrepareRequest) => {
     installed = true;
     const installedPackages = request.packages.map((name: string) => ({
       name,

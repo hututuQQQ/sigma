@@ -20,7 +20,10 @@ import type {
   ModelStreamEvent,
   ModelToolDefinition
 } from "../packages/agent-protocol/src/index.js";
-import { EVENT_SCHEMA_VERSION } from "../packages/agent-protocol/src/index.js";
+import {
+  EVENT_SCHEMA_VERSION,
+  createBudgetLedger
+} from "../packages/agent-protocol/src/index.js";
 import {
   createRuntime,
   createRuntimeForTesting,
@@ -29,6 +32,7 @@ import {
 } from "../packages/agent-runtime/src/testing.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
+import { persistEmptyCustomization } from "./testkit/agent-event-fixtures.js";
 
 class UnusedGateway implements ModelGateway {
   readonly provider = "test";
@@ -112,8 +116,9 @@ async function recoveryFixture(
     runId,
     workspacePath: workspace,
     scopePaths: ["target.txt"],
-    baseSeq: 2
+    baseSeq: 3
   });
+  const customization = await persistEmptyCustomization(storeRootDir, sessionId);
   const events = [
     event(sessionId, runId, 1, "session.created", {
       workspacePath: workspace,
@@ -121,13 +126,15 @@ async function recoveryFixture(
       title: "Checkpoint recovery fixture",
       writeScope: [],
       strictWriteScope: false,
-      modelRole: "orchestrator"
+      modelRole: "orchestrator",
+      budgetLimits: createBudgetLedger().limits
     }),
-    event(sessionId, runId, 2, "run.started", {
+    event(sessionId, runId, 2, "customization.frozen", customization),
+    event(sessionId, runId, 3, "run.started", {
       mode: "change",
       deadlineAt: new Date(Date.now() + 60_000).toISOString()
     }),
-    event(sessionId, runId, 3, "checkpoint.created", checkpointPayload(checkpoint))
+    event(sessionId, runId, 4, "checkpoint.created", checkpointPayload(checkpoint))
   ];
   for (const stored of events) await store.append(stored, stored.seq - 1);
   await writeFile(path.join(workspace, "target.txt"), "partial mutation", "utf8");

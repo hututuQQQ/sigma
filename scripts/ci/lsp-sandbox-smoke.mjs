@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
+import { sigmaManifest } from "../lib/sigma-manifest.mjs";
 
 const scriptPath = fileURLToPath(import.meta.url);
 
@@ -109,10 +110,14 @@ async function verifyPortableIntegrity(layout, metadata) {
 }
 
 export function assertMetadata(metadata, targetPlatform, brokerPath, brokerDigest, layout) {
-  const productMajor = Number.parseInt(String(metadata.productVersion ?? "").split(".")[0] ?? "", 10);
-  if ((productMajor !== 3 && productMajor !== 4) || metadata.schemaVersion !== productMajor) {
+  if (metadata.schemaVersion !== 1) {
     throw new Error(
-      `Portable package metadata schemaVersion=${String(metadata.schemaVersion)} must match supported product major ${String(metadata.productVersion)}.`
+      `unsupported_schema_version: path=package-metadata expected=1 actual=${String(metadata.schemaVersion)}`
+    );
+  }
+  if (metadata.productVersion !== sigmaManifest.productVersion) {
+    throw new Error(
+      `Portable package productVersion '${String(metadata.productVersion)}' must match sigma-manifest.json productVersion '${sigmaManifest.productVersion}'.`
     );
   }
   if (metadata.targetPlatform !== targetPlatform || typeof metadata.targetArch !== "string") {

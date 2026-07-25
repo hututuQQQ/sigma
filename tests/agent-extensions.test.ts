@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  DEFAULT_PROFILE_ASSURANCE,
   HookDispatcher,
   HookGateError,
   defaultProfileRoots,
@@ -240,6 +241,7 @@ function profile(overrides: Partial<ResolvedAgentProfile> = {}): ResolvedAgentPr
       checkpointBeforeMutation: true,
       reviewMode: "advisory"
     },
+    assurancePolicy: { ...DEFAULT_PROFILE_ASSURANCE },
     allowedChildProfiles: [],
     ...overrides
   };

@@ -78,7 +78,20 @@ function result(
   diagnostics: string[] = [],
   artifacts: string[] = []
 ): ToolReceipt {
-  return { callId: request.callId, ok, output, observedEffects: ["filesystem.read"], artifacts, diagnostics, startedAt, completedAt: new Date().toISOString() };
+  const effects: ToolReceipt["observedEffects"] = ["filesystem.read"];
+  return {
+    callId: request.callId,
+    ok,
+    output,
+    outcome: { status: ok ? "succeeded" : "failed", output, diagnosticCodes: diagnostics },
+    observedEffects: effects,
+    actualEffects: effects,
+    artifacts,
+    diagnostics,
+    evidence: [],
+    startedAt,
+    completedAt: new Date().toISOString()
+  };
 }
 
 const listGlobCharacterLimit = 512;

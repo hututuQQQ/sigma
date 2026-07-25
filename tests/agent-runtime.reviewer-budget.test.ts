@@ -221,7 +221,7 @@ class FallbackReviewerGateway extends ReviewerGateway {
       role: "reviewer",
       modelSpecId: "deepseek/deepseek-v4-pro",
       providerId: "deepseek",
-      tokenizerId: "sigma/cjk-byte-v1",
+      tokenizerId: "sigma/cjk-byte",
       tokenizerAccuracy: "approximate",
       attempt: 1
     } as ModelResponse;
@@ -697,6 +697,7 @@ function validation(coveredPaths = ["src/code.ts"]): ValidationEvidence {
     producer: { authority: "tool", id: "validate" },
     summary: "passed",
     data: {
+      schemaVersion: 1,
       validator: "command",
       exitCode: 0,
       artifactIds: [],
@@ -962,7 +963,7 @@ describe("independent reviewer budget accounting", () => {
     expect(target.durable.state.evidence.find((item) => item.kind === "review")).toMatchObject({
       status: "passed",
       data: {
-        schemaVersion: 3,
+        schemaVersion: 1,
         verdict: "approved"
       }
     });
@@ -981,7 +982,7 @@ describe("independent reviewer budget accounting", () => {
     expect(narrowTarget.durable.state.evidence.find((item) => item.kind === "review"))
       .toMatchObject({
         status: "passed",
-        data: { schemaVersion: 3, verdict: "approved" }
+        data: { schemaVersion: 1, verdict: "approved" }
       });
 
     const failedTarget = runtimeSession();
@@ -1011,11 +1012,11 @@ describe("independent reviewer budget accounting", () => {
     expect(failedTarget.durable.state.evidence.find((item) => item.kind === "review"))
       .toMatchObject({
         status: "passed",
-        data: { schemaVersion: 3, verdict: "approved" }
+        data: { schemaVersion: 1, verdict: "approved" }
       });
   });
 
-  it("requires the V3 reviewer to enumerate durable acceptance criteria", async () => {
+  it("requires the reviewer to enumerate durable acceptance criteria", async () => {
     const gateway = new ReviewerGateway(
       undefined,
       JSON.stringify({
@@ -1051,7 +1052,7 @@ describe("independent reviewer budget accounting", () => {
     expect(result).toMatchObject({
       status: "failed",
       data: {
-        schemaVersion: 3,
+        schemaVersion: 1,
         verdict: "changes_requested",
         criteria: [expect.objectContaining({
           criterion: "Preserve compatibility with the documented format.",
@@ -1061,7 +1062,7 @@ describe("independent reviewer budget accounting", () => {
     });
   });
 
-  it("uses the V3 submit tool without forcing an immediate verdict before inspection", async () => {
+  it("uses the submit tool without forcing an immediate verdict before inspection", async () => {
     const gateway = new StructuredReviewerGateway();
     const criterion = "Preserve compatibility with the documented format.";
     const result = await new ModelReviewer(gateway).review({
@@ -1350,7 +1351,7 @@ ${JSON.stringify({
     expect(result.data).not.toHaveProperty("failureCode");
   });
 
-  it("drops unknown legacy evidence references but still fails closed without authentic proof", () => {
+  it("drops unknown evidence references but still fails closed without authentic proof", () => {
     const target = runtimeSession();
     const raw = (evidence: string[]): ReviewEvidence => ({
       evidenceId: "raw-review",
@@ -1362,7 +1363,7 @@ ${JSON.stringify({
       producer: { authority: "runtime", id: "reviewer" },
       summary: "approved",
       data: {
-        schemaVersion: 3,
+        schemaVersion: 1,
         reviewerId: "reviewer",
         verdict: "approved",
         findings: [],
@@ -1692,11 +1693,19 @@ ${JSON.stringify({
         producer: { authority: "runtime", id: "fake-port" },
         summary: "approved",
         data: {
+          schemaVersion: 1,
           reviewerId: "fake-port",
           verdict: "approved",
           findings: [],
+          criteria: [{
+            criterion: input.goal,
+            status: "satisfied",
+            evidence: ["delta"]
+          }],
           frontierRevision: input.frontierRevision,
           stateDigest: input.stateDigest,
+          reviewBasisDigest: input.reviewBasisDigest,
+          durableEvidenceIds: ["delta"],
           validationEvidenceIds: input.validations.map((item) => item.evidenceId)
         }
       })
@@ -1724,11 +1733,19 @@ ${JSON.stringify({
         producer: { authority: "runtime", id: "contradictory-port" },
         summary: "approved with a finding",
         data: {
+          schemaVersion: 1,
           reviewerId: "contradictory-port",
           verdict: "approved",
           findings: ["An unresolved correctness issue remains."],
+          criteria: [{
+            criterion: input.goal,
+            status: "satisfied",
+            evidence: ["delta"]
+          }],
           frontierRevision: input.frontierRevision,
           stateDigest: input.stateDigest,
+          reviewBasisDigest: input.reviewBasisDigest,
+          durableEvidenceIds: ["delta"],
           validationEvidenceIds: input.validations.map((item) => item.evidenceId)
         }
       })
@@ -1761,14 +1778,22 @@ ${JSON.stringify({
         producer: { authority: "runtime", id: "structured-reviewer" },
         summary: "advisory observations",
         data: {
+          schemaVersion: 1,
           reviewerId: "structured-reviewer",
           verdict: "changes_requested",
           findings: [
             { actionable: false, severity: "info", summary: "Validation coverage is strong." },
             { actionable: true, severity: "warning", summary: "Consider a follow-up cleanup." }
           ],
+          criteria: [{
+            criterion: input.goal,
+            status: "satisfied",
+            evidence: ["delta"]
+          }],
           frontierRevision: input.frontierRevision,
           stateDigest: input.stateDigest,
+          reviewBasisDigest: input.reviewBasisDigest,
+          durableEvidenceIds: ["delta"],
           validationEvidenceIds: input.validations.map((item) => item.evidenceId)
         }
       })
@@ -1800,6 +1825,7 @@ ${JSON.stringify({
           producer: { authority: "runtime", id: "dedupe-reviewer" },
           summary: "reviewer unavailable",
           data: {
+            schemaVersion: 1,
             reviewerId: "dedupe-reviewer",
             verdict: "changes_requested",
             findings: ["reviewer unavailable"],
@@ -1818,7 +1844,7 @@ ${JSON.stringify({
     await new ReviewCoordinator(reviewer, emit).maybeReview(target, new AbortController().signal, true);
     await new ReviewCoordinator(reviewer, emit).maybeReview(target, new AbortController().signal, true);
 
-    // V9 allows at most the initial review and one re-review for the run.
+    // A run allows at most the initial review and one re-review.
     expect(calls).toBe(2);
   });
 
@@ -1839,13 +1865,21 @@ ${JSON.stringify({
           producer: { authority: "runtime", id: "freshness-reviewer" },
           summary: calls === 1 ? "add stronger validation" : "approved",
           data: {
+            schemaVersion: 1,
             reviewerId: "freshness-reviewer",
             verdict: calls === 1 ? "changes_requested" : "approved",
             findings: calls === 1
               ? [{ actionable: true, severity: "error", summary: "Add a runtime check." }]
               : [],
+            criteria: [{
+              criterion: input.goal,
+              status: calls === 1 ? "unverified" : "satisfied",
+              evidence: calls === 1 ? [] : ["delta"]
+            }],
             frontierRevision: input.frontierRevision,
             stateDigest: input.stateDigest,
+            reviewBasisDigest: input.reviewBasisDigest,
+            durableEvidenceIds: calls === 1 ? [] : ["delta"],
             validationEvidenceIds: input.validations.map((item) => item.evidenceId)
           }
         };
@@ -1924,7 +1958,7 @@ ${JSON.stringify({
     }, new AbortController().signal);
     expect(truncated).toMatchObject({
       status: "passed",
-      data: { schemaVersion: 3, verdict: "approved" }
+      data: { schemaVersion: 1, verdict: "approved" }
     });
     expect(truncatedGateway.calls).toBe(1);
 
@@ -1967,7 +2001,7 @@ ${JSON.stringify({
     }, new AbortController().signal);
     expect(unvalidated).toMatchObject({
       status: "passed",
-      data: { schemaVersion: 3, verdict: "approved" }
+      data: { schemaVersion: 1, verdict: "approved" }
     });
     expect(unvalidatedGateway.calls).toBe(1);
   });
@@ -2054,7 +2088,7 @@ ${JSON.stringify({
     }, new AbortController().signal);
     expect(blocked).toMatchObject({
       status: "passed",
-      data: { schemaVersion: 3, verdict: "approved" }
+      data: { schemaVersion: 1, verdict: "approved" }
     });
     expect(blockedGateway.calls).toBe(1);
   });
@@ -2104,7 +2138,7 @@ ${JSON.stringify({
 
     expect(result).toMatchObject({
       status: "passed",
-      data: { schemaVersion: 3, verdict: "approved" }
+      data: { schemaVersion: 1, verdict: "approved" }
     });
     expect(gateway.calls).toBe(1);
   });
@@ -2161,7 +2195,7 @@ ${JSON.stringify({
 
     expect(result).toMatchObject({
       status: "passed",
-      data: { schemaVersion: 3, verdict: "approved" }
+      data: { schemaVersion: 1, verdict: "approved" }
     });
     expect(gateway.calls).toBe(1);
   });

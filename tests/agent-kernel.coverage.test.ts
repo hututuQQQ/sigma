@@ -11,7 +11,6 @@ import {
   acceptMutationFrontier,
   assertKernelInvariants,
   createKernelState,
-  decodeLegacyKernelStateV5,
   decide,
   emptyMutationFrontier,
   evolve,
@@ -96,9 +95,11 @@ function settle(
   ok = true,
   effects: JsonValue = ["filesystem.read"]
 ): KernelState {
-  const turn = state.pendingTools.find((item) => item.request.callId === callId)!.modelTurn;
+  const pending = state.pendingTools.find((item) => item.request.callId === callId)!;
+  const turn = pending.modelTurn;
   return apply(state, ok ? "tool.completed" : "tool.failed", {
     callId,
+    name: pending.request.name,
     ...turn,
     ok,
     output: ok ? "observed" : "failed",
@@ -111,6 +112,7 @@ function settle(
     actualEffects: effects,
     artifacts: [],
     diagnostics: ok ? [] : ["failed"],
+    evidence: [],
     startedAt: NOW,
     completedAt: NOW
   });
@@ -142,7 +144,7 @@ function workspaceEvidence(id = "workspace"): EvidenceRecord {
   };
 }
 
-describe("agent-kernel V7 protocol behavior", () => {
+describe("agent-kernel protocol behavior", () => {
   it("records every call in a mixed batch without interpreting its semantics", () => {
     let state = apply(initial(), "user.message", { text: "Inspect or ask." });
     state = toolTurn(state, 1, [
@@ -367,10 +369,9 @@ describe("agent-kernel V7 protocol behavior", () => {
     });
   });
 
-  it("rejects legacy state and invalid durable invariants", () => {
+  it("rejects invalid durable invariants", () => {
     const state = initial();
     expect(isKernelState(state)).toBe(true);
-    expect(isKernelState({ ...state, taskControl: {} })).toBe(false);
     expect(() => assertKernelInvariants({
       ...state,
       activeProcessIds: ["same", "same"]
@@ -379,7 +380,7 @@ describe("agent-kernel V7 protocol behavior", () => {
 
   it("rejects malformed and cross-scope durable ledgers", () => {
     const state = initial();
-    expect(() => assertKernelInvariants({ ...state, schemaVersion: 7 } as KernelState))
+    expect(() => assertKernelInvariants({ ...state, schemaVersion: 999 } as KernelState))
       .toThrow("schema version");
     expect(() => assertKernelInvariants({ ...state, plan: {} } as KernelState))
       .toThrow("plan graph");
@@ -501,7 +502,7 @@ describe("agent-kernel V7 protocol behavior", () => {
     })).toThrow("proposed outcome");
   });
 
-  it("validates V8 optional deadline, recovery, prompt, and frozen state", () => {
+  it("validates optional deadline, recovery, prompt, and frozen state", () => {
     const state = initial();
     expect(isKernelState(null)).toBe(false);
     expect(isKernelState([])).toBe(false);
@@ -543,20 +544,5 @@ describe("agent-kernel V7 protocol behavior", () => {
     expect(isKernelState({ ...state, frozenProfile: {} })).toBe(false);
     expect(isKernelState({ ...state, frozenCustomization: {} })).toBe(false);
     expect(isKernelState({ ...state, frozenSkills: [{}] })).toBe(false);
-  });
-
-  it("decodes only valid legacy V5 completion drafts", () => {
-    expect(decodeLegacyKernelStateV5(null)).toBeNull();
-    expect(decodeLegacyKernelStateV5([])).toBeNull();
-    expect(decodeLegacyKernelStateV5({ schemaVersion: 6 })).toBeNull();
-    expect(decodeLegacyKernelStateV5({
-      schemaVersion: 5,
-      taskControl: { schemaVersion: 1 }
-    })).toBeNull();
-    expect(decodeLegacyKernelStateV5({ schemaVersion: 5 })).toEqual({});
-    expect(decodeLegacyKernelStateV5({
-      schemaVersion: 5,
-      completionRepair: { answer: " repaired " }
-    })).toEqual({ completionDraft: "repaired" });
   });
 });

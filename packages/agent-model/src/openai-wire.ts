@@ -18,8 +18,6 @@ export interface OpenAIWireProfile {
    * them ahead of the conversation on every request. */
   trailingInstructionRole?: "developer" | "system" | "latest_reminder";
   toolChoicePolicy: OpenAIToolChoicePolicy;
-  /** @deprecated Use toolChoicePolicy. */
-  supportsToolChoice?: boolean;
   thinking?: "enabled" | "disabled";
   retryableFinishReasons: readonly string[];
 }
@@ -30,22 +28,10 @@ const defaultWireProfile: OpenAIWireProfile = {
   retryableFinishReasons: []
 };
 
-function legacyToolChoicePolicy(value: boolean | undefined): OpenAIToolChoicePolicy | undefined {
-  if (value === undefined) return undefined;
-  return value ? "always" : "never";
-}
-
 function validateToolChoiceProfile(
   canonical: OpenAIToolChoicePolicy | undefined,
-  legacy: OpenAIToolChoicePolicy | undefined,
   thinking: OpenAIWireProfile["thinking"]
 ): void {
-  if (canonical && legacy && canonical !== legacy) {
-    throw new ModelGatewayError(
-      `OpenAI wire profile has conflicting tool choice settings: toolChoicePolicy='${canonical}' and supportsToolChoice=${String(legacy === "always")}.`,
-      "configuration"
-    );
-  }
   if (canonical === "non_thinking_only" && !thinking) {
     throw new ModelGatewayError(
       "OpenAI wire profile requires a thinking mode when toolChoicePolicy='non_thinking_only'.",
@@ -56,9 +42,8 @@ function validateToolChoiceProfile(
 
 function resolvedToolChoicePolicy(profile: Partial<OpenAIWireProfile> | undefined): OpenAIToolChoicePolicy {
   const canonical = profile?.toolChoicePolicy;
-  const legacy = legacyToolChoicePolicy(profile?.supportsToolChoice);
-  validateToolChoiceProfile(canonical, legacy, profile?.thinking);
-  return canonical ?? legacy ?? defaultWireProfile.toolChoicePolicy;
+  validateToolChoiceProfile(canonical, profile?.thinking);
+  return canonical ?? defaultWireProfile.toolChoicePolicy;
 }
 
 export function resolveWireProfile(profile: Partial<OpenAIWireProfile> | undefined): OpenAIWireProfile {
@@ -172,7 +157,7 @@ export function parseArguments(value: string): JsonValue {
     // Some OpenAI-compatible providers occasionally serialize the function
     // arguments object twice. Accept exactly one extra object layer, then let
     // the ordinary descriptor schema remain the authority. Never recursively
-    // unwrap strings or accept arrays/scalars through this compatibility path.
+    // unwrap strings or accept arrays/scalars through this provider-normalization path.
     try {
       const nested = JSON.parse(parsed) as unknown;
       return nested && typeof nested === "object" && !Array.isArray(nested)

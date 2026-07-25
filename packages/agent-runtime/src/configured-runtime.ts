@@ -11,7 +11,7 @@ import type {
   ContainerEngine,
   ContainerTarget,
   ExecutionBroker,
-  TrustedContainerLauncherV1
+  TrustedContainerLauncher
 } from "agent-execution";
 import type { HookDefinition, HookRunnerPort } from "agent-extensions";
 import { SegmentedJsonlStore } from "agent-store";
@@ -28,8 +28,8 @@ import { BrokerCommandHookRunner } from "./hook-runner.js";
 import { frozenHookExecutionRoot } from "./frozen-hook-assets.js";
 import { verifyWorkspaceCustomizationTrust } from "./workspace-customization-trust.js";
 import { createRoleGateways } from "./model-composition.js";
-import { createSubjectAttestationContextV1, type SubjectProductAttestationV1 } from "./subject-attestation.js";
-import { subjectConfigurationV1 } from "./subject-configuration.js";
+import { createSubjectAttestationContext, type SubjectProductAttestation } from "./subject-attestation.js";
+import { subjectConfiguration } from "./subject-configuration.js";
 import { brokerRuntimeEnvironment } from "./execution-capabilities.js";
 import { createConfiguredTools } from "./configured-runtime-tools.js";
 import {
@@ -65,7 +65,7 @@ export interface RuntimeCompositionConfig {
   networkMode?: "none" | "loopback" | "full";
   processHandoff?: "allow" | "deny";
   reviewerWaiver?: boolean;
-  legacySingleModelRoute?: boolean;
+  explicitSingleModelRoute?: boolean;
   modelSpecs?: readonly ModelSpecConfigValue[];
   modelRoutes?: readonly ModelRouteConfigValue[];
   budget?: {
@@ -81,13 +81,13 @@ export interface RuntimeFactoryDeps {
   executionBroker?: ExecutionBroker;
   /** Trusted product launcher input. Never derive this from workspace, model,
    * task metadata, CLI flags, or general environment variables. */
-  containerLauncher?: TrustedContainerLauncherV1;
+  containerLauncher?: TrustedContainerLauncher;
   hookDefinitions?: readonly HookDefinition[];
   hookRunner?: HookRunnerPort;
   agentProfileHookRunner?: HookRunnerPort;
   /** Trusted launcher input. CLI flags, environment variables, workspaces, and
    * evaluator inputs must never populate this contract. */
-  subjectProductAttestation?: SubjectProductAttestationV1;
+  subjectProductAttestation?: SubjectProductAttestation;
 }
 export interface ConfiguredRuntime {
   runtime: RuntimeClient;
@@ -112,9 +112,9 @@ function configuredSubjectAttestation(
     throw new Error("A trusted subject product attestation requires an explicit runtime surface.");
   }
   if (!deps.subjectProductAttestation || !options.surface) return undefined;
-  return createSubjectAttestationContextV1(
+  return createSubjectAttestationContext(
     deps.subjectProductAttestation,
-    subjectConfigurationV1(config),
+    subjectConfiguration(config),
     options.surface,
     brokerRuntimeEnvironment(executionReport).platform
   );

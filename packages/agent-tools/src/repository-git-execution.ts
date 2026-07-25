@@ -1,16 +1,16 @@
 import path from "node:path";
 import type { ToolExecutionContext } from "agent-protocol";
-import type { RepositoryMetadataLeaseV1 } from "agent-execution";
+import type { RepositoryMetadataLease } from "agent-execution";
 import {
   repositoryMetadataTopologyCandidate,
   runProcess,
   type ProcessExecutionPort,
-  type RepositoryTopologyV1
+  type RepositoryTopology
 } from "agent-platform";
 
 const GIT_NULL_DEVICE = process.platform === "win32" ? "NUL" : "/dev/null";
 
-export type RepositoryWorktreeTopology = RepositoryTopologyV1 & { worktreeRoot: string };
+export type RepositoryWorktreeTopology = RepositoryTopology & { worktreeRoot: string };
 
 export async function repositoryInspectionTopologyCandidate(
   context: Pick<ToolExecutionContext, "workspacePath" | "signal">
@@ -41,7 +41,7 @@ async function repositoryMetadataLease(
   execution: ProcessExecutionPort,
   topology: RepositoryWorktreeTopology,
   signal: AbortSignal
-): Promise<RepositoryMetadataLeaseV1> {
+): Promise<RepositoryMetadataLease> {
   if (!execution.acquireRepositoryMetadataLease) {
     throw Object.assign(new Error("The execution broker does not expose repository metadata leases."), {
       code: "repository_metadata_lease_unavailable"
@@ -64,7 +64,7 @@ export async function runLeasedRepositoryGit(
   signal: AbortSignal,
   maxOutputBytes: number
 ) {
-  // RepositoryMetadataLeaseV1 is consumed before broker validation/launch.
+  // RepositoryMetadataLease is consumed before broker validation/launch.
   // Every subprocess therefore needs a fresh capability.
   const lease = await repositoryMetadataLease(execution, topology, signal);
   return await runProcess({

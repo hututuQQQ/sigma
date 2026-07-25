@@ -2,7 +2,7 @@ import path from "node:path";
 import type { ProcessExecutionPort } from "agent-platform";
 import type { ToolPreparationContext } from "agent-protocol";
 import {
-  collectRepositoryInspectionV2,
+  collectRepositoryInspection,
   repositoryInspectionTopologyCandidate,
   type PlannedToolExecutionContext,
   type RepositoryRecoverySelectionStore,
@@ -68,7 +68,7 @@ export async function recoveryOperation(
       "Repository recovery selection was issued for a different repository root."
     ), { code: "repository_recovery_selection_stale" });
   }
-  const current = await collectRepositoryInspectionV2(execution, currentTopology, context.signal);
+  const current = await collectRepositoryInspection(execution, currentTopology, context.signal);
   const evidence = selected.evidence.data;
   const candidate = current.recoveryCandidates.find((item) =>
     item.candidateId === input.candidateId && item.object === selected.selectedObject);

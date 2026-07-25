@@ -21,7 +21,7 @@ export interface ModelCompositionConfig {
   streamIdleSec: number;
   streamActiveSec?: number;
   maxModelRetries?: number;
-  legacySingleModelRoute?: boolean;
+  explicitSingleModelRoute?: boolean;
   modelSpecs?: readonly ModelSpecConfigValue[];
   modelRoutes?: readonly ModelRouteConfigValue[];
   budget?: { maxCostMicroUsd: number };
@@ -58,13 +58,13 @@ function hasCredential(provider: ModelSpec["providerId"], env: NodeJS.ProcessEnv
 }
 
 export function productionModelCandidates(
-  config: Pick<ModelCompositionConfig, "provider" | "model" | "legacySingleModelRoute">,
+  config: Pick<ModelCompositionConfig, "provider" | "model" | "explicitSingleModelRoute">,
   env: NodeJS.ProcessEnv = process.env
 ): ModelSpec[] {
   const model = config.model === "auto" ? defaultModel(config.provider, env) : config.model;
   const primary = builtinModelSpec(config.provider, model);
   if (!primary) return [];
-  if (config.legacySingleModelRoute) return [primary];
+  if (config.explicitSingleModelRoute) return [primary];
   return [
     primary,
     ...BUILTIN_MODEL_SPECS.filter((spec) => spec.id !== primary.id && hasCredential(spec.providerId, env))
@@ -138,7 +138,7 @@ function catalog(
   available.set(primary.id, primary);
   const explicitRoutes = (config.modelRoutes ?? []).map(configuredRoute);
   let routes: ModelRoute[];
-  if (config.legacySingleModelRoute) {
+  if (config.explicitSingleModelRoute) {
     routes = [{ id: "default", candidates: [primary.id], fallbackOn: FALLBACK_ON, maxAttempts: 1 }];
   } else if (explicitRoutes.length > 0) {
     routes = explicitRoutes;

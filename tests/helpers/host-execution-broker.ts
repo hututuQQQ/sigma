@@ -13,15 +13,15 @@ import type {
   ProcessHandle,
   ProcessPollResult,
   ProcessSpawnRequest,
-  RepositoryMetadataLeaseRequestV1,
-  RepositoryMetadataLeaseV1,
-  RepositoryOperationV2,
-  RepositoryRunBaselineRequestV1,
-  RepositoryRunBaselineResultV1,
-  RepositoryTransactionBeginRequestV2,
-  RepositoryTransactionBoundRequestV2, RepositoryTransactionContinueRequestV2,
-  RepositoryTransactionLeaseRequestV2, RepositoryTransactionLeaseV2,
-  RepositoryTransactionRecoverRequestV2, RepositoryTransactionResultV2
+  RepositoryMetadataLeaseRequest,
+  RepositoryMetadataLease,
+  RepositoryOperation,
+  RepositoryRunBaselineRequest,
+  RepositoryRunBaselineResult,
+  RepositoryTransactionBeginRequest,
+  RepositoryTransactionBoundRequest, RepositoryTransactionContinueRequest,
+  RepositoryTransactionLeaseRequest, RepositoryTransactionLease,
+  RepositoryTransactionRecoverRequest, RepositoryTransactionResult
 } from "../../packages/agent-execution/src/index.js";
 import { createMinimalEnvironment } from "../../packages/agent-execution/src/index.js";
 
@@ -47,7 +47,7 @@ interface HostProcess {
 }
 
 interface HostRepositorySnapshot {
-  lease: RepositoryTransactionLeaseV2;
+  lease: RepositoryTransactionLease;
   snapshotRoot: string;
   externalMetadataSnapshot?: string;
 }
@@ -112,20 +112,20 @@ export class HostExecutionBroker implements ExecutionBroker {
   readonly lostProcessHandles: readonly ProcessHandle[] = [];
   private readonly instanceId = `test-host-${randomUUID()}`;
   private readonly processes = new Map<string, HostProcess>();
-  private readonly repositoryLeases = new Map<string, RepositoryTransactionLeaseV2>();
+  private readonly repositoryLeases = new Map<string, RepositoryTransactionLease>();
   private readonly repositoryRunBaselines = new Map<string, HostRepositorySnapshot & {
     baselineId: string;
     restoreCapability: string;
   }>();
   private readonly repositoryTransactions = new Map<string, {
     handle: string;
-    lease: RepositoryTransactionLeaseV2;
+    lease: RepositoryTransactionLease;
     snapshotRoot: string;
     externalMetadataSnapshot?: string;
-    operations: RepositoryOperationV2[];
-    expectedPostconditions?: RepositoryTransactionBeginRequestV2["expectedPostconditions"];
+    operations: RepositoryOperation[];
+    expectedPostconditions?: RepositoryTransactionBeginRequest["expectedPostconditions"];
     next: number;
-    pending?: RepositoryOperationV2;
+    pending?: RepositoryOperation;
     output: string[];
   }>();
 
@@ -133,9 +133,9 @@ export class HostExecutionBroker implements ExecutionBroker {
   async doctor(): Promise<BrokerDoctorReport> { return this.report(); }
 
   async acquireRepositoryMetadataLease(
-    request: RepositoryMetadataLeaseRequestV1,
+    request: RepositoryMetadataLeaseRequest,
     options: BrokerRequestOptions = {}
-  ): Promise<RepositoryMetadataLeaseV1> {
+  ): Promise<RepositoryMetadataLease> {
     options.signal?.throwIfAborted();
     return {
       ...request,
@@ -146,9 +146,9 @@ export class HostExecutionBroker implements ExecutionBroker {
   }
 
   async acquireRepositoryTransactionLease(
-    request: RepositoryTransactionLeaseRequestV2,
+    request: RepositoryTransactionLeaseRequest,
     options: BrokerRequestOptions = {}
-  ): Promise<RepositoryTransactionLeaseV2> {
+  ): Promise<RepositoryTransactionLease> {
     options.signal?.throwIfAborted();
     if (request.maxSnapshotFiles !== undefined || request.maxSnapshotBytes !== undefined) {
       const size = async (root: string): Promise<{ files: number; bytes: number }> => {
@@ -175,7 +175,7 @@ export class HostExecutionBroker implements ExecutionBroker {
         });
       }
     }
-    const baseLease: RepositoryTransactionLeaseV2 = {
+    const baseLease: RepositoryTransactionLease = {
       ...request,
       leaseId: `test-transaction-lease-${randomUUID()}`,
       executableSha256: "b".repeat(64),
@@ -191,7 +191,7 @@ export class HostExecutionBroker implements ExecutionBroker {
       };
       this.repositoryRunBaselines.set(key, baseline);
     }
-    const lease: RepositoryTransactionLeaseV2 = {
+    const lease: RepositoryTransactionLease = {
       ...baseLease,
       runBaseline: {
         schemaVersion: 1,
@@ -204,15 +204,15 @@ export class HostExecutionBroker implements ExecutionBroker {
   }
 
   private repositoryRunBaselineKey(request: Pick<
-    RepositoryRunBaselineRequestV1, "sessionId" | "runId" | "repositoryRoot"
+    RepositoryRunBaselineRequest, "sessionId" | "runId" | "repositoryRoot"
   >): string {
     return `${request.sessionId}\0${request.runId}\0${path.resolve(request.repositoryRoot)}`;
   }
 
   private async createRepositorySnapshot(
-    lease: RepositoryTransactionLeaseV2
+    lease: RepositoryTransactionLease
   ): Promise<HostRepositorySnapshot> {
-    const temporary = await mkdtemp(path.join(os.tmpdir(), "sigma-host-repository-v2-"));
+    const temporary = await mkdtemp(path.join(os.tmpdir(), "sigma-host-repository-"));
     await cp(lease.repositoryRoot, path.join(temporary, "worktree"), { recursive: true });
     const commonInsideRoot = path.relative(lease.repositoryRoot, lease.commonDir);
     const external = commonInsideRoot === ".." || commonInsideRoot.startsWith(`..${path.sep}`)
@@ -226,7 +226,7 @@ export class HostExecutionBroker implements ExecutionBroker {
   }
 
   private gitTransactionCommand(transaction: {
-    lease: RepositoryTransactionLeaseV2;
+    lease: RepositoryTransactionLease;
   }, args: string[]): { exitCode: number; stdout: string; stderr: string } {
     try {
       const stdout = execFileSync("git", [
@@ -262,7 +262,7 @@ export class HostExecutionBroker implements ExecutionBroker {
     }
   }
 
-  private hostConflictCount(transaction: { lease: RepositoryTransactionLeaseV2 }): number {
+  private hostConflictCount(transaction: { lease: RepositoryTransactionLease }): number {
     const result = this.gitTransactionCommand(transaction, ["ls-files", "--unmerged"]);
     if (result.exitCode !== 0) throw Object.assign(new Error(result.stderr), {
       code: "repository_state_unavailable"
@@ -270,7 +270,7 @@ export class HostExecutionBroker implements ExecutionBroker {
     return new Set(result.stdout.split(/\r?\n/u).filter(Boolean).map((line) => line.split("\t")[1])).size;
   }
 
-  private continuation(operation: RepositoryOperationV2): string[] {
+  private continuation(operation: RepositoryOperation): string[] {
     switch (operation.operationClass) {
       case "merge": return ["merge", "--continue"];
       case "rebase": return ["rebase", "--continue"];
@@ -283,8 +283,8 @@ export class HostExecutionBroker implements ExecutionBroker {
   }
 
   private async hostSemanticAssertions(transaction: {
-    lease: RepositoryTransactionLeaseV2;
-    expectedPostconditions?: RepositoryTransactionBeginRequestV2["expectedPostconditions"];
+    lease: RepositoryTransactionLease;
+    expectedPostconditions?: RepositoryTransactionBeginRequest["expectedPostconditions"];
   }) {
     const command = (args: string[], missing = false): string | null => {
       const result = this.gitTransactionCommand(transaction, args);
@@ -323,7 +323,7 @@ export class HostExecutionBroker implements ExecutionBroker {
       targetAssertions = { ...expected, satisfied: true as const };
     }
     return {
-      schemaVersion: 3 as const,
+      schemaVersion: 1 as const,
       head,
       symbolicRef,
       refsDigest: digest(refs),
@@ -341,11 +341,11 @@ export class HostExecutionBroker implements ExecutionBroker {
   }
 
   private async applyHostTransaction(transaction: {
-    handle: string; lease: RepositoryTransactionLeaseV2; snapshotRoot: string;
-    externalMetadataSnapshot?: string; operations: RepositoryOperationV2[];
-    expectedPostconditions?: RepositoryTransactionBeginRequestV2["expectedPostconditions"];
-    next: number; pending?: RepositoryOperationV2; output: string[];
-  }): Promise<RepositoryTransactionResultV2> {
+    handle: string; lease: RepositoryTransactionLease; snapshotRoot: string;
+    externalMetadataSnapshot?: string; operations: RepositoryOperation[];
+    expectedPostconditions?: RepositoryTransactionBeginRequest["expectedPostconditions"];
+    next: number; pending?: RepositoryOperation; output: string[];
+  }): Promise<RepositoryTransactionResult> {
     while (transaction.next < transaction.operations.length) {
       const operation = transaction.operations[transaction.next]!;
       const result = this.gitTransactionCommand(transaction, operation.args);
@@ -357,7 +357,7 @@ export class HostExecutionBroker implements ExecutionBroker {
           transaction.pending = operation;
           transaction.next += 1;
           return {
-            protocolVersion: 2, status: "conflicts_pending",
+            protocolVersion: 1, status: "conflicts_pending",
             transactionHandle: transaction.handle, operation: operation.operationClass,
             conflictCount: conflicts, output: transaction.output.join("\n"), rollbackState: "journaled"
           };
@@ -369,7 +369,7 @@ export class HostExecutionBroker implements ExecutionBroker {
     }
     try {
       return {
-        protocolVersion: 3, status: "completed_pending_seal",
+        protocolVersion: 1, status: "completed_pending_seal",
         transactionHandle: transaction.handle, conflictCount: 0,
         output: transaction.output.join("\n"), rollbackState: "journaled",
         semanticAssertions: await this.hostSemanticAssertions(transaction)
@@ -381,9 +381,9 @@ export class HostExecutionBroker implements ExecutionBroker {
   }
 
   async beginRepositoryTransaction(
-    request: RepositoryTransactionBeginRequestV2,
+    request: RepositoryTransactionBeginRequest,
     options: BrokerRequestOptions = {}
-  ): Promise<RepositoryTransactionResultV2> {
+  ): Promise<RepositoryTransactionResult> {
     options.signal?.throwIfAborted();
     const lease = this.repositoryLeases.get(request.leaseId);
     if (!lease) throw Object.assign(new Error("invalid lease"), {
@@ -408,9 +408,9 @@ export class HostExecutionBroker implements ExecutionBroker {
   }
 
   async continueRepositoryTransaction(
-    request: RepositoryTransactionContinueRequestV2,
+    request: RepositoryTransactionContinueRequest,
     options: BrokerRequestOptions = {}
-  ): Promise<RepositoryTransactionResultV2> {
+  ): Promise<RepositoryTransactionResult> {
     options.signal?.throwIfAborted();
     const transaction = this.boundHostTransaction(request);
     for (const operation of request.operations ?? []) {
@@ -422,7 +422,7 @@ export class HostExecutionBroker implements ExecutionBroker {
     }
     if (this.hostConflictCount(transaction) > 0) {
       return {
-        protocolVersion: 2, status: "conflicts_pending",
+        protocolVersion: 1, status: "conflicts_pending",
         transactionHandle: transaction.handle, operation: transaction.pending?.operationClass,
         conflictCount: this.hostConflictCount(transaction), rollbackState: "journaled"
       };
@@ -436,7 +436,7 @@ export class HostExecutionBroker implements ExecutionBroker {
     return await this.applyHostTransaction(transaction);
   }
 
-  private boundHostTransaction(request: RepositoryTransactionBoundRequestV2) {
+  private boundHostTransaction(request: RepositoryTransactionBoundRequest) {
     const transaction = this.repositoryTransactions.get(request.transactionHandle);
     if (!transaction || transaction.lease.sessionId !== request.sessionId
       || transaction.lease.runId !== request.runId) {
@@ -448,7 +448,7 @@ export class HostExecutionBroker implements ExecutionBroker {
   }
 
   private async restoreHostTransaction(transaction: {
-    handle: string; lease: RepositoryTransactionLeaseV2; snapshotRoot: string;
+    handle: string; lease: RepositoryTransactionLease; snapshotRoot: string;
     externalMetadataSnapshot?: string;
   }): Promise<void> {
     await this.restoreRepositorySnapshot(transaction);
@@ -468,38 +468,38 @@ export class HostExecutionBroker implements ExecutionBroker {
   }
 
   async abortRepositoryTransaction(
-    request: RepositoryTransactionBoundRequestV2
-  ): Promise<RepositoryTransactionResultV2> {
+    request: RepositoryTransactionBoundRequest
+  ): Promise<RepositoryTransactionResult> {
     const transaction = this.boundHostTransaction(request);
     await this.restoreHostTransaction(transaction);
     return {
-      protocolVersion: 2, status: "aborted", transactionHandle: request.transactionHandle,
+      protocolVersion: 1, status: "aborted", transactionHandle: request.transactionHandle,
       rollbackState: "restored", gitAbortSucceeded: false
     };
   }
 
   async sealRepositoryTransaction(
-    request: RepositoryTransactionBoundRequestV2
-  ): Promise<RepositoryTransactionResultV2> {
+    request: RepositoryTransactionBoundRequest
+  ): Promise<RepositoryTransactionResult> {
     const transaction = this.boundHostTransaction(request);
     await rm(transaction.snapshotRoot, { recursive: true, force: true });
     this.repositoryTransactions.delete(transaction.handle);
-    return { protocolVersion: 2, status: "sealed", transactionHandle: request.transactionHandle };
+    return { protocolVersion: 1, status: "sealed", transactionHandle: request.transactionHandle };
   }
 
   async recoverRepositoryTransactions(
-    request: RepositoryTransactionRecoverRequestV2
-  ): Promise<RepositoryTransactionResultV2> {
+    request: RepositoryTransactionRecoverRequest
+  ): Promise<RepositoryTransactionResult> {
     const matches = [...this.repositoryTransactions.values()].filter((transaction) =>
       transaction.lease.sessionId === request.sessionId
       && (request.runId === undefined || transaction.lease.runId === request.runId));
     for (const transaction of matches) await this.restoreHostTransaction(transaction);
-    return { protocolVersion: 2, status: "recovered", recovered: matches.length };
+    return { protocolVersion: 1, status: "recovered", recovered: matches.length };
   }
 
   async restoreRepositoryRunBaseline(
-    request: RepositoryRunBaselineRequestV1
-  ): Promise<RepositoryRunBaselineResultV1> {
+    request: RepositoryRunBaselineRequest
+  ): Promise<RepositoryRunBaselineResult> {
     const key = this.repositoryRunBaselineKey(request);
     const baseline = this.repositoryRunBaselines.get(key);
     if (!baseline) throw Object.assign(new Error("missing run baseline"), {
@@ -519,8 +519,8 @@ export class HostExecutionBroker implements ExecutionBroker {
   }
 
   async releaseRepositoryRunBaseline(
-    request: RepositoryRunBaselineRequestV1
-  ): Promise<RepositoryRunBaselineResultV1> {
+    request: RepositoryRunBaselineRequest
+  ): Promise<RepositoryRunBaselineResult> {
     const key = this.repositoryRunBaselineKey(request);
     const baseline = this.repositoryRunBaselines.get(key);
     if (!baseline) throw Object.assign(new Error("missing run baseline"), {

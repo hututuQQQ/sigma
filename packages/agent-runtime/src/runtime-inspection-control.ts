@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type {
-  ArtifactPageV1,
-  WorkspaceFrontierPageV1
+  ArtifactPage,
+  WorkspaceFrontierPage
 } from "agent-protocol";
 import {
   currentFrontierValidationStatus,
@@ -50,7 +50,7 @@ export class RuntimeInspectionControl {
   readWorkspaceFrontier(
     session: RuntimeSession,
     input: { cursor?: string; limit?: number } = {}
-  ): WorkspaceFrontierPageV1 {
+  ): WorkspaceFrontierPage {
     const frontier = session.durable.state.mutationFrontier;
     const workspacePaths = [...frontier.changedPaths].sort();
     const environmentPaths = [...(frontier.environmentChangedPaths ?? [])].sort();
@@ -94,7 +94,7 @@ export class RuntimeInspectionControl {
   async readArtifact(
     session: RuntimeSession,
     input: { artifactId: string; offsetBytes?: number; maxBytes?: number }
-  ): Promise<ArtifactPageV1> {
+  ): Promise<ArtifactPage> {
     const lifecycleArtifacts = sessionProcessSettlementEvidence(session).flatMap((item) => {
       const diagnostic = item.data.diagnostic;
       if (!diagnostic || typeof diagnostic !== "object" || Array.isArray(diagnostic)) return [];
@@ -128,7 +128,7 @@ export class RuntimeInspectionControl {
   private artifactPage(
     input: { artifactId: string; offsetBytes?: number; maxBytes?: number },
     bytes: Buffer
-  ): ArtifactPageV1 {
+  ): ArtifactPage {
     const offset = input.offsetBytes === undefined ? 0 : Math.trunc(input.offsetBytes);
     const maximum = input.maxBytes === undefined
       ? 8 * 1_024 : Math.min(64 * 1_024, Math.max(1, Math.trunc(input.maxBytes)));
@@ -138,7 +138,7 @@ export class RuntimeInspectionControl {
       });
     }
     let end = Math.min(bytes.length, offset + maximum);
-    let encoding: ArtifactPageV1["encoding"] = "utf8";
+    let encoding: ArtifactPage["encoding"] = "utf8";
     let content = "";
     for (let trim = 0; trim <= 3; trim += 1) {
       try {

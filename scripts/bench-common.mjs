@@ -7,7 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   assertUniqueHarborTaskExecutionIdentities,
-  buildResolvedTaskAttestationV2,
+  buildResolvedTaskAttestation,
   harborTaskExecutionIdentity,
   harborTaskExecutionIdentitySha256,
   projectHarborTaskConfig,
@@ -18,7 +18,7 @@ import {
 
 export {
   assertUniqueHarborTaskExecutionIdentities,
-  buildResolvedTaskAttestationV2,
+  buildResolvedTaskAttestation,
   harborTaskExecutionIdentity,
   harborTaskExecutionIdentitySha256,
   projectHarborTaskConfig,
@@ -1828,13 +1828,11 @@ async function runSlotIntegrityReasons(runDir, config) {
     } else if (typeof slot.resolved_task_attestation_path === "string") {
       const attestationPath = path.resolve(runDir, slot.resolved_task_attestation_path);
       const attestation = await readJsonSafe(attestationPath);
-      if (attestation.schema_version === 2) {
-        if (attestation.job_config_sha256 !== slot.job_config_sha256
-          || attestation.task_selection_sha256 !== config.task_selection_sha256) {
-          reasons.push(`Harbor run slot ${slot.run_slot} V2 attestation does not match frozen controls.`);
-        }
-      } else if (attestation.schema_version !== 1) {
+      if (attestation.schema_version !== 1) {
         reasons.push(`Harbor run slot ${slot.run_slot} task attestation is missing or unsupported.`);
+      } else if (attestation.job_config_sha256 !== slot.job_config_sha256
+        || attestation.task_selection_sha256 !== config.task_selection_sha256) {
+        reasons.push(`Harbor run slot ${slot.run_slot} attestation does not match frozen controls.`);
       }
     }
   }

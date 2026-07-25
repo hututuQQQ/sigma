@@ -3,7 +3,7 @@ import type {
   ModelGateway,
   ModelMessage,
   ModelRequest,
-  StrategyResetV2,
+  StrategyReset,
   UsageRecord
 } from "agent-protocol";
 import { mutationFrontierHasChanges } from "agent-kernel";
@@ -22,7 +22,7 @@ import {
   strategistTrigger,
   strategyBasisDigest,
   strategyMessages,
-  type StrategyTriggerV2
+  type StrategyTrigger
 } from "./long-horizon-strategy.js";
 import {
   nextLongHorizonState,
@@ -64,7 +64,7 @@ interface PreparedStrategist {
 
 interface StrategistExecution {
   usage: UsageRecord;
-  strategy: StrategyResetV2;
+  strategy: StrategyReset;
 }
 
 const MAX_STRATEGY_OUTPUT_TOKENS = 4_096;
@@ -165,13 +165,6 @@ export class LongHorizonCoordinator {
     return true;
   }
 
-  /**
-   * V9 used this hook to force the next tool action after a heuristic
-   * checkpoint. V10 retains the call site for snapshot compatibility but has
-   * no semantic action requirement to consume.
-   */
-  async markActionRequiredConsumed(_session: RuntimeSession): Promise<void> {}
-
   async markRepairTurnConsumed(session: RuntimeSession): Promise<void> {
     const state = session.durable.state.longHorizon;
     const remaining = state.assurance.protectedRepairTurnsRemaining;
@@ -205,7 +198,7 @@ export class LongHorizonCoordinator {
   private async runStrategist(
     session: RuntimeSession,
     signal: AbortSignal,
-    trigger: StrategyTriggerV2
+    trigger: StrategyTrigger
   ): Promise<void> {
     const prepared = await this.prepareStrategist(session, trigger);
     if (!prepared) return;
@@ -239,7 +232,7 @@ export class LongHorizonCoordinator {
 
   private async prepareStrategist(
     session: RuntimeSession,
-    trigger: StrategyTriggerV2
+    trigger: StrategyTrigger
   ): Promise<PreparedStrategist | undefined> {
     const gateway = this.options.runtime.gatewayForRole?.("planner", session.services.profile)
       ?? session.services.gateway;
@@ -282,7 +275,7 @@ export class LongHorizonCoordinator {
     signal: AbortSignal,
     requestId: string,
     prepared: PreparedStrategist,
-    trigger: StrategyTriggerV2
+    trigger: StrategyTrigger
   ): Promise<StrategistExecution> {
     const startedAt = performance.now();
     const basis = strategyBasisDigest(session);
@@ -347,7 +340,7 @@ export class LongHorizonCoordinator {
 
   private async persistStrategy(
     session: RuntimeSession,
-    strategy: StrategyResetV2
+    strategy: StrategyReset
   ): Promise<void> {
     const accounted = withAccountedAssurance(
       session,

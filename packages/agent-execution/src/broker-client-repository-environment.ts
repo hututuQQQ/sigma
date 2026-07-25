@@ -15,17 +15,17 @@ import { requestRepositoryMetadataLease } from "./broker-client-repository-lease
 import type { RepositoryOperationMethod } from "./repository-execution-broker-base.js";
 import type {
   BrokerRequestOptions,
-  RepositoryMetadataLeaseRequestV1,
-  RepositoryRunBaselineLeaseV1,
-  RepositoryRunBaselineRequestV1,
-  RepositoryRunBaselineResultV1,
-  RepositoryTransactionBeginRequestV2,
-  RepositoryTransactionBoundRequestV2,
-  RepositoryTransactionContinueRequestV2,
-  RepositoryTransactionLeaseRequestV2,
-  RepositoryTransactionLeaseV2,
-  RepositoryTransactionRecoverRequestV2,
-  RepositoryTransactionResultV2
+  RepositoryMetadataLeaseRequest,
+  RepositoryRunBaselineLease,
+  RepositoryRunBaselineRequest,
+  RepositoryRunBaselineResult,
+  RepositoryTransactionBeginRequest,
+  RepositoryTransactionBoundRequest,
+  RepositoryTransactionContinueRequest,
+  RepositoryTransactionLeaseRequest,
+  RepositoryTransactionLease,
+  RepositoryTransactionRecoverRequest,
+  RepositoryTransactionResult
 } from "./types.js";
 
 export async function invokeBrokerClientRepositoryOperation(
@@ -38,42 +38,42 @@ export async function invokeBrokerClientRepositoryOperation(
   switch (method) {
     case "acquireRepositoryMetadataLease":
       return await requestRepositoryMetadataLease(
-        transport, request as RepositoryMetadataLeaseRequestV1, options
+        transport, request as RepositoryMetadataLeaseRequest, options
       );
     case "acquireRepositoryTransactionLease":
       return await environment.acquireTransactionLease(
-        request as RepositoryTransactionLeaseRequestV2, options
+        request as RepositoryTransactionLeaseRequest, options
       );
     case "beginRepositoryTransaction":
-      return await environment.beginTransaction(request as RepositoryTransactionBeginRequestV2, options);
+      return await environment.beginTransaction(request as RepositoryTransactionBeginRequest, options);
     case "continueRepositoryTransaction":
-      return await environment.continueTransaction(request as RepositoryTransactionContinueRequestV2, options);
+      return await environment.continueTransaction(request as RepositoryTransactionContinueRequest, options);
     case "abortRepositoryTransaction":
-      return await environment.abortTransaction(request as RepositoryTransactionBoundRequestV2, options);
+      return await environment.abortTransaction(request as RepositoryTransactionBoundRequest, options);
     case "recoverRepositoryTransactions":
-      return await environment.recoverTransactions(request as RepositoryTransactionRecoverRequestV2, options);
+      return await environment.recoverTransactions(request as RepositoryTransactionRecoverRequest, options);
     case "sealRepositoryTransaction":
-      return await environment.sealTransaction(request as RepositoryTransactionBoundRequestV2, options);
+      return await environment.sealTransaction(request as RepositoryTransactionBoundRequest, options);
     case "restoreRepositoryRunBaseline":
-      return await environment.restoreRunBaseline(request as RepositoryRunBaselineRequestV1, options);
+      return await environment.restoreRunBaseline(request as RepositoryRunBaselineRequest, options);
     case "releaseRepositoryRunBaseline":
-      return await environment.releaseRunBaseline(request as RepositoryRunBaselineRequestV1, options);
+      return await environment.releaseRunBaseline(request as RepositoryRunBaselineRequest, options);
   }
 }
 
 /** Retains broker-only restore capabilities outside model-visible tool data. */
 export class BrokerRepositoryEnvironmentClient {
   private readonly runBaselines = new Map<string, {
-    binding: RepositoryRunBaselineLeaseV1;
-    request: RepositoryRunBaselineRequestV1;
+    binding: RepositoryRunBaselineLease;
+    request: RepositoryRunBaselineRequest;
   }>();
 
   constructor(private readonly transport: BrokerTransport) {}
 
   async acquireTransactionLease(
-    request: RepositoryTransactionLeaseRequestV2,
+    request: RepositoryTransactionLeaseRequest,
     options: BrokerRequestOptions
-  ): Promise<RepositoryTransactionLeaseV2> {
+  ): Promise<RepositoryTransactionLease> {
     const lease = await acquireRepositoryTransactionLease(this.transport, request, options);
     if (lease.runBaseline) {
       this.runBaselines.set(this.baselineKey(request), {
@@ -91,69 +91,69 @@ export class BrokerRepositoryEnvironmentClient {
   }
 
   async beginTransaction(
-    request: RepositoryTransactionBeginRequestV2,
+    request: RepositoryTransactionBeginRequest,
     options: BrokerRequestOptions
-  ): Promise<RepositoryTransactionResultV2> {
+  ): Promise<RepositoryTransactionResult> {
     return await beginRepositoryTransaction(this.transport, request, {
       ...options, timeoutMs: options.timeoutMs ?? 600_000
     });
   }
 
   async continueTransaction(
-    request: RepositoryTransactionContinueRequestV2,
+    request: RepositoryTransactionContinueRequest,
     options: BrokerRequestOptions
-  ): Promise<RepositoryTransactionResultV2> {
+  ): Promise<RepositoryTransactionResult> {
     return await continueRepositoryTransaction(this.transport, request, {
       ...options, timeoutMs: options.timeoutMs ?? 600_000
     });
   }
 
   async abortTransaction(
-    request: RepositoryTransactionBoundRequestV2,
+    request: RepositoryTransactionBoundRequest,
     options: BrokerRequestOptions
-  ): Promise<RepositoryTransactionResultV2> {
+  ): Promise<RepositoryTransactionResult> {
     return await abortRepositoryTransaction(this.transport, request, {
       ...options, timeoutMs: options.timeoutMs ?? 120_000
     });
   }
 
   async recoverTransactions(
-    request: RepositoryTransactionRecoverRequestV2,
+    request: RepositoryTransactionRecoverRequest,
     options: BrokerRequestOptions
-  ): Promise<RepositoryTransactionResultV2> {
+  ): Promise<RepositoryTransactionResult> {
     return await recoverRepositoryTransactions(this.transport, request, {
       ...options, timeoutMs: options.timeoutMs ?? 120_000
     });
   }
 
   async sealTransaction(
-    request: RepositoryTransactionBoundRequestV2,
+    request: RepositoryTransactionBoundRequest,
     options: BrokerRequestOptions
-  ): Promise<RepositoryTransactionResultV2> {
+  ): Promise<RepositoryTransactionResult> {
     return await sealRepositoryTransaction(this.transport, request, options);
   }
 
   async restoreRunBaseline(
-    request: RepositoryRunBaselineRequestV1,
+    request: RepositoryRunBaselineRequest,
     options: BrokerRequestOptions
-  ): Promise<RepositoryRunBaselineResultV1> {
+  ): Promise<RepositoryRunBaselineResult> {
     return await this.consumeRunBaseline(request, "restore", options);
   }
 
   async releaseRunBaseline(
-    request: RepositoryRunBaselineRequestV1,
+    request: RepositoryRunBaselineRequest,
     options: BrokerRequestOptions
-  ): Promise<RepositoryRunBaselineResultV1> {
+  ): Promise<RepositoryRunBaselineResult> {
     return await this.consumeRunBaseline(request, "release", options);
   }
 
   clear(): void { this.runBaselines.clear(); }
 
   private async consumeRunBaseline(
-    request: RepositoryRunBaselineRequestV1,
+    request: RepositoryRunBaselineRequest,
     action: "restore" | "release",
     options: BrokerRequestOptions
-  ): Promise<RepositoryRunBaselineResultV1> {
+  ): Promise<RepositoryRunBaselineResult> {
     const key = this.baselineKey(request);
     const cached = this.runBaselines.get(key);
     if (!cached) {
@@ -181,7 +181,7 @@ export class BrokerRepositoryEnvironmentClient {
   }
 
   private baselineKey(request: Pick<
-    RepositoryRunBaselineRequestV1, "sessionId" | "runId" | "repositoryRoot"
+    RepositoryRunBaselineRequest, "sessionId" | "runId" | "repositoryRoot"
   >): string {
     return `${request.sessionId}\0${request.runId}\0${path.resolve(request.repositoryRoot)}`;
   }

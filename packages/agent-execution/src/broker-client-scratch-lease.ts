@@ -2,8 +2,8 @@ import { BrokerTransport } from "./broker-transport.js";
 import { BrokerPolicyError, BrokerProtocolError } from "./errors.js";
 import type {
   BrokerRequestOptions,
-  ScratchLeaseRequestV1,
-  ScratchLeaseV1
+  ScratchLeaseRequest,
+  ScratchLease
 } from "./types.js";
 import { parseScratchLease } from "./values.js";
 
@@ -15,11 +15,11 @@ function assertSessionId(sessionId: string): void {
 
 export async function requestScratchLease(
   transport: BrokerTransport,
-  request: ScratchLeaseRequestV1,
+  request: ScratchLeaseRequest,
   options: BrokerRequestOptions
-): Promise<ScratchLeaseV1> {
+): Promise<ScratchLease> {
   if (request.protocolVersion !== 1) {
-    throw new BrokerPolicyError("Scratch lease requests must use protocol V1.");
+    throw new BrokerPolicyError("Scratch lease requests must use protocol version 1.");
   }
   assertSessionId(request.sessionId);
   const lease = parseScratchLease(await transport.request("scratch.acquire", {
@@ -34,7 +34,7 @@ export async function requestScratchLease(
 
 export async function releaseScratchLease(
   transport: BrokerTransport,
-  lease: ScratchLeaseV1,
+  lease: ScratchLease,
   options: BrokerRequestOptions
 ): Promise<void> {
   assertSessionId(lease.sessionId);
@@ -50,14 +50,14 @@ export async function releaseScratchLease(
 }
 
 export class BrokerScratchLeaseClient {
-  private readonly leases = new Map<string, ScratchLeaseV1>();
+  private readonly leases = new Map<string, ScratchLease>();
 
   constructor(private readonly transport: BrokerTransport) {}
 
   clear(): void { this.leases.clear(); }
 
-  async acquire(request: ScratchLeaseRequestV1,
-    options: BrokerRequestOptions): Promise<ScratchLeaseV1> {
+  async acquire(request: ScratchLeaseRequest,
+    options: BrokerRequestOptions): Promise<ScratchLease> {
     const existing = this.leases.get(request.sessionId);
     if (existing) return existing;
     const lease = await requestScratchLease(this.transport, request, options);

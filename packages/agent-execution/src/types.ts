@@ -48,10 +48,10 @@ export interface ExecutionPolicy {
   readOnlyValidationWorkspaceRoot?: string;
   /** Broker-issued one-use capability for an exact local Git executable and
    * canonical repository topology. Model/tool arguments cannot mint it. */
-  repositoryMetadataLease?: RepositoryMetadataLeaseV1;
+  repositoryMetadataLease?: RepositoryMetadataLease;
   /** Runtime-only broker capability. Tool/model arguments cannot construct or
    * select its host paths or lease id. */
-  scratchLease?: ScratchLeaseV1;
+  scratchLease?: ScratchLease;
 }
 
 export interface ExecutionRequest {
@@ -99,9 +99,9 @@ export interface ProcessOutput {
     stream: "stdout" | "stderr"; code: "invalid_output_encoding" | "encoding_lossy"; message: string;
   }>;
   /** Authenticated native launch failure, when the sandbox launcher never reached the user process. */
-  failure?: ProcessLaunchFailureV1;
+  failure?: ProcessLaunchFailure;
 }
-export interface ProcessLaunchFailureV1 {
+export interface ProcessLaunchFailure {
   phase: "sandbox_launch";
   code: string;
   message: string;
@@ -183,11 +183,11 @@ export interface BrokerCapabilities {
    * PATH when the target resolves a bare executable name. */
   executableSearchPaths?: string[];
   /** Digest of broker-attested runtime data installed in the disposable
-   * target. It is absent for legacy/native brokers and cannot be supplied by
+   * target. It may be absent when the target has no packaged runtime data and cannot be supplied by
    * a model request. */
   runtimeDataDigest?: string;
   /** Connection-bound closure of the authenticated target runtime. */
-  runtimeClosure?: BrokerRuntimeClosureV1;
+  runtimeClosure?: BrokerRuntimeClosure;
   managedEnvironment?: BrokerManagedEnvironmentCapability;
 }
 
@@ -205,14 +205,14 @@ export interface BrokerDoctorReport {
 export interface TrustedContainerBrokerRequest {
   workspace: string;
   config: ContainerExecutionConfig;
-  managedAttestation?: TrustedManagedContainerAttestationV1;
+  managedAttestation?: TrustedManagedContainerAttestation;
 }
 
 /** Product/launcher dependency only. Never construct this value from CLI,
  * environment, workspace configuration, task metadata, or model output. */
-export interface TrustedContainerLauncherV1 {
+export interface TrustedContainerLauncher {
   protocolVersion: 1;
-  managedAttestation?: TrustedManagedContainerAttestationV1;
+  managedAttestation?: TrustedManagedContainerAttestation;
   createBroker(request: TrustedContainerBrokerRequest): ExecutionBroker;
 }
 
@@ -287,20 +287,20 @@ export interface ExecutionBroker extends RepositoryExecutionBroker {
   sandboxLeaseStatus?(workspacePath: string, signal?: AbortSignal): Promise<BrokerSandboxLeaseStatus>;
   revokeSandboxLease?(workspacePath: string, signal?: AbortSignal): Promise<BrokerSandboxRevokeResult>;
   acquireScratchLease?(
-    request: ScratchLeaseRequestV1,
+    request: ScratchLeaseRequest,
     options?: BrokerRequestOptions
-  ): Promise<ScratchLeaseV1>;
+  ): Promise<ScratchLease>;
   /** Idempotently ends a RuntimeSession lease after all of its processes have
    * reached a terminal state. */
   releaseScratchLease?(sessionId: string, options?: BrokerRequestOptions): Promise<void>;
   bindManagedSession?(
-    request: ManagedSessionBindingRequestV1,
+    request: ManagedSessionBindingRequest,
     options?: BrokerRequestOptions
-  ): Promise<ManagedSessionBindingV1>;
+  ): Promise<ManagedSessionBinding>;
   prepareManagedEnvironment?(
-    request: ManagedEnvironmentPrepareRequestV1,
+    request: ManagedEnvironmentPrepareRequest,
     options?: BrokerRequestOptions
-  ): Promise<ManagedEnvironmentPrepareResultV1>;
+  ): Promise<ManagedEnvironmentPrepareResult>;
   execute(request: ExecutionRequest, options?: BrokerRequestOptions): Promise<ExecutionResult>;
   spawn(request: ProcessSpawnRequest, options?: BrokerRequestOptions): Promise<ProcessHandle>;
   poll(handle: ProcessHandle, options?: BrokerRequestOptions): Promise<ProcessPollResult>;
@@ -342,58 +342,58 @@ export interface SigmaExecBrokerClientOptions {
   trustedToolchains?: TrustedToolchainManifestEntry[];
 }
 import type { Duplex } from "node:stream";
-import type { ScratchLeaseRequestV1, ScratchLeaseV1 } from "./scratch-lease-types.js";
-import type { RepositoryMetadataLeaseV1 } from "./repository-metadata-lease-types.js";
+import type { ScratchLeaseRequest, ScratchLease } from "./scratch-lease-types.js";
+import type { RepositoryMetadataLease } from "./repository-metadata-lease-types.js";
 import type { RepositoryExecutionBroker } from "./repository-execution-broker.js";
 import type {
-  ManagedEnvironmentPrepareRequestV1,
-  ManagedEnvironmentPrepareResultV1
+  ManagedEnvironmentPrepareRequest,
+  ManagedEnvironmentPrepareResult
 } from "./managed-environment-types.js";
 import type {
   BrokerContainerReport,
-  BrokerRuntimeClosureV1,
+  BrokerRuntimeClosure,
   ContainerExecutionConfig,
-  ManagedSessionBindingRequestV1,
-  ManagedSessionBindingV1,
-  TrustedManagedContainerAttestationV1
+  ManagedSessionBindingRequest,
+  ManagedSessionBinding,
+  TrustedManagedContainerAttestation
 } from "./container-types.js";
-export type { ScratchLeaseRequestV1, ScratchLeaseV1 } from "./scratch-lease-types.js";
+export type { ScratchLeaseRequest, ScratchLease } from "./scratch-lease-types.js";
 export type {
-  RepositoryMetadataLeaseRequestV1,
-  RepositoryMetadataLeaseV1
+  RepositoryMetadataLeaseRequest,
+  RepositoryMetadataLease
 } from "./repository-metadata-lease-types.js";
 export type {
-  RepositoryExpectedPostconditionsV3,
-  RepositoryOperationV2,
-  RepositoryRunBaselineLeaseV1,
-  RepositoryRunBaselineBoundRequestV1,
-  RepositoryRunBaselineRequestV1,
-  RepositoryRunBaselineResultV1,
-  RepositorySemanticAssertionsV3,
-  RepositoryTargetAssertionsV3,
-  RepositoryTransactionBeginRequestV2,
-  RepositoryTransactionBoundRequestV2,
-  RepositoryTransactionContinueRequestV2,
-  RepositoryTransactionLeaseRequestV2,
-  RepositoryTransactionLeaseV2,
-  RepositoryTransactionRecoverRequestV2,
-  RepositoryTransactionResultV2,
-  RepositoryTransactionResultV3
+  RepositoryExpectedPostconditions,
+  RepositoryOperation,
+  RepositoryRunBaselineLease,
+  RepositoryRunBaselineBoundRequest,
+  RepositoryRunBaselineRequest,
+  RepositoryRunBaselineResult,
+  RepositorySemanticAssertions,
+  RepositoryTargetAssertions,
+  RepositoryTransactionBeginRequest,
+  RepositoryTransactionBoundRequest,
+  RepositoryTransactionContinueRequest,
+  RepositoryTransactionLeaseRequest,
+  RepositoryTransactionLease,
+  RepositoryTransactionWireLease,
+  RepositoryTransactionRecoverRequest,
+  RepositoryTransactionResult
 } from "./repository-transaction-types.js";
 export type {
   BrokerContainerReport,
-  BrokerRuntimeClosureV1,
+  BrokerRuntimeClosure,
   ContainerEngine,
   ContainerExecutionConfig,
   ContainerTarget,
-  ManagedSessionBindingRequestV1,
-  ManagedSessionBindingV1,
+  ManagedSessionBindingRequest,
+  ManagedSessionBinding,
   ResolvedContainerEngine,
-  TrustedManagedContainerAttestationV1,
-  TrustedManagedEnvironmentProofV1
+  TrustedManagedContainerAttestation,
+  TrustedManagedEnvironmentProof
 } from "./container-types.js";
 export type {
-  ManagedEnvironmentPrepareRequestV1,
-  ManagedEnvironmentPrepareResultV1,
-  RuntimeDependencyObservationV1
+  ManagedEnvironmentPrepareRequest,
+  ManagedEnvironmentPrepareResult,
+  RuntimeDependencyObservation
 } from "./managed-environment-types.js";

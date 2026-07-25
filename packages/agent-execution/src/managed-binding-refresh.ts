@@ -1,14 +1,14 @@
 import type {
-  BrokerRuntimeClosureV1,
-  ManagedSessionBindingV1,
+  BrokerRuntimeClosure,
+  ManagedSessionBinding,
 } from "./types.js";
 import { stableSha256 } from "./container-attestation.js";
 
 /** Refresh the one broker-issued session capability in place so every holder
  * observes the authenticated post-prepare runtime closure. */
 export function refreshManagedSessionBinding(
-  binding: ManagedSessionBindingV1,
-  runtimeClosure: BrokerRuntimeClosureV1
+  binding: ManagedSessionBinding,
+  runtimeClosure: BrokerRuntimeClosure
 ): void {
   const payload = {
     protocolVersion: binding.protocolVersion,

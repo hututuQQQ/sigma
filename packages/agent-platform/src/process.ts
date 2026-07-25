@@ -3,25 +3,25 @@ import type {
   BrokerRequestOptions,
   ExecutionRequest,
   ExecutionResult,
-  ManagedEnvironmentPrepareRequestV1,
-  ManagedEnvironmentPrepareResultV1,
-  ManagedSessionBindingRequestV1,
-  ManagedSessionBindingV1,
-  ProcessLaunchFailureV1,
+  ManagedEnvironmentPrepareRequest,
+  ManagedEnvironmentPrepareResult,
+  ManagedSessionBindingRequest,
+  ManagedSessionBinding,
+  ProcessLaunchFailure,
   ProcessHandle,
   ProcessHandoffResult,
   ProcessPollResult,
-  RepositoryMetadataLeaseRequestV1,
-  RepositoryMetadataLeaseV1,
-  RepositoryTransactionBeginRequestV2,
-  RepositoryTransactionBoundRequestV2,
-  RepositoryTransactionContinueRequestV2,
-  RepositoryTransactionLeaseRequestV2,
-  RepositoryTransactionLeaseV2,
-  RepositoryTransactionRecoverRequestV2,
-  RepositoryTransactionResultV2
-  , RepositoryRunBaselineRequestV1
-  , RepositoryRunBaselineResultV1
+  RepositoryMetadataLeaseRequest,
+  RepositoryMetadataLease,
+  RepositoryTransactionBeginRequest,
+  RepositoryTransactionBoundRequest,
+  RepositoryTransactionContinueRequest,
+  RepositoryTransactionLeaseRequest,
+  RepositoryTransactionLease,
+  RepositoryTransactionRecoverRequest,
+  RepositoryTransactionResult
+  , RepositoryRunBaselineRequest
+  , RepositoryRunBaselineResult
 } from "agent-execution";
 import { BrokerCancelledError } from "agent-execution";
 import type { ShellKind } from "./environment.js";
@@ -41,40 +41,40 @@ export interface ProcessExecutionPort {
   /** Idempotently releases broker-owned scratch after every session process has settled. */
   releaseScratchLease?(sessionId: string, options?: BrokerRequestOptions): Promise<void>;
   bindManagedSession?(
-    request: ManagedSessionBindingRequestV1,
+    request: ManagedSessionBindingRequest,
     options?: BrokerRequestOptions
-  ): Promise<ManagedSessionBindingV1>;
+  ): Promise<ManagedSessionBinding>;
   prepareManagedEnvironment?(
-    request: ManagedEnvironmentPrepareRequestV1,
+    request: ManagedEnvironmentPrepareRequest,
     options?: BrokerRequestOptions
-  ): Promise<ManagedEnvironmentPrepareResultV1>;
+  ): Promise<ManagedEnvironmentPrepareResult>;
   acquireRepositoryMetadataLease?(
-    request: RepositoryMetadataLeaseRequestV1, options?: BrokerRequestOptions
-  ): Promise<RepositoryMetadataLeaseV1>;
+    request: RepositoryMetadataLeaseRequest, options?: BrokerRequestOptions
+  ): Promise<RepositoryMetadataLease>;
   acquireRepositoryTransactionLease?(
-    request: RepositoryTransactionLeaseRequestV2, options?: BrokerRequestOptions
-  ): Promise<RepositoryTransactionLeaseV2>;
+    request: RepositoryTransactionLeaseRequest, options?: BrokerRequestOptions
+  ): Promise<RepositoryTransactionLease>;
   beginRepositoryTransaction?(
-    request: RepositoryTransactionBeginRequestV2, options?: BrokerRequestOptions
-  ): Promise<RepositoryTransactionResultV2>;
+    request: RepositoryTransactionBeginRequest, options?: BrokerRequestOptions
+  ): Promise<RepositoryTransactionResult>;
   continueRepositoryTransaction?(
-    request: RepositoryTransactionContinueRequestV2, options?: BrokerRequestOptions
-  ): Promise<RepositoryTransactionResultV2>;
+    request: RepositoryTransactionContinueRequest, options?: BrokerRequestOptions
+  ): Promise<RepositoryTransactionResult>;
   abortRepositoryTransaction?(
-    request: RepositoryTransactionBoundRequestV2, options?: BrokerRequestOptions
-  ): Promise<RepositoryTransactionResultV2>;
+    request: RepositoryTransactionBoundRequest, options?: BrokerRequestOptions
+  ): Promise<RepositoryTransactionResult>;
   recoverRepositoryTransactions?(
-    request: RepositoryTransactionRecoverRequestV2, options?: BrokerRequestOptions
-  ): Promise<RepositoryTransactionResultV2>;
+    request: RepositoryTransactionRecoverRequest, options?: BrokerRequestOptions
+  ): Promise<RepositoryTransactionResult>;
   sealRepositoryTransaction?(
-    request: RepositoryTransactionBoundRequestV2, options?: BrokerRequestOptions
-  ): Promise<RepositoryTransactionResultV2>;
+    request: RepositoryTransactionBoundRequest, options?: BrokerRequestOptions
+  ): Promise<RepositoryTransactionResult>;
   restoreRepositoryRunBaseline?(
-    request: RepositoryRunBaselineRequestV1, options?: BrokerRequestOptions
-  ): Promise<RepositoryRunBaselineResultV1>;
+    request: RepositoryRunBaselineRequest, options?: BrokerRequestOptions
+  ): Promise<RepositoryRunBaselineResult>;
   releaseRepositoryRunBaseline?(
-    request: RepositoryRunBaselineRequestV1, options?: BrokerRequestOptions
-  ): Promise<RepositoryRunBaselineResultV1>;
+    request: RepositoryRunBaselineRequest, options?: BrokerRequestOptions
+  ): Promise<RepositoryRunBaselineResult>;
 }
 
 export interface ProcessRequest {
@@ -93,7 +93,7 @@ export interface ProcessRequest {
   protectedPaths?: string[];
   network?: "none" | "full";
   networkApproved?: boolean;
-  repositoryMetadataLease?: RepositoryMetadataLeaseV1;
+  repositoryMetadataLease?: RepositoryMetadataLease;
 }
 
 export interface ProcessResult {
@@ -106,7 +106,7 @@ export interface ProcessResult {
   stdoutLimitReached: boolean;
   outputTruncated: boolean;
   /** Authenticated sandbox launch failure when the user process never started. */
-  failure?: ProcessLaunchFailureV1;
+  failure?: ProcessLaunchFailure;
 }
 
 export class ProcessExecutionUnavailableError extends Error {

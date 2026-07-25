@@ -35,7 +35,7 @@ use crate::managed_server::{ManagedEnvironmentPrepareParams, ManagedServerContex
 
 static ARTIFACT_ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 pub(crate) const INTERNAL_LAUNCH_FAILURE_MARKER_PREFIX: &str =
-    "@@SIGMA_EXEC_INTERNAL_LAUNCH_FAILURE_V1@@";
+    "@@SIGMA_EXEC_INTERNAL_LAUNCH_FAILURE@@";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

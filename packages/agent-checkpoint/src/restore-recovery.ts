@@ -149,18 +149,12 @@ async function recoverUnfinishedTransaction(
   parsed: RecoveryJournal,
   lease: WorkspaceTransactionDirectoryLease
 ): Promise<void> {
-  if (parsed.schemaVersion !== 3) {
-    throw new CheckpointRecoveryError(
-      "Checkpoint recovery journal predates postimage identity checks and cannot be replayed safely.",
-      transactionPath
-    );
-  }
   parsed.phase = "rolling_back";
   await writeRecoveryJournal(transactionPath, parsed);
   for (const operation of [...parsed.operations].reverse()) {
     await recoverOperation(options, transactionPath, parsed, operation, lease);
   }
-  for (const directory of [...(parsed.directoryModes ?? [])]
+  for (const directory of [...parsed.directoryModes]
     .sort((left, right) => right.path.split("/").length - left.path.split("/").length)) {
     if (directory.currentMode === undefined) continue;
     const pinned = await pinCheckpointParent(options.workspacePath, directory.path);
@@ -186,12 +180,6 @@ async function finalizeVerifiedTransaction(
   parsed: RecoveryJournal,
   lease: WorkspaceTransactionDirectoryLease
 ): Promise<void> {
-  if (parsed.schemaVersion === 1 || !parsed.finalization) {
-    throw new CheckpointRecoveryError(
-      "Checkpoint restore is verified but its legacy journal cannot finalize the checkpoint record automatically.",
-      transactionPath
-    );
-  }
   await lease.verify();
   await options.finalize(parsed.finalization);
   await writeRecoveryJournal(transactionPath, { ...parsed, phase: "finalized" });

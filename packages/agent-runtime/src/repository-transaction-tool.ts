@@ -80,7 +80,7 @@ function transactionPlan(
     network: "none",
     processMode: "none",
     checkpointScope: [],
-    mutationAuthority: "broker_repository_transaction_v2",
+    mutationAuthority: "broker_repository_transaction",
     idempotence: "non_replayable"
   };
 }
@@ -135,7 +135,7 @@ async function conflictReceiptOrRestore(
   } catch (probeError) {
     try {
       const restored = await execution.abortRepositoryTransaction({
-        protocolVersion: 2,
+        protocolVersion: 1,
         transactionHandle: transaction.handle,
         sessionId: transaction.sessionId,
         runId: transaction.runId
@@ -177,7 +177,7 @@ async function beginTransaction(
     recoverySelection = recovery.binding;
     if (recovery.binding.integrationMode === "exact_head") {
       expectedPostconditions = {
-        schemaVersion: 3 as const,
+        schemaVersion: 1 as const,
         selectedHead: recovery.binding.selectedObject,
         selectedSymbolicRef: recovery.binding.selectedSymbolicRef,
         requiredReachableObjects: [recovery.binding.selectedObject]
@@ -187,7 +187,7 @@ async function beginTransaction(
   operations.forEach(gitOperationArgs);
   const before = await collectRepositoryEvidenceState(execution, topology, context.signal);
   const lease = await execution.acquireRepositoryTransactionLease({
-    protocolVersion: 2,
+    protocolVersion: 1,
     sessionId: context.sessionId,
     runId: context.runId,
     repositoryRoot: topology.worktreeRoot,
@@ -199,7 +199,7 @@ async function beginTransaction(
     ...(limits.maxBytes === undefined ? {} : { maxSnapshotBytes: limits.maxBytes })
   }, { signal: context.signal });
   const result = await execution.beginRepositoryTransaction({
-    protocolVersion: expectedPostconditions ? 3 : 2,
+    protocolVersion: 1,
     leaseId: lease.leaseId,
     operations: brokerOperations(operations),
     ...(expectedPostconditions ? { expectedPostconditions } : {})
@@ -238,7 +238,7 @@ async function continueTransaction(
 ): Promise<ToolReceipt> {
   const transaction = pendingForInput(pending, input, context);
   const result = await execution.continueRepositoryTransaction({
-    protocolVersion: 2,
+    protocolVersion: 1,
     transactionHandle: transaction.handle,
     sessionId: context.sessionId,
     runId: context.runId,
@@ -268,21 +268,25 @@ async function abortTransaction(
 ): Promise<ToolReceipt> {
   const transaction = pendingForInput(pending, input, context);
   const result = await execution.abortRepositoryTransaction({
-    protocolVersion: 2,
+    protocolVersion: 1,
     transactionHandle: transaction.handle,
     sessionId: context.sessionId,
     runId: context.runId
   }, { signal: context.signal });
   pending.consume(transaction.handle);
   const effects = transactionEffects(transaction.operations, transaction.topology);
+  const ok = result.status === "aborted" && result.rollbackState === "restored";
+  const output = JSON.stringify({
+    status: result.status,
+    rollbackState: result.rollbackState,
+    gitAbortSucceeded: result.gitAbortSucceeded ?? false
+  });
+  const diagnostics = result.rollbackState === "restored" ? ["repository_restored"] : [];
   return {
     callId: request.callId,
-    ok: result.status === "aborted" && result.rollbackState === "restored",
-    output: JSON.stringify({
-      status: result.status,
-      rollbackState: result.rollbackState,
-      gitAbortSucceeded: result.gitAbortSucceeded ?? false
-    }),
+    ok,
+    output,
+    outcome: { status: ok ? "succeeded" : "failed", output, diagnosticCodes: diagnostics },
     result: {
       status: result.status,
       rollbackState: result.rollbackState ?? null,
@@ -291,7 +295,7 @@ async function abortTransaction(
     observedEffects: effects,
     actualEffects: effects,
     artifacts: [],
-    diagnostics: result.rollbackState === "restored" ? ["repository_restored"] : [],
+    diagnostics,
     evidence: [],
     startedAt,
     completedAt: new Date().toISOString()
@@ -305,7 +309,7 @@ export async function recoverInterruptedRepositoryTransactions(
 ): Promise<void> {
   if (!execution?.recoverRepositoryTransactions) return;
   const result = await execution.recoverRepositoryTransactions({
-    protocolVersion: 2,
+    protocolVersion: 1,
     sessionId,
     ...(runId ? { runId } : {})
   }, { timeoutMs: 120_000 });
@@ -332,7 +336,7 @@ export function repositoryTransactionTool(
       maximumEffects: [
         "repository.write", "filesystem.read.external", "filesystem.write", "destructive"
       ],
-      brokerMutationAuthority: "repository_transaction_v2",
+      brokerMutationAuthority: "repository_transaction",
       availableModes: ["change"],
       executionMode: "exclusive",
       resourceKeys: ["workspace:write", "repository:git"],

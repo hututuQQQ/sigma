@@ -1,4 +1,4 @@
-export interface RepositoryMetadataLeaseRequestV1 {
+export interface RepositoryMetadataLeaseRequest {
   protocolVersion: 1;
   repositoryRoot: string;
   gitDir: string;
@@ -7,7 +7,7 @@ export interface RepositoryMetadataLeaseRequestV1 {
   network: "none";
 }
 
-export interface RepositoryMetadataLeaseV1 extends RepositoryMetadataLeaseRequestV1 {
+export interface RepositoryMetadataLease extends RepositoryMetadataLeaseRequest {
   leaseId: string;
   /** SHA-256 of the exact executable object pinned when the broker issued the lease. */
   executableSha256: string;

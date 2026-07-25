@@ -5,23 +5,17 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   EVENT_SCHEMA_VERSION,
-  LEGACY_SNAPSHOT_SCHEMA_VERSION_V7,
-  LEGACY_SNAPSHOT_SCHEMA_VERSION_V8,
-  LEGACY_SNAPSHOT_SCHEMA_VERSION_V9,
   SNAPSHOT_SCHEMA_VERSION,
-  STORE_LAYOUT_VERSION,
+  createBudgetLedger,
   type AgentEventEnvelope
 } from "../packages/agent-protocol/src/index.js";
 import {
   ContentAddressedArtifactStore,
   JsonlEvaluationSink,
-  legacySessionDirectoryV2,
-  legacySessionDirectoryV3,
   safeId,
   segmentName,
   SegmentedJsonlStore,
   sessionDirectory,
-  sessionsDirectory,
   snapshotName
 } from "../packages/agent-store/src/index.js";
 
@@ -37,12 +31,12 @@ function event(sessionId: string, seq: number, type: "session.created" | "diagno
     authority: "runtime",
     payload: type === "session.created" ? {
       workspacePath: "D:/workspace", mode: "change", title: "task", writeScope: ["."],
-      strictWriteScope: true, modelRole: "orchestrator"
+      strictWriteScope: true, modelRole: "orchestrator", budgetLimits: createBudgetLedger().limits
     } : { kind: "recovery.retry_model", message: `diagnostic ${seq}` }
   };
 }
 
-describe("agent-store V5 durability", () => {
+describe("agent-store durability", () => {
   it.skipIf(process.platform === "win32")("creates owner-only state directories", async () => {
     const parent = await mkdtemp(path.join(os.tmpdir(), "sigma-private-store-"));
     const root = path.join(parent, "state");
@@ -119,42 +113,48 @@ describe("agent-store V5 durability", () => {
     await recovered.append(event("crash", 3) as never, 2);
   });
 
-  it("replays V5 events and upgrades legacy metadata on the next append", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-event-v5-upgrade-"));
+  it("persists current events with minimal schema 1 metadata", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-event-current-"));
     const store = new SegmentedJsonlStore({ rootDir: root });
-    await store.append(event("event-v5", 1, "session.created") as never, 0);
-    const directory = sessionDirectory(root, "event-v5");
-    const eventPath = path.join(directory, "events", "000001.jsonl");
-    const stored = JSON.parse((await readFile(eventPath, "utf8")).trim()) as {
-      event: AgentEventEnvelope;
-    };
-    const legacyEvent = { ...stored.event, schemaVersion: 5 };
-    await writeFile(eventPath, `${JSON.stringify({
-      checksum: createHash("sha256").update(JSON.stringify(legacyEvent)).digest("hex"),
-      event: legacyEvent
-    })}\n`, "utf8");
+    await store.append(event("current", 1, "session.created") as never, 0);
+    const directory = sessionDirectory(root, "current");
     const metaPath = path.join(directory, "meta.json");
     const meta = JSON.parse(await readFile(metaPath, "utf8")) as Record<string, unknown>;
-    await writeFile(metaPath, `${JSON.stringify({
-      ...meta,
-      eventSchemaVersion: 5,
-      snapshotSchemaVersion: 6
-    })}\n`, "utf8");
-
-    const recovered = new SegmentedJsonlStore({ rootDir: root });
-    const replayed: number[] = [];
-    for await (const item of recovered.events("event-v5")) replayed.push(item.seq);
-    expect(replayed).toEqual([1]);
-    await recovered.append(event("event-v5", 2) as never, 1);
-    await expect(readFile(metaPath, "utf8").then((value) => JSON.parse(value)))
-      .resolves.toMatchObject({
-        eventSchemaVersion: EVENT_SCHEMA_VERSION,
-        snapshotSchemaVersion: SNAPSHOT_SCHEMA_VERSION,
-        lastSeq: 2
-      });
+    expect(meta).toMatchObject({ schemaVersion: 1, sessionId: "current", lastSeq: 1 });
+    expect(Object.keys(meta).sort()).toEqual([
+      "createdAt", "lastSeq", "schemaVersion", "segment", "segmentEvents", "sessionId", "updatedAt"
+    ]);
   });
 
-  it("rejects checksummed event corruption through the shared V5 schema", async () => {
+  it("rejects an unknown event schema without rewriting it", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-unknown-event-"));
+    const store = new SegmentedJsonlStore({ rootDir: root });
+    await store.append(event("unknown-event", 1, "session.created") as never, 0);
+    const target = path.join(sessionDirectory(root, "unknown-event"), "events", segmentName(1));
+    const stored = JSON.parse((await readFile(target, "utf8")).trim()) as {
+      event: AgentEventEnvelope;
+    };
+    const unknown = { ...stored.event, schemaVersion: 999 };
+    const original = `${JSON.stringify({
+      checksum: createHash("sha256").update(JSON.stringify(unknown)).digest("hex"),
+      event: unknown
+    })}\n`;
+    await writeFile(target, original, "utf8");
+    const consume = async (): Promise<void> => {
+      for await (const _event of store.events("unknown-event")) {
+        // Reading is enough to validate the durable boundary.
+      }
+    };
+    await expect(consume()).rejects.toMatchObject({
+      code: "unsupported_schema_version",
+      path: target,
+      expected: 1,
+      actual: 999
+    });
+    expect(await readFile(target, "utf8")).toBe(original);
+  });
+
+  it("rejects checksummed event corruption through the current schema", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-corruption-"));
     const store = new SegmentedJsonlStore({ rootDir: root });
     await store.append(event("corrupt", 1, "session.created") as never, 0);
@@ -174,12 +174,31 @@ describe("agent-store V5 durability", () => {
     await expect(consume()).rejects.toThrow("payload");
   });
 
+  it("rejects a current event whose checksum does not match without rewriting it", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-checksum-mismatch-"));
+    const store = new SegmentedJsonlStore({ rootDir: root });
+    await store.append(event("checksum-mismatch", 1, "session.created") as never, 0);
+    const target = path.join(sessionDirectory(root, "checksum-mismatch"), "events", segmentName(1));
+    const stored = JSON.parse((await readFile(target, "utf8")).trim()) as {
+      event: AgentEventEnvelope;
+    };
+    const original = `${JSON.stringify({ checksum: "0".repeat(64), event: stored.event })}\n`;
+    await writeFile(target, original, "utf8");
+    const consume = async (): Promise<void> => {
+      for await (const _event of store.events("checksum-mismatch")) {
+        // Reading is enough to verify the current durable checksum boundary.
+      }
+    };
+    await expect(consume()).rejects.toThrow("Event checksum mismatch");
+    expect(await readFile(target, "utf8")).toBe(original);
+  });
+
   it("falls back across corrupt snapshots and isolates evaluation reports", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-snapshots-"));
     const store = new SegmentedJsonlStore({ rootDir: root });
     await store.append(event("snap", 1, "session.created") as never, 0);
     for (const seq of [1, 2]) await store.writeSnapshot({
-      schemaVersion: SNAPSHOT_SCHEMA_VERSION, storeLayoutVersion: STORE_LAYOUT_VERSION,
+      schemaVersion: SNAPSHOT_SCHEMA_VERSION,
       sessionId: "snap", seq, createdAt: new Date(1_700_000_000_000 + seq).toISOString(), state: { seq }
     });
     await writeFile(path.join(sessionDirectory(root, "snap"), "snapshots", snapshotName(2)), "{corrupt", "utf8");
@@ -189,59 +208,85 @@ describe("agent-store V5 durability", () => {
     expect(await store.listSessions()).toHaveLength(1);
   });
 
-  it("recovers every V7-V9 snapshot migration boundary without rewriting it", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-legacy-snapshots-"));
+  it("rejects an unknown snapshot schema without rewriting it", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-unknown-snapshot-"));
     const store = new SegmentedJsonlStore({ rootDir: root });
-    const versions = [
-      LEGACY_SNAPSHOT_SCHEMA_VERSION_V7,
-      LEGACY_SNAPSHOT_SCHEMA_VERSION_V8,
-      LEGACY_SNAPSHOT_SCHEMA_VERSION_V9
-    ] as const;
-    for (const version of versions) {
-      const sessionId = `legacy-snapshot-${version}`;
-      await store.append(event(sessionId, 1, "session.created") as never, 0);
-      const snapshot = {
-        schemaVersion: version,
-        storeLayoutVersion: STORE_LAYOUT_VERSION,
-        sessionId,
-        seq: 1,
-        createdAt: new Date(1_700_000_000_000 + version).toISOString(),
-        state: { migratedFrom: version }
-      };
-      const checksum = createHash("sha256")
-        .update(JSON.stringify(snapshot))
-        .digest("hex");
-      const target = path.join(
-        sessionDirectory(root, sessionId),
-        "snapshots",
-        snapshotName(1)
-      );
-      await mkdir(path.dirname(target), { recursive: true });
-      await writeFile(target, JSON.stringify({ checksum, snapshot }), "utf8");
-      await expect(store.latestSnapshot(sessionId)).resolves.toMatchObject({
-        schemaVersion: version,
-        sessionId,
-        state: { migratedFrom: version }
-      });
-      expect(JSON.parse(await readFile(target, "utf8"))).toEqual({ checksum, snapshot });
-    }
+    const sessionId = "unknown-snapshot";
+    await store.append(event(sessionId, 1, "session.created") as never, 0);
+    const snapshot = {
+      schemaVersion: 999,
+      sessionId,
+      seq: 1,
+      createdAt: new Date(1_700_000_000_001).toISOString(),
+      state: {}
+    };
+    const checksum = createHash("sha256").update(JSON.stringify(snapshot)).digest("hex");
+    const target = path.join(sessionDirectory(root, sessionId), "snapshots", snapshotName(1));
+    const original = `${JSON.stringify({ checksum, snapshot })}\n`;
+    await mkdir(path.dirname(target), { recursive: true });
+    await writeFile(target, original, "utf8");
+    await expect(store.latestSnapshot(sessionId)).rejects.toMatchObject({
+      code: "unsupported_schema_version",
+      path: target,
+      expected: 1,
+      actual: 999
+    });
+    expect(await readFile(target, "utf8")).toBe(original);
   });
 
-  it("uses stores/v5 while preserving V2, V3, and V4 directories byte-for-byte", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-versioned-store-"));
-    const legacyFiles = [
-      path.join(legacySessionDirectoryV2(root, "old-v2"), "meta.json"),
-      path.join(legacySessionDirectoryV3(root, "old-v3"), "meta.json"),
-      path.join(root, "stores", "v4", "sessions", "old-v4", "meta.json")
-    ];
-    for (const file of legacyFiles) {
-      await mkdir(path.dirname(file), { recursive: true });
-      await writeFile(file, "legacy bytes\n", "utf8");
-    }
+  it("rejects unknown session metadata without rewriting it", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-unknown-meta-"));
+    const target = path.join(sessionDirectory(root, "unknown-meta"), "meta.json");
+    const original = `${JSON.stringify({
+      schemaVersion: 999,
+      sessionId: "unknown-meta",
+      createdAt: "opaque",
+      updatedAt: "opaque",
+      lastSeq: 0,
+      segment: 1,
+      segmentEvents: 0
+    })}\n`;
+    await mkdir(path.dirname(target), { recursive: true });
+    await writeFile(target, original, "utf8");
     const store = new SegmentedJsonlStore({ rootDir: root });
-    await store.append(event("new-v5", 1, "session.created") as never, 0);
-    expect(sessionDirectory(root, "new-v5")).toContain(path.join("stores", "v5", "sessions"));
-    for (const file of legacyFiles) expect(await readFile(file, "utf8")).toBe("legacy bytes\n");
-    expect(await readdir(sessionsDirectory(root))).toEqual(["new-v5"]);
+    await expect(store.listSessions()).rejects.toMatchObject({
+      code: "unsupported_schema_version",
+      path: target,
+      expected: 1,
+      actual: 999
+    });
+    expect(await readFile(target, "utf8")).toBe(original);
+  });
+
+  it("rejects an unknown store layout without creating or rewriting data", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-unknown-store-"));
+    const unknownFile = path.join(root, "stores", "v999", "sessions", "session", "meta.json");
+    await mkdir(path.dirname(unknownFile), { recursive: true });
+    await writeFile(unknownFile, "unknown bytes\n", "utf8");
+    const store = new SegmentedJsonlStore({ rootDir: root });
+    await expect(store.listSessions()).rejects.toMatchObject({
+      code: "unsupported_store_layout",
+      path: path.join(root, "stores", "v999"),
+      expected: 1,
+      actual: "v999"
+    });
+    expect(await readFile(unknownFile, "utf8")).toBe("unknown bytes\n");
+    await expect(stat(path.join(root, "stores", "v1"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects an unversioned session layout without creating or rewriting data", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-unversioned-store-"));
+    const unknownFile = path.join(root, "sessions", "session", "meta.json");
+    await mkdir(path.dirname(unknownFile), { recursive: true });
+    await writeFile(unknownFile, "unversioned bytes\n", "utf8");
+    const store = new SegmentedJsonlStore({ rootDir: root });
+    await expect(store.listSessions()).rejects.toMatchObject({
+      code: "unsupported_store_layout",
+      path: path.join(root, "sessions"),
+      expected: 1,
+      actual: "unversioned"
+    });
+    expect(await readFile(unknownFile, "utf8")).toBe("unversioned bytes\n");
+    await expect(stat(path.join(root, "stores", "v1"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 });

@@ -5,8 +5,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import {
-  assertOptimizationExperimentV1, assertOptimizerClusterCardV1, branchForCluster,
-  isActiveExperimentStatus, optimizationExperimentIdV1, sha256
+  assertOptimizationExperiment, assertOptimizerClusterCard, branchForCluster,
+  isActiveExperimentStatus, optimizationExperimentId, sha256
 } from "./optimizer-schema.mjs";
 import { resolveWorkspaceStateRoot } from "./event-store.mjs";
 
@@ -18,7 +18,7 @@ function defaultGuardrails() {
   return REQUIRED_DIMENSIONS.map((metric) => ({ metric, rule: "no_regression", limit: null }));
 }
 
-export function createOptimizationExperimentV1(input) {
+export function createOptimizationExperiment(input) {
   const createdAt = input.createdAt ?? new Date().toISOString();
   const base = {
     schemaVersion: 1,
@@ -48,12 +48,12 @@ export function createOptimizationExperimentV1(input) {
     },
     abPolicy: { pairs: 3, order: FROZEN_ORDER, invalidPairAction: "block" }
   };
-  return assertOptimizationExperimentV1({ ...base, experimentId: optimizationExperimentIdV1(base) });
+  return assertOptimizationExperiment({ ...base, experimentId: optimizationExperimentId(base) });
 }
 
 export function assertSingleActiveExperiment(experiments, clusterId, exceptId = null) {
   const active = experiments.filter((item) => {
-    const experiment = assertOptimizationExperimentV1(item);
+    const experiment = assertOptimizationExperiment(item);
     return experiment.clusterId === clusterId
       && experiment.experimentId !== exceptId
       && isActiveExperimentStatus(experiment.status);
@@ -61,24 +61,24 @@ export function assertSingleActiveExperiment(experiments, clusterId, exceptId = 
   if (active.length > 0) throw new Error("An active experiment already exists for this cluster.");
 }
 
-export function freezeOptimizationExperimentV1(input, candidateDigest, frozenAt = new Date().toISOString()) {
-  const experiment = structuredClone(assertOptimizationExperimentV1(input));
+export function freezeOptimizationExperiment(input, candidateDigest, frozenAt = new Date().toISOString()) {
+  const experiment = structuredClone(assertOptimizationExperiment(input));
   if (experiment.status !== "preregistered") throw new Error("Only a preregistered experiment can be frozen.");
   experiment.status = "frozen";
   experiment.candidate.candidateDigest = candidateDigest;
   experiment.candidate.frozenAt = frozenAt;
-  return assertOptimizationExperimentV1(experiment);
+  return assertOptimizationExperiment(experiment);
 }
 
-export async function freezeRegisteredOptimizationExperimentV1(
+export async function freezeRegisteredOptimizationExperiment(
   input, candidateDigest, directory, frozenAt = new Date().toISOString()
 ) {
-  const requested = assertOptimizationExperimentV1(input);
+  const requested = assertOptimizationExperiment(input);
   const registered = await readRegisteredOptimizationExperiment(requested.experimentId, directory);
   if (JSON.stringify(registered) !== JSON.stringify(requested)) {
     throw new Error("Experiment file does not match its immutable registered preregistration.");
   }
-  const frozen = freezeOptimizationExperimentV1(registered, candidateDigest, frozenAt);
+  const frozen = freezeOptimizationExperiment(registered, candidateDigest, frozenAt);
   await updateRegisteredExperiment(frozen, directory, "freeze");
   return frozen;
 }
@@ -107,7 +107,7 @@ export async function readRegisteredOptimizationExperiments(directory) {
   });
   const experiments = [];
   for (const name of names.filter((item) => item.endsWith(".json"))) {
-    experiments.push(assertOptimizationExperimentV1(JSON.parse(await readFile(path.join(directory, name), "utf8"))));
+    experiments.push(assertOptimizationExperiment(JSON.parse(await readFile(path.join(directory, name), "utf8"))));
   }
   return experiments;
 }
@@ -122,7 +122,7 @@ async function readTrustedEligibilityCard(experiment, directory) {
   );
   let card;
   try {
-    card = assertOptimizerClusterCardV1(JSON.parse(await readFile(cardPath, "utf8")));
+    card = assertOptimizerClusterCard(JSON.parse(await readFile(cardPath, "utf8")));
   } catch (error) {
     if (error?.code === "ENOENT") {
       throw new Error("No trusted cluster card exists for this experiment.", { cause: error });
@@ -143,7 +143,7 @@ async function readTrustedEligibilityCard(experiment, directory) {
 
 async function readOptionalRegisteredExperiment(target) {
   return readFile(target, "utf8").then(
-    (value) => assertOptimizationExperimentV1(JSON.parse(value)),
+    (value) => assertOptimizationExperiment(JSON.parse(value)),
     (error) => {
       if (error?.code === "ENOENT") return null;
       throw error;
@@ -151,8 +151,8 @@ async function readOptionalRegisteredExperiment(target) {
   );
 }
 
-export async function registerOptimizationExperimentV1(experiment, directory) {
-  const validated = assertOptimizationExperimentV1(experiment);
+export async function registerOptimizationExperiment(experiment, directory) {
+  const validated = assertOptimizationExperiment(experiment);
   if (validated.status !== "preregistered") throw new Error("Only preregistered experiments may enter the registry.");
   const target = path.join(directory, `${validated.experimentId}.json`);
   const registered = await readOptionalRegisteredExperiment(target);
@@ -209,12 +209,12 @@ export async function registerOptimizationExperimentV1(experiment, directory) {
 }
 
 export async function readRegisteredOptimizationExperiment(experimentId, directory) {
-  return assertOptimizationExperimentV1(JSON.parse(await readFile(path.join(directory, `${experimentId}.json`), "utf8")));
+  return assertOptimizationExperiment(JSON.parse(await readFile(path.join(directory, `${experimentId}.json`), "utf8")));
 }
 
 async function updateRegisteredExperiment(experiment, directory, transition) {
   const target = path.join(directory, `${experiment.experimentId}.json`);
-  const current = await readFile(target, "utf8").then((value) => assertOptimizationExperimentV1(JSON.parse(value))).catch((error) => {
+  const current = await readFile(target, "utf8").then((value) => assertOptimizationExperiment(JSON.parse(value))).catch((error) => {
     if (error?.code === "ENOENT") throw new Error("Experiment must be registered before it can be updated.");
     throw error;
   });
@@ -242,23 +242,23 @@ async function updateRegisteredExperiment(experiment, directory, transition) {
   await rename(temp, target);
 }
 
-export async function closeOptimizationExperimentV1(
+export async function closeOptimizationExperiment(
   input, status, directory, closedAt = new Date().toISOString()
 ) {
   if (!new Set(["accepted", "rejected", "rolled_back"]).has(status)) {
     throw new Error("Experiment may close only as accepted, rejected, or rolled_back.");
   }
-  const experiment = structuredClone(assertOptimizationExperimentV1(input));
+  const experiment = structuredClone(assertOptimizationExperiment(input));
   if (!isActiveExperimentStatus(experiment.status)) throw new Error("Experiment is already closed.");
   experiment.status = status;
   experiment.closedAt = closedAt;
-  assertOptimizationExperimentV1(experiment);
+  assertOptimizationExperiment(experiment);
   await updateRegisteredExperiment(experiment, directory, "close");
   const pointer = path.join(directory, "active", `${experiment.clusterId}.json`);
   const active = JSON.parse(await readFile(pointer, "utf8"));
   if (active.experimentId !== experiment.experimentId) throw new Error("Active experiment pointer does not match.");
   await rm(pointer, { force: false });
-  return assertOptimizationExperimentV1(experiment);
+  return assertOptimizationExperiment(experiment);
 }
 
 function pairDimensionsRegressed(pair) {
@@ -308,7 +308,7 @@ function validPair(pair) {
 }
 
 export function decideFrozenOptimizationGate(input, pairs) {
-  const experiment = assertOptimizationExperimentV1(input);
+  const experiment = assertOptimizationExperiment(input);
   if (experiment.status !== "frozen" && experiment.status !== "draft_pr") {
     throw new Error("The external gate only accepts a frozen candidate.");
   }
@@ -329,21 +329,21 @@ async function cli(argv) {
   if (!command || !file) throw new Error("Usage: optimization-experiment.mjs <validate|register|freeze> <file> [value]");
   const experiment = JSON.parse(await readFile(path.resolve(file), "utf8"));
   if (command === "validate") {
-    assertOptimizationExperimentV1(experiment);
-    process.stdout.write("OptimizationExperimentV1 is valid.\n");
+    assertOptimizationExperiment(experiment);
+    process.stdout.write("OptimizationExperiment is valid.\n");
     return;
   }
   const registry = await resolveOptimizationExperimentRegistry();
   if (command === "register") {
-    const target = await registerOptimizationExperimentV1(experiment, registry);
-    process.stdout.write(`OptimizationExperimentV1 registered: ${target}\n`);
+    const target = await registerOptimizationExperiment(experiment, registry);
+    process.stdout.write(`OptimizationExperiment registered: ${target}\n`);
     return;
   }
   if (command === "close") throw new Error("Accepted/rejected transitions belong only to the sealed external gate.");
   if (command !== "freeze" || !value) throw new Error("freeze requires a candidate SHA-256 digest.");
-  const frozen = await freezeRegisteredOptimizationExperimentV1(experiment, value, registry);
+  const frozen = await freezeRegisteredOptimizationExperiment(experiment, value, registry);
   await writeFile(path.resolve(file), `${JSON.stringify(frozen, null, 2)}\n`, "utf8");
-  process.stdout.write("OptimizationExperimentV1 candidate frozen.\n");
+  process.stdout.write("OptimizationExperiment candidate frozen.\n");
 }
 
 const invoked = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);

@@ -5,7 +5,6 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type {
   AgentEventEnvelope,
-  JsonValue,
   ModelCapabilities,
   ModelGateway,
   ModelMessage,
@@ -17,15 +16,13 @@ import type {
 } from "../packages/agent-protocol/src/index.js";
 import {
   EVENT_SCHEMA_VERSION,
-  SNAPSHOT_SCHEMA_VERSION,
-  STORE_LAYOUT_VERSION
+  SNAPSHOT_SCHEMA_VERSION
 } from "../packages/agent-protocol/src/index.js";
 import { createKernelState } from "../packages/agent-kernel/src/index.js";
 import {
   auditDurableChildren,
   createChildAgentFactory,
   createRuntime as createBaseRuntime,
-  rebuildSnapshotFromEvents,
   restoreStoredSession
 } from "../packages/agent-runtime/src/testing.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
@@ -511,7 +508,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
       .toEqual([]);
   }, 30_000);
 
-  it("returns legacy completion calls as ordinary failed receipts until the model stops", async () => {
+  it("returns unregistered completion calls as ordinary failed receipts until the model stops", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-malformed-terminal-repair-"));
     await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
     const gateway = new ScriptedGateway([
@@ -1091,12 +1088,6 @@ describe("runtime queues and non-blocking instruction steering", () => {
         tokenCount: 3, priority: 9_000
       }]
     });
-    await store.writeSnapshot({
-      schemaVersion: SNAPSHOT_SCHEMA_VERSION, storeLayoutVersion: STORE_LAYOUT_VERSION,
-      sessionId, seq, createdAt: new Date().toISOString(),
-      state: { schemaVersion: 2, sessionId, messages: "invalid" }
-    });
-
     const restored = await restoreStoredSession(store, sessionId, 30_000);
     expect(restored.followUps).toEqual([{ id: "queue-2", text: "second" }]);
     expect(restored.contextItems).toContainEqual(expect.objectContaining({ id: "project:nested", content: "nested rule" }));
@@ -1131,7 +1122,6 @@ describe("runtime queues and non-blocking instruction steering", () => {
     };
     await store.writeSnapshot({
       schemaVersion: SNAPSHOT_SCHEMA_VERSION,
-      storeLayoutVersion: STORE_LAYOUT_VERSION,
       sessionId,
       seq: 1,
       createdAt: startedAt,
@@ -1144,143 +1134,11 @@ describe("runtime queues and non-blocking instruction steering", () => {
     ]);
   });
 
-  it("does not synthesize task control from legacy-looking V6 completion fields", async () => {
-    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-protected-completion-recovery-"));
-    const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
-    const sessionId = "protected-completion-session";
-    const runId = "protected-completion-run";
-    const startedAt = new Date().toISOString();
-    const deadlineAt = new Date(Date.now() + 30_000).toISOString();
-    await store.append({
-      schemaVersion: EVENT_SCHEMA_VERSION,
-      seq: 1,
-      eventId: "protected-completion-created",
-      sessionId,
-      runId,
-      occurredAt: startedAt,
-      type: "session.created",
-      authority: "runtime",
-      payload: completeAgentEventPayload("session.created", { workspacePath: workspace, mode: "change" })
-    }, 0);
-    const snapshotState = {
-      ...createKernelState({ sessionId, runId, mode: "change", startedAt, deadlineAt }),
-      phase: "ready_model" as const,
-      revision: 1,
-      lastSeq: 1,
-      completionRepairAttempts: 1,
-      completionRepair: {
-        kind: "protected_completion" as const,
-        answer: "The durable natural answer."
-      },
-      continuationAttempts: 0,
-      repeatedToolBatchCount: 0,
-      receiptCountAtLastUserInput: 0,
-      semanticProgress: { workspaceChanges: 0, durableEvidence: 1, revision: 1 },
-      messages: [{ role: "assistant" as const, content: "The durable natural answer." }],
-      evidence: [{
-        evidenceId: "protected-completion-evidence",
-        sessionId,
-        runId,
-        kind: "diagnostic" as const,
-        status: "passed" as const,
-        createdAt: startedAt,
-        producer: { authority: "runtime" as const },
-        summary: "checked",
-        data: { source: "recovery-test", diagnostic: { ok: true } }
-      }]
-    };
-    delete (snapshotState as Partial<typeof snapshotState>).taskControl;
-    await store.writeSnapshot({
-      schemaVersion: SNAPSHOT_SCHEMA_VERSION,
-      storeLayoutVersion: STORE_LAYOUT_VERSION,
-      sessionId,
-      seq: 1,
-      createdAt: startedAt,
-      state: snapshotState
-    });
-
-    const restored = await restoreStoredSession(store, sessionId, 30_000);
-    expect(restored.state).not.toHaveProperty("taskControl");
-    expect(restored.state.messages.at(-1)).toMatchObject({
-      role: "assistant",
-      content: "The durable natural answer."
-    });
-  });
-
-  it("does not synthesize a V3 completion-repair state while rebuilding V5 events", async () => {
-    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-legacy-completion-repair-"));
-    const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
-    const sessionId = "legacy-completion-session";
-    const runId = "legacy-completion-run";
-    const deadlineAt = new Date(Date.now() + 30_000).toISOString();
-    let seq = 0;
-    const append = async (
-      type: AgentEventEnvelope["type"],
-      payload: AgentEventEnvelope["payload"]
-    ): Promise<void> => {
-      const stored: AgentEventEnvelope = {
-        schemaVersion: EVENT_SCHEMA_VERSION,
-        seq: seq + 1,
-        eventId: `legacy-repair-${seq + 1}`,
-        sessionId,
-        runId,
-        occurredAt: new Date(Date.now() + seq).toISOString(),
-        type,
-        authority: type === "user.message" ? "user" : "runtime",
-        payload: completeAgentEventPayload(type, payload)
-      };
-      await store.append(stored, seq);
-      seq += 1;
-    };
-    await append("session.created", { workspacePath: workspace, mode: "change" });
-    await append("run.started", { mode: "change", deadlineAt });
-    await append("user.message", { text: "inspect the durable result" });
-    await append("evidence.recorded", {
-      evidenceId: "legacy-repair-evidence",
-      sessionId,
-      runId,
-      kind: "diagnostic",
-      status: "passed",
-      createdAt: new Date().toISOString(),
-      producer: { authority: "runtime" },
-      summary: "checked",
-      data: { source: "legacy-recovery-test", diagnostic: { ok: true } }
-    });
-    await append("model.started", { turnId: 1, effectRevision: 4 });
-    await append("model.completed", {
-      turnId: 1,
-      effectRevision: 4,
-      message: { role: "assistant", content: "Legacy protected answer." },
-      toolCalls: [],
-      finishReason: "stop"
-    });
-    const rebuilt = await rebuildSnapshotFromEvents({
-      sessionId,
-      lastSeq: seq,
-      events: () => store.events(sessionId)
-    }, 30_000);
-    const legacyState = structuredClone(rebuilt.state);
-    if (!legacyState || typeof legacyState !== "object" || Array.isArray(legacyState)) {
-      throw new Error("Rebuilt snapshot state must be an object.");
-    }
-    delete (legacyState as Record<string, JsonValue>).completionRepair;
-    await store.writeSnapshot({ ...rebuilt, state: legacyState });
-
-    const restored = await restoreStoredSession(store, sessionId, 30_000);
-    expect(restored.state).not.toHaveProperty("completionRepair");
-    expect(restored.state).not.toHaveProperty("completionRepairAttempts");
-    expect(restored.state).not.toHaveProperty("taskControl");
-    expect(restored.state.messages.at(-1)).toMatchObject({
-      role: "assistant",
-      content: "Legacy protected answer."
-    });
-  });
-
   it.each([
     ["change", "analyze", "without a snapshot", false],
-    ["change", "analyze", "from an older snapshot", true],
+    ["change", "analyze", "from a current snapshot", true],
     ["analyze", "change", "without a snapshot", false],
-    ["analyze", "change", "from an older snapshot", true]
+    ["analyze", "change", "from a current snapshot", true]
   ] as const)("restores %s -> %s run mode %s", async (initialMode, currentMode, _scenario, withSnapshot) => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-mode-recovery-"));
     const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
@@ -1370,7 +1228,6 @@ describe("runtime queues and non-blocking instruction steering", () => {
       };
       await store.writeSnapshot({
         schemaVersion: SNAPSHOT_SCHEMA_VERSION,
-        storeLayoutVersion: STORE_LAYOUT_VERSION,
         sessionId,
         seq,
         createdAt: new Date().toISOString(),

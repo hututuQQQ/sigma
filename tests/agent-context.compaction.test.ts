@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { ContextArchiveV1, ContextItem, ModelMessage } from "../packages/agent-protocol/src/index.js";
+import type { ContextArchive, ContextItem, ModelMessage } from "../packages/agent-protocol/src/index.js";
 import {
   historyAfterArchive,
   historyBlocks,
@@ -73,7 +73,7 @@ function expectToolPairs(messages: ModelMessage[]): void {
   expect(pending.size).toBe(0);
 }
 
-describe("V6 context archive planning", () => {
+describe("context archive planning", () => {
   it("does not proactively omit history that fits the provider window", () => {
     const history: ModelMessage[] = [{ role: "user", content: "Keep all recent context." }];
     for (let index = 0; index < 40; index += 1) history.push(...toolLoop(index));
@@ -132,7 +132,7 @@ describe("V6 context archive planning", () => {
     ];
     const covered = historyBlocks(history).slice(0, 2);
     const sourceDigest = stableHistoryDigest(covered);
-    const archive: ContextArchiveV1 = {
+    const archive: ContextArchive = {
       schemaVersion: 1,
       item: {
         id: "archive",

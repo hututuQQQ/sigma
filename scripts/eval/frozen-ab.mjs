@@ -8,15 +8,15 @@ import {
   writeEvaluationVaultJsonExclusive
 } from "./evaluation-vault.mjs";
 import {
-  closeOptimizationExperimentV1, decideFrozenOptimizationGate, readRegisteredOptimizationExperiment,
+  closeOptimizationExperiment, decideFrozenOptimizationGate, readRegisteredOptimizationExperiment,
   resolveOptimizationExperimentRegistry
 } from "./optimization-experiment.mjs";
-import { assertOptimizationExperimentV1, sha256 } from "./optimizer-schema.mjs";
+import { assertOptimizationExperiment, sha256 } from "./optimizer-schema.mjs";
 import { scanCandidateBenchmarkFairness } from "./fairness-scan.mjs";
 import { buildEvalRunReport } from "./report.mjs";
 import { digest } from "./common.mjs";
 import { evaluatorDigestFromSnapshot, verifierSourceDigest } from "./runner.mjs";
-import { loadEvalManifestV2 } from "./schema.mjs";
+import { loadEvalManifest } from "./schema.mjs";
 import { evaluatorLinkTargetRoot, seedWorkspace, snapshotWorkspace } from "./workspace.mjs";
 import {
   assertCandidateModificationScope, computeEvaluationControlDigest, computeProductDigest, isGitWorktreeClean
@@ -136,7 +136,7 @@ function armResult(report, metric) {
     // eslint-disable-next-line complexity
     || report.attempts.some((attempt) => {
     const signals = attempt?.dimensions?.reliability?.signals ?? [];
-    return attempt?.schemaVersion !== 2 || attempt?.kind !== "eval_attempt" || attempt?.validity !== "valid"
+    return attempt?.schemaVersion !== 1 || attempt?.kind !== "eval_attempt" || attempt?.validity !== "valid"
       || ["correctness", "delivery", "safety", "experience", "reliability"].some((name) =>
         !new Set(["pass", "fail"]).has(attempt?.dimensions?.[name]?.status))
       || !Number.isFinite(attempt?.metrics?.counts?.totalEvents)
@@ -144,7 +144,7 @@ function armResult(report, metric) {
       || !attemptPrimaryObserved(attempt, metric)
       || signals.some((signal) => new Set(["missing_durable_events", "event_store_read_failed"]).has(signal?.code));
     });
-  const invalid = !report || report.sourceSchemaVersion !== 2 || report.validity === "unavailable"
+  const invalid = !report || report.schemaVersion !== 1
     || report.validity.invalid > 0 || report.validity.notObserved > 0 || report.validity.missing > 0
     || (Array.isArray(report.infrastructureErrors) && report.infrastructureErrors.length > 0)
     || evidenceIncomplete;
@@ -186,7 +186,7 @@ export function matchedAttemptGuardrailRegressions(baselineReport, candidateRepo
 // Compatibility validation rejects every absent frozen-control field.
 // eslint-disable-next-line complexity
 function reportCompatibilityProjection(report) {
-  if (!report || report.sourceSchemaVersion !== 2 || report.suite !== "quick" || report.repeat !== 1) return null;
+  if (!report || report.schemaVersion !== 1 || report.suite !== "quick" || report.repeat !== 1) return null;
   const subject = report.subject ?? {};
   const scenarios = Array.isArray(report.scenarios) ? report.scenarios.map((item) => ({
     scenarioId: item.scenarioId,
@@ -336,7 +336,7 @@ async function expectedQuickProjection(harnessRoot, verifierRuntimeAttestation, 
     throw new Error("Formal A/B requires one trusted measured toolchain digest.");
   }
   const manifestPath = path.join(harnessRoot, "test-fixtures", "agent-evals", "manifest.json");
-  const manifest = await loadEvalManifestV2(manifestPath);
+  const manifest = await loadEvalManifest(manifestPath);
   const frozenRunPolicy = manifest.frozenRunPolicies.quick;
   if (!frozenRunPolicy || frozenRunPolicy.repeat !== 1) {
     throw new Error("Formal quick A/B requires its trusted suite policy to use repeat=1 per slot.");
@@ -563,7 +563,7 @@ async function prepareFrozenBuilds(directories, digests, dependencies) {
 // sealing phases visible here makes partial execution auditable.
 // eslint-disable-next-line complexity, max-lines-per-function
 export async function runFrozenOptimizationAb(options, dependencies = {}) {
-  const experiment = assertOptimizationExperimentV1(JSON.parse(await readFile(path.resolve(options.experiment), "utf8")));
+  const experiment = assertOptimizationExperiment(JSON.parse(await readFile(path.resolve(options.experiment), "utf8")));
   if (!new Set(["frozen", "draft_pr"]).has(experiment.status)) throw new Error("Formal A/B requires a frozen candidate.");
   const directories = { baseline: path.resolve(options.baseline), candidate: path.resolve(options.candidate) };
   const experimentRegistry = path.resolve(dependencies.experimentRegistry
@@ -653,7 +653,7 @@ export async function runFrozenOptimizationAb(options, dependencies = {}) {
     ...gate
   };
   await writeEvaluationVaultJsonExclusive(path.join(sealedRoot, "decision.json"), decision, vaultWriteOptions);
-  await closeOptimizationExperimentV1(
+  await closeOptimizationExperiment(
     registered, decision.decision === "accepted" ? "accepted" : "rejected", experimentRegistry
   );
   return { sealedRoot, decision };

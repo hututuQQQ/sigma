@@ -398,7 +398,7 @@ describe("context, platform, and repository tool capabilities", () => {
       network: "full"
     });
     const scopedProcessPlan = await tools.prepare!(request("scoped-process", "exec", {
-      executable: process.execPath, args: ["--version"], writePaths: ["src"]
+      executable: process.execPath, args: ["--version"], expectedChanges: ["src"]
     }), {
       sessionId: "session", runId: "run", workspacePath: workspace, runMode: "change"
     });

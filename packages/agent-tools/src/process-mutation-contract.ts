@@ -14,7 +14,6 @@ export interface ProcessMutationContract {
 
 interface ProcessMutationDeclaration {
   access?: ProcessAccess;
-  legacy: string[];
   writeRoots: string[];
   expectedChanges: string[];
 }
@@ -45,21 +44,13 @@ function mutationDeclaration(input: Record<string, JsonValue>): ProcessMutationD
     throw writePlanError("access must be readonly or write.", "write_plan_invalid");
   }
   const access = rawAccess as ProcessAccess | undefined;
-  const legacy = pathStrings(input, "writePaths");
   const writeRoots = pathStrings(input, "writeRoots");
   const expectedChanges = pathStrings(input, "expectedChanges");
-  const hasNewWriteScope = writeRoots.length + expectedChanges.length > 0;
-  if (legacy.length > 0 && hasNewWriteScope) {
-    throw writePlanError(
-      "Legacy writePaths cannot be combined with writeRoots or expectedChanges.",
-      "write_plan_invalid"
-    );
-  }
-  return { ...(access ? { access } : {}), legacy, writeRoots, expectedChanges };
+  return { ...(access ? { access } : {}), writeRoots, expectedChanges };
 }
 
 function readonlyContract(declaration: ProcessMutationDeclaration): ProcessMutationContract {
-  const declaredPaths = declaration.legacy.length + declaration.writeRoots.length + declaration.expectedChanges.length;
+  const declaredPaths = declaration.writeRoots.length + declaration.expectedChanges.length;
   if (declaredPaths > 0) {
     throw writePlanError("Readonly process access cannot declare write scope.", "write_plan_invalid");
   }
@@ -78,8 +69,8 @@ function writeContract(
   if (runMode !== "change") {
     throw writePlanError("Process write access is unavailable in analyze mode.", "policy_denied");
   }
-  const roots = declaration.legacy.length > 0 ? declaration.legacy : declaration.writeRoots;
-  const expected = declaration.legacy.length > 0 ? declaration.legacy : declaration.expectedChanges;
+  const roots = declaration.writeRoots;
+  const expected = declaration.expectedChanges;
   if (roots.length === 0 || expected.length === 0) {
     throw writePlanError(
       "Write access requires non-empty writeRoots and expectedChanges.",
@@ -124,7 +115,7 @@ async function inferExpectedChangesContract(
   declaration: ProcessMutationDeclaration,
   workspacePath: string
 ): Promise<ProcessMutationDeclaration> {
-  if (declaration.access || declaration.legacy.length > 0 || declaration.expectedChanges.length === 0) {
+  if (declaration.access || declaration.expectedChanges.length === 0) {
     return declaration;
   }
   const inferredRoots = declaration.writeRoots.length > 0
@@ -372,7 +363,7 @@ export async function processMutationContract(
   writeScope: "workspace" | "enclosing-container" = "workspace"
 ): Promise<ProcessMutationContract> {
   const declaration = await inferExpectedChangesContract(mutationDeclaration(input), workspacePath);
-  const contract = declaration.access === "write" || declaration.legacy.length > 0
+  const contract = declaration.access === "write"
     ? writeContract(declaration, runMode)
     : readonlyContract(declaration);
   return await validateMutationContract(workspacePath, contract, background, writeScope);

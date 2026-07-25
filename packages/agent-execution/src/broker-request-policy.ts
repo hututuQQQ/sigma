@@ -226,7 +226,7 @@ function assertWirePolicyBoundaries(
   }
   if (String(policy.sandbox) !== "required") {
     throw new BrokerPolicyError(
-      "Unsafe host execution was removed in V5; use the required sandbox or a real OCI backend."
+      "Unsafe host execution is unavailable; use the required sandbox or a real OCI backend."
     );
   }
 }

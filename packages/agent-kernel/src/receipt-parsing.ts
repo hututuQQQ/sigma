@@ -53,14 +53,15 @@ function toolEffects(value: JsonValue | undefined): ToolEffect[] {
   return Array.isArray(value) ? value.filter((effect): effect is ToolEffect => typeof effect === "string") : [];
 }
 
-function toolOutcome(value: JsonValue | undefined): ToolOutcome | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+function toolOutcome(value: JsonValue | undefined): ToolOutcome | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   if ((value.status !== "succeeded" && value.status !== "failed") || typeof value.output !== "string"
-    || !Array.isArray(value.diagnosticCodes)) return undefined;
+    || !Array.isArray(value.diagnosticCodes)
+    || value.diagnosticCodes.some((entry) => typeof entry !== "string")) return null;
   return {
     status: value.status,
     output: value.output,
-    diagnosticCodes: value.diagnosticCodes.filter((entry): entry is string => typeof entry === "string")
+    diagnosticCodes: [...value.diagnosticCodes as string[]]
   };
 }
 
@@ -80,21 +81,24 @@ export function toolReceipt(value: unknown): ToolReceipt | null {
   const item = value as Record<string, JsonValue>;
   if (typeof item.callId !== "string" || typeof item.ok !== "boolean") return null;
   const outcome = toolOutcome(item.outcome);
-  const actualEffects = Array.isArray(item.actualEffects) ? toolEffects(item.actualEffects) : undefined;
+  if (!outcome || !Array.isArray(item.actualEffects) || !Array.isArray(item.evidence)) return null;
+  const evidence = item.evidence.filter(isEvidenceRecord);
+  if (evidence.length !== item.evidence.length) return null;
+  const actualEffects = toolEffects(item.actualEffects);
   const delta = workspaceDelta(item.workspaceDelta);
   return {
     callId: item.callId,
     ok: item.ok,
     output: text(item.output),
     ...(isJsonValue(item.result) ? { result: item.result } : {}),
-    ...(outcome ? { outcome } : {}),
+    outcome,
     observedEffects: toolEffects(item.observedEffects),
-    ...(actualEffects ? { actualEffects } : {}),
+    actualEffects,
     ...(delta ? { workspaceDelta: delta } : {}),
     artifacts: stringArray(item.artifacts),
     ...(artifactRefs(item.artifactRefs).length > 0 ? { artifactRefs: artifactRefs(item.artifactRefs) } : {}),
     diagnostics: stringArray(item.diagnostics),
-    evidence: Array.isArray(item.evidence) ? item.evidence.filter(isEvidenceRecord) : [],
+    evidence,
     startedAt: text(item.startedAt),
     completedAt: text(item.completedAt)
   };
@@ -102,8 +106,6 @@ export function toolReceipt(value: unknown): ToolReceipt | null {
 
 export function receiptContent(receipt: ToolReceipt): string {
   const heading = `${receipt.ok ? "Successful" : "Failed"} tool receipt ID: ${receipt.callId}`;
-  // Preserve the V2 projection for old durable events. Runtime-normalized V3
-  // receipts always carry outcome and receive a bounded machine-readable summary.
   const output = boundedText(receipt.output);
   const artifacts = (receipt.artifactRefs ?? []).slice(0, 32).map((artifact) => ({
     artifactId: artifact.artifactId,
@@ -112,16 +114,13 @@ export function receiptContent(receipt: ToolReceipt): string {
     ...(artifact.mediaType ? { mediaType: artifact.mediaType } : {}),
     ...(artifact.sizeBytes === undefined ? {} : { sizeBytes: artifact.sizeBytes })
   }));
-  if (!receipt.outcome) {
-    return `${heading}\n${output}${artifacts.length > 0 ? `\nArtifacts (JSON): ${JSON.stringify(artifacts)}` : ""}`;
-  }
   const summary = {
     outcome: {
       status: receipt.outcome.status,
       diagnosticCodes: [...new Set(receipt.outcome.diagnosticCodes)].slice(0, 32)
     },
     diagnostics: [...new Set(receipt.diagnostics)].slice(0, 32),
-    evidence: (receipt.evidence ?? []).slice(0, 20).map((item) => ({
+    evidence: receipt.evidence.slice(0, 20).map((item) => ({
       evidenceId: item.evidenceId,
       kind: item.kind,
       status: item.status,

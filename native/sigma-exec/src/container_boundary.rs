@@ -119,7 +119,7 @@ fn inspect_inner() -> Result<EnclosingContainerBoundary, String> {
         .map_err(|error| format!("cannot re-inspect container marker: {error}"))?;
     let mount_namespace_digest = format!("{:x}", Sha256::digest(mountinfo.as_bytes()));
     let material = format!(
-        "v2\0{}\0{}\0{}\0{}\0{:x}\0{}",
+        "sigma-enclosing-container\0{}\0{}\0{}\0{}\0{:x}\0{}",
         marker.display(),
         marker_metadata.dev(),
         marker_metadata.ino(),

@@ -56,7 +56,7 @@ function event(
   sessionId = "session-one"
 ): AgentEventEnvelope {
   return {
-    schemaVersion: 2,
+    schemaVersion: 1,
     seq,
     eventId: `event-${seq}`,
     sessionId,

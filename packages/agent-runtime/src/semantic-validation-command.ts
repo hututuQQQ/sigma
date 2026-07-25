@@ -1,10 +1,10 @@
 import path from "node:path";
-import type { ValidationClaimKindV1 } from "agent-protocol";
+import type { ValidationClaimKind } from "agent-protocol";
 import { shellSemanticValidation } from "./semantic-validation-shell.js";
 
 export interface SemanticValidationCommand {
   executable: string;
-  kind: ValidationClaimKindV1;
+  kind: ValidationClaimKind;
   exactPathCandidates: string[];
 }
 
@@ -110,7 +110,7 @@ function compilerExactPathCandidates(executable: string, args: string[]): string
   ])].sort();
 }
 
-function compilerClaimKind(executable: string, args: string[]): ValidationClaimKindV1 | undefined {
+function compilerClaimKind(executable: string, args: string[]): ValidationClaimKind | undefined {
   if (compilerExactPathCandidates(executable, args).length > 0) return "acceptance";
   return sourcePathCandidates(args, TRANSITIVE_COMPILER_INPUTS[executable]).length > 0
     ? "acceptance" : undefined;
@@ -142,7 +142,7 @@ function cargoSubcommand(args: string[]): string | undefined {
   return undefined;
 }
 
-function cargoClaimKind(args: string[]): ValidationClaimKindV1 | undefined {
+function cargoClaimKind(args: string[]): ValidationClaimKind | undefined {
   const subcommand = cargoSubcommand(args);
   if (subcommand === "test") return "unit";
   if (subcommand === "clippy" || subcommand === "fmt") return "lint";
@@ -150,7 +150,7 @@ function cargoClaimKind(args: string[]): ValidationClaimKindV1 | undefined {
   return undefined;
 }
 
-function nodeScriptClaimKind(value: string): ValidationClaimKindV1 | undefined {
+function nodeScriptClaimKind(value: string): ValidationClaimKind | undefined {
   const name = path.basename(value).toLowerCase();
   if (/(?:^|[._-])(?:integration|e2e)(?:[._-]|$)/u.test(name)) return "integration";
   if (/(?:^|[._-])(?:test|tests|spec)(?:[._-]|$)/u.test(name)) return "unit";
@@ -217,7 +217,7 @@ function inlinePythonScript(args: string[]): string | undefined {
   return index >= 0 ? args[index + 1] : undefined;
 }
 
-function pythonClaimKind(args: string[]): ValidationClaimKindV1 | undefined {
+function pythonClaimKind(args: string[]): ValidationClaimKind | undefined {
   // Inline Python is an open-ended program. A text scan cannot distinguish
   // executable assertions from comments or string literals, nor prove that a
   // caught exception affects the process exit status. Structured module and
@@ -236,7 +236,7 @@ function pythonExactPathCandidates(args: string[]): string[] {
   return args.filter((item) => !item.startsWith("-") && /\.(?:py|pyw)$/iu.test(item));
 }
 
-function nodeClaimKind(args: string[]): ValidationClaimKindV1 | undefined {
+function nodeClaimKind(args: string[]): ValidationClaimKind | undefined {
   if (args.some((item) => item === "--test" || item.startsWith("--test="))) return "unit";
   if (args[0] === "--check") return "syntax";
   if (inlineNodeScript(args) !== undefined) return undefined;
@@ -244,7 +244,7 @@ function nodeClaimKind(args: string[]): ValidationClaimKindV1 | undefined {
   return script ? nodeScriptClaimKind(script) : undefined;
 }
 
-function packageScriptClaimKind(executable: string, args: string[]): ValidationClaimKindV1 {
+function packageScriptClaimKind(executable: string, args: string[]): ValidationClaimKind {
   const script = scriptName(executable, args);
   if (!script) return "probe";
   if (/integration|e2e/u.test(script)) return "integration";
@@ -255,7 +255,7 @@ function packageScriptClaimKind(executable: string, args: string[]): ValidationC
   return "probe";
 }
 
-function claimKind(executable: string, args: string[]): ValidationClaimKindV1 {
+function claimKind(executable: string, args: string[]): ValidationClaimKind {
   if (executable === "node") return nodeClaimKind(args) ?? "probe";
   if (/^python(?:\d+(?:\.\d+)*)?$/u.test(executable)) return pythonClaimKind(args) ?? "probe";
   if (executable === "tsc" || args.some((item) => executableName(item) === "tsc")) return "typecheck";

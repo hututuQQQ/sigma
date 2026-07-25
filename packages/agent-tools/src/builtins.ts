@@ -102,10 +102,12 @@ function applyPatchTool(atomicPatchStateRootDir?: string): RegisteredEffectTool 
         ...(atomicPatchStateRootDir ? { stateRootDir: atomicPatchStateRootDir } : {})
       });
       const completedAt = new Date().toISOString();
+      const output = JSON.stringify(result);
       return {
         callId: request.callId,
         ok: true,
-        output: JSON.stringify(result),
+        output,
+        outcome: { status: "succeeded", output, diagnosticCodes: [] },
         observedEffects: ["filesystem.read", "filesystem.write"],
         actualEffects: ["filesystem.read", "filesystem.write"],
         workspaceDelta: result.delta,

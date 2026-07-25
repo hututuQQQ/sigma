@@ -1,8 +1,9 @@
 # sigma-exec
 
-`sigma-exec` is Sigma Code's process broker. It speaks a versioned, four-byte
-big-endian length-prefixed JSON protocol over stdin/stdout. Stdout is reserved
-for protocol frames; diagnostics go to stderr.
+`sigma-exec` is Sigma Code's process broker. It speaks the current protocol
+schema 1 as four-byte big-endian length-prefixed JSON over stdin/stdout. Stdout
+is reserved for protocol frames; diagnostics go to stderr. Unknown Sigma
+protocol schemas are rejected; the broker has no compatibility branch.
 
 The broker fails closed. `sandbox: "required"` is accepted only after the
 platform backend passes its self-test. Linux uses bubblewrap namespaces, an
@@ -28,5 +29,6 @@ absent. Session HOME and temporary directories remain broker-owned writable
 scratch, while other filesystem locations stay absent unless the execution
 policy explicitly grants them.
 
-V5 has no unsafe host-execution switch. Commands must use the native sandbox;
-an OCI execution mode must be backed by a real container runtime or fail closed.
+There is no unsafe host-execution switch. Commands must use the native sandbox;
+an OCI execution mode must be backed by a real container runtime or fail
+closed.

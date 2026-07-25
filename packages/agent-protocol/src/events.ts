@@ -9,14 +9,8 @@ import {
   type AgentEventType
 } from "./event-payload-schemas.js";
 import { type JsonValue } from "./json.js";
-import {
-  EVENT_SCHEMA_VERSION,
-  LEGACY_EVENT_SCHEMA_VERSION_V5,
-  LEGACY_EVENT_SCHEMA_VERSION_V6,
-  LEGACY_EVENT_SCHEMA_VERSION_V7,
-  LEGACY_EVENT_SCHEMA_VERSION_V8
-} from "./versions.js";
-import { isRuntimePromptStateV2 } from "./context.js";
+import { EVENT_SCHEMA_VERSION } from "./versions.js";
+import { isRuntimePromptState } from "./context.js";
 
 export { AGENT_EVENT_TYPES, parseAgentEventPayload, type AgentEventPayloadMap, type AgentEventType };
 
@@ -71,7 +65,7 @@ export class AgentEventValidationError extends Error {
 
   constructor(readonly issues: readonly ProtocolValidationIssue[]) {
     const details = issues.map((issue) => `${issue.path.join(".") || "<root>"}: ${issue.message}`).join("; ");
-    super(`Invalid AgentEventEnvelope V${EVENT_SCHEMA_VERSION}: ${details}`);
+    super(`Invalid AgentEventEnvelope schema ${EVENT_SCHEMA_VERSION}: ${details}`);
     this.name = "AgentEventValidationError";
   }
 }
@@ -81,13 +75,7 @@ export function isSolverVisibleAuthority(authority: ContextAuthority): boolean {
 }
 
 const eventMetadataSchema = z.object({
-  schemaVersion: z.union([
-    z.literal(LEGACY_EVENT_SCHEMA_VERSION_V5),
-    z.literal(LEGACY_EVENT_SCHEMA_VERSION_V6),
-    z.literal(LEGACY_EVENT_SCHEMA_VERSION_V7),
-    z.literal(LEGACY_EVENT_SCHEMA_VERSION_V8),
-    z.literal(EVENT_SCHEMA_VERSION)
-  ]),
+  schemaVersion: z.literal(EVENT_SCHEMA_VERSION),
   seq: z.number().int().positive(),
   eventId: z.string().min(1),
   sessionId: z.string().min(1),
@@ -137,93 +125,25 @@ function accountingScopeIssue(event: AgentEventEnvelope): ProtocolValidationIssu
   return undefined;
 }
 
-function eventVersionIssue(
-  event: AgentEventEnvelope,
-  accepted: readonly number[],
-  message: string
-): ProtocolValidationIssue | undefined {
-  return accepted.includes(Number(event.schemaVersion))
-    ? undefined
-    : {
-        path: ["schemaVersion"],
-        code: "invalid_schema_version",
-        message
-      };
-}
-
-function durableFeatureVersionIssue(
-  event: AgentEventEnvelope
-): ProtocolValidationIssue | undefined {
-  if (event.type === "review.tool_completed"
-  ) {
-    return eventVersionIssue(
-      event,
-      [EVENT_SCHEMA_VERSION],
-      "review.tool_completed requires event schema V9 or newer"
-    );
-  }
-  if (event.type === "long_horizon.updated"
-    || event.type === "context.reasoning_trajectory_tombstoned") {
-    return eventVersionIssue(
-      event,
-      [LEGACY_EVENT_SCHEMA_VERSION_V8, EVENT_SCHEMA_VERSION],
-      `${event.type} requires event schema V8 or newer`
-    );
-  }
-  if (event.type === "context.tool_results_pruned") {
-    return eventVersionIssue(
-      event,
-      [LEGACY_EVENT_SCHEMA_VERSION_V7, EVENT_SCHEMA_VERSION],
-      "context.tool_results_pruned requires event schema V7"
-    );
-  }
-  return undefined;
-}
-
-function promptMaterializationVersionIssue(
+function promptMaterializationIssue(
   event: AgentEventEnvelope
 ): ProtocolValidationIssue | undefined {
   if (event.type !== "model.prompt_materialized") return undefined;
-  if (Number(event.schemaVersion) === LEGACY_EVENT_SCHEMA_VERSION_V5
-  ) {
-    return {
-      path: ["schemaVersion"],
-      code: "invalid_schema_version",
-      message: "model.prompt_materialized requires event schema V6"
-    };
-  }
-  const currentPromptVersions: readonly number[] = [
-    EVENT_SCHEMA_VERSION,
-    LEGACY_EVENT_SCHEMA_VERSION_V8,
-    LEGACY_EVENT_SCHEMA_VERSION_V7
-  ];
-  const currentPromptVersion = currentPromptVersions.includes(
-    Number(event.schemaVersion)
-  );
-  if (!currentPromptVersion) return undefined;
   const payload = event.payload as Record<string, unknown>;
-  if (isRuntimePromptStateV2(payload.promptState)
+  if (isRuntimePromptState(payload.promptState)
     && (payload.frameMode === "full" || payload.frameMode === "delta")) {
     return undefined;
   }
   return {
     path: ["payload", "promptState"],
     code: "invalid_prompt_state",
-    message: "Current event-schema prompt materialization requires RuntimePromptStateV2 and frameMode"
+    message: "Prompt materialization requires the current runtime prompt state and frameMode"
   };
 }
 
-function versionScopeIssue(event: AgentEventEnvelope): ProtocolValidationIssue | undefined {
-  const durable = durableFeatureVersionIssue(event);
-  if (durable) return durable;
-  const prompt = promptMaterializationVersionIssue(event);
-  if (prompt) return prompt;
-  return undefined;
-}
-
 function scopeIssues(event: AgentEventEnvelope): ProtocolValidationIssue[] {
-  const versionIssue = versionScopeIssue(event);
-  if (versionIssue) return [versionIssue];
+  const promptIssue = promptMaterializationIssue(event);
+  if (promptIssue) return [promptIssue];
   const accountingIssue = accountingScopeIssue(event);
   if (accountingIssue) return [accountingIssue];
   if (event.type === "checkpoint.recovery_resolved" && event.authority !== "user") {
@@ -242,6 +162,16 @@ function scopeIssues(event: AgentEventEnvelope): ProtocolValidationIssue[] {
 }
 
 export function validateAgentEventEnvelope(value: unknown): readonly ProtocolValidationIssue[] {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const actual = (value as Record<string, unknown>).schemaVersion;
+    if (actual !== EVENT_SCHEMA_VERSION) {
+      return [{
+        path: ["schemaVersion"],
+        code: "unsupported_schema_version",
+        message: `Event schema expected ${EVENT_SCHEMA_VERSION}, received ${String(actual)}`
+      }];
+    }
+  }
   const metadata = eventMetadataSchema.safeParse(value);
   if (!metadata.success) {
     return metadata.error.issues.map((issue) => ({

@@ -7,13 +7,13 @@ import {
   writeTaskIdentityArchive
 } from "../scripts/bench-task-identity-archive.mjs";
 import {
-  buildResolvedTaskAttestationV2,
+  buildResolvedTaskAttestation,
   harborTaskExecutionIdentitySha256,
   taskSelectionIdentitySha256
 } from "../scripts/harbor-task-identity.mjs";
 import {
   sha256,
-  sigmaFormalRunPreregistrationV1
+  sigmaFormalRunPreregistration
 } from "../scripts/bench-terminal-bench-formal-preregistration.mjs";
 
 const commit = "a".repeat(40);
@@ -28,7 +28,7 @@ function task(name: string, provenance = "catalog") {
 }
 
 function preregistration(tasks: Array<ReturnType<typeof task>>) {
-  return sigmaFormalRunPreregistrationV1({
+  return sigmaFormalRunPreregistration({
     formal_run_id: "archive-fixture",
     source: { revision: "c".repeat(40), dirty: false, diff_sha256: null },
     archive_sha256: "b".repeat(64),
@@ -80,14 +80,14 @@ describe("task identity archive", () => {
       );
       const attestationDirectory = path.join(root, "resolved");
       await mkdir(attestationDirectory);
-      const attestation = buildResolvedTaskAttestationV2({
+      const attestation = buildResolvedTaskAttestation({
         jobConfigSha256: "d".repeat(64),
         taskSelectionSha256: "e".repeat(64),
         selectedTasks: [second],
         resolvedTasks: [second]
       });
       await writeFile(
-        path.join(attestationDirectory, "resolved-task-attestation.v2.json"),
+        path.join(attestationDirectory, "resolved-task-attestation.json"),
         `${JSON.stringify(attestation)}\n`
       );
       await mkdir(path.join(root, "node_modules"));
@@ -97,7 +97,7 @@ describe("task identity archive", () => {
         createdAt: "2026-07-22T00:00:00.000Z"
       });
       expect(archive).toMatchObject({
-        kind: "SigmaTaskIdentityArchiveV1",
+        kind: "SigmaTaskIdentityArchive",
         source_count: 3,
         execution_identity_count: 2,
         selection_identity_count: 2
@@ -113,7 +113,7 @@ describe("task identity archive", () => {
       expect(archive.sources.map((source: { path: string }) => source.path)).toEqual([
         "frozen-preregistration.json",
         "prior.tasks.json",
-        "resolved/resolved-task-attestation.v2.json"
+        "resolved/resolved-task-attestation.json"
       ]);
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -124,7 +124,7 @@ describe("task identity archive", () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-task-archive-tamper-"));
     try {
       const selected = task("one");
-      const attestation = buildResolvedTaskAttestationV2({
+      const attestation = buildResolvedTaskAttestation({
         jobConfigSha256: "d".repeat(64),
         taskSelectionSha256: "e".repeat(64),
         selectedTasks: [selected],
@@ -132,7 +132,7 @@ describe("task identity archive", () => {
       });
       attestation.tasks[0].selection_identity_sha256 = "0".repeat(64);
       await writeFile(
-        path.join(root, "resolved-task-attestation.v2.json"),
+        path.join(root, "resolved-task-attestation.json"),
         `${JSON.stringify(attestation)}\n`
       );
       await expect(createTaskIdentityArchive(root)).rejects.toThrow(/inconsistent/u);

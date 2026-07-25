@@ -124,13 +124,13 @@ describe("capability-aware model routing", () => {
     expect(gateway.capabilities.contextWindowTokens).toBe(42_000);
   });
 
-  it("composes production fallback candidates only when configured and keeps legacy flags single", () => {
+  it("composes production fallback candidates and honors an explicit single-model route", () => {
     expect(productionModelCandidates(
       { provider: "deepseek", model: "auto" },
       { DEEPSEEK_API_KEY: "primary", GLM_API_KEY: "fallback" }
     ).map((item) => item.id)).toEqual(["deepseek/deepseek-v4-pro", "glm/glm-5.2"]);
     expect(productionModelCandidates(
-      { provider: "glm", model: "auto", legacySingleModelRoute: true },
+      { provider: "glm", model: "auto", explicitSingleModelRoute: true },
       { GLM_API_KEY: "primary", DEEPSEEK_API_KEY: "unused" }
     ).map((item) => item.id)).toEqual(["glm/glm-5.2"]);
     expect(productionModelCandidates(
@@ -309,8 +309,13 @@ describe("capability-aware model routing", () => {
 
     const result = await router.complete("orchestrator", "main", request());
     expect(calls).toEqual(["deepseek/a", "glm/b"]);
-    expect(result).toMatchObject({ modelSpecId: "glm/b", attempt: 1, inputTokens: expect.any(Number) });
-    expect(result.usage).toMatchObject({ providerReported: false, retryAttempt: 1, costMicroUsd: expect.any(Number) });
+    expect(result).toMatchObject({ modelSpecId: "glm/b", attempt: 1 });
+    expect(result.usage).toMatchObject({
+      inputTokens: expect.any(Number),
+      providerReported: false,
+      retryAttempt: 1,
+      costMicroUsd: expect.any(Number)
+    });
   });
 
   it("does not fall back on protocol failures or after streamed semantic output", async () => {
@@ -502,9 +507,14 @@ describe("normalized model usage", () => {
     expect(done).toMatchObject({
       type: "done",
       response: {
-        inputTokens: 10,
-        outputTokens: 3,
-        usage: { cacheReadTokens: 4, reasoningTokens: 2, providerReported: true, costMicroUsd: 13 }
+        usage: {
+          inputTokens: 10,
+          outputTokens: 3,
+          cacheReadTokens: 4,
+          reasoningTokens: 2,
+          providerReported: true,
+          costMicroUsd: 13
+        }
       }
     });
   });
@@ -531,5 +541,19 @@ describe("normalized model usage", () => {
 });
 
 function response(content: string): ModelResponse {
-  return { message: { role: "assistant", content }, finishReason: "stop" };
+  return {
+    message: { role: "assistant", content },
+    finishReason: "stop",
+    usage: {
+      inputTokens: 1,
+      outputTokens: 1,
+      reasoningTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      providerReported: false,
+      costMicroUsd: null,
+      latencyMs: 0,
+      retryAttempt: 0
+    }
+  };
 }

@@ -5,7 +5,7 @@ import type {
 } from "agent-protocol";
 import type {
   PreparedReviewerCall,
-  ReviewerToolCheckV1,
+  ReviewerToolCheck,
   ReviewerToolSessionPort
 } from "./reviewer-contracts.js";
 import {
@@ -17,7 +17,7 @@ import { reviewerResponseObject } from "./reviewer-response-object.js";
 
 export interface ReviewerTurnLoopResult {
   finalResponse?: ModelResponse;
-  checks: ReviewerToolCheckV1[];
+  checks: ReviewerToolCheck[];
   usages: UsageRecord[];
 }
 
@@ -30,7 +30,7 @@ interface ReviewerTurnStepInput {
   maxToolCalls: number;
   inspectionRequired: boolean;
   messages: ModelMessage[];
-  checks: ReviewerToolCheckV1[];
+  checks: ReviewerToolCheck[];
   usages: UsageRecord[];
   signal: AbortSignal;
 }
@@ -76,7 +76,7 @@ export function malformedReviewSubmission(
 export function failedReviewTurn(
   response: ModelResponse,
   message: string,
-  checks: ReviewerToolCheckV1[],
+  checks: ReviewerToolCheck[],
   usages: UsageRecord[]
 ): ReviewerTurnLoopResult {
   return {
@@ -90,7 +90,7 @@ export function submittedReviewTurn(
   response: ModelResponse,
   calls: NonNullable<ModelResponse["message"]["toolCalls"]>,
   inspectionRequired: boolean,
-  checks: ReviewerToolCheckV1[],
+  checks: ReviewerToolCheck[],
   usages: UsageRecord[]
 ): ReviewerTurnLoopResult | undefined {
   const submitted = submittedReviewResponse(response, calls);
@@ -185,7 +185,7 @@ export async function executeInspectionCalls(
   response: ModelResponse,
   calls: NonNullable<ModelResponse["message"]["toolCalls"]>,
   messages: ModelMessage[],
-  checks: ReviewerToolCheckV1[],
+  checks: ReviewerToolCheck[],
   signal: AbortSignal
 ): Promise<number> {
   messages.push(assistantReviewMessage(response, calls));

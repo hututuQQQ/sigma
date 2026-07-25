@@ -10,7 +10,7 @@ static SCRATCH_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ScratchLeaseStatusV1 {
+pub(crate) struct ScratchLeaseStatus {
     protocol_version: u32,
     lease_id: String,
     session_id: String,
@@ -187,8 +187,8 @@ impl ScratchLease {
         Ok(())
     }
 
-    pub(crate) fn status(&self, session_id: &str) -> ScratchLeaseStatusV1 {
-        ScratchLeaseStatusV1 {
+    pub(crate) fn status(&self, session_id: &str) -> ScratchLeaseStatus {
+        ScratchLeaseStatus {
             protocol_version: 1,
             lease_id: self.lease_id.clone(),
             session_id: session_id.to_owned(),
@@ -283,7 +283,7 @@ impl ScratchLeases {
         &self,
         instance_id: &str,
         params: AcquireScratchLeaseParams,
-    ) -> Result<ScratchLeaseStatusV1, RpcError> {
+    ) -> Result<ScratchLeaseStatus, RpcError> {
         if params.protocol_version != 1 {
             return Err(RpcError::new(
                 "unsupported_protocol",

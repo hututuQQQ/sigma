@@ -13,7 +13,7 @@ import {
   buildHarborArgs,
   buildHarborJobConfig,
   buildHarborTimeoutProbeConfig,
-  buildResolvedTaskAttestationV2,
+  buildResolvedTaskAttestation,
   commandText,
   computeHarborTimeoutPlan,
   detectHarborRunCapabilities,
@@ -528,13 +528,13 @@ async function runTerminalBenchCliImpl(argv, deps, signal) {
     let attestationPath = null;
     let attestation = null;
     if (spec.task) {
-      attestation = buildResolvedTaskAttestationV2({
+      attestation = buildResolvedTaskAttestation({
         jobConfigSha256,
         taskSelectionSha256,
         selectedTasks: [spec.task],
         resolvedTasks: spec.resolvedTask ? [spec.resolvedTask] : []
       });
-      attestationPath = path.join(slotRoot, "resolved-task-attestation.v2.json");
+      attestationPath = path.join(slotRoot, "resolved-task-attestation.json");
       await writeJson(attestationPath, attestation);
     }
     const args = buildHarborArgs({

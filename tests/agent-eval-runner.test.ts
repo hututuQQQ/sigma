@@ -19,7 +19,7 @@ afterEach(async () => {
 
 function event(seq: number, type: string, payload: unknown = {}, at = seq): Record<string, unknown> {
   return {
-    schemaVersion: 3,
+    schemaVersion: 1,
     seq,
     eventId: `event-${seq}`,
     sessionId: "session",
@@ -55,7 +55,7 @@ async function manifest(options: {
   await writeFile(path.join(workspace, "value.txt"), "expected\n", "utf8");
   await writeFile(path.join(workspace, "notes.txt"), "committed\n", "utf8");
   const value = {
-    schemaVersion: 2,
+    schemaVersion: 1,
     frozenRunPolicies: {
       quick: {
         schemaVersion: 1, seed: 17, repeat: options.repeat ?? 1,
@@ -69,7 +69,7 @@ async function manifest(options: {
       }
     },
     scenarios: [{
-      schemaVersion: 2,
+      schemaVersion: 1,
       id: "neutral-case",
       title: "Neutral runner case",
       suites: ["quick", "experience"],
@@ -215,7 +215,7 @@ describe("agent experience evaluation runner", () => {
       interactions: []
     });
     expect(JSON.parse(await readFile(path.join(result.runDir, "schedule.json"), "utf8"))).toMatchObject({
-      schemaVersion: 2,
+      schemaVersion: 1,
       repeat: 2,
       frozenRunPolicy: {
         schemaVersion: 1, seed: 17, repeat: 2,

@@ -22,7 +22,7 @@ export function createApprovingReviewer(id = "test-independent-reviewer"): Revie
         producer: { authority: "runtime", id },
         summary: "Independent test reviewer approved the supplied durable diff and validation evidence.",
         data: {
-          schemaVersion: 3,
+          schemaVersion: 1,
           reviewerId: id,
           verdict: "approved",
           findings: [],

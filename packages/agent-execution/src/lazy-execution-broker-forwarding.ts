@@ -3,8 +3,8 @@ import type {
   BrokerSandboxLeaseStatus,
   BrokerSandboxRevokeResult,
   ExecutionBroker,
-  ScratchLeaseRequestV1,
-  ScratchLeaseV1
+  ScratchLeaseRequest,
+  ScratchLease
 } from "./types.js";
 
 export async function forwardSandboxLeaseStatus(
@@ -22,9 +22,9 @@ export async function forwardSandboxLeaseStatus(
 
 export async function forwardScratchLease(
   client: ExecutionBroker,
-  request: ScratchLeaseRequestV1,
+  request: ScratchLeaseRequest,
   options?: BrokerRequestOptions
-): Promise<ScratchLeaseV1> {
+): Promise<ScratchLease> {
   if (!client.acquireScratchLease || !client.releaseScratchLease) {
     throw Object.assign(new Error("RuntimeSession scratch leases are unavailable."), {
       code: "scratch_lease_unavailable"

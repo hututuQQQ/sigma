@@ -12,10 +12,12 @@ function processHandle(input: Record<string, JsonValue>): ProcessHandle {
 }
 
 function handoffReceipt(request: ToolRequest, startedAt: string, value: unknown): ToolReceipt {
+  const output = JSON.stringify(value);
   return {
     callId: request.callId,
     ok: true,
-    output: JSON.stringify(value),
+    output,
+    outcome: { status: "succeeded", output, diagnosticCodes: [] },
     observedEffects: ["process.handoff"],
     actualEffects: ["process.handoff"],
     artifacts: [],

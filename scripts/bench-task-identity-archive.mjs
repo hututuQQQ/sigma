@@ -15,7 +15,7 @@ import { canonicalJson } from "./bench-terminal-bench-formal-preregistration.mjs
 const SKIPPED_DIRECTORIES = new Set([
   ".git", ".transactions", "artifacts", "harbor-jobs", "logs", "node_modules", "tasks"
 ]);
-const RESOLVED_ATTESTATION = /^resolved-task-attestation(?:\.v\d+)?(?:-\d+)?\.json$/u;
+const RESOLVED_ATTESTATION = /^resolved-task-attestation(?:-\d+)?\.json$/u;
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -64,8 +64,10 @@ function identityRecord(task, index, baseDir) {
 }
 
 function attestationRecords(value, label) {
-  if (value?.schema_version !== 2 || !Array.isArray(value.tasks)) {
-    throw new Error(`${label} is not ResolvedTaskAttestationV2.`);
+  if (value?.schema_version !== 1 || !Array.isArray(value.tasks)) {
+    throw new Error(
+      `unsupported_schema_version: path=${label} expected=1 actual=${String(value?.schema_version)}`
+    );
   }
   return value.tasks.map((task, index) => {
     const execution = task?.harbor_task_identity;
@@ -131,7 +133,7 @@ export async function createTaskIdentityArchive(rootPath, options = {}) {
   const selectionIdentitySha256s = [...selectionDigests].sort();
   return {
     schemaVersion: 1,
-    kind: "SigmaTaskIdentityArchiveV1",
+    kind: "SigmaTaskIdentityArchive",
     created_at: options.createdAt ?? new Date().toISOString(),
     source_root_sha256: sha256(canonicalJson(sources)),
     source_count: sources.length,

@@ -127,8 +127,6 @@ export class OpenAIModelGateway implements ModelGateway {
         ...(calls.length ? { toolCalls: calls } : {})
       },
       finishReason: normalizedFinishReason(choice.finish_reason, calls.length > 0),
-      inputTokens: typeof usage.prompt_tokens === "number" ? usage.prompt_tokens : undefined,
-      outputTokens: typeof usage.completion_tokens === "number" ? usage.completion_tokens : undefined,
       raw: jsonValue(raw)
     };
     return normalizeModelResponse({

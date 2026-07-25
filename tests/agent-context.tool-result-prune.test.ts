@@ -17,7 +17,7 @@ function history(blocks: number): ModelMessage[] {
   }]).flat();
 }
 
-describe("V8 durable tool-result pruning boundary", () => {
+describe("durable tool-result pruning boundary", () => {
   it("protects the newest 40K tokens and freezes old results only after 20K", () => {
     const durable = history(72);
     const before = structuredClone(durable);

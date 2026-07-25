@@ -4,7 +4,7 @@ import path from "node:path";
 import { CheckpointManager } from "../packages/agent-checkpoint/src/index.js";
 import {
   createBudgetLedger,
-  SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1,
+  SUBJECT_ATTESTATION_EVIDENCE_SOURCE,
   type AgentEventEnvelope,
   type BudgetLimits
 } from "../packages/agent-protocol/src/index.js";
@@ -49,7 +49,7 @@ function controller(target: RuntimeSession): BudgetController {
   });
 }
 
-describe("V3 shared budget ledger", () => {
+describe("shared budget ledger", () => {
   it("reconciles provider-measured usage above its reservation without discarding the charge", async () => {
     const target = session(limits({ inputTokens: 1_000 }));
     const events: string[] = [];
@@ -278,7 +278,7 @@ describe("V3 shared budget ledger", () => {
       createdAt: "2026-01-01T00:00:00.000Z",
       producer: { authority: "runtime", id: "subject-attestor" },
       summary: "Subject build identity was frozen before execution.",
-      data: { source: SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1, diagnostic: { productDigest: "a" } }
+      data: { source: SUBJECT_ATTESTATION_EVIDENCE_SOURCE, diagnostic: { productDigest: "a" } }
     }];
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-plan-evidence-"));
     const control = new RuntimeControlService({
@@ -294,7 +294,11 @@ describe("V3 shared budget ledger", () => {
       nodes: [{
         ...target.durable.state.plan.nodes[0]!,
         status: "completed" as const,
-        evidence: [{ evidenceId: "subject-attestation:run", kind: "diagnostic" as const }]
+        evidence: [{
+          evidenceId: "subject-attestation:run",
+          kind: "diagnostic" as const,
+          claim: "acceptance_met" as const
+        }]
       }]
     };
 

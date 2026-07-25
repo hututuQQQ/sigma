@@ -24,7 +24,10 @@ import { createPresentationState, projectEvent } from "../packages/agent-present
 import { AgentSupervisor } from "../packages/agent-supervisor/src/index.js";
 import { createApprovingReviewer } from "./helpers/approving-reviewer.js";
 import { registerContentValidator, validationTurn } from "./helpers/content-validator.js";
-import { completeAgentEventPayload } from "./testkit/agent-event-fixtures.js";
+import {
+  completeAgentEventPayload,
+  persistEmptyCustomization
+} from "./testkit/agent-event-fixtures.js";
 
 const createRuntime = (options: Parameters<typeof createBaseRuntime>[0]) => createBaseRuntime({
   ...options,
@@ -472,14 +475,16 @@ describe("Sigma architecture", () => {
     const pendingRoot = path.join(pendingWorkspace, ".agent");
     const pendingStore = new SegmentedJsonlStore({ rootDir: pendingRoot });
     const future = new Date(Date.now() + 10_000).toISOString();
+    const pendingCustomization = await persistEmptyCustomization(pendingRoot, "session");
     const pendingEvents = [
       event(1, "session.created", { workspacePath: pendingWorkspace, mode: "change" }),
-      event(2, "run.started", { mode: "change", deadlineAt: future }),
-      event(3, "user.message", { text: "finish" }),
-      event(4, "model.started", { turnId: 1, effectRevision: 3 }),
-      event(5, "model.completed", {
+      event(2, "customization.frozen", pendingCustomization),
+      event(3, "run.started", { mode: "change", deadlineAt: future }),
+      event(4, "user.message", { text: "finish" }),
+      event(5, "model.started", { turnId: 1, effectRevision: 4 }),
+      event(6, "model.completed", {
         turnId: 1,
-        effectRevision: 3,
+        effectRevision: 4,
         message: { role: "assistant", content: "already generated" },
         toolCalls: [],
         finishReason: "stop"
@@ -496,10 +501,12 @@ describe("Sigma architecture", () => {
     const expiredWorkspace = await mkdtemp(path.join(os.tmpdir(), "sigma-expired-resume-"));
     const expiredRoot = path.join(expiredWorkspace, ".agent");
     const expiredStore = new SegmentedJsonlStore({ rootDir: expiredRoot });
+    const expiredCustomization = await persistEmptyCustomization(expiredRoot, "session");
     const expiredEvents = [
       event(1, "session.created", { workspacePath: expiredWorkspace, mode: "change" }),
-      event(2, "run.started", { mode: "change", deadlineAt: new Date(Date.now() - 1_000).toISOString() }),
-      event(3, "user.message", { text: "do not extend this run" })
+      event(2, "customization.frozen", expiredCustomization),
+      event(3, "run.started", { mode: "change", deadlineAt: new Date(Date.now() - 1_000).toISOString() }),
+      event(4, "user.message", { text: "do not extend this run" })
     ];
     for (const stored of expiredEvents) await expiredStore.append(stored, stored.seq - 1);
     const expiredRuntime = createRuntime({
@@ -551,9 +558,11 @@ describe("Sigma architecture", () => {
       checkpointScope: ["restored.txt"],
       idempotence: "replay_safe"
     };
+    const customization = await persistEmptyCustomization(storeRootDir, "session");
     const persisted = [
       event(1, "session.created", { workspacePath: workspace, mode: "change" }),
-      event(2, "plan.updated", {
+      event(2, "customization.frozen", customization),
+      event(3, "plan.updated", {
         previousRevision: 0,
         plan: {
           revision: 1,
@@ -570,25 +579,25 @@ describe("Sigma architecture", () => {
           }]
         }
       }),
-      event(3, "run.started", { mode: "change" }),
-      event(4, "user.message", { text: "write restored.txt" }),
-      event(5, "model.started", { turnId: 1, effectRevision: 4 }),
-      event(6, "model.completed", {
-        turnId: 1, effectRevision: 4,
+      event(4, "run.started", { mode: "change" }),
+      event(5, "user.message", { text: "write restored.txt" }),
+      event(6, "model.started", { turnId: 1, effectRevision: 5 }),
+      event(7, "model.completed", {
+        turnId: 1, effectRevision: 5,
         message: { role: "assistant", content: "", toolCalls: [{ id: "restored-write", name: "write", arguments: { path: "restored.txt", content: "ok" } }] },
         finishReason: "tool_calls",
         toolCalls: [{ id: "restored-write", name: "write", arguments: { path: "restored.txt", content: "ok" } }]
       }),
-      event(7, "tool.requested", { turnId: 1, effectRevision: 4, callId: "restored-write", name: "write", arguments: { path: "restored.txt", content: "ok" } }),
-      event(8, "execution.planned", {
+      event(8, "tool.requested", { turnId: 1, effectRevision: 5, callId: "restored-write", name: "write", arguments: { path: "restored.txt", content: "ok" } }),
+      event(9, "execution.planned", {
         executionId: "restored-write", toolCallId: "restored-write", plan: restoredPlan
       }),
-      event(9, "tool.approval_requested", {
-        turnId: 1, effectRevision: 4, requestId: "restored-write", callId: "restored-write",
+      event(10, "tool.approval_requested", {
+        turnId: 1, effectRevision: 5, requestId: "restored-write", callId: "restored-write",
         toolName: "write", arguments: { path: "restored.txt", content: "ok" },
         effects: ["filesystem.read", "filesystem.write"], plan: restoredPlan
       }),
-      event(10, "run.suspended", { turnId: 1, effectRevision: 4, requestId: "restored-write", callId: "restored-write", message: "approval required" })
+      event(11, "run.suspended", { turnId: 1, effectRevision: 5, requestId: "restored-write", callId: "restored-write", message: "approval required" })
     ];
     for (const stored of persisted) await store.append(stored, stored.seq - 1);
     const runtime = createRuntime({
@@ -616,20 +625,38 @@ describe("Sigma architecture", () => {
     const createSuspendedStore = async (workspace: string): Promise<{ storeRootDir: string; store: SegmentedJsonlStore }> => {
       const storeRootDir = path.join(workspace, ".agent");
       const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
+      const customization = await persistEmptyCustomization(storeRootDir, "session");
+      const pendingPlan = {
+        exactEffects: ["filesystem.read", "filesystem.write"],
+        readPaths: ["result.txt"],
+        writePaths: ["result.txt"],
+        network: "none",
+        processMode: "none",
+        checkpointScope: ["result.txt"],
+        idempotence: "replay_safe"
+      };
       const persisted = [
         event(1, "session.created", { workspacePath: workspace, mode: "change" }),
-        event(2, "run.started", { mode: "change" }),
-        event(3, "user.message", { text: "write result" }),
-        event(4, "model.started", { turnId: 1, effectRevision: 3 }),
-        event(5, "model.completed", {
-          turnId: 1, effectRevision: 3,
+        event(2, "customization.frozen", customization),
+        event(3, "run.started", { mode: "change" }),
+        event(4, "user.message", { text: "write result" }),
+        event(5, "model.started", { turnId: 1, effectRevision: 4 }),
+        event(6, "model.completed", {
+          turnId: 1, effectRevision: 4,
           message: { role: "assistant", content: "", toolCalls: [{ id: "pending-write", name: "write", arguments: { path: "result.txt", content: "x" } }] },
           finishReason: "tool_calls",
           toolCalls: [{ id: "pending-write", name: "write", arguments: { path: "result.txt", content: "x" } }]
         }),
-        event(6, "tool.requested", { turnId: 1, effectRevision: 3, callId: "pending-write", name: "write", arguments: { path: "result.txt", content: "x" } }),
-        event(7, "tool.approval_requested", { turnId: 1, effectRevision: 3, requestId: "pending-write", callId: "pending-write", toolName: "write" }),
-        event(8, "run.suspended", { turnId: 1, effectRevision: 3, requestId: "pending-write", callId: "pending-write", message: "approval required" })
+        event(7, "tool.requested", { turnId: 1, effectRevision: 4, callId: "pending-write", name: "write", arguments: { path: "result.txt", content: "x" } }),
+        event(8, "execution.planned", {
+          executionId: "pending-write", toolCallId: "pending-write", plan: pendingPlan
+        }),
+        event(9, "tool.approval_requested", {
+          turnId: 1, effectRevision: 4, requestId: "pending-write", callId: "pending-write",
+          toolName: "write", arguments: { path: "result.txt", content: "x" },
+          effects: ["filesystem.read", "filesystem.write"], plan: pendingPlan
+        }),
+        event(10, "run.suspended", { turnId: 1, effectRevision: 4, requestId: "pending-write", callId: "pending-write", message: "approval required" })
       ];
       for (const stored of persisted) await store.append(stored, stored.seq - 1);
       return { storeRootDir, store };
@@ -667,15 +694,15 @@ describe("Sigma architecture", () => {
     const durableDeniedWorkspace = await mkdtemp(path.join(os.tmpdir(), "sigma-durable-deny-resume-"));
     const durableDeniedStore = await createSuspendedStore(durableDeniedWorkspace);
     await durableDeniedStore.store.append({
-      ...event(9, "tool.approval_resolved", {
+      ...event(11, "tool.approval_resolved", {
         turnId: 1,
-        effectRevision: 3,
+        effectRevision: 4,
         requestId: "pending-write",
         callId: "pending-write",
         decision: "deny"
       }),
       authority: "user"
-    }, 8);
+    }, 10);
     const durableDeniedRuntime = createRuntime({
       gateway: new FakeGateway([{ message: { role: "assistant", content: "durable denial settled" }, finishReason: "stop" }]),
       store: durableDeniedStore.store,

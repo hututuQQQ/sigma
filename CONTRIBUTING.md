@@ -40,9 +40,12 @@ checks were run and which environment-dependent checks remain for CI.
 
 - Keep each pull request focused and explain the product behavior it changes.
 - Add or update tests for observable behavior.
-- Preserve fail-closed security behavior and durable protocol compatibility.
+- Preserve fail-closed security behavior. Sigma-owned serialized boundaries
+  accept only schema 1; unknown schemas must be rejected without modifying the
+  input.
 - Do not include generated packages, local artifacts, credentials, or benchmark-
   specific shortcuts.
-- Update public documentation and `CHANGELOG.md` for user-visible changes.
+- Update the current-behavior documentation for user-visible changes. Do not
+  add migration narratives or compatibility aliases for unpublished formats.
 
 By contributing, you agree that your contribution is licensed under the MIT License.

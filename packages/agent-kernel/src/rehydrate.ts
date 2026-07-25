@@ -2,7 +2,7 @@ import {
   KERNEL_STATE_VERSION,
   isBudgetLedgerState,
   isCheckpointRef,
-  isContextArchiveV1,
+  isContextArchive,
   isEvidenceRecord,
   isPlanGraph,
   isUsageRecord,
@@ -33,7 +33,7 @@ function assertDurableLedgers(state: KernelState): void {
   if (new Set(state.budget.reservations.map((item) => item.reservationId)).size !== state.budget.reservations.length) {
     throw new Error("Duplicate budget reservation IDs.");
   }
-  if (state.contextArchive && !isContextArchiveV1(state.contextArchive)) {
+  if (state.contextArchive && !isContextArchive(state.contextArchive)) {
     throw new Error("Kernel context archive is invalid.");
   }
 }

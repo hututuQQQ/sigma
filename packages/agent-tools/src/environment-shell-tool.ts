@@ -96,7 +96,7 @@ export function environmentShellTools(
         ],
         ["change"]
       ),
-      brokerMutationAuthority: "disposable_enclosing_container_v1",
+      brokerMutationAuthority: "disposable_enclosing_container",
       async prepare(value, context) {
         const input = environmentArguments(value, context.workspacePath);
         assertAvailableShell(input, options);

@@ -35,7 +35,7 @@ export interface CliConfig {
   networkMode: "none" | "loopback" | "full";
   processHandoff: "allow" | "deny";
   reviewerWaiver: boolean;
-  legacySingleModelRoute: boolean;
+  explicitSingleModelRoute: boolean;
   modelSpecs: ModelSpecConfigValue[];
   modelRoutes: ModelRouteConfigValue[];
   runDeadlineSec: number;
@@ -56,7 +56,6 @@ export interface CliConfig {
   };
   checkpoint: { maxFiles: number; maxBytes: number };
   outputFormat: "text" | "json" | "stream-json";
-  outputSchema: 2 | 3;
   streamJsonMaxLineBytes: number;
   initialMode: "analyze" | "change";
   tuiFps: number;
@@ -72,7 +71,6 @@ export interface CliConfigLoadOptions {
   homeDir?: string;
   trustStorePath?: string;
   customizationTrustStorePath?: string;
-  allowLegacyMigrationKeys?: boolean;
 }
 
 interface TomlDocument {
@@ -86,21 +84,6 @@ function readToml(filePath: string): TomlDocument | undefined {
   const parsed = parseToml(source);
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`Configuration must be a TOML table: ${filePath}`);
   return { source, values: parsed as Record<string, unknown> };
-}
-
-function withoutRemovedMigrationKeys(document: TomlDocument | undefined): TomlDocument | undefined {
-  if (!document) return undefined;
-  const version = document.values.schema_version;
-  if (version !== undefined && version !== 2 && version !== 3 && version !== 4) return document;
-  const security = document.values.security;
-  if (!security || typeof security !== "object" || Array.isArray(security)
-    || !Object.hasOwn(security, "allow_unsafe_host_exec")) return document;
-  const migratedSecurity = { ...security as Record<string, unknown> };
-  delete migratedSecurity.allow_unsafe_host_exec;
-  return {
-    ...document,
-    values: { ...document.values, security: migratedSecurity }
-  };
 }
 
 export function parseArgs(argv: string[]): ParsedArgs {
@@ -162,10 +145,8 @@ function configInputs(flags: Record<string, unknown>, options: CliConfigLoadOpti
     env,
     workspace,
     homeDir,
-    workspaceDocument: options.allowLegacyMigrationKeys
-      ? withoutRemovedMigrationKeys(workspaceDocument) : workspaceDocument,
-    homeDocument: options.allowLegacyMigrationKeys
-      ? withoutRemovedMigrationKeys(homeDocument) : homeDocument
+    workspaceDocument,
+    homeDocument
   };
 }
 
@@ -212,7 +193,7 @@ function customizationTrustAttestation(
 function cliConfig(
   values: ReturnType<typeof resolveConfig>,
   input: ConfigInputs,
-  legacySingleModelRoute: boolean,
+  explicitSingleModelRoute: boolean,
   mcpServers: McpServerConfigValue[],
   source: McpConfigSource,
   trust: WorkspaceMcpTrustAttestation | undefined,
@@ -232,7 +213,7 @@ function cliConfig(
     networkMode: values.networkMode as CliConfig["networkMode"],
     processHandoff: values.processHandoff as CliConfig["processHandoff"],
     reviewerWaiver: values.reviewerWaiver === true,
-    legacySingleModelRoute,
+    explicitSingleModelRoute,
     modelSpecs: values.modelSpecs as ModelSpecConfigValue[],
     modelRoutes: values.modelRoutes as ModelRouteConfigValue[],
     runDeadlineSec: Number(values.runDeadlineSec),
@@ -249,7 +230,6 @@ function cliConfig(
     },
     checkpoint: { maxFiles: Number(values.checkpointMaxFiles), maxBytes: Number(values.checkpointMaxBytes) },
     outputFormat: values.outputFormat as CliConfig["outputFormat"],
-    outputSchema: Number(values.outputSchema) as 2 | 3,
     streamJsonMaxLineBytes: Number(values.streamJsonMaxLineBytes),
     initialMode: values.initialMode as CliConfig["initialMode"],
     tuiFps: Number(values.tuiFps),
@@ -275,8 +255,8 @@ export function loadCliConfig(flags: Record<string, unknown>, options: CliConfig
   const customizationTrust = customizationTrustAttestation(
     values.trustWorkspaceCustomization === true, input, options
   );
-  const legacySingleModelRoute = Object.hasOwn(flags, "provider") || Object.hasOwn(flags, "model");
-  return cliConfig(values, input, legacySingleModelRoute, mcpServers, source, trust, customizationTrust);
+  const explicitSingleModelRoute = Object.hasOwn(flags, "provider") || Object.hasOwn(flags, "model");
+  return cliConfig(values, input, explicitSingleModelRoute, mcpServers, source, trust, customizationTrust);
 }
 
 export function cliConfigHelp(): string {

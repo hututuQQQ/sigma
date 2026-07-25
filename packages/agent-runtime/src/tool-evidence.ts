@@ -5,9 +5,9 @@ import type {
   EvidenceRecord,
   InputAccessEvidence,
   MutationFrontier,
-  RepositoryAcceptanceEvidenceV1,
-  RepositoryRecoveryDecisionEvidenceV1,
-  RepositoryRecoverySelectionEvidenceV1,
+  RepositoryAcceptanceEvidence,
+  RepositoryRecoveryDecisionEvidence,
+  RepositoryRecoverySelectionEvidence,
   RepositoryDeltaEvidence,
   ToolCallPlan,
   ToolReceipt,
@@ -30,7 +30,7 @@ export interface ReceiptEvidenceScope {
       subjects: string[];
       criterionIds: string[];
     };
-    claim?: Omit<import("agent-protocol").ValidationClaimV1, "status">;
+    claim?: Omit<import("agent-protocol").ValidationClaim, "status">;
   };
   repositoryScope?: {
     goalEpoch: number;
@@ -79,7 +79,7 @@ function sanitizeValidation(
     status: receipt.ok && raw.status === "passed" ? "passed" : "failed",
     summary: raw.summary,
     data: {
-      schemaVersion: 2,
+      schemaVersion: 1,
       ...(frontier.intent ? {
         intent: {
           ...frontier.intent,
@@ -213,7 +213,7 @@ function repositoryAcceptance(
   delta: RepositoryDeltaEvidence,
   receipt: ToolReceipt,
   scope: ReceiptEvidenceScope
-): RepositoryAcceptanceEvidenceV1 | undefined {
+): RepositoryAcceptanceEvidence | undefined {
   const repository = scope.repositoryScope;
   const assertions = delta.data.semanticAssertions;
   const target = assertions?.targetAssertions;
@@ -255,10 +255,10 @@ function repositoryAcceptance(
 }
 
 function sanitizeRepositorySelection(
-  raw: RepositoryRecoverySelectionEvidenceV1,
+  raw: RepositoryRecoverySelectionEvidence,
   receipt: ToolReceipt,
   scope: ReceiptEvidenceScope
-): RepositoryRecoverySelectionEvidenceV1 | undefined {
+): RepositoryRecoverySelectionEvidence | undefined {
   if (scope.repositoryScope?.goalEpoch !== raw.data.goalEpoch) return undefined;
   return {
     ...raw,
@@ -275,10 +275,10 @@ function sanitizeRepositorySelection(
 }
 
 function sanitizeRepositoryDecision(
-  raw: RepositoryRecoveryDecisionEvidenceV1,
+  raw: RepositoryRecoveryDecisionEvidence,
   receipt: ToolReceipt,
   scope: ReceiptEvidenceScope
-): RepositoryRecoveryDecisionEvidenceV1 | undefined {
+): RepositoryRecoveryDecisionEvidence | undefined {
   if (scope.repositoryScope?.goalEpoch !== raw.data.goalEpoch) return undefined;
   return {
     ...raw,
@@ -385,7 +385,7 @@ export function normalizeReceiptEvidence(
   const evidence = (receipt.evidence ?? []).flatMap((raw) =>
     normalizeEvidenceRecord(raw, receipt, toolName, plan, scope, actualEffects));
   const environmentMutation =
-    plan.mutationAuthority === "disposable_enclosing_container_v1"
+    plan.mutationAuthority === "disposable_enclosing_container"
       && actualEffects.includes("filesystem.write")
       ? enclosingContainerMutationDiagnostic(receipt, plan, scope, actualEffects)
       : undefined;

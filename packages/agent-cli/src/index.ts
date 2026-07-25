@@ -1,12 +1,17 @@
 #!/usr/bin/env node
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { CommandRegistry, SIGMA_CONFIG_SCHEMA, configHelp, type CommandDefinition } from "agent-config";
+import {
+  CommandRegistry,
+  SIGMA_CONFIG_SCHEMA,
+  SIGMA_PROJECT_FACTS,
+  configHelp,
+  type CommandDefinition
+} from "agent-config";
 import type { RuntimeClient } from "agent-protocol";
 import type { TuiAppOptions } from "agent-tui";
 import { runDoctorCommand } from "./commands/doctor.js";
 import { runSandboxCommand } from "./commands/sandbox.js";
-import { runConfigCommand } from "./commands/config.js";
 import { runInitCommand } from "./commands/init.js";
 import { runReplayCommand } from "./commands/replay.js";
 import { runCommand } from "./commands/run.js";
@@ -26,7 +31,7 @@ export interface AgentCliMainOptions {
 
 function printHelp(): void {
   const commands = new CommandRegistry().definitions();
-  process.stdout.write(`Sigma Code 3.0\n\nUsage: agent <command> [options]\n\nCommands:\n${commands.map((item) => `  ${item.name.padEnd(10)} ${item.summary}`).join("\n")}\n\nConfiguration:\n${configHelp().join("\n")}\n`);
+  process.stdout.write(`Sigma Code ${SIGMA_PROJECT_FACTS.productVersion}\n\nUsage: agent <command> [options]\n\nCommands:\n${commands.map((item) => `  ${item.name.padEnd(10)} ${item.summary}`).join("\n")}\n\nConfiguration:\n${configHelp().join("\n")}\n`);
 }
 
 function completionScript(shell: string): string {
@@ -91,7 +96,6 @@ async function dispatchCommand(
     case "sandbox": return await runSandboxCommand(argv);
     case "version": return await runVersionCommand(argv);
     case "init": return await runInitCommand(argv);
-    case "config": return await runConfigCommand(argv);
     case "completion":
       process.stdout.write(completionScript(argv[0] ?? ""));
       return 0;

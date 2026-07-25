@@ -249,7 +249,7 @@ describe("execution tool capability closure", () => {
     });
     const environment = tools.descriptor("environment_process_spawn");
     expect(environment).toMatchObject({
-      brokerMutationAuthority: "disposable_enclosing_container_v1",
+      brokerMutationAuthority: "disposable_enclosing_container",
       inputSchema: {
         properties: {
           lifecycle: { enum: ["session", "deliverable"] }
@@ -270,7 +270,7 @@ describe("execution tool capability closure", () => {
     });
     const plan = await tools.prepare(call, preparation(root));
     expect(plan).toMatchObject({
-      mutationAuthority: "disposable_enclosing_container_v1",
+      mutationAuthority: "disposable_enclosing_container",
       processMode: "background",
       checkpointScope: [path.parse(path.resolve(root)).root]
     });

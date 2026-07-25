@@ -25,6 +25,7 @@ const dimensions = (passing = true) => ({
     status: passing ? "pass" : "fail",
     checks: [{ name: "post-run verifier", ok: passing, detail: passing ? "passed" : "expected file missing" }]
   },
+  delivery: { status: passing ? "pass" : "fail", checks: [] },
   safety: { status: "pass", violations: [] },
   experience: { status: "pass", violations: [], warnings: [] },
   reliability: { status: "pass", signals: [] }
@@ -38,7 +39,7 @@ const subject = (overrides: Record<string, unknown> = {}) => ({
   platform: "win32",
   arch: "x64",
   gitSha: "abc123",
-  configDigest: "config-1",
+  environmentDigest: "environment-1",
   fixtureDigest: "fixture-1",
   scenarioDigest: "scenario-1",
   evaluatorDigest: "evaluator-1",
@@ -52,17 +53,23 @@ function attempt({
   scenarioId = "small-edit",
   repetition = 1,
   passing = true,
+  validity = "valid",
   durationMs = 1000,
+  metrics = {},
   subjectOverrides = {},
   artifacts = {}
 }: {
   scenarioId?: string;
   repetition?: number;
   passing?: boolean;
+  validity?: "valid" | "invalid" | "not_observed";
   durationMs?: number;
+  metrics?: Record<string, unknown>;
   subjectOverrides?: Record<string, unknown>;
   artifacts?: Record<string, unknown>;
 } = {}) {
+  const observed = validity === "valid";
+  const currentDimensions = dimensions(passing);
   return {
     schemaVersion: 1,
     kind: "eval_attempt",
@@ -80,7 +87,18 @@ function attempt({
       sessionId: `session-${repetition}`,
       exitCode: passing ? 0 : 1
     },
-    dimensions: dimensions(passing),
+    validity,
+    ...(observed ? {} : {
+      validityDetail: { owner: "evaluator", phase: "observation", code: "observation_unavailable" }
+    }),
+    failureChain: { primary: null, contributing: [], terminal: null },
+    dimensions: observed ? currentDimensions : {
+      correctness: { status: "not_observed", checks: [] },
+      delivery: { status: "not_observed", checks: [] },
+      safety: { status: "not_observed", violations: [] },
+      experience: { status: "not_observed", violations: [], warnings: [] },
+      reliability: { status: "not_observed", signals: [] }
+    },
     metrics: {
       durationMs,
       counts: {
@@ -93,7 +111,8 @@ function attempt({
       usage: { inputTokens: passing ? 10_000 : 80_000, outputTokens: 500, costUsd: 0.04 },
       repetition: { duplicateRequestRate: passing ? 0 : 0.5, duplicateOutputBytes: passing ? 0 : 4096 },
       stagnation: { windowCount: passing ? 0 : 2 },
-      postAnswer: { toolCalls: passing ? 0 : 3, durationMs: passing ? 0 : 5000 }
+      postAnswer: { toolCalls: passing ? 0 : 3, durationMs: passing ? 0 : 5000 },
+      ...metrics
     },
     artifacts: {
       events: `attempts/${scenarioId}-${repetition}/events.jsonl`,
@@ -118,63 +137,6 @@ function run(attempts: ReturnType<typeof attempt>[], overrides: Record<string, u
     scenarios: [],
     counts: {},
     status: "unknown",
-    ...overrides
-  };
-}
-
-function attemptV2({
-  scenarioId = "general-case",
-  repetition = 1,
-  passing = true,
-  validity = "valid",
-  durationMs = 1000,
-  metrics = {},
-  subjectOverrides = {}
-}: {
-  scenarioId?: string;
-  repetition?: number;
-  passing?: boolean;
-  validity?: "valid" | "invalid" | "not_observed";
-  durationMs?: number;
-  metrics?: Record<string, unknown>;
-  subjectOverrides?: Record<string, unknown>;
-} = {}) {
-  const legacy = attempt({ scenarioId, repetition, passing, durationMs, subjectOverrides });
-  const observed = validity === "valid";
-  return {
-    ...legacy,
-    schemaVersion: 2,
-    validity,
-    ...(observed ? {} : {
-      validityDetail: { owner: "evaluator", phase: "observation", code: "observation_unavailable" }
-    }),
-    failureChain: { primary: null, contributing: [], terminal: null },
-    dimensions: {
-      correctness: observed ? legacy.dimensions.correctness : { status: "not_observed", checks: [] },
-      delivery: observed ? { status: passing ? "pass" : "fail", checks: [] } : { status: "not_observed", checks: [] },
-      safety: observed ? legacy.dimensions.safety : { status: "not_observed", violations: [] },
-      experience: observed ? legacy.dimensions.experience : { status: "not_observed", violations: [], warnings: [] },
-      reliability: observed ? legacy.dimensions.reliability : { status: "not_observed", signals: [] }
-    },
-    metrics: { ...legacy.metrics, ...metrics }
-  };
-}
-
-function runV2(attempts: ReturnType<typeof attemptV2>[], overrides: Record<string, unknown> = {}) {
-  const runId = typeof overrides.runId === "string" ? overrides.runId : "run-v2";
-  return {
-    schemaVersion: 2,
-    kind: "eval_run",
-    runId,
-    suite: "quick",
-    repeat: 3,
-    startedAt: "2026-07-12T00:00:00.000Z",
-    finishedAt: "2026-07-12T00:05:00.000Z",
-    subject: subject(),
-    attempts: attempts.map((item) => ({ ...item, runId })),
-    scenarios: [],
-    frozenRunPolicy: { repeat: 3 },
-    scheduleDigest: "schedule-1",
     ...overrides
   };
 }
@@ -212,7 +174,7 @@ describe("agent evaluation report", () => {
     });
     expect(report.dimensions).toEqual({
       correctness: "fail",
-      delivery: "unavailable",
+      delivery: "fail",
       safety: "stable",
       experience: "stable",
       reliability: "stable"
@@ -221,10 +183,11 @@ describe("agent evaluation report", () => {
     expect(renderEvalReportMarkdown(report)).toContain("does not calculate a composite score");
   });
 
-  it("accepts a versioned attempt as a one-repetition run and rejects unversioned input", () => {
+  it("accepts a schema 1 attempt and rejects an unknown schema", () => {
     const report = buildEvalRunReport(attempt());
     expect(report).toMatchObject({ repeat: 1, status: "stable", counts: { attempts: { total: 1, passed: 1 } } });
-    expect(() => buildEvalRunReport({ kind: "eval_run", attempts: [] })).toThrow("versioned");
+    expect(() => buildEvalRunReport({ schemaVersion: 999, kind: "eval_run", attempts: [] }))
+      .toThrow(/unsupported_schema_version.*expected=1.*actual=999/u);
   });
 
   it("rejects duplicate attempt identities and repetitions instead of manufacturing stability", () => {
@@ -235,30 +198,25 @@ describe("agent evaluation report", () => {
       .toThrow("scenarioId/repetition");
   });
 
-  it("rejects legacy attempts mixed into a V2 run", () => {
-    const mixed = runV2([attemptV2()]);
-    mixed.attempts[0] = attempt() as never;
-    expect(() => buildEvalRunReport(mixed)).toThrow(/schemaVersion.*sourceSchemaVersion/);
-  });
-
   it("keeps a declared scenario visible when no attempt was produced", () => {
     const report = buildEvalRunReport(run([], {
       scenarios: [{ scenarioId: "never-launched", scenarioDigest: "scenario-never-launched" }]
     }));
 
-    expect(report.status).toBe("fail");
+    expect(report.status).toBe("inconclusive");
     expect(report.scenarios).toEqual([expect.objectContaining({
       scenarioId: "never-launched",
       scenarioDigest: "scenario-never-launched",
       attempts: 0,
       missingAttempts: 3,
-      status: "fail"
+      status: "inconclusive"
     })]);
     expect(report.dimensions).toEqual({
-      correctness: "fail", delivery: "unavailable", safety: "fail", experience: "fail", reliability: "fail"
+      correctness: "inconclusive", delivery: "inconclusive", safety: "inconclusive",
+      experience: "inconclusive", reliability: "inconclusive"
     });
     expect(buildHumanAuditPack(report).topSignals).toContainEqual(expect.objectContaining({
-      code: "scenario_not_attempted", severity: "blocker"
+      code: "scenario_not_attempted", severity: "warning"
     }));
   });
 
@@ -267,8 +225,8 @@ describe("agent evaluation report", () => {
       repeat: 1,
       infrastructureErrors: [{ code: "subject_preparation_failed", phase: "subject_preparation" }]
     }));
-    expect(report.status).toBe("fail");
-    expect(report.dimensions.reliability).toBe("fail");
+    expect(report.status).toBe("inconclusive");
+    expect(report.dimensions.reliability).toBe("inconclusive");
     expect(buildHumanAuditPack(report).topSignals).toContainEqual(expect.objectContaining({
       code: "subject_preparation_failed", severity: "blocker"
     }));
@@ -358,7 +316,7 @@ describe("agent evaluation report", () => {
     expect([persisted, markdown, humanAuditMarkdown, ...published].join("\n"))
       .not.toContain("sk-path-secret-value-12345");
     expect(humanAudit).toMatchObject({
-      schemaVersion: 2,
+      schemaVersion: 1,
       kind: "human_audit_pack",
       audience: "human_only",
       feedbackPolicy: "never_supply_to_solving_or_optimization_agents",
@@ -368,7 +326,7 @@ describe("agent evaluation report", () => {
     expect(result).not.toHaveProperty("codexReviewPath");
     expect(result).not.toHaveProperty("humanAuditPack");
     expect(latest).toEqual(expect.objectContaining({
-      schemaVersion: 2,
+      schemaVersion: 1,
       kind: "eval_latest",
       runId: "run-current",
       runDir: "run-current",
@@ -378,7 +336,7 @@ describe("agent evaluation report", () => {
         report: `run-current/report.${result.bundleDigest}.md`
       },
       humanReview: {
-        schemaVersion: 2,
+        schemaVersion: 1,
         kind: "human_audit_pack",
         audience: "human_only",
         feedbackPolicy: "never_supply_to_solving_or_optimization_agents",
@@ -502,14 +460,13 @@ describe("agent evaluation report", () => {
     expect(renderHumanAuditMarkdown(pack)).toContain("must never be supplied to a solving or optimization agent");
   });
 
-  it("separates valid, invalid, not-observed, and missing V2 samples without charging correctness", () => {
-    const valid = attemptV2({ repetition: 1 });
-    const invalid = attemptV2({ repetition: 2, validity: "invalid" });
-    const report = buildEvalRunReport(runV2([valid, invalid]));
+  it("separates valid, invalid, not-observed, and missing samples without charging correctness", () => {
+    const valid = attempt({ repetition: 1 });
+    const invalid = attempt({ repetition: 2, validity: "invalid" });
+    const report = buildEvalRunReport(run([valid, invalid]));
 
     expect(report).toMatchObject({
-      schemaVersion: 2,
-      sourceSchemaVersion: 2,
+      schemaVersion: 1,
       status: "inconclusive",
       validity: { valid: 1, invalid: 1, notObserved: 0, missing: 1 },
       counts: { attempts: { total: 2, valid: 1, invalid: 1, passed: 1, failed: 0 } }
@@ -528,11 +485,11 @@ describe("agent evaluation report", () => {
   });
 
   it("keeps correctness passed when a correct subject fails only the delivery protocol", () => {
-    const value = attemptV2();
+    const value = attempt();
     value.outcome = { status: "failed", finishReason: "terminal_protocol_failed", sessionId: "session", exitCode: 1 };
     value.dimensions.correctness = { status: "pass", checks: [{ name: "result", ok: true }] };
     value.dimensions.delivery = { status: "fail", checks: [{ name: "terminal", ok: false }] };
-    const report = buildEvalRunReport(runV2([value], { repeat: 1 }));
+    const report = buildEvalRunReport(run([value], { repeat: 1 }));
 
     expect(report.validity).toEqual({ valid: 1, invalid: 0, notObserved: 0, missing: 0 });
     expect(report.dimensions).toMatchObject({ correctness: "stable", delivery: "fail" });
@@ -540,7 +497,7 @@ describe("agent evaluation report", () => {
   });
 
   it("reports Wilson intervals, cost per success, convergence, and mutation discipline without a composite", () => {
-    const attempts = [1, 2, 3].map((repetition) => attemptV2({
+    const attempts = [1, 2, 3].map((repetition) => attempt({
       repetition,
       metrics: {
         failureConvergence: {
@@ -558,7 +515,7 @@ describe("agent evaluation report", () => {
         }
       }
     }));
-    const report = buildEvalRunReport(runV2(attempts));
+    const report = buildEvalRunReport(run(attempts));
 
     expect(wilsonPassRate(2, 3)).toMatchObject({ passed: 2, total: 3, rate: 2 / 3 });
     expect(report.failureConvergence).toMatchObject({
@@ -573,8 +530,8 @@ describe("agent evaluation report", () => {
     expect(hasScoreKey(report)).toBe(false);
   });
 
-  it("reports incomplete metric coverage instead of supplementing malformed V2 attempts with zeroes", () => {
-    const complete = attemptV2({ repetition: 1, metrics: {
+  it("reports incomplete metric coverage instead of supplementing malformed attempts with zeroes", () => {
+    const complete = attempt({ repetition: 1, metrics: {
       failureConvergence: {
         episodeCount: 0, failFastEligibleEpisodes: 0, failFastTriggeredOnTime: 0, failFastLate: 0,
         failFastMissed: 0, recoverySucceeded: 0, recoveryBypassed: 0, recoveryFailed: 0,
@@ -588,10 +545,10 @@ describe("agent evaluation report", () => {
         workspaceDeltaEvents: 0
       }
     } });
-    const malformed = attemptV2({ repetition: 2, metrics: {
+    const malformed = attempt({ repetition: 2, metrics: {
       failureConvergence: { failFastMissed: 99 }, mutationDiscipline: { mutationRequests: 99 }
     } });
-    const report = buildEvalRunReport(runV2([complete, malformed], { repeat: 2 }));
+    const report = buildEvalRunReport(run([complete, malformed], { repeat: 2 }));
 
     expect(report.failureConvergence).toMatchObject({
       failFastMissed: 0, coverage: { observed: 1, total: 2, status: "incomplete" }
@@ -601,21 +558,6 @@ describe("agent evaluation report", () => {
     });
   });
 
-  it("renders migrated V1 fields as unavailable and rejects V1/V2 statistical comparison", () => {
-    const legacy = buildEvalRunReport(run([attempt()], { repeat: 1 }));
-    const modern = runV2([attemptV2()], { runId: "run-modern", repeat: 1 });
-
-    expect(legacy).toMatchObject({
-      schemaVersion: 2,
-      sourceSchemaVersion: 1,
-      validity: "unavailable",
-      failureConvergence: "unavailable",
-      mutationDiscipline: "unavailable"
-    });
-    expect(legacy.dimensions.delivery).toBe("unavailable");
-    expect(compareEvalRuns(legacy, modern).compatibility.mismatches)
-      .toContainEqual(expect.objectContaining({ field: "schemaVersion" }));
-  });
 });
 
 describe("agent evaluation baseline comparison", () => {
@@ -714,17 +656,17 @@ describe("agent evaluation baseline comparison", () => {
     const baseline = run([1, 2, 3].map((repetition) => attempt({ repetition })));
     const candidate = run([1, 2, 3].map((repetition) => attempt({
       repetition,
-      subjectOverrides: { configDigest: "config-2", scenarioDigest: "scenario-2" }
+      subjectOverrides: { environmentDigest: "environment-2", scenarioDigest: "scenario-2" }
     })), {
       runId: "run-candidate",
-      subject: subject({ configDigest: "config-2", scenarioDigest: "scenario-2" })
+      subject: subject({ environmentDigest: "environment-2", scenarioDigest: "scenario-2" })
     });
 
     const comparison = compareEvalRuns(baseline, candidate);
 
     expect(comparison.comparable).toBe(false);
     expect(comparison.compatibility.mismatches.map((item: { field: string }) => item.field)).toEqual(expect.arrayContaining([
-      "scenarioDigest", "configDigest"
+      "scenarioDigest", "environmentDigest"
     ]));
     expect(comparison.metrics.durationMs).toMatchObject({ change: "invalid", delta: null });
     expect(comparison.scenarios).toEqual([]);
@@ -779,9 +721,9 @@ describe("agent evaluation baseline comparison", () => {
   });
 
   it("reports paired median differences and accepts three non-inferior twenty-percent continuous pairs", () => {
-    const baseline = runV2([1, 2, 3].map((repetition) => attemptV2({ repetition, durationMs: 1000 })));
-    const candidate = runV2([1, 2, 3].map((repetition) => attemptV2({ repetition, durationMs: 800 })), {
-      runId: "run-v2-candidate"
+    const baseline = run([1, 2, 3].map((repetition) => attempt({ repetition, durationMs: 1000 })));
+    const candidate = run([1, 2, 3].map((repetition) => attempt({ repetition, durationMs: 800 })), {
+      runId: "run-candidate"
     });
     const comparison = compareEvalRuns(baseline, candidate);
 
@@ -800,28 +742,28 @@ describe("agent evaluation baseline comparison", () => {
   });
 
   it("enforces binary wins, zero losses, valid pairs, and product guardrails", () => {
-    const baseline = runV2([1, 2, 3].map((repetition) => attemptV2({ repetition, passing: false })));
-    const candidate = runV2([1, 2, 3].map((repetition) => attemptV2({ repetition })), {
-      runId: "run-v2-candidate"
+    const baseline = run([1, 2, 3].map((repetition) => attempt({ repetition, passing: false })));
+    const candidate = run([1, 2, 3].map((repetition) => attempt({ repetition })), {
+      runId: "run-candidate"
     });
     expect(evaluateFrozenABGate(baseline, candidate, { kind: "binary" })).toMatchObject({
       passed: true,
       primary: { wins: 3, losses: 0, requiredWins: 2 }
     });
 
-    const guardedBaseline = runV2([1, 2, 3].map((repetition) => attemptV2({ repetition })));
-    const regressedAttempts = [1, 2, 3].map((repetition) => attemptV2({ repetition }));
+    const guardedBaseline = run([1, 2, 3].map((repetition) => attempt({ repetition })));
+    const regressedAttempts = [1, 2, 3].map((repetition) => attempt({ repetition }));
     regressedAttempts[0].dimensions.safety = {
       status: "fail", violations: [{ code: "workspace_changed" }]
     };
-    const guardedCandidate = runV2(regressedAttempts, { runId: "run-guardrail-regression" });
+    const guardedCandidate = run(regressedAttempts, { runId: "run-guardrail-regression" });
     const rejected = evaluateFrozenABGate(guardedBaseline, guardedCandidate, { kind: "binary" });
     expect(rejected.passed).toBe(false);
     expect(rejected.reasons).toEqual(expect.arrayContaining(["guardrail_regression", "candidate_loss"]));
 
-    const invalidAttempts = [1, 2, 3].map((repetition) => attemptV2({ repetition }));
-    invalidAttempts[1] = attemptV2({ repetition: 2, validity: "invalid" });
-    const invalidCandidate = runV2(invalidAttempts, { runId: "run-invalid-candidate" });
+    const invalidAttempts = [1, 2, 3].map((repetition) => attempt({ repetition }));
+    invalidAttempts[1] = attempt({ repetition: 2, validity: "invalid" });
+    const invalidCandidate = run(invalidAttempts, { runId: "run-invalid-candidate" });
     expect(evaluateFrozenABGate(guardedBaseline, invalidCandidate, { kind: "binary" }).reasons)
       .toEqual(expect.arrayContaining(["incompatible_runs", "invalid_pair"]));
   });

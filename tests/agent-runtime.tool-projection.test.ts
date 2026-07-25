@@ -57,21 +57,11 @@ describe("session model-tool capability projection", () => {
       .not.toHaveProperty("skill");
   });
 
-  it("projects legacy durable skills without widening frozen or profile capabilities", () => {
-    const legacy = { qualifiedName: "home:legacy", executionManifestArtifactId: "a", executionManifestDigest: "b" };
-    expect(sessionSkillProjectionCapabilities({ loadedSkills: [legacy] })).toEqual({
-      skillsAvailable: true,
-      executableSkillResourcesLoaded: true
-    });
+  it("projects durable skills without widening frozen or profile capabilities", () => {
+    const loaded = { qualifiedName: "home:loaded", executionManifestArtifactId: "a", executionManifestDigest: "b" };
     expect(sessionSkillProjectionCapabilities({
       frozenCustomization: { skills: [] },
-      liveSkillDescriptors: [legacy],
-      loadedSkills: [legacy]
-    })).toEqual({ skillsAvailable: false, executableSkillResourcesLoaded: false });
-    expect(sessionSkillProjectionCapabilities({
-      liveSkillDescriptors: [legacy],
-      loadedSkills: [legacy],
-      profileSkillNames: []
+      loadedSkills: [loaded]
     })).toEqual({ skillsAvailable: false, executableSkillResourcesLoaded: false });
     expect(sessionSkillProjectionCapabilities({
       frozenCustomization: { skills: [{ qualifiedName: "home:frozen" }] },

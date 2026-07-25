@@ -75,7 +75,7 @@ export interface ReviewerPort {
   review(input: ReviewerInput, signal: AbortSignal): Promise<ReviewEvidence>;
 }
 
-export interface ReviewerToolCheckV1 {
+export interface ReviewerToolCheck {
   toolName: string;
   evidenceIds: string[];
   summary: string;
@@ -85,7 +85,7 @@ export interface ReviewerToolSessionPort {
   definitions(): readonly ModelToolDefinition[];
   execute(call: ModelToolCall, signal: AbortSignal): Promise<{
     message: ModelMessage;
-    check: ReviewerToolCheckV1;
+    check: ReviewerToolCheck;
   }>;
   close(): Promise<void>;
 }

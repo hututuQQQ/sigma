@@ -6,14 +6,14 @@ import {
 } from "./errors.js";
 import type {
   BrokerDoctorReport,
-  BrokerRuntimeClosureV1,
+  BrokerRuntimeClosure,
   ContainerExecutionConfig,
-  ManagedSessionBindingRequestV1,
-  TrustedManagedEnvironmentProofV1,
-  TrustedManagedContainerAttestationV1
+  ManagedSessionBindingRequest,
+  TrustedManagedEnvironmentProof,
+  TrustedManagedContainerAttestation
 } from "./types.js";
 
-export const MANAGED_ENVIRONMENT_PROTECTED_PATHS_V1 = [
+export const MANAGED_ENVIRONMENT_PROTECTED_PATHS = [
   "/app",
   "/logs",
   "/opt/agent-cli",
@@ -114,7 +114,7 @@ export function assertContainerSha256(value: string, name: string): void {
 }
 
 export function managedContainerAttestationDigest(
-  attestation: Omit<TrustedManagedContainerAttestationV1, "attestationDigest">
+  attestation: Omit<TrustedManagedContainerAttestation, "attestationDigest">
 ): string {
   return stableSha256({
     protocolVersion: attestation.protocolVersion,
@@ -130,7 +130,7 @@ export function managedContainerAttestationDigest(
 }
 
 export function managedEnvironmentProofDigest(
-  proof: Omit<TrustedManagedEnvironmentProofV1, "proofDigest">
+  proof: Omit<TrustedManagedEnvironmentProof, "proofDigest">
 ): string {
   return stableSha256({
     protocolVersion: proof.protocolVersion,
@@ -145,11 +145,11 @@ export function managedEnvironmentProofDigest(
 }
 
 export function managedEnvironmentProofAvailable(
-  attestation: TrustedManagedContainerAttestationV1 | undefined
+  attestation: TrustedManagedContainerAttestation | undefined
 ): boolean {
   const proof = attestation?.managedEnvironment;
   if (!proof) return false;
-  const expectedPaths = [...MANAGED_ENVIRONMENT_PROTECTED_PATHS_V1];
+  const expectedPaths = [...MANAGED_ENVIRONMENT_PROTECTED_PATHS];
   return proof.protocolVersion === 1
     && proof.targetAttestationDigest === attestation!.attestationDigest
     && proof.targetId === attestation!.targetId
@@ -173,7 +173,7 @@ export function managedEnvironmentProofAvailable(
 
 export function assertContainerExecutionConfig(
   config: ContainerExecutionConfig,
-  managedAttestation?: TrustedManagedContainerAttestationV1
+  managedAttestation?: TrustedManagedContainerAttestation
 ): void {
   if (config.target === "owned") {
     if (!config.image) {
@@ -233,7 +233,7 @@ export function sameContainerIdentity(
 export function containerRuntimeClosure(
   report: BrokerDoctorReport,
   observed: PinnedContainerIdentity
-): BrokerRuntimeClosureV1 {
+): BrokerRuntimeClosure {
   const searchPaths = [...new Set(report.capabilities.executableSearchPaths ?? [])].sort();
   const runtimeCommands = [...new Set(report.capabilities.runtimeCommands ?? [])].sort();
   const targetAttestationDigest = observed.attestationDigest ?? stableSha256(observed);
@@ -253,10 +253,10 @@ export function containerRuntimeClosure(
 }
 
 export function canonicalManagedBindingRequest(
-  request: ManagedSessionBindingRequestV1,
+  request: ManagedSessionBindingRequest,
   options: { config: ContainerExecutionConfig; workspace?: string },
   observed: PinnedContainerIdentity
-): ManagedSessionBindingRequestV1 {
+): ManagedSessionBindingRequest {
   const targetPath = path.posix;
   if (request.protocolVersion !== 1
     || !/^[A-Za-z0-9_.-]{1,128}$/u.test(request.sessionId)

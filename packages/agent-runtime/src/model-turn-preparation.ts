@@ -130,9 +130,13 @@ export async function prepareModelAttempt(
   );
   const forecast = deadlineForecast(session);
   let available = availableOrchestratorBudget(session);
+  if (!session.durable.frozenCustomization) {
+    throw Object.assign(new Error(
+      `Session '${session.identity.sessionId}' is missing its schema 1 customization bundle.`
+    ), { code: "unsupported_schema_version" });
+  }
   const capabilities = sessionSkillProjectionCapabilities({
     frozenCustomization: session.durable.frozenCustomization,
-    liveSkillDescriptors: options.runtime.skills?.descriptors,
     loadedSkills: session.durable.state.frozenSkills,
     profileSkillNames: session.services.profile?.profile.skills
   });

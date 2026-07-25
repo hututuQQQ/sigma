@@ -178,6 +178,7 @@ function commandEvidence(
   if (validation) return {
     ...base, kind: "validation", summary: `Validation '${command}' exited with ${String(result.exitCode)}.`,
     data: {
+      schemaVersion: 1,
       validator: "command", command, exitCode: result.exitCode,
       termination: {
         processStarted: result.failure === undefined,
@@ -227,19 +228,22 @@ export async function commandReceipt(
   await preserveProjectedStream("stderr", result.stderr, stderr, context, imported);
   await acknowledge(imported, broker);
   const evidence = commandEvidence(request, command, result, validation, completedAt, context, imported);
+  const output = [stdout.value, stderr.value].filter(Boolean).join("\n");
+  const diagnostics = [
+    `exit_code=${String(result.exitCode)}`,
+    ...(result.failure ? [result.failure.code] : []),
+    ...dependencyDiagnostics(result),
+    ...(result.outputTruncated ? ["output_truncated"] : []), ...imported.diagnostics,
+    ...decodingDiagnostics(result),
+    ...(result.timedOut || result.idleTimedOut ? ["process_timed_out"] : [])
+  ];
   return {
     callId: request.callId, ok,
-    output: [stdout.value, stderr.value].filter(Boolean).join("\n"),
+    output,
+    outcome: { status: ok ? "succeeded" : "failed", output, diagnosticCodes: diagnostics },
     observedEffects: [...actualEffects], actualEffects: [...actualEffects],
     artifacts: imported.ids, artifactRefs: imported.refs,
-    diagnostics: [
-      `exit_code=${String(result.exitCode)}`,
-      ...(result.failure ? [result.failure.code] : []),
-      ...dependencyDiagnostics(result),
-      ...(result.outputTruncated ? ["output_truncated"] : []), ...imported.diagnostics,
-      ...decodingDiagnostics(result),
-      ...(result.timedOut || result.idleTimedOut ? ["process_timed_out"] : [])
-    ],
+    diagnostics,
     evidence: [evidence], startedAt, completedAt
   };
 }
@@ -291,18 +295,25 @@ export async function processReceipt(
     data: { source: "sigma-exec", diagnostic: { type: "process_output_artifacts", artifacts: imported.metadata } }
   }];
   const outcome = processOutcome(operation, value);
+  const ok = value.failure === undefined && outcome.ok;
+  const output = JSON.stringify(
+    outputValue,
+    (_key, item: unknown) => item instanceof Uint8Array ? undefined : item
+  );
+  const diagnostics = [
+    ...(value.failure ? [value.failure.code] : []),
+    ...outcome.diagnostics,
+    ...(value.outputTruncated ? ["output_truncated"] : []),
+    ...decodingDiagnostics(value),
+    ...imported.diagnostics
+  ];
   return {
-    callId: request.callId, ok: value.failure === undefined && outcome.ok,
-    output: JSON.stringify(outputValue, (_key, item: unknown) => item instanceof Uint8Array ? undefined : item),
+    callId: request.callId, ok,
+    output,
+    outcome: { status: ok ? "succeeded" : "failed", output, diagnosticCodes: diagnostics },
     observedEffects: effects, actualEffects: effects,
     artifacts: imported.ids, artifactRefs: imported.refs,
-    diagnostics: [
-      ...(value.failure ? [value.failure.code] : []),
-      ...outcome.diagnostics,
-      ...(value.outputTruncated ? ["output_truncated"] : []),
-      ...decodingDiagnostics(value),
-      ...imported.diagnostics
-    ],
+    diagnostics,
     evidence, startedAt, completedAt
   };
 }

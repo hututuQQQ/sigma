@@ -153,10 +153,10 @@ const runSuspended: EventReducer = (state, _event, payload) => {
   const proposedInput = Number.isInteger(payload.outcomeRevision)
     && acceptsOutcomeRevision(state, payload)
     && state.proposedOutcome?.kind === "needs_input";
-  const legacyOrRuntimeSuspension = payload.outcomeRevision === undefined
+  const runtimeSuspension = payload.outcomeRevision === undefined
     && (isApprovalSuspension(state, payload) || isRecoverySuspension(state, payload)
       || typeof payload.requestId === "string");
-  if (!proposedInput && !legacyOrRuntimeSuspension) return state;
+  if (!proposedInput && !runtimeSuspension) return state;
   return {
     ...state,
     ...(Number.isSafeInteger(payload.remainingDeadlineMs) && Number(payload.remainingDeadlineMs) >= 1

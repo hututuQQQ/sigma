@@ -32,10 +32,12 @@ export async function readReviewerArtifact(
       ? { maxBytes: Number(input.maxBytes) }
       : {})
   });
+  const output = JSON.stringify(result);
   const raw: ToolReceipt = {
     callId: call.id,
     ok: true,
-    output: JSON.stringify(result),
+    output,
+    outcome: { status: "succeeded", output, diagnosticCodes: [] },
     result: result as unknown as JsonValue,
     observedEffects: ["filesystem.read"],
     actualEffects: ["filesystem.read"],
@@ -79,10 +81,12 @@ export async function readReviewerChangeSet(
     utf8: chunk.toString("utf8"),
     base64: chunk.toString("base64")
   };
+  const output = JSON.stringify(result);
   const raw: ToolReceipt = {
     callId: call.id,
     ok: true,
-    output: JSON.stringify(result),
+    output,
+    outcome: { status: "succeeded", output, diagnosticCodes: [] },
     result,
     observedEffects: ["filesystem.read"],
     actualEffects: ["filesystem.read"],

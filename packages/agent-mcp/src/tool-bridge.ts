@@ -49,13 +49,17 @@ function receipt(
   descriptor: ToolDescriptor,
   diagnostics: string[] = []
 ): ToolReceipt {
+  const effects = [...descriptor.possibleEffects];
   return {
     callId: request.callId,
     ok,
     output,
-    observedEffects: [...descriptor.possibleEffects],
+    outcome: { status: ok ? "succeeded" : "failed", output, diagnosticCodes: diagnostics },
+    observedEffects: effects,
+    actualEffects: effects,
     artifacts: [],
     diagnostics,
+    evidence: [],
     startedAt,
     completedAt: new Date().toISOString()
   };

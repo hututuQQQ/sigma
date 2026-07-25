@@ -7,16 +7,16 @@ import {
 import type {
   BrokerDoctorReport,
   BrokerRequestOptions,
-  ManagedEnvironmentPrepareRequestV1,
-  ManagedEnvironmentPrepareResultV1
+  ManagedEnvironmentPrepareRequest,
+  ManagedEnvironmentPrepareResult
 } from "./types.js";
 
 export async function requestManagedEnvironmentPreparation(
   transport: BrokerTransport,
   report: BrokerDoctorReport | undefined,
-  request: ManagedEnvironmentPrepareRequestV1,
+  request: ManagedEnvironmentPrepareRequest,
   options: BrokerRequestOptions
-): Promise<ManagedEnvironmentPrepareResultV1> {
+): Promise<ManagedEnvironmentPrepareResult> {
   if (report?.capabilities.managedEnvironment?.prepare !== true) {
     throw new BrokerPolicyError("Broker does not advertise managed environment preparation.");
   }

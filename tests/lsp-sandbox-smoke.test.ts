@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -12,6 +13,10 @@ import {
 } from "../scripts/ci/lsp-sandbox-smoke.mjs";
 
 const execFileAsync = promisify(execFile);
+
+async function fileDigest(filePath: string): Promise<string> {
+  return createHash("sha256").update(await readFile(filePath)).digest("hex");
+}
 
 describe("bundled LSP sandbox smoke", () => {
   it("resolves portable inputs without host PATH assumptions", () => {
@@ -104,21 +109,48 @@ describe("bundled LSP sandbox smoke", () => {
     }, integrity, nodeDigest)).toThrow("does not match the integrity manifest");
   });
 
-  it("binds portable metadata schema to the supported product major", () => {
+  it("requires schema 1 metadata with the manifest product version", () => {
     const layout = portableLayout("release", "win32");
     const broker = path.join(layout.bundle, "bin", "sigma-exec.exe");
     const digest = "a".repeat(64);
     const metadata = {
-      schemaVersion: 4,
-      productVersion: "4.0.0",
+      schemaVersion: 1,
+      productVersion: "0.1.0",
       targetPlatform: "win32",
       targetArch: "x64",
       sigmaExec: { path: "bin/sigma-exec.exe", sha256: digest }
     };
     expect(() => assertMetadata(metadata, "win32", broker, digest, layout)).not.toThrow();
     expect(() => assertMetadata(
-      { ...metadata, schemaVersion: 3 }, "win32", broker, digest, layout
-    )).toThrow("must match supported product major 4.0.0");
+      { ...metadata, schemaVersion: 999 }, "win32", broker, digest, layout
+    )).toThrow("unsupported_schema_version");
+    expect(() => assertMetadata(
+      { ...metadata, productVersion: "0.1.1" }, "win32", broker, digest, layout
+    )).toThrow("must match sigma-manifest.json productVersion '0.1.0'");
+  });
+
+  it("rejects unknown package metadata without rewriting the artifact", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-package-metadata-schema-"));
+    const metadataPath = path.join(root, "package-metadata.json");
+    const metadata = {
+      schemaVersion: 999,
+      productVersion: "0.1.0",
+      targetPlatform: "win32",
+      targetArch: "x64",
+      sigmaExec: { path: "bin/sigma-exec.exe", sha256: "a".repeat(64) }
+    };
+    await writeFile(metadataPath, `${JSON.stringify(metadata)}\n`, "utf8");
+    const before = await fileDigest(metadataPath);
+    const layout = portableLayout(root, "win32");
+    const parsed = JSON.parse(await readFile(metadataPath, "utf8"));
+    expect(() => assertMetadata(
+      parsed,
+      "win32",
+      path.join(layout.bundle, "bin", "sigma-exec.exe"),
+      "a".repeat(64),
+      layout
+    )).toThrow("unsupported_schema_version");
+    expect(await fileDigest(metadataPath)).toBe(before);
   });
 
   it("removes stale evidence before reporting a failed smoke", async () => {

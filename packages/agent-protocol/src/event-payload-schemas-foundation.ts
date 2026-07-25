@@ -57,8 +57,8 @@ export const toolCallPlanSchema = z.object({
     checkpointId: nonEmptyStringSchema
   }).strict().optional(),
   mutationAuthority: z.enum([
-    "broker_repository_transaction_v2",
-    "disposable_enclosing_container_v1"
+    "broker_repository_transaction",
+    "disposable_enclosing_container"
   ]).optional(),
   idempotence: z.enum(["read_only", "replay_safe", "non_replayable"]),
   executionIntent: z.object({
@@ -105,12 +105,12 @@ export const durableToolReceiptShape = {
   result: jsonValueSchema.optional(),
   outcome: toolOutcomeSchema,
   observedEffects: z.array(toolEffectSchema),
-  actualEffects: z.array(toolEffectSchema).optional(),
+  actualEffects: z.array(toolEffectSchema),
   workspaceDelta: checkpointDeltaSchema.optional(),
   artifacts: z.array(z.string()),
   artifactRefs: z.array(artifactRefSchema).optional(),
   diagnostics: z.array(z.string()),
-  evidence: z.array(evidenceRecordSchema).optional(),
+  evidence: z.array(evidenceRecordSchema),
   startedAt: dateTimeSchema,
   completedAt: dateTimeSchema,
   ...turnSchema
@@ -126,8 +126,8 @@ export const contextItemSchema = z.object({
   cacheKey: z.string().optional()
 }).strict();
 
-export const runtimePromptStateV2Schema = z.object({
-  schemaVersion: z.literal(2),
+export const runtimePromptStateSchema = z.object({
+  schemaVersion: z.literal(1),
   sectionDigests: z.object({
     repository: z.string().regex(/^[a-f0-9]{64}$/u).optional(),
     completion: z.string().regex(/^[a-f0-9]{64}$/u).optional(),
@@ -141,67 +141,8 @@ export const runtimePromptStateV2Schema = z.object({
   archiveSourceDigest: z.string().regex(/^[a-f0-9]{64}$/u).optional()
 }).strict();
 
-const strategyResetActionV1Schema = z.object({
-  title: nonEmptyStringSchema,
-  expectedSignal: nonEmptyStringSchema,
-  kind: z.enum(["inspect", "change", "validate", "ask"])
-}).strict();
-
-export const strategyResetV1Schema = z.object({
+export const strategyResetSchema = z.object({
   schemaVersion: z.literal(1),
-  basisDigest: z.string().regex(/^[a-f0-9]{64}$/u),
-  establishedFacts: z.array(nonEmptyStringSchema).max(12),
-  lowYieldApproaches: z.array(nonEmptyStringSchema).max(8),
-  hypothesis: nonEmptyStringSchema,
-  nextActions: z.array(strategyResetActionV1Schema).min(1).max(3),
-  validationTarget: nonEmptyStringSchema.optional()
-}).strict();
-
-export const longHorizonStateV1Schema = z.object({
-  schemaVersion: z.literal(1),
-  goalEpoch: z.number().int().nonnegative(),
-  progressBasisDigest: z.string().regex(/^[a-f0-9]{64}$/u),
-  settledBatchCount: z.number().int().nonnegative(),
-  noProgressBatches: z.number().int().nonnegative(),
-  maxNoProgressBatches: z.number().int().nonnegative(),
-  mutationBatchesWithoutValidation: z.number().int().nonnegative(),
-  recentOutcomes: z.array(z.object({
-    batch: z.number().int().nonnegative(),
-    toolNames: z.array(nonEmptyStringSchema).min(1),
-    callDigest: z.string().regex(/^[a-f0-9]{64}$/u),
-    resultDigest: z.string().regex(/^[a-f0-9]{64}$/u),
-    summary: z.string()
-  }).strict()).max(8),
-  stage: z.enum(["normal", "checkpoint", "strategy_required", "strategy_reset", "action_required"]),
-  validationDue: z.boolean(),
-  checkpointBasisDigest: z.string().regex(/^[a-f0-9]{64}$/u).optional(),
-  strategy: strategyResetV1Schema.optional(),
-  strategyResetBatchCount: z.number().int().nonnegative().optional(),
-  actionRequiredConsumed: z.boolean(),
-  assurance: z.object({
-    schemaVersion: z.literal(1),
-    maxAuxiliaryCalls: z.literal(3),
-    maxAuxiliaryBudgetBps: z.literal(2000),
-    strategistCalls: z.number().int().min(0).max(1),
-    reviewerCalls: z.number().int().min(0).max(2),
-    auxiliaryInputTokens: z.number().int().nonnegative(),
-    auxiliaryOutputTokens: z.number().int().nonnegative(),
-    auxiliaryCostMicroUsd: z.number().int().nonnegative(),
-    protectedRepairTurnsRemaining: z.number().int().min(0).max(2),
-    protectedToolCallsRemaining: z.number().int().min(0).max(4)
-  }).strict()
-}).strict()
-  .refine((state) => state.maxNoProgressBatches >= state.noProgressBatches, {
-    path: ["maxNoProgressBatches"],
-    message: "Maximum no-progress streak cannot be smaller than the current streak"
-  })
-  .refine((state) => state.assurance.strategistCalls + state.assurance.reviewerCalls <= 3, {
-    path: ["assurance"],
-    message: "At most three auxiliary calls are permitted"
-  });
-
-export const strategyResetV2Schema = z.object({
-  schemaVersion: z.literal(2),
   basisDigest: z.string().regex(/^[a-f0-9]{64}$/u),
   establishedFacts: z.array(nonEmptyStringSchema).max(12),
   falsifiedApproaches: z.array(nonEmptyStringSchema).max(8),
@@ -215,8 +156,8 @@ export const strategyResetV2Schema = z.object({
     "revise_plan",
     "validate_current",
     "request_user_input"
-  ]).optional(),
-  decisionRationale: nonEmptyStringSchema.optional(),
+  ]),
+  decisionRationale: nonEmptyStringSchema,
   trigger: z.enum([
     "model_request",
     "input_request",
@@ -224,16 +165,7 @@ export const strategyResetV2Schema = z.object({
     "evidence_window",
     "resource_band"
   ])
-}).strict().superRefine((strategy, context) => {
-  if ((strategy.decision === undefined)
-    !== (strategy.decisionRationale === undefined)) {
-    context.addIssue({
-      code: "custom",
-      path: ["decision"],
-      message: "Strategy decision and rationale must be provided together"
-    });
-  }
-});
+}).strict();
 
 export const assuranceResourcePolicySchema = z.object({
   budgetPercent: z.number().int().min(1).max(100),
@@ -248,8 +180,8 @@ export const assuranceResourcePolicySchema = z.object({
   strategyRemainingPercent: z.number().int().min(1).max(100)
 }).strict();
 
-export const longHorizonStateV2Schema = z.object({
-  schemaVersion: z.literal(2),
+export const longHorizonStateSchema = z.object({
+  schemaVersion: z.literal(1),
   goalEpoch: z.number().int().nonnegative(),
   settledBatchCount: z.number().int().nonnegative(),
   recentOutcomes: z.array(z.object({
@@ -262,9 +194,9 @@ export const longHorizonStateV2Schema = z.object({
   duplicateStreak: z.number().int().nonnegative(),
   strategyRequested: z.boolean(),
   resourceBandTriggered: z.boolean(),
-  strategy: strategyResetV2Schema.optional(),
+  strategy: strategyResetSchema.optional(),
   assurance: assuranceResourcePolicySchema.extend({
-    schemaVersion: z.literal(2),
+    schemaVersion: z.literal(1),
     maxAuxiliaryCalls: z.number().int().nonnegative(),
     maxAuxiliaryBudgetBps: z.number().int().min(100).max(10_000),
     strategistCalls: z.number().int().nonnegative(),

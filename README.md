@@ -14,8 +14,8 @@
 </p>
 
 <p align="center">
-  <img alt="Status: Stable" src="https://img.shields.io/badge/status-v4.0.0-2ea44f">
-  <img alt="Release targets: Linux stable and Windows preview" src="https://img.shields.io/badge/release%20targets-Linux%20stable%20%2B%20Windows%20preview-0078d4">
+  <img alt="Status: 0.1.0 development preview" src="https://img.shields.io/badge/status-0.1.0%20development%20preview-f59e0b">
+  <img alt="Release targets: Linux and Windows previews" src="https://img.shields.io/badge/release%20targets-Linux%20preview%20%2B%20Windows%20unsigned%20preview-0078d4">
   <img alt="Formal evaluation: preregistered" src="https://img.shields.io/badge/formal%20evaluation-preregistered-4cc9c0">
 </p>
 
@@ -25,16 +25,16 @@
 
 Sigma Code turns a coding task into a durable stream of typed decisions and evidence. It can explore a repository, make scoped changes, run sandboxed commands, validate the result, ask an independent reviewer, and recover the same session after interruption. The product uses one event-sourced kernel, one session format, and one terminal UI instead of separate execution paths that drift apart.
 
-`v4.0.0` is the first stable Sigma Code release. Linux x64 is the official stable
-binary target; Windows x64 is published alongside it as an explicitly unsigned
-preview until trusted Authenticode signing is available. See the
-[changelog](CHANGELOG.md), [security policy](SECURITY.md), and [contribution
-guide](CONTRIBUTING.md) before reporting or proposing changes.
+`0.1.0` is a development preview and the only supported product baseline. Linux
+x64 and Windows x64 artifacts are preview candidates; Windows remains explicitly
+unsigned until trusted Authenticode signing is available. See the [security
+policy](SECURITY.md) and [contribution guide](CONTRIBUTING.md) before reporting
+or proposing changes.
 
 > [!IMPORTANT]
 > **Current product boundary**
 >
-> - **Linux x64 is the official stable binary release. Windows x64 is an unsigned preview.** Both archives pass native sandbox, packaged-product, checksum, SBOM, and signed-provenance gates, but the Windows executables do not yet have a trusted Authenticode signature and may trigger Windows security warnings.
+> - **Sigma Code 0.1.0 is a development preview on both Tier 1 targets.** Linux x64 and Windows x64 candidates must pass native sandbox, packaged-product, checksum, SBOM, and signed-provenance gates. Windows executables do not yet have a trusted Authenticode signature and may trigger Windows security warnings.
 > - **Formal evaluation is preregistered, not provider-coded.** The SHA-bound run manifest freezes the provider, model, source, archive, task selection, network, timeouts, concurrency, attempts, and retries before execution.
 > - Provider comparisons are valid only when their SHA-bound run manifests freeze comparable controls; the harness does not infer comparability from a model name.
 > - Sigma treats **OpenCode as a direct competitor and a product target, not a parity claim**. There is still a real gap between Sigma and OpenCode in overall practical performance and maturity today.
@@ -49,9 +49,11 @@ guide](CONTRIBUTING.md) before reporting or proposing changes.
 | Fail-closed containment | Process execution stays in the required native sandbox even when host reads or networking are authorized. If the sandbox is unhealthy, Sigma refuses to execute. |
 | One product path | CLI automation and the TUI use the same `RuntimeClient`, kernel, store, tools, recovery logic, and outcome protocol. |
 
-## Quick start on Linux
+## Quick start on Linux (development preview)
 
-Download the latest Linux x64 archive from [GitHub Releases](https://github.com/hututuQQQ/sigma/releases), verify its SHA-256 sidecar and signed provenance, and extract it:
+Obtain a `0.1.0` Linux x64 preview archive from a verified project release or
+build it from source, verify its SHA-256 sidecar and signed provenance, and
+extract it:
 
 ```sh
 SIGMA="$HOME/.local/share/sigma-code"
@@ -91,9 +93,10 @@ $env:DEEPSEEK_API_KEY = "your-api-key"
 
 The example sets the key only for the current PowerShell process. Keep secrets out of `.agent/config.toml` and source control.
 
-Both platform archives include a SHA-256 checksum, CycloneDX SBOM, signed provenance,
-and the public provenance verification key. Only Linux x64 is a stable binary release;
-Windows x64 remains an unsigned preview. See [SECURITY.md](SECURITY.md) for the trust boundary and
+Published preview archives include a SHA-256 checksum, CycloneDX SBOM, signed
+provenance, and the public provenance verification key. Neither target is a
+stable release at `0.1.0`; Windows x64 additionally remains unsigned. See
+[SECURITY.md](SECURITY.md) for the trust boundary and
 [RELEASING.md](RELEASING.md) for the maintainer process.
 
 For a one-shot task:
@@ -189,7 +192,14 @@ The production package dependency graph is checked for cycles and packages commu
 
 `agent-execution` is the only production package allowed to start arbitrary processes. It talks to the bundled Rust `sigma-exec` broker over a framed protocol. On Windows, each sandboxed command uses an AppContainer identity with scoped filesystem ACLs, a kill-on-close Job Object, capability-gated networking, and ConPTY for interactive processes. Linux uses the native namespace sandbox and a watchdog for process-tree cleanup.
 
-Configuration schema v5 defaults to `permission_mode=workspace-auto`, `sandbox=required`, `read_scope=workspace`, `network=full`, and the native sandbox backend. Workspace-scoped offline reads and declared writes run automatically; external reads, full-network calls, and repository metadata writes remain separately authorized. An explicit `network=none` or `network=loopback` setting narrows the capability. Required isolation never falls back to host execution, and `container` mode fails with `container_unavailable` until a real OCI backend is installed.
+Configuration schema 1 defaults to `permission_mode=workspace-auto`,
+`sandbox=required`, `read_scope=workspace`, `network=full`,
+`process_handoff=allow`, and the native sandbox backend. Workspace-scoped reads
+and declared writes run automatically; external reads, full-network calls, and
+repository metadata writes remain separately authorized. An explicit
+`network=none` or `network=loopback` setting narrows the capability. Required
+isolation never falls back to host execution, and `container` mode fails with
+`container_unavailable` until a real OCI backend is installed.
 
 Absolute external inputs are read through stable no-follow traversal and produce `input_access` evidence with path, digest, and size. Process calls mount only their declared stable read roots. A failed goal input remains an unresolved completion obligation until the same external path is read successfully; a run-created fixture cannot replace it.
 
@@ -202,7 +212,7 @@ Linux advertises `processHandoff` only when safe transfer is available. A `deliv
 Runtime state is stored outside the agent-writable workspace under a workspace-derived user-state directory:
 
 ```text
-<user-state>/sigma/workspaces/<workspace-sha256>/stores/v5/sessions/<session-id>/
+<user-state>/sigma/workspaces/<workspace-sha256>/stores/v1/sessions/<session-id>/
   meta.json
   events/000001.jsonl
   snapshots/000000000250.json
@@ -215,7 +225,36 @@ Event records have checksums and monotonic sequence numbers. Segments rotate at 
 
 A provider `stop` is only `model_stopped`. The Completion Coordinator independently derives assurance and review requirements from the current mutation frontier and emits `run.completed` only when `model_stopped`, `assurance_satisfied`, and `review_satisfied` are all true. Failed, stale, weak, or incomplete semantic validation produces structured repair guidance or a typed blocker; the model has no completion tool that can bypass the gate.
 
-All net changes require passed semantic validation on the current state. Sealed no-op checkpoints do not advance that frontier; mutating validation is rebound after its checkpoint seals. The standard profile runs independent review as advisory and records findings as warnings; the strict profile requires approval. Active non-detached children are joined before completion, and an unintegrated writer worktree keeps the parent open.
+All net changes require passed semantic validation on the current state. Sealed
+no-op checkpoints do not advance that frontier; mutating validation is rebound
+after its checkpoint seals. The standard profile requires current-frontier
+review approval or an explicit one-time user waiver. The strict profile does
+not accept a waiver and requires approval backed by a reviewer-executed check.
+Active non-detached children are joined before completion, and an unintegrated
+writer worktree keeps the parent open.
+
+### Current serialized and tool contracts
+
+- Every Sigma-owned serialized boundary uses strict `schemaVersion: 1` (or
+  `schema_version = 1` in TOML). Unknown schemas, another store layout, and old
+  checkpoint journals fail with `unsupported_schema_version` or
+  `unsupported_store_layout`; the rejected files are never rewritten,
+  migrated, or deleted.
+- Active review is read-only and runs checks in a disposable overlay. It can
+  inspect the authenticated current frontier and durable process lifecycle
+  evidence without writing the parent workspace.
+- At an ordinary solver-budget boundary, already-started session processes are
+  allowed to settle within the outer deadline. Deliverable processes remain
+  session-owned until an independently health-checked `process_handoff`
+  succeeds.
+- `write` and `edit` report the resulting byte length and SHA-256;
+  `write_chunk` uses an expected preimage length and digest. An omitted shell is
+  resolved deterministically by the broker. Non-UTF-8 process output must be
+  preserved as a byte-safe artifact; a decoding error without that artifact is
+  rejected as a broker protocol violation.
+- `inspect_image` and `inspect_document` are bounded, offline, read-only
+  fallbacks for text-only providers. Their OCR or extraction metadata is
+  inspection data, not completion evidence.
 
 ## Commands
 
@@ -251,7 +290,7 @@ Stable process exit codes are `0` for `Completed`, `2` for `NeedsInput`, `130` f
 Precedence is **CLI flags → environment → workspace `.agent/config.toml` → home `~/.sigma/config.toml` → defaults**. Unknown flags and TOML keys fail immediately. Workspace-authored MCP servers and executable hooks require an explicit digest-bound trust grant.
 
 ```toml
-schema_version = 5
+schema_version = 1
 
 [model]
 provider = "deepseek"
@@ -263,7 +302,7 @@ mode = "workspace-auto"
 [security]
 sandbox = "required"
 read_scope = "workspace"
-network = "none"
+network = "full"
 process_handoff = "allow"
 
 [runtime]
@@ -287,7 +326,7 @@ fps = 30
 To opt into broader per-call capabilities, use:
 
 ```toml
-schema_version = 5
+schema_version = 1
 
 [security]
 sandbox = "required"
@@ -296,13 +335,20 @@ network = "full"
 process_handoff = "deny"
 ```
 
-Older configuration files can be checked with `agent config migrate --workspace . --check` and atomically upgraded with `agent config migrate --workspace . --write`. Durable V5 sessions are written only to `stores/v5`; V5 never reads or falls back to a V4 session store.
+`agent init` writes the current schema directly. Sigma does not expose a
+configuration migration command and does not read another durable store layout.
+Back up or move incompatible state yourself; rejection is deliberately
+read-only.
 
 DeepSeek uses `DEEPSEEK_API_KEY`. The runtime also recognizes `GLM_API_KEY`, `ZAI_API_KEY`, or `BIGMODEL_API_KEY` for the experimental GLM/Z.ai path. A provider is part of a formal claim only when it is frozen in that run's preregistration.
 
 ## Evaluation and benchmark boundary
 
-Sigma's formal experience evaluator runs the packaged product in fresh, opaque workspaces and reduces the durable event stream into separate correctness, safety, experience, and reliability results. Terminal-Bench formal runs require a `SigmaFormalRunPreregistrationV1`; code supplies no formal dataset, model, quota, retry, or score threshold default.
+Sigma's formal experience evaluator runs the packaged product in fresh, opaque
+workspaces and reduces the durable event stream into separate correctness,
+safety, experience, and reliability results. Terminal-Bench formal runs require
+a `SigmaFormalRunPreregistration`; code supplies no formal dataset, model,
+quota, retry, or score threshold default.
 
 The evaluator may select a task, launch the packaged CLI, and collect artifacts after the run. It must not send scenario identity, verifier output, scores, rewards, hidden checks, or post-run failures into the solving session, and verifier feedback never triggers another solving attempt. This fairness boundary is enforced by protocol types and production-source scans.
 
@@ -336,7 +382,7 @@ pnpm lint
 pnpm test:coverage
 ```
 
-Build and verify the current official target:
+Build and verify the current Windows preview candidate:
 
 ```powershell
 pnpm package:agent-cli:windows

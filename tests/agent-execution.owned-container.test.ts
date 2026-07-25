@@ -203,7 +203,7 @@ describe("OwnedContainerExecutionBroker", () => {
       sandboxHelperTarget: "/usr/local/bin/bwrap",
       network: "loopback"
     });
-    expect(engine.spec?.labels).toMatchObject({ "com.sigma.oci-owned": "v1" });
+    expect(engine.spec?.labels).toMatchObject({ "com.sigma.oci-owned": "true" });
     const artifactParent = engine.spec!.artifactParent;
     await expect(access(artifactParent)).resolves.toBeUndefined();
 

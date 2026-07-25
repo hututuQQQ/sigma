@@ -31,7 +31,7 @@ describe("package-harbor-runtime", () => {
     expect(readme).not.toContain(removedHarborPackageName);
     expect(readme).not.toContain(removedHarborDirectoryName);
     expect(readme).toContain("pnpm package:agent-cli");
-    expect(readme).toContain("SigmaFormalRunPreregistrationV1");
+    expect(readme).toContain("SigmaFormalRunPreregistration");
     expect(readme).toContain("pnpm bench:tb:formal");
     expect(readme).not.toContain("deepseek");
   });

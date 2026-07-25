@@ -1,11 +1,11 @@
 import type {
   BudgetAmounts,
-  LongHorizonStateV2,
+  LongHorizonState,
   ModelGateway,
   ModelMessage,
   ModelRequest,
   ModelResponse,
-  StrategyResetV2
+  StrategyReset
 } from "agent-protocol";
 import type { ModelRouteConstraints } from "agent-model";
 import {
@@ -20,7 +20,7 @@ import {
 } from "./long-horizon-state.js";
 import type { RuntimeSession } from "./types.js";
 
-export type StrategyTriggerV2 = StrategyResetV2["trigger"];
+export type StrategyTrigger = StrategyReset["trigger"];
 
 function boundedUserInstructions(session: RuntimeSession): string[] {
   return session.durable.state.messages
@@ -34,7 +34,7 @@ function boundedUserInstructions(session: RuntimeSession): string[] {
 
 export function strategyMessages(
   session: RuntimeSession,
-  trigger: StrategyTriggerV2
+  trigger: StrategyTrigger
 ): ModelMessage[] {
   const state = session.durable.state;
   const frontier = state.mutationFrontier;
@@ -106,7 +106,7 @@ function nonemptyString(value: unknown): string | undefined {
 
 function parsedStrategyDecision(
   record: Record<string, unknown>
-): Pick<StrategyResetV2, "decision" | "decisionRationale"> | undefined {
+): Pick<StrategyReset, "decision" | "decisionRationale"> | undefined {
   const allowed = [
     "continue_exploring",
     "implement_candidate",
@@ -125,7 +125,7 @@ function parsedStrategyDecision(
 
 function parsedStrategyFields(
   value: unknown
-): Omit<StrategyResetV2, "schemaVersion" | "basisDigest" | "trigger"> | undefined {
+): Omit<StrategyReset, "schemaVersion" | "basisDigest" | "trigger"> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
   const allowed = new Set([
@@ -166,14 +166,14 @@ function parsedStrategyFields(
 export function parsedStrategy(
   content: string,
   basisDigest: string,
-  trigger: StrategyTriggerV2
-): StrategyResetV2 | undefined {
+  trigger: StrategyTrigger
+): StrategyReset | undefined {
   try {
     const value = JSON.parse(content.trim()) as unknown;
     const fields = parsedStrategyFields(value);
     if (!fields) return undefined;
     return {
-      schemaVersion: 2,
+      schemaVersion: 1,
       basisDigest,
       ...fields,
       trigger
@@ -184,13 +184,13 @@ export function parsedStrategy(
 }
 
 export function fallbackStrategy(
-  state: LongHorizonStateV2,
+  state: LongHorizonState,
   basisDigest: string,
-  trigger: StrategyTriggerV2,
+  trigger: StrategyTrigger,
   reason: string
-): StrategyResetV2 {
+): StrategyReset {
   return {
-    schemaVersion: 2,
+    schemaVersion: 1,
     basisDigest,
     establishedFacts: state.recentOutcomes.slice(-4).map((item) => item.summary)
       .filter((item) => item.length > 0),
@@ -209,7 +209,7 @@ export function fallbackStrategy(
   };
 }
 
-export function strategistTrigger(session: RuntimeSession): StrategyTriggerV2 | undefined {
+export function strategistTrigger(session: RuntimeSession): StrategyTrigger | undefined {
   const state = session.durable.state.longHorizon;
   if (state.strategy || state.assurance.strategistCalls >= 1
     || state.assurance.strategistMode === "off") return undefined;

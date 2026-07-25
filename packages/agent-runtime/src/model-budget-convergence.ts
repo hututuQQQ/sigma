@@ -7,7 +7,7 @@ import type {
   ModelRequest,
   ModelToolDefinition,
   RunOutcome,
-  RuntimePromptStateV2,
+  RuntimePromptState,
   ToolDescriptor
 } from "agent-protocol";
 import type { ContextPlan } from "agent-context";
@@ -42,14 +42,12 @@ export interface PreparedModelTurn {
   outputReserveTokens: number;
   toolSchemaDigest: string;
   requestDigest: string;
-  promptState: RuntimePromptStateV2;
+  promptState: RuntimePromptState;
   frameMode: "full" | "delta";
 }
 
 export interface TurnPreparationInput {
   session: RuntimeSession;
-  /** Kept optional for one compatibility release; deadlines are not model-visible. */
-  forecast?: unknown;
   turnId: number;
   descriptors: readonly ToolDescriptor[];
   capabilities: ModelToolProjectionCapabilities;
@@ -196,7 +194,7 @@ function committedPromptState(
   input: TurnPreparationInput,
   frame: RuntimePromptFrame,
   plan: ContextPlan
-): RuntimePromptStateV2 {
+): RuntimePromptState {
   const included = new Set(plan.included.map((item) => item.id));
   const previous = input.session.durable.state.promptState;
   const sectionDigests = { ...previous.sectionDigests };

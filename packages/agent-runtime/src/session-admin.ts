@@ -11,4 +11,4 @@ export {
   rebuildSnapshotFromEvents,
   type SnapshotRebuildInput
 } from "./restore-session.js";
-export { SessionStorageVersionUnsupportedError } from "./session-catalog.js";
+export { SessionStorageUnsupportedError } from "./session-catalog.js";

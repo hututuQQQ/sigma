@@ -8,7 +8,7 @@ import {
   type ExecutionBroker,
   type ExecutionRequest,
   type ExecutionResult,
-  type TrustedManagedContainerAttestationV1
+  type TrustedManagedContainerAttestation
 } from "../packages/agent-execution/src/index.js";
 
 const digest = `sha256:${"1".repeat(64)}`;
@@ -96,7 +96,7 @@ function broker(reports: BrokerDoctorReport[]): ExecutionBroker & { execute: Ret
   };
 }
 
-function attestation(): TrustedManagedContainerAttestationV1 {
+function attestation(): TrustedManagedContainerAttestation {
   return {
     ...attestationPayload,
     attestationDigest

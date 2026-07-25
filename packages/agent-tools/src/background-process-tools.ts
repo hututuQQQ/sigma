@@ -109,7 +109,7 @@ function environmentProcessTool(
         ],
         ["change"]
       ),
-      brokerMutationAuthority: "disposable_enclosing_container_v1",
+      brokerMutationAuthority: "disposable_enclosing_container",
       prepare(value, context) {
         return prepareExecutionCallPlan(
           environmentProcessArguments(value, context.workspacePath),
@@ -178,7 +178,7 @@ function spawnTool(
         effects
       ),
       ...(enclosing
-        ? { brokerMutationAuthority: "disposable_enclosing_container_v1" as const }
+        ? { brokerMutationAuthority: "disposable_enclosing_container" as const }
         : {}),
       prepare(value, context) {
         return prepareExecutionCallPlan(value, context, options, false, true);

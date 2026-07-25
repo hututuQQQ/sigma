@@ -453,13 +453,17 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(record["classification"], "agent_setup_failed")
             self.assertEqual(record["checks"][1]["exit_code"], 3)
 
-    async def test_setup_rejects_legacy_doctor_payload(self):
+    async def test_setup_rejects_unknown_doctor_schema(self):
         module = import_portable_agent_module()
         with TemporaryDirectory() as tmp:
             env = SimpleNamespace(
                 exec=AsyncMock(side_effect=[
                     SimpleNamespace(return_code=0, stdout="usage", stderr=""),
-                    SimpleNamespace(return_code=0, stdout='{"status":"ok"}', stderr=""),
+                    SimpleNamespace(
+                        return_code=0,
+                        stdout='{"doctorSchemaVersion":999,"status":"ok"}',
+                        stderr="",
+                    ),
                 ])
             )
             agent = module.SigmaCliHarborAgent(logs_dir=Path(tmp) / "logs")
@@ -519,7 +523,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("usage blew up", str(raised.exception))
             self.assertIn("missing runtime", str(raised.exception))
 
-    async def test_run_forwards_only_v2_runtime_flags(self):
+    async def test_run_forwards_only_current_runtime_flags(self):
         module = import_portable_agent_module()
         with TemporaryDirectory() as tmp:
             exec_commands = []
@@ -562,7 +566,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("--permission-mode auto", command)
             self.assertIn("--agent-profile standard", command)
             self.assertIn("--output-format stream-json", command)
-            self.assertIn("--output-schema 3", command)
+            self.assertNotIn("--output-schema", command)
             self.assertIn("--stream-json-max-line-bytes 49152", command)
             self.assertNotIn("--validation", command)
             self.assertNotIn("--retry", command)
@@ -576,7 +580,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory() as tmp:
             agent = module.SigmaCliHarborAgent(logs_dir=Path(tmp) / "logs")
             wrapped = {
-                "schemaVersion": 3,
+                "schemaVersion": 1,
                 "kind": "event",
                 "type": "run.completed",
                 "event": {
@@ -591,7 +595,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             width = 4_000
             parts = [encoded[index:index + width] for index in range(0, len(encoded), width)]
             lines = [json.dumps({
-                "schemaVersion": 3,
+                "schemaVersion": 1,
                 "kind": "chunk",
                 "recordId": "event-large",
                 "index": index,
@@ -600,7 +604,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                 "data": part,
             }) for index, part in enumerate(parts)]
             lines.append(json.dumps({
-                "schemaVersion": 3,
+                "schemaVersion": 1,
                 "kind": "result",
                 "type": "result",
                 "result": {"status": "completed", "finishReason": "completed"},
@@ -884,7 +888,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                     await agent.run("run", env, context)
                 self.assertEqual(context.failure_kind, expected)
 
-    async def test_runtime_terminal_failures_keep_v4_categories(self):
+    async def test_runtime_terminal_failures_keep_stable_categories(self):
         module = import_portable_agent_module()
         agent = module.SigmaCliHarborAgent(logs_dir=Path("unused"))
         cases = (
@@ -940,7 +944,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("run_timeout", trace)
             self.assertIn("partial broker stderr", (logs_dir / "stderr.partial.log").read_text(encoding="utf-8"))
 
-    async def test_run_has_no_legacy_controller_flags_by_default(self):
+    async def test_run_uses_only_current_controller_flags_by_default(self):
         module = import_portable_agent_module()
         with TemporaryDirectory() as tmp:
             exec_commands = []

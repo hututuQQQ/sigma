@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -24,7 +24,12 @@ import {
   type UsageRecord
 } from "../packages/agent-protocol/src/index.js";
 import { emptyMutationFrontier, frontierAfterCheckpoint } from "../packages/agent-kernel/src/index.js";
-import { createRuntime } from "../packages/agent-runtime/src/testing.js";
+import {
+  createRuntime,
+  restoreStoredSession
+} from "../packages/agent-runtime/src/testing.js";
+import { reviewBasisDigest as calculateReviewBasisDigest } from "../packages/agent-runtime/src/mutation-evidence.js";
+import { requestIdentity } from "../packages/agent-runtime/src/review-coordinator-support.js";
 import type {
   AccountableReviewerPort,
   PreparedReviewerCall,
@@ -32,7 +37,10 @@ import type {
 } from "../packages/agent-runtime/src/reviewer.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
-import { completeAgentEventPayload } from "./testkit/agent-event-fixtures.js";
+import {
+  completeAgentEventPayload,
+  persistEmptyCustomization
+} from "./testkit/agent-event-fixtures.js";
 
 type Boundary =
   | "plan"
@@ -199,7 +207,7 @@ class CountingReviewer implements AccountableReviewerPort {
       producer: { authority: "runtime", id: this.reviewerId },
       summary: "Recovered durable delta approved.",
       data: {
-        schemaVersion: 3,
+        schemaVersion: 1,
         reviewerId: this.reviewerId,
         verdict: "approved",
         findings: [],
@@ -299,6 +307,9 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
 
   await writeFile(path.join(workspace, "target.ts"), "before\n", "utf8");
   await append("session.created", { workspacePath: workspace, mode: "change" });
+  await append("customization.frozen", await persistEmptyCustomization(
+    storeRootDir, sessionId
+  ));
   await append("run.started", { mode: "change", deadlineAt: new Date(Date.now() + 60_000).toISOString() });
   await append("plan.updated", {
     previousRevision: 0,
@@ -318,7 +329,7 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
     }
   });
   await append("user.message", { text: "Mutate target.ts exactly once." }, "user");
-  const turn = { turnId: 1, effectRevision: 4 };
+  const turn = { turnId: 1, effectRevision: 5 };
   await append("model.started", turn);
   const toolCalls = [
     { id: "mutation-call", name: "mutate_once", arguments: { path: "target.ts" } },
@@ -380,7 +391,18 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
     consumed: { ...amount, toolCalls: 0 },
     createdAt: now
   });
-  await append("budget.reserved", { reservationId, ledger });
+  await append("budget.reserved", {
+    reservationId,
+    mutation: {
+      schemaVersion: 1,
+      kind: "reserve",
+      reservation: ledger.reservations[0]!,
+      totals: {
+        consumed: ledger.consumed,
+        reserved: ledger.reserved
+      }
+    }
+  });
   if (!reached(boundary, "checkpoint")) return { workspace, storeRootDir, store, sessionId, runId };
 
   const manager = new CheckpointManager({ rootDir: storeRootDir });
@@ -396,7 +418,16 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
     callId: "mutation-call", checkpointId: checkpoint.checkpointId
   }), "utf8").toString("base64url")}`;
   ledger.reservations[0] = { ...ledger.reservations[0]!, ownerId: boundOwner };
-  await append("budget.reservation_bound", { reservationId, ownerId: boundOwner, ledger });
+  await append("budget.reservation_bound", {
+    reservationId,
+    ownerId: boundOwner,
+    mutation: {
+      schemaVersion: 1,
+      kind: "bind",
+      reservationId,
+      ownerId: boundOwner
+    }
+  });
   if (!reached(boundary, "mutation")) return { workspace, storeRootDir, store, sessionId, runId, checkpoint };
 
   await append("execution.started", { executionId: "mutation-call" });
@@ -476,6 +507,7 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
     producer: { authority: "runtime", id: "command-validator" },
     summary: "Project validation command passed.",
     data: {
+      schemaVersion: 1,
       validator: "command",
       artifactIds: [],
       frontierRevision: sealedFrontier.revision,
@@ -507,74 +539,31 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
     consumed: { ...amount },
     settledAt: now
   };
-  await append("budget.committed", { reservationId, ledger: mutationCommitted });
+  await append("budget.committed", {
+    reservationId,
+    mutation: {
+      schemaVersion: 1,
+      kind: "settle",
+      reservationId,
+      status: "committed",
+      consumed: amount,
+      settledAt: now,
+      totals: {
+        consumed: mutationCommitted.consumed,
+        reserved: mutationCommitted.reserved
+      }
+    }
+  });
   if (!reached(boundary, "review_started")) return { workspace, storeRootDir, store, sessionId, runId, checkpoint };
 
   const reviewerId = "fault-injection-reviewer";
-  const validationSignature = JSON.stringify({
-    status: "passed",
-    validator: "command",
-    command: null,
-    exitCode: null,
-    termination: null,
-    coveredPaths: ["target.ts"],
-    intent: null,
-    adapterInference: null,
-    claim: {
-      kind: "typecheck",
-      commandDigest: "c".repeat(64),
-      subject: {
-        projectId: ".",
-        configPaths: [],
-        selectedTests: [],
-        exactFiles: []
-      },
-      status: "passed"
-    },
-    frontierRevision: sealedFrontier.revision,
-    stateDigest: sealedFrontier.currentStateDigest
-  });
-  const readReceiptSignature = JSON.stringify({
-    callId: "read-proof",
-    ok: true,
-    outputDigest: createHash("sha256").update("inspected").digest("hex"),
-    resultDigest: createHash("sha256").update("null").digest("hex"),
-    outcome: { status: "succeeded", output: "ok", diagnosticCodes: [] },
-    observedEffects: ["filesystem.read"],
-    actualEffects: [],
-    workspaceDelta: null,
-    artifacts: [],
-    artifactRefs: [],
-    diagnostics: [],
-    startedAt: now,
-    completedAt: now
-  });
-  const reviewBasisDigest = createHash("sha256").update(JSON.stringify({
-    frontierRevision: sealedFrontier.revision,
-    stateDigest: sealedFrontier.currentStateDigest,
-    plan: {
-      goal: "Exercise durable recovery.",
-      activeNodeId: "root",
-      nodes: [{
-        id: "root",
-        title: "Perform one mutation",
-        status: "in_progress",
-        acceptanceCriteria: ["Mutation occurs at most once"],
-        blockedReason: null
-      }]
-    },
-    validations: [validationSignature],
-    receipts: [readReceiptSignature]
-  })).digest("hex");
-  const reviewRequestId = `review:${createHash("sha256").update(JSON.stringify({
-    sessionId,
-    runId,
-    reviewerId,
-    revision: sealedFrontier.revision,
-    stateDigest: sealedFrontier.currentStateDigest,
-    reviewBasisDigest,
-    attempt: 1
-  })).digest("hex")}`;
+  const restoredForReview = await restoreStoredSession(store, sessionId, 60_000);
+  const reviewSession = {
+    identity: { sessionId },
+    durable: { runId, state: restoredForReview.state }
+  } as Parameters<typeof calculateReviewBasisDigest>[0];
+  const reviewBasisDigest = calculateReviewBasisDigest(reviewSession);
+  const reviewRequestId = requestIdentity(reviewSession, reviewerId, reviewBasisDigest, 1);
   const reviewerAmount = {
     inputTokens: 1,
     outputTokens: 1,
@@ -594,7 +583,18 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
     consumed: { ...reviewerAmount, inputTokens: 0, outputTokens: 0, modelTurns: 0 },
     createdAt: now
   });
-  await append("budget.reserved", { reservationId: reviewerReservationId, ledger: reviewReserved });
+  await append("budget.reserved", {
+    reservationId: reviewerReservationId,
+    mutation: {
+      schemaVersion: 1,
+      kind: "reserve",
+      reservation: reviewReserved.reservations[1]!,
+      totals: {
+        consumed: reviewReserved.consumed,
+        reserved: reviewReserved.reserved
+      }
+    }
+  });
   await append("review.started", {
     reviewerId,
     requestId: reviewRequestId,
@@ -617,7 +617,21 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
     consumed: reviewerAmount,
     settledAt: now
   };
-  await append("budget.committed", { reservationId: reviewerReservationId, ledger: reviewCommitted });
+  await append("budget.committed", {
+    reservationId: reviewerReservationId,
+    mutation: {
+      schemaVersion: 1,
+      kind: "settle",
+      reservationId: reviewerReservationId,
+      status: "committed",
+      consumed: reviewerAmount,
+      settledAt: now,
+      totals: {
+        consumed: reviewCommitted.consumed,
+        reserved: reviewCommitted.reserved
+      }
+    }
+  });
   await append("usage.recorded", {
     usageId: `${reviewRequestId}:usage`,
     requestId: reviewRequestId,
@@ -650,7 +664,7 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
     producer: { authority: "runtime", id: "fault-injection-reviewer" },
     summary: "Recovered delta approved.",
     data: {
-      schemaVersion: 3,
+      schemaVersion: 1,
       reviewerId: "fault-injection-reviewer",
       verdict: "approved",
       findings: [],
@@ -691,9 +705,17 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
         owner: { kind: "root" },
         acceptanceCriteria: ["Mutation occurs at most once"],
         evidence: [
-          { evidenceId: deltaId, kind: "workspace_delta" },
-          { evidenceId: `command-validation:${checkpoint.checkpointId}`, kind: "validation" },
-          { evidenceId: `review:${checkpoint.checkpointId}`, kind: "review" }
+          { evidenceId: deltaId, kind: "workspace_delta", claim: "acceptance_met" },
+          {
+            evidenceId: `command-validation:${checkpoint.checkpointId}`,
+            kind: "validation",
+            claim: "validation_passed"
+          },
+          {
+            evidenceId: `review:${checkpoint.checkpointId}`,
+            kind: "review",
+            claim: "acceptance_met"
+          }
         ]
       }]
     }
@@ -710,11 +732,17 @@ async function events(store: SegmentedJsonlStore, sessionId: string): Promise<Ag
 function mutationReservationIds(stored: AgentEventEnvelope[]): Set<string> {
   const result = new Set<string>();
   for (const item of stored.filter((event) => event.type === "budget.reserved")) {
-    const payload = item.payload as { ledger?: { reservations?: Array<{ reservationId?: string; ownerId?: string }> } };
-    for (const reservation of payload.ledger?.reservations ?? []) {
-      if (reservation.ownerId === "tool:mutation-call" && reservation.reservationId) {
-        result.add(reservation.reservationId);
-      }
+    const payload = item.payload as {
+      mutation?: {
+        kind?: string;
+        reservation?: { reservationId?: string; ownerId?: string };
+      };
+    };
+    const reservation = payload.mutation?.kind === "reserve"
+      ? payload.mutation.reservation
+      : undefined;
+    if (reservation?.ownerId === "tool:mutation-call" && reservation.reservationId) {
+      result.add(reservation.reservationId);
     }
   }
   return result;
@@ -796,7 +824,7 @@ describe("durable transaction fault-injection recovery", () => {
       await expect(readFile(path.join(fixture.workspace, "target.ts"), "utf8")).resolves.toBe("executed-1\n");
       expect(reviewer.calls).toBe(0);
       const stored = await events(fixture.store, fixture.sessionId);
-      expect(settledMutationReservations(stored, "budget.committed")).toBe(0);
+      expect(settledMutationReservations(stored, "budget.committed")).toBe(1);
       expect(stored.filter((item) => item.type === "run.completed")).toHaveLength(0);
     });
   }

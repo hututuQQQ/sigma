@@ -1,9 +1,9 @@
 import type {
-  RepositoryRecoverySelectionEvidenceV1
+  RepositoryRecoverySelectionEvidence
 } from "agent-protocol";
 
-export interface StoredRepositoryRecoverySelectionV1 {
-  evidence: RepositoryRecoverySelectionEvidenceV1;
+export interface StoredRepositoryRecoverySelection {
+  evidence: RepositoryRecoverySelectionEvidence;
   repositoryRoot: string;
   selectedObject: string;
 }
@@ -28,16 +28,16 @@ function invalidSelection(message: string, code: string): Error {
  * fails closed until a fresh inspection is performed.
  */
 export class RepositoryRecoverySelectionStore {
-  private readonly records = new Map<string, StoredRepositoryRecoverySelectionV1>();
+  private readonly records = new Map<string, StoredRepositoryRecoverySelection>();
 
-  record(value: StoredRepositoryRecoverySelectionV1): void {
+  record(value: StoredRepositoryRecoverySelection): void {
     this.records.set(value.evidence.evidenceId, value);
   }
 
   resolve(
     evidenceId: string,
     scope: RepositoryRecoverySelectionScope
-  ): StoredRepositoryRecoverySelectionV1 {
+  ): StoredRepositoryRecoverySelection {
     const record = this.records.get(evidenceId);
     if (!record) {
       throw invalidSelection(

@@ -205,7 +205,7 @@ async function commandCheck(check, context, broker) {
   }
   const variables = { WORKSPACE: context.workspace, MANIFEST_DIR: context.manifestDir };
   const [command, ...args] = rawArgv.map((item) => substitute(item, variables));
-  if (command !== "node") throw new Error(`Unsupported verifier executable '${command}'; EvalScenarioV1 command checks are restricted to node.`);
+  if (command !== "node") throw new Error(`Unsupported verifier executable '${command}'; EvalScenario command checks are restricted to node.`);
   // Required Windows AppContainer execution intentionally cannot lstat an
   // entire drive root. Prevent Node's ESM resolver from canonicalizing every
   // ancestor while the broker still enforces the declared read roots.

@@ -37,6 +37,12 @@ function validateEntry(entry: CheckpointEntry): void {
 }
 
 function validateLinkType(entry: CheckpointEntry): void {
+  if (entry.kind !== "symlink" && entry.linkType !== undefined) {
+    throw new CheckpointConflictError(`Checkpoint link type is only valid for symlinks: ${entry.path}`);
+  }
+  if (process.platform === "win32" && entry.kind === "symlink" && entry.linkType === undefined) {
+    throw new CheckpointConflictError(`Checkpoint symlink type is missing: ${entry.path}`);
+  }
   if (entry.linkType !== undefined && !["file", "directory"].includes(entry.linkType)) {
     throw new CheckpointConflictError(`Checkpoint symlink type is invalid: ${entry.path}`);
   }

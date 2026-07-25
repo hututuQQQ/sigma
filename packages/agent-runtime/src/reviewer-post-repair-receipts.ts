@@ -27,7 +27,6 @@ function latestSubstantiveReviewAt(session: RuntimeSession): number | undefined 
   const latest = session.durable.state.evidence.filter((item) =>
     item.kind === "review"
     && item.runId === session.durable.runId
-    && item.data.schemaVersion === 3
     && item.data.failureKind === undefined
     && !NON_SUBSTANTIVE_FAILURES.has(item.data.failureCode ?? "")).at(-1);
   if (!latest) return undefined;

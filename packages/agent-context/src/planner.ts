@@ -121,7 +121,7 @@ function arrangeMessages(
     item === archive || item === summary || item === summaryDelta
       ? toArchiveMessage(item)
       : toContextMessage(item);
-  const legacy = [...included.map(asMessage), ...retainedHistory];
+  const chronological = [...included.map(asMessage), ...retainedHistory];
   const promptFrameMessages: ModelMessage[] = promptCache && dynamicSuffix.length > 0
     ? [{
         role: "developer",
@@ -137,7 +137,7 @@ function arrangeMessages(
     ...promptFrameMessages
   ];
   return {
-    messages: promptCache ? cacheFirst : legacy,
+    messages: promptCache ? cacheFirst : chronological,
     promptFrameMessages,
     dynamicTokens: dynamic.reduce((total, item) => total + item.tokenCount, 0)
       + (promptFrameMessages.length > 0 ? approximateTokens(promptFrameMessages[0]!.content) + 6 : 0)

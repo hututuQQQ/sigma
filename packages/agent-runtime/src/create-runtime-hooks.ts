@@ -18,7 +18,6 @@ export function createRuntimeHooks(
   const agentProfileRunner = options.agentProfileHookRunner ?? productionProfileRunner;
   const materializer = new FrozenWorkspaceHookMaterializer(options.storeRootDir, artifacts);
   return new RuntimeHookCoordinator({
-    definitions: options.hooks ?? [],
     runner: options.hookRunner ?? {
       run: async () => ({ ok: false, error: "Hook runner is unavailable.", durationMs: 0 })
     },

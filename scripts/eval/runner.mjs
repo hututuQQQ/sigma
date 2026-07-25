@@ -7,10 +7,10 @@ import {
   artifactSecretValues as collectArtifactSecretValues, createRedactor, digest, evalRootDir, fixtureRootDir, loadEvalSecrets,
   makeRunId, relativeArtifact, rootDir, subjectEnvironment, writeJson
 } from "./common.mjs";
-import { listV5Sessions, readV5Session, resolveWorkspaceStateRoot } from "./event-store.mjs";
+import { listSessions, readSession, resolveWorkspaceStateRoot } from "./event-store.mjs";
 import { reduceAgentEvents } from "./metrics.mjs";
 import { writeEvalReport } from "./report.mjs";
-import { loadEvalManifestV2, toSubjectDriverSpecV2 } from "./schema.mjs";
+import { loadEvalManifest, toSubjectDriverSpec } from "./schema.mjs";
 import { runCliSubject } from "./subject-cli.mjs";
 import {
   applySubjectLaunchEnvironment, createDevNodeLaunch, loadPackagedSubjectLaunch
@@ -419,11 +419,11 @@ async function scanArtifactTree(directory, secretValues) {
 
 async function durableEvents(workspace, stateHome, subjectResult) {
   const stateRoot = await resolveWorkspaceStateRoot(workspace, { env: { SIGMA_STATE_HOME: stateHome } });
-  const sessions = await listV5Sessions(stateRoot);
+  const sessions = await listSessions(stateRoot);
   const sessionId = subjectResult.sessionId ?? sessions[0]?.sessionId;
   if (!sessionId) return { stateRoot, sessionId: null, events: subjectResult.events ?? [] };
   try {
-    const stored = await readV5Session(stateRoot, sessionId);
+    const stored = await readSession(stateRoot, sessionId);
     return { stateRoot, sessionId, events: stored.events };
   } catch (error) {
     if ((subjectResult.events ?? []).length === 0) throw error;
@@ -440,9 +440,9 @@ async function appendExternalReport(stateRoot, attempt) {
       reportId: attempt.attemptId,
       ...(attempt.outcome.sessionId ? { sessionId: attempt.outcome.sessionId } : {}),
       occurredAt: attempt.finishedAt,
-      evaluator: "sigma-experience-eval-v2",
+      evaluator: "sigma-experience-eval",
       payload: {
-        schemaVersion: 2,
+        schemaVersion: 1,
         scenarioDigest: attempt.subject.scenarioDigest,
         validity: attempt.validity,
         dimensions: Object.fromEntries(Object.entries(attempt.dimensions).map(([key, value]) => [key, value.status])),
@@ -503,9 +503,6 @@ function subjectConfiguration(context, fixtureSnapshot) {
     measuredToolchainDigest: configuration.measuredToolchainDigest,
     budget
   });
-  // configDigest remains as a compatibility alias for schema-v1 readers. It
-  // now describes controlled evaluation conditions rather than subject bytes.
-  configuration.configDigest = configuration.environmentDigest;
   return configuration;
 }
 
@@ -667,7 +664,7 @@ function infrastructureAttemptReport(context, lifecycle, evidence) {
   const owner = phase === "verifier" ? "verifier" : "evaluator";
   const cause = { code: `${owner}_infrastructure_error`, owner, phase };
   return {
-    schemaVersion: 2,
+    schemaVersion: 1,
     kind: "eval_attempt",
     runId,
     attemptId,
@@ -764,7 +761,7 @@ async function prepareAttemptExecution(context, deps, lifecycle) {
     ? baseSubjectEnv
     : applySubjectLaunchEnvironment(baseSubjectEnv, subject.launch);
   const budget = structuredClone(frozenRunPolicy.budget);
-  const driverSpec = toSubjectDriverSpecV2(scenario);
+  const driverSpec = toSubjectDriverSpec(scenario);
   const evaluatorController = driverSpec.surface === "tui" ? runTuiSubject : runCliSubject;
   // The built-in evaluator controller closes over the frozen stop policy.
   // The mandatory subject-launch boundary below never receives that policy.
@@ -1068,7 +1065,7 @@ function terminalCause(rawMetrics, subjectResult, expectedActual) {
     : null;
 }
 
-export function buildFailureChainV2(rawMetrics, safetyViolations, reliabilitySignals, subjectResult, expectedActual, invalidCause = null) {
+export function buildFailureChain(rawMetrics, safetyViolations, reliabilitySignals, subjectResult, expectedActual, invalidCause = null) {
   if (invalidCause) return { primary: invalidCause, contributing: [], terminal: invalidCause };
   const terminal = terminalCause(rawMetrics, subjectResult, expectedActual);
   const terminalCodes = new Set([terminal?.code, "deadline_exceeded"]);
@@ -1109,7 +1106,7 @@ function buildAttemptReport(context, lifecycle, collected, verified, evidence) {
       : null;
   const validity = validityCause ? "invalid" : "valid";
   return {
-    schemaVersion: 2, kind: "eval_attempt", runId, attemptId,
+    schemaVersion: 1, kind: "eval_attempt", runId, attemptId,
     scenarioId: scenario.id, suites: scenario.suites, repetition, startedAt,
     finishedAt: new Date().toISOString(), subject: subjectConfig,
     validity,
@@ -1138,7 +1135,7 @@ function buildAttemptReport(context, lifecycle, collected, verified, evidence) {
         signals: reliabilitySignals
       }
     },
-    failureChain: buildFailureChainV2(
+    failureChain: buildFailureChain(
       rawMetrics, safetyViolations, reliabilitySignals, subjectResult, expectedActual, validityCause
     ),
     metrics,
@@ -1267,7 +1264,7 @@ async function resolveEvaluationInput(options) {
   const { suite, subjectKind } = validateEvaluationOptions(options);
   const manifestPath = path.resolve(options.manifestPath ?? DEFAULT_MANIFEST);
   const manifestDir = path.dirname(manifestPath);
-  const manifest = await loadEvalManifestV2(manifestPath);
+  const manifest = await loadEvalManifest(manifestPath);
   const frozenRunPolicy = manifest.frozenRunPolicies[suite];
   if (!frozenRunPolicy) throw new Error(`Unknown evaluation suite '${suite}'.`);
   const scenarios = selectEvaluationScenarios(manifest, suite, options.scenarios);
@@ -1355,7 +1352,7 @@ async function prepareEvaluationContext(input, options, deps) {
   }));
   const scheduleDigest = digest({ policy: frozenRunPolicy, attempts: scheduleProjection });
   await writeJson(path.join(runDir, "schedule.json"), {
-    schemaVersion: 2,
+    schemaVersion: 1,
     suite,
     repeat,
     frozenRunPolicy,
@@ -1499,7 +1496,7 @@ function rawEvaluationRun(context, subject, verifierRuntime, attempts, infrastru
     scenarios, frozenRunPolicy, scheduleDigest, toolchainMeasurement } = context;
   const firstEnvironmentDigest = attempts[0]?.subject?.environmentDigest ?? null;
   return {
-    schemaVersion: 2,
+    schemaVersion: 1,
     kind: "eval_run",
     runId,
     suite,
@@ -1536,7 +1533,7 @@ function rawRunSubject(
     nodeDigest: subjectValue(subject, "nodeDigest"), cliTreeDigest: subjectValue(subject, "cliTreeDigest"),
     brokerDigest: subjectValue(subject, "brokerDigest"), subjectDigest: subjectValue(subject, "subjectDigest"),
     nativeSourceDigest: subjectValue(subject, "nativeSourceDigest"),
-    nativeTarget: subjectValue(subject, "nativeTarget"), environmentDigest, configDigest: environmentDigest
+    nativeTarget: subjectValue(subject, "nativeTarget"), environmentDigest
   };
 }
 

@@ -74,6 +74,7 @@ function toolTurn(
     actualEffects: ["filesystem.read"],
     artifacts: [],
     diagnostics: ok ? [] : ["command_failed"],
+    evidence: [],
     startedAt: NOW,
     completedAt: NOW
   });
@@ -155,9 +156,12 @@ describe("model-led convergence properties", () => {
           ...turn,
           ok: true,
           output: question,
+          outcome: { status: "succeeded", output: question, diagnosticCodes: [] },
           observedEffects: ["outcome.request_input"],
+          actualEffects: ["outcome.request_input"],
           artifacts: [],
           diagnostics: [],
+          evidence: [],
           startedAt: NOW,
           completedAt: NOW
         });

@@ -75,7 +75,7 @@ export function completionFailure(
     return failed(
       call,
       startedAt,
-      "Natural model stop is the completion protocol; no completion tool is registered in V6.",
+      "Natural model stop is the completion protocol; no completion tool is registered.",
       "internal_tool_denied"
     );
   }

@@ -1,8 +1,8 @@
-import type { LongHorizonStateV2, ModelMessage } from "agent-protocol";
+import type { LongHorizonState, ModelMessage } from "agent-protocol";
 
 export function strategyRebasedHistory(
   messages: readonly ModelMessage[],
-  _state: LongHorizonStateV2
+  _state: LongHorizonState
 ): ModelMessage[] {
   // Strategy state is projected through the bounded incremental runtime frame.
   // Re-slicing history around a moving "last four calls" boundary invalidates

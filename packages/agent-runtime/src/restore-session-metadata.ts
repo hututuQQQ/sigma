@@ -1,9 +1,9 @@
 import {
   createBudgetLedger,
-  isAssuranceResourcePolicyV1,
+  isAssuranceResourcePolicy,
   isBudgetLedgerState,
   type AgentEventEnvelope,
-  type AssuranceResourcePolicyV1,
+  type AssuranceResourcePolicy,
   type BudgetLimits,
   type JsonValue,
   type ModelExecutionRole,
@@ -17,8 +17,8 @@ export interface RestoredSessionMetadata {
   writeScope: string[];
   strictWriteScope: boolean;
   modelRole: ModelExecutionRole;
-  budgetLimits?: BudgetLimits;
-  assurancePolicy?: AssuranceResourcePolicyV1;
+  budgetLimits: BudgetLimits;
+  assurancePolicy?: AssuranceResourcePolicy;
 }
 
 function modelExecutionRole(value: JsonValue | undefined): ModelExecutionRole {
@@ -26,17 +26,20 @@ function modelExecutionRole(value: JsonValue | undefined): ModelExecutionRole {
     || value === "child_write" || value === "summarizer" ? value : "orchestrator";
 }
 
-function validBudgetLimits(value: JsonValue | undefined): { budgetLimits: BudgetLimits } | Record<string, never> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+function validBudgetLimits(value: JsonValue | undefined): BudgetLimits {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("session.created budgetLimits are missing.");
+  }
   const candidate = createBudgetLedger(value as unknown as BudgetLimits);
-  return isBudgetLedgerState(candidate) ? { budgetLimits: candidate.limits } : {};
+  if (!isBudgetLedgerState(candidate)) throw new Error("session.created budgetLimits are invalid.");
+  return candidate.limits;
 }
 
 function validAssurancePolicy(
   value: JsonValue | undefined
-): { assurancePolicy: AssuranceResourcePolicyV1 } | Record<string, never> {
-  return isAssuranceResourcePolicyV1(value)
-    ? { assurancePolicy: { ...(value as unknown as AssuranceResourcePolicyV1) } }
+): { assurancePolicy: AssuranceResourcePolicy } | Record<string, never> {
+  return isAssuranceResourcePolicy(value)
+    ? { assurancePolicy: { ...(value as unknown as AssuranceResourcePolicy) } }
     : {};
 }
 
@@ -53,7 +56,7 @@ export function createdSessionMetadata(event: AgentEventEnvelope | undefined): R
       ? value.writeScope.filter((item): item is string => typeof item === "string") : [],
     strictWriteScope: value.strictWriteScope === true,
     modelRole: modelExecutionRole(value.modelRole),
-    ...validBudgetLimits(value.budgetLimits),
+    budgetLimits: validBudgetLimits(value.budgetLimits),
     ...validAssurancePolicy(value.assurancePolicy)
   };
 }

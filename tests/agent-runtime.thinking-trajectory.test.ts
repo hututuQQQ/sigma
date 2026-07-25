@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
-  emptyReasoningTrajectoryStateV1,
+  emptyReasoningTrajectoryState,
   type AgentEventEnvelope,
   type ModelCapabilities,
   type ModelGateway,
@@ -88,7 +88,7 @@ function requestInputResponse(id: string): ModelResponse {
   };
 }
 
-describe("V9 thinking-provider trajectory integrity", () => {
+describe("thinking-provider trajectory integrity", () => {
   it("rejects a normal thinking tool call without reasoning before any side effect", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-thinking-missing-workspace-"));
     const state = await mkdtemp(path.join(os.tmpdir(), "sigma-thinking-missing-state-"));
@@ -247,19 +247,19 @@ describe("V9 thinking-provider trajectory integrity", () => {
       && message.content.includes("non-executable observation summary"))).toBe(true);
   });
 
-  it("converts a complete legacy block with missing reasoning into one non-executable tombstone", () => {
+  it("converts a complete block with missing reasoning into one non-executable tombstone", () => {
     const history = [{
       role: "assistant" as const,
       content: "",
-      toolCalls: [{ id: "legacy-call", name: "write", arguments: { path: "a", content: "b" } }]
+      toolCalls: [{ id: "settled-call", name: "write", arguments: { path: "a", content: "b" } }]
     }, {
       role: "tool" as const,
-      toolCallId: "legacy-call",
+      toolCallId: "settled-call",
       content: "already settled"
     }];
     const proposal = proposeReasoningTrajectoryTombstones(
       history,
-      emptyReasoningTrajectoryStateV1(),
+      emptyReasoningTrajectoryState(),
       true
     );
     const projected = projectReasoningSafeHistory(history, proposal.state, true);

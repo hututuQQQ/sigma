@@ -1,24 +1,16 @@
-import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
   EVENT_SCHEMA_VERSION,
-  KERNEL_STATE_VERSION,
   SNAPSHOT_SCHEMA_VERSION,
-  STORE_LAYOUT_VERSION,
   isCompletionReferenceableEvidence,
-  type JsonValue,
   type ToolDescriptor,
   type ValidationEvidence
 } from "../packages/agent-protocol/src/index.js";
 import { createKernelState } from "../packages/agent-kernel/src/index.js";
-import {
-  SegmentedJsonlStore,
-  sessionDirectory,
-  snapshotName
-} from "../packages/agent-store/src/index.js";
+import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { restoreStoredSession } from "../packages/agent-runtime/src/restore-session.js";
 import { armRunDeadline } from "../packages/agent-runtime/src/run-deadline.js";
 import { ordinaryToolFailureReceipt } from "../packages/agent-runtime/src/tool-failure-receipt.js";
@@ -46,32 +38,6 @@ function runtime(toolIdleWatchdogMs?: number | false): RuntimeOptions {
   return {
     ...(toolIdleWatchdogMs === undefined ? {} : { toolIdleWatchdogMs })
   } as RuntimeOptions;
-}
-
-async function writeLegacyV5Snapshot(input: {
-  rootDir: string;
-  sessionId: string;
-  seq: number;
-  createdAt: string;
-  state: Record<string, JsonValue>;
-  envelopeSchemaVersion?: 5 | 6 | 7 | 8;
-}): Promise<void> {
-  const snapshot = {
-    schemaVersion: input.envelopeSchemaVersion ?? 5,
-    storeLayoutVersion: STORE_LAYOUT_VERSION,
-    sessionId: input.sessionId,
-    seq: input.seq,
-    createdAt: input.createdAt,
-    state: input.state
-  };
-  const checksum = createHash("sha256").update(JSON.stringify(snapshot)).digest("hex");
-  const directory = path.join(sessionDirectory(input.rootDir, input.sessionId), "snapshots");
-  await mkdir(directory, { recursive: true });
-  await writeFile(
-    path.join(directory, snapshotName(input.seq)),
-    JSON.stringify({ checksum, snapshot }),
-    "utf8"
-  );
 }
 
 describe("runtime recovery convergence", () => {
@@ -119,342 +85,6 @@ describe("runtime recovery convergence", () => {
     }
   });
 
-  it("migrates the published V5 task authorities and strips every legacy field", async () => {
-    const workspacePath = await mkdtemp(path.join(os.tmpdir(), "sigma-semantic-restore-"));
-    const storeRootDir = path.join(workspacePath, ".agent");
-    const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
-    const sessionId = "legacy-semantic-session";
-    const runId = "legacy-semantic-run";
-    const startedAt = "2026-07-12T00:00:00.000Z";
-    await store.append({
-      schemaVersion: EVENT_SCHEMA_VERSION,
-      seq: 1,
-      eventId: "legacy-created",
-      sessionId,
-      runId,
-      occurredAt: startedAt,
-      type: "session.created",
-      authority: "runtime",
-      payload: completeAgentEventPayload("session.created", { workspacePath, mode: "change" })
-    }, 0);
-    const current = createKernelState({
-      sessionId,
-      runId,
-      mode: "change",
-      startedAt,
-      deadlineAt: "2026-07-12T00:15:00.000Z"
-    });
-    const oldSnapshot = JSON.parse(JSON.stringify({ ...current, lastSeq: 1 })) as Record<string, JsonValue>;
-    Object.assign(oldSnapshot, {
-      schemaVersion: 5,
-      taskControl: {
-        schemaVersion: 1,
-        goalEpoch: 3,
-        goalEpochSource: "submit",
-        phase: "repair_only",
-        semanticFacts: { entries: [] },
-        episode: {
-          basisDigest: "b".repeat(64),
-          startedRevision: 1,
-          noProgressBatches: 6,
-          observations: 7
-        },
-        obligation: {
-          kind: "terminal_resolution",
-          stage: "report",
-          basisDigest: "c".repeat(64),
-          openedRevision: 1,
-          attempts: 2,
-          failureCode: "legacy_no_progress"
-        },
-        completionCandidate: {
-          answer: "Preserved draft.",
-          digest: "d".repeat(64)
-        },
-        modelContinuationAttempts: 4
-      },
-      completionRepairAttempts: 0,
-      continuationAttempts: 0,
-      repeatedToolBatchCount: 0,
-      receiptCountAtLastUserInput: 0,
-      semanticProgress: { workspaceChanges: 0, durableEvidence: 0, revision: 0 }
-    });
-    await writeLegacyV5Snapshot({
-      rootDir: storeRootDir,
-      sessionId,
-      seq: 1,
-      createdAt: startedAt,
-      state: oldSnapshot
-    });
-
-    const restored = await restoreStoredSession(store, sessionId, 60_000);
-    expect(restored.state.schemaVersion).toBe(KERNEL_STATE_VERSION);
-    expect(restored.state).not.toHaveProperty("taskControl");
-    expect(restored.state.messages.at(-1)).toMatchObject({
-      role: "assistant",
-      content: "Preserved draft."
-    });
-    for (const key of [
-      "completionRepairAttempts", "completionRepair", "continuationAttempts",
-      "repeatedToolBatchCount", "receiptCountAtLastUserInput", "semanticProgress",
-      "semanticFailureCluster", "lastToolBatchSignature", "lastToolBatchOutcomeSignature"
-    ]) expect(restored.state).not.toHaveProperty(key);
-    await expect(store.latestSnapshot(sessionId)).resolves.toMatchObject({
-      schemaVersion: SNAPSHOT_SCHEMA_VERSION,
-      state: { schemaVersion: KERNEL_STATE_VERSION }
-    });
-  });
-
-  it("migrates a published V6 snapshot into the V8 prompt and truncation state", async () => {
-    const workspacePath = await mkdtemp(path.join(os.tmpdir(), "sigma-v6-restore-"));
-    const storeRootDir = path.join(workspacePath, ".agent");
-    const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
-    const sessionId = "legacy-v6-session";
-    const runId = "legacy-v6-run";
-    const startedAt = "2026-07-12T00:00:00.000Z";
-    await store.append({
-      schemaVersion: EVENT_SCHEMA_VERSION,
-      seq: 1,
-      eventId: "v6-created",
-      sessionId,
-      runId,
-      occurredAt: startedAt,
-      type: "session.created",
-      authority: "runtime",
-      payload: completeAgentEventPayload("session.created", {
-        workspacePath,
-        mode: "change"
-      })
-    }, 0);
-    const raw = JSON.parse(JSON.stringify(createKernelState({
-      sessionId,
-      runId,
-      mode: "change",
-      startedAt,
-      deadlineAt: "2026-07-12T00:15:00.000Z"
-    }))) as Record<string, JsonValue>;
-    raw.schemaVersion = 6;
-    delete raw.lastModelFinishReason;
-    delete raw.consecutiveLengthFinishes;
-    delete raw.consecutiveLengthNoAction;
-    delete raw.lastModelHadToolCalls;
-    await writeLegacyV5Snapshot({
-      rootDir: storeRootDir,
-      sessionId,
-      seq: 1,
-      createdAt: startedAt,
-      state: raw,
-      envelopeSchemaVersion: 6
-    });
-
-    const restored = await restoreStoredSession(store, sessionId, 60_000);
-    expect(restored.state).toMatchObject({
-      schemaVersion: KERNEL_STATE_VERSION,
-      consecutiveLengthFinishes: 0,
-      consecutiveLengthNoAction: 0,
-      lastModelHadToolCalls: false
-    });
-    await expect(store.latestSnapshot(sessionId)).resolves.toMatchObject({
-      schemaVersion: SNAPSHOT_SCHEMA_VERSION,
-      state: { schemaVersion: KERNEL_STATE_VERSION }
-    });
-  });
-
-  it("migrates V7 without losing messages, truncation state, or completed tool effects", async () => {
-    const workspacePath = await mkdtemp(path.join(os.tmpdir(), "sigma-v7-restore-"));
-    const storeRootDir = path.join(workspacePath, ".agent");
-    const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
-    const sessionId = "legacy-v7-session";
-    const runId = "legacy-v7-run";
-    const startedAt = "2026-07-12T00:00:00.000Z";
-    await store.append({
-      schemaVersion: EVENT_SCHEMA_VERSION,
-      seq: 1,
-      eventId: "v7-created",
-      sessionId,
-      runId,
-      occurredAt: startedAt,
-      type: "session.created",
-      authority: "runtime",
-      payload: completeAgentEventPayload("session.created", {
-        workspacePath,
-        mode: "change"
-      })
-    }, 0);
-    const current = createKernelState({
-      sessionId,
-      runId,
-      mode: "change",
-      startedAt,
-      deadlineAt: "2026-07-12T00:15:00.000Z"
-    });
-    current.messages = [{ role: "assistant", content: "Preserve this durable answer." }];
-    current.receipts = [{
-      callId: "already-executed",
-      ok: true,
-      output: "written once",
-      outcome: { status: "succeeded", output: "written once", diagnosticCodes: [] },
-      observedEffects: ["filesystem.write"],
-      actualEffects: ["filesystem.write"],
-      artifacts: [],
-      diagnostics: [],
-      startedAt,
-      completedAt: startedAt
-    }];
-    current.toolCallIds = ["already-executed"];
-    current.lastModelFinishReason = "length";
-    current.consecutiveLengthFinishes = 2;
-    current.consecutiveLengthNoAction = 0;
-    current.lastModelHadToolCalls = true;
-    const raw = JSON.parse(JSON.stringify(current)) as Record<string, JsonValue>;
-    raw.schemaVersion = 7;
-    delete raw.promptState;
-    delete raw.lengthRecovery;
-    await writeLegacyV5Snapshot({
-      rootDir: storeRootDir,
-      sessionId,
-      seq: 1,
-      createdAt: startedAt,
-      state: raw,
-      envelopeSchemaVersion: 7
-    });
-
-    const restored = await restoreStoredSession(store, sessionId, 60_000);
-    expect(restored.state).toMatchObject({
-      schemaVersion: KERNEL_STATE_VERSION,
-      messages: [{ role: "assistant", content: "Preserve this durable answer." }],
-      toolCallIds: ["already-executed"],
-      lastModelFinishReason: "length",
-      consecutiveLengthFinishes: 2,
-      lastModelHadToolCalls: true,
-      promptState: { schemaVersion: 2, sectionDigests: {}, budgetBand: 100 },
-      lengthRecovery: {
-        schemaVersion: 1,
-        mode: "continue_after_tools",
-        attempts: 2
-      }
-    });
-    expect(restored.state.receipts.filter((receipt) =>
-      receipt.callId === "already-executed")).toHaveLength(1);
-    await expect(store.latestSnapshot(sessionId)).resolves.toMatchObject({
-      schemaVersion: SNAPSHOT_SCHEMA_VERSION,
-      state: { schemaVersion: KERNEL_STATE_VERSION }
-    });
-  });
-
-  it("migrates V8 to V9 without replaying tools or losing atomic reasoning history", async () => {
-    const workspacePath = await mkdtemp(path.join(os.tmpdir(), "sigma-v8-restore-"));
-    const storeRootDir = path.join(workspacePath, ".agent");
-    const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
-    const sessionId = "legacy-v8-session";
-    const runId = "legacy-v8-run";
-    const startedAt = "2026-07-12T00:00:00.000Z";
-    await store.append({
-      schemaVersion: EVENT_SCHEMA_VERSION,
-      seq: 1,
-      eventId: "v8-created",
-      sessionId,
-      runId,
-      occurredAt: startedAt,
-      type: "session.created",
-      authority: "runtime",
-      payload: completeAgentEventPayload("session.created", {
-        workspacePath,
-        mode: "change"
-      })
-    }, 0);
-    const current = createKernelState({
-      sessionId,
-      runId,
-      mode: "change",
-      startedAt,
-      deadlineAt: "2026-07-12T00:15:00.000Z"
-    });
-    current.messages = [{
-      role: "assistant",
-      content: "",
-      reasoningContent: "Preserve this provider reasoning with its call.",
-      toolCalls: [{
-        id: "v8-executed",
-        name: "write",
-        arguments: { path: "done.txt", content: "done" }
-      }]
-    }, {
-      role: "tool",
-      toolCallId: "v8-executed",
-      content: "already written"
-    }];
-    current.receipts = [{
-      callId: "v8-executed",
-      ok: true,
-      output: "already written",
-      outcome: { status: "succeeded", output: "already written", diagnosticCodes: [] },
-      observedEffects: ["filesystem.write"],
-      actualEffects: ["filesystem.write"],
-      artifacts: [],
-      diagnostics: [],
-      startedAt,
-      completedAt: startedAt
-    }];
-    current.toolCallIds = ["v8-executed"];
-    current.lastModelFinishReason = "length";
-    current.consecutiveLengthFinishes = 1;
-    current.consecutiveLengthNoAction = 1;
-    current.lastModelHadToolCalls = false;
-    current.lengthRecovery = {
-      schemaVersion: 1,
-      mode: "action_required",
-      attempts: 1
-    };
-    const raw = JSON.parse(JSON.stringify(current)) as Record<string, JsonValue>;
-    raw.schemaVersion = 8;
-    delete raw.longHorizon;
-    delete raw.reasoningTrajectory;
-    await writeLegacyV5Snapshot({
-      rootDir: storeRootDir,
-      sessionId,
-      seq: 1,
-      createdAt: startedAt,
-      state: raw,
-      envelopeSchemaVersion: 8
-    });
-
-    const restored = await restoreStoredSession(store, sessionId, 60_000);
-    expect(restored.state).toMatchObject({
-      schemaVersion: KERNEL_STATE_VERSION,
-      promptState: { schemaVersion: 2, sectionDigests: {}, budgetBand: 100 },
-      lengthRecovery: {
-        schemaVersion: 1,
-        mode: "action_required",
-        attempts: 1
-      },
-      longHorizon: {
-        schemaVersion: 2,
-        settledBatchCount: 0,
-        assurance: {
-          schemaVersion: 2,
-          maxAuxiliaryCalls: 9,
-          protectedRepairTurnsRemaining: 3,
-          protectedToolCallsRemaining: 8
-        }
-      },
-      reviewReceipts: [],
-      reasoningTrajectory: {
-        schemaVersion: 1,
-        blockDigests: []
-      }
-    });
-    expect(restored.state.messages).toEqual(current.messages);
-    expect(restored.state.receipts.filter((receipt) =>
-      receipt.callId === "v8-executed")).toHaveLength(1);
-    expect(restored.state.toolCallIds.filter((callId) =>
-      callId === "v8-executed")).toHaveLength(1);
-    await expect(store.latestSnapshot(sessionId)).resolves.toMatchObject({
-      schemaVersion: SNAPSHOT_SCHEMA_VERSION,
-      state: { schemaVersion: KERNEL_STATE_VERSION }
-    });
-  });
-
   it("preserves failed validation status, scope, and execution claim across snapshot restore", async () => {
     const workspacePath = await mkdtemp(path.join(os.tmpdir(), "sigma-validation-restore-"));
     const store = new SegmentedJsonlStore({ rootDir: path.join(workspacePath, ".agent") });
@@ -489,6 +119,7 @@ describe("runtime recovery convergence", () => {
       producer: { authority: "tool", id: "validate" },
       summary: "tests exited 1",
       data: {
+        schemaVersion: 1,
         validator: "command",
         command: "pnpm test",
         exitCode: 1,
@@ -504,13 +135,22 @@ describe("runtime recovery convergence", () => {
         artifactIds: ["stderr"],
         frontierRevision: 0,
         stateDigest: "0".repeat(64),
-        coveredPaths: ["delta"]
+        coveredPaths: ["delta"],
+        claim: {
+          kind: "unit",
+          commandDigest: "1".repeat(64),
+          subject: {
+            configPaths: [],
+            selectedTests: ["tests/unit.test.ts"],
+            exactFiles: ["delta"]
+          },
+          status: "failed"
+        }
       }
     };
     current.evidence = [failed];
     await store.writeSnapshot({
       schemaVersion: SNAPSHOT_SCHEMA_VERSION,
-      storeLayoutVersion: STORE_LAYOUT_VERSION,
       sessionId,
       seq: 1,
       createdAt: startedAt,
@@ -562,7 +202,6 @@ describe("runtime recovery convergence", () => {
     };
     await store.writeSnapshot({
       schemaVersion: SNAPSHOT_SCHEMA_VERSION,
-      storeLayoutVersion: STORE_LAYOUT_VERSION,
       sessionId,
       seq: 1,
       createdAt: startedAt,

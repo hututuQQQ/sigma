@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import {
   FAILURE_TAXONOMY_VERSION,
   INFRASTRUCTURE_FAILURE_LIMIT,
-  classifyInfrastructureFailureCodesV1
+  classifyInfrastructureFailureCodes
 } from "../../packages/agent-protocol/src/failure-taxonomy.ts";
 
 const TERMINAL_TYPES = new Set(["run.completed", "run.cancelled", "run.failed", "run.suspended"]);
@@ -869,7 +869,7 @@ function countFailureAttempt(state, episode, classification, event, attemptKey) 
 
 function recordInfrastructureFailure(state, event, semanticRevision) {
   if (event.type !== "tool.failed" && event.type !== "execution.failed") return;
-  const classification = classifyInfrastructureFailureCodesV1(failureCodes(event));
+  const classification = classifyInfrastructureFailureCodes(failureCodes(event));
   if (!classification) return;
   const workId = eventWorkId(event, state.aliases);
   const attemptKey = `${workId}\0${classification.family}`;
@@ -1086,7 +1086,7 @@ function hardFailures(events, mode, workspace) {
 }
 
 /**
- * Reduce validated V5 durable events to JSON-safe, content-redacted experience metrics.
+ * Reduce validated durable events to JSON-safe, content-redacted experience metrics.
  * Tool arguments and outputs are represented only by SHA-256 fingerprints.
  */
 export function reduceAgentEvents(input, options = {}) {
@@ -1176,7 +1176,7 @@ function percent(value) {
   return `${(value * 100).toFixed(1)}%`;
 }
 
-/** Render one SessionMetricsV1 object without reproducing model/tool content. */
+/** Render one SessionMetrics object without reproducing model/tool content. */
 export function renderSessionMetricsMarkdown(metrics) {
   const lines = [
     `## Session ${metrics.sessionId ?? "unknown"}`,

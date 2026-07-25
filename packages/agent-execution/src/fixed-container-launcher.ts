@@ -11,8 +11,8 @@ import {
 } from "./container-execution-broker.js";
 import { SigmaExecBrokerClient } from "./broker-client.js";
 import type {
-  TrustedContainerLauncherV1,
-  TrustedManagedContainerAttestationV1
+  TrustedContainerLauncher,
+  TrustedManagedContainerAttestation
 } from "./types.js";
 
 export const FIXED_OCI_BOUNDARY_ROOT = "/run/sigma-oci";
@@ -26,7 +26,7 @@ const ATTESTATION_KEYS = new Set([
   "managedEnvironment", "workspace"
 ]);
 
-interface FixedAttestationDocument extends TrustedManagedContainerAttestationV1 {
+interface FixedAttestationDocument extends TrustedManagedContainerAttestation {
   workspace?: string;
 }
 
@@ -44,7 +44,7 @@ function requiredString(value: unknown, field: string): string {
   return value;
 }
 
-function managedEnvironmentProof(value: unknown): TrustedManagedContainerAttestationV1["managedEnvironment"] {
+function managedEnvironmentProof(value: unknown): TrustedManagedContainerAttestation["managedEnvironment"] {
   if (value === undefined || value === null) return undefined;
   const proof = record(value);
   const keys = new Set([
@@ -162,7 +162,7 @@ async function readPinnedAttestation(): Promise<string> {
 export async function loadFixedContainerLauncher(
   workspace: string,
   platform: NodeJS.Platform = process.platform
-): Promise<TrustedContainerLauncherV1 | undefined> {
+): Promise<TrustedContainerLauncher | undefined> {
   if (platform !== "linux") return undefined;
   await assertBoundaryPath(FIXED_OCI_BOUNDARY_ROOT, "directory");
   await assertBoundaryPath(FIXED_OCI_BROKER_SOCKET, "socket");

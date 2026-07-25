@@ -12,9 +12,9 @@ import {
 } from "./domain-schema-primitives.js";
 import {
   repositoryDeltaEvidenceSchema,
-  repositoryAcceptanceEvidenceV1Schema,
-  repositoryRecoveryDecisionEvidenceV1Schema,
-  repositoryRecoverySelectionEvidenceV1Schema
+  repositoryAcceptanceEvidenceSchema,
+  repositoryRecoveryDecisionEvidenceSchema,
+  repositoryRecoverySelectionEvidenceSchema
 } from "./repository-evidence-schemas.js";
 export {
   checkpointDeltaSchema,
@@ -70,9 +70,7 @@ export const mutationFrontierSchema = z.object({
   baselineManifestDigest: digestSchema,
   currentStateDigest: digestSchema,
   changedPaths: z.array(nonEmptyStringSchema),
-  /** V10 compatibility field. Legacy snapshots omit it and materialize an
-   * empty environment frontier on their next durable update. */
-  environmentChangedPaths: z.array(nonEmptyStringSchema).optional(),
+  environmentChangedPaths: z.array(nonEmptyStringSchema),
   sourceCheckpointIds: z.array(nonEmptyStringSchema),
   repositoryStateDigest: digestSchema.optional()
 }).strict();
@@ -94,7 +92,7 @@ export const validationEvidenceSchema = z.object({
   ...evidenceBaseShape,
   kind: z.literal("validation"),
   data: z.object({
-    schemaVersion: z.literal(2).optional(),
+    schemaVersion: z.literal(1),
     intent: z.object({
       purpose: nonEmptyStringSchema.optional(),
       subjects: z.array(nonEmptyStringSchema).max(128),
@@ -175,7 +173,7 @@ export const reviewEvidenceSchema = z.object({
   ...evidenceBaseShape,
   kind: z.literal("review"),
   data: z.object({
-    schemaVersion: z.union([z.literal(2), z.literal(3)]).optional(),
+    schemaVersion: z.literal(1),
     reviewerId: nonEmptyStringSchema,
     reviewRequestId: nonEmptyStringSchema.optional(),
     verdict: z.enum(["approved", "changes_requested", "validation_required", "blocked"]),
@@ -253,7 +251,7 @@ export const userWaiverEvidenceSchema = z.object({
   }).strict()
 }).strict();
 
-export const workspaceRestorationEvidenceV1Schema = z.object({
+export const workspaceRestorationEvidenceSchema = z.object({
   ...evidenceBaseShape,
   kind: z.literal("restoration"),
   data: z.object({
@@ -289,18 +287,18 @@ export const evidenceRecordSchema = z.discriminatedUnion("kind", [
   checkpointEvidenceSchema,
   childOutcomeEvidenceSchema,
   userWaiverEvidenceSchema,
-  workspaceRestorationEvidenceV1Schema
-  , repositoryRecoverySelectionEvidenceV1Schema
-  , repositoryRecoveryDecisionEvidenceV1Schema
-  , repositoryAcceptanceEvidenceV1Schema
+  workspaceRestorationEvidenceSchema
+  , repositoryRecoverySelectionEvidenceSchema
+  , repositoryRecoveryDecisionEvidenceSchema
+  , repositoryAcceptanceEvidenceSchema
 ]);
 
 export {
   repositoryDeltaEvidenceSchema,
-  repositoryAcceptanceEvidenceV1Schema,
-  repositoryRecoveryDecisionEvidenceV1Schema,
-  repositoryRecoverySelectionEvidenceV1Schema,
-  repositorySemanticAssertionsV3Schema
+  repositoryAcceptanceEvidenceSchema,
+  repositoryRecoveryDecisionEvidenceSchema,
+  repositoryRecoverySelectionEvidenceSchema,
+  repositorySemanticAssertionsSchema
 } from "./repository-evidence-schemas.js";
 
 export const modelExecutionRoleSchema = z.enum([
@@ -334,7 +332,7 @@ export const usageRecordSchema = z.object({
 export const evidenceRefSchema = z.object({
   evidenceId: nonEmptyStringSchema,
   kind: evidenceKindSchema,
-  claim: evidenceClaimSchema.optional()
+  claim: evidenceClaimSchema
 }).strict();
 
 const planNodeOwnerSchema = z.discriminatedUnion("kind", [

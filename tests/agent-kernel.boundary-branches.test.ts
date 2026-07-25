@@ -129,7 +129,7 @@ function checkpoint(
   };
 }
 
-describe("agent-kernel boundary branch contracts", () => {
+describe("agent-kernel boundary contracts", () => {
   it("parses model calls, messages, and turn identities fail-closed", () => {
     expect(modelToolCalls(undefined)).toEqual([]);
     expect(modelToolCalls({})).toEqual([]);
@@ -166,7 +166,7 @@ describe("agent-kernel boundary branch contracts", () => {
     expect(isCurrentModelTurn(active, { turnId: 1, effectRevision: 0 })).toBe(true);
   });
 
-  it("normalizes complete and malformed durable tool receipts", () => {
+  it("accepts complete durable tool receipts and rejects malformed structures", () => {
     expect(toolReceipt(null)).toBeNull();
     expect(toolReceipt([])).toBeNull();
     expect(toolReceipt({ ok: true })).toBeNull();
@@ -187,24 +187,13 @@ describe("agent-kernel boundary branch contracts", () => {
       startedAt: 1,
       completedAt: null
     });
-    expect(malformed).toMatchObject({
-      callId: "call",
-      output: "",
-      observedEffects: ["filesystem.read"],
-      artifacts: [],
-      diagnostics: [],
-      evidence: [],
-      startedAt: "",
-      completedAt: ""
-    });
-    expect(malformed).not.toHaveProperty("outcome");
-    expect(malformed).not.toHaveProperty("workspaceDelta");
+    expect(malformed).toBeNull();
     const parsed = toolReceipt({
       callId: "call",
       ok: false,
       output: "failed",
       result: { nested: true },
-      outcome: { status: "failed", output: "failed", diagnosticCodes: ["x", 2] },
+      outcome: { status: "failed", output: "failed", diagnosticCodes: ["x"] },
       observedEffects: ["filesystem.write"],
       actualEffects: ["filesystem.write"],
       workspaceDelta: { added: ["a"], modified: ["b"], deleted: ["c"] },
@@ -217,7 +206,7 @@ describe("agent-kernel boundary branch contracts", () => {
         sizeBytes: 4
       }],
       diagnostics: ["x", 1],
-      evidence: [evidenceFixture(), {}],
+      evidence: [evidenceFixture()],
       startedAt: NOW,
       completedAt: NOW
     });
@@ -232,9 +221,8 @@ describe("agent-kernel boundary branch contracts", () => {
   });
 
   it("bounds receipt projections and includes only populated summary fields", () => {
-    const legacy = {
+    const truncated = {
       ...receipt(),
-      outcome: undefined,
       output: "x".repeat(13_000),
       artifactRefs: [{
         artifactId: "artifact",
@@ -242,8 +230,8 @@ describe("agent-kernel boundary branch contracts", () => {
         digest: "d".repeat(64)
       }]
     };
-    expect(receiptContent(legacy)).toContain("receipt output omitted");
-    expect(receiptContent(legacy)).toContain("Artifacts (JSON)");
+    expect(receiptContent(truncated)).toContain("receipt output omitted");
+    expect(receiptContent(truncated)).toContain('"artifactRefs"');
     const rich = {
       ...receipt("rich", ["filesystem.write"]),
       output: "ok",

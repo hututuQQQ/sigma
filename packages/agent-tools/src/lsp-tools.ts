@@ -243,8 +243,10 @@ function receipt(
   scope: { sessionId: string; runId: string }
 ): ToolReceipt {
   const completedAt = new Date().toISOString();
+  const outputText = JSON.stringify(output);
   return {
-    callId: request.callId, ok: true, output: JSON.stringify(output),
+    callId: request.callId, ok: true, output: outputText,
+    outcome: { status: "succeeded", output: outputText, diagnosticCodes: [] },
     observedEffects: ["filesystem.read", "process.spawn.readonly"],
     actualEffects: ["filesystem.read", "process.spawn.readonly"], artifacts: [], diagnostics: [],
     evidence: evidence(request, op, output, completedAt, scope), startedAt, completedAt
@@ -274,8 +276,10 @@ export function codeIntelTool(options: CodeIntelToolOptions): RegisteredEffectTo
         if (!result) throw new Error("Language server declined the rename.");
         const applied = await applyRename(context.workspacePath, result as LspWorkspaceEdit);
         const completedAt = new Date().toISOString();
+        const output = JSON.stringify(applied);
         return {
-          callId: request.callId, ok: true, output: JSON.stringify(applied),
+          callId: request.callId, ok: true, output,
+          outcome: { status: "succeeded", output, diagnosticCodes: [] },
           observedEffects: ["filesystem.read", "process.spawn.readonly", "filesystem.write"],
           actualEffects: ["filesystem.read", "process.spawn.readonly", "filesystem.write"],
           workspaceDelta: applied.delta, artifacts: [], diagnostics: [], startedAt, completedAt,

@@ -5,11 +5,11 @@ import {
   type RepositoryWorktreeTopology
 } from "./repository-git-execution.js";
 import type {
-  RepositoryHeadRelationV2,
-  RepositoryInspectionProbeV2,
-  RepositoryInspectionV2,
-  RepositoryRecoveryCandidateV2,
-  RepositoryReflogEntryV2
+  RepositoryHeadRelation,
+  RepositoryInspectionProbe,
+  RepositoryInspection,
+  RepositoryRecoveryCandidate,
+  RepositoryReflogEntry
 } from "./repository-git-inspection-types.js";
 
 const CAPTURE_BYTES = 512 * 1024;
@@ -57,7 +57,7 @@ async function stableProbe(
   kind: StableProbeKind,
   args: string[],
   signal: AbortSignal
-): Promise<RepositoryInspectionProbeV2> {
+): Promise<RepositoryInspectionProbe> {
   const output = await runLeasedRepositoryGit(execution, topology, args, signal, CAPTURE_BYTES);
   const ok = output.exitCode === 0 && !output.outputTruncated;
   const lines = ok ? stableLines(kind, output.stdout) : [];
@@ -73,7 +73,7 @@ async function stableProbe(
   };
 }
 
-type ReflogProbe = RepositoryInspectionProbeV2;
+type ReflogProbe = RepositoryInspectionProbe;
 
 async function reflogProbe(
   execution: ProcessExecutionPort,
@@ -161,12 +161,12 @@ function alignedReflogEntries(
   ordinal: ReflogProbe,
   raw: ReflogProbe,
   ordinalAfter: ReflogProbe
-): { aligned: boolean; entries: RepositoryReflogEntryV2[] } {
+): { aligned: boolean; entries: RepositoryReflogEntry[] } {
   if (!ordinal.ok || !raw.ok || !ordinalAfter.ok
     || ordinal.digest !== ordinalAfter.digest || ordinal.lines.length !== raw.lines.length) {
     return { aligned: false, entries: [] };
   }
-  const entries: RepositoryReflogEntryV2[] = [];
+  const entries: RepositoryReflogEntry[] = [];
   for (let index = 0; index < ordinal.lines.length; index += 1) {
     const left = ordinalEntry(ordinal.lines[index]!);
     const right = rawEntry(raw.lines[index]!);
@@ -189,16 +189,16 @@ function alignedReflogEntries(
   return { aligned: true, entries };
 }
 
-function parsedHead(probe: RepositoryInspectionProbeV2): string | null {
+function parsedHead(probe: RepositoryInspectionProbe): string | null {
   const value = probe.ok ? probe.lines[0]?.trim().toLowerCase() : undefined;
   return value && OID_PATTERN.test(value) ? value : null;
 }
 
-export function repositoryInspectionBasisDigest(value: Pick<RepositoryInspectionV2,
+export function repositoryInspectionBasisDigest(value: Pick<RepositoryInspection,
   "head" | "symbolicRef" | "status" | "refs" | "reflog" | "unreachable" | "complete"
 >): string {
   return repositoryInspectionDigest({
-    schemaVersion: 2,
+    schemaVersion: 1,
     complete: value.complete,
     head: value.head,
     symbolicRef: value.symbolicRef,
@@ -231,7 +231,7 @@ async function relationToHead(
   candidate: string,
   head: string | null,
   signal: AbortSignal
-): Promise<RepositoryHeadRelationV2> {
+): Promise<RepositoryHeadRelation> {
   if (!head) return "unknown";
   if (candidate === head) return "same";
   const [candidateAncestor, headAncestor] = await Promise.all([
@@ -246,12 +246,12 @@ async function relationToHead(
 async function recoveryCandidates(
   execution: ProcessExecutionPort,
   topology: RepositoryWorktreeTopology,
-  entries: readonly RepositoryReflogEntryV2[],
-  unreachable: RepositoryInspectionProbeV2,
+  entries: readonly RepositoryReflogEntry[],
+  unreachable: RepositoryInspectionProbe,
   head: string | null,
   basisDigest: string,
   signal: AbortSignal
-): Promise<RepositoryRecoveryCandidateV2[]> {
+): Promise<RepositoryRecoveryCandidate[]> {
   const unreachableCommits = new Set(unreachable.lines.flatMap((line) => {
     const [kind, object] = line.split("\t");
     return kind === "commit" && object ? [object] : [];
@@ -270,7 +270,7 @@ async function recoveryCandidates(
   return await Promise.all(selected.map(async (entry) => ({
     ...entry,
     candidateId: repositoryInspectionDigest({
-      schemaVersion: 2, basisDigest, object: entry.object,
+      schemaVersion: 1, basisDigest, object: entry.object,
       ordinalSelector: entry.ordinalSelector, rawSelector: entry.rawSelector,
       timestamp: entry.timestamp, action: entry.action
     }),
@@ -279,10 +279,10 @@ async function recoveryCandidates(
 }
 
 interface RepositoryStateProbes {
-  head: RepositoryInspectionProbeV2;
-  symbolicRef: RepositoryInspectionProbeV2;
-  status: RepositoryInspectionProbeV2;
-  refs: RepositoryInspectionProbeV2;
+  head: RepositoryInspectionProbe;
+  symbolicRef: RepositoryInspectionProbe;
+  status: RepositoryInspectionProbe;
+  refs: RepositoryInspectionProbe;
 }
 
 async function repositoryStateProbes(
@@ -315,7 +315,7 @@ function repositoryProbesStable(
 
 function inspectionComplete(
   initial: RepositoryStateProbes,
-  unreachable: RepositoryInspectionProbeV2,
+  unreachable: RepositoryInspectionProbe,
   reflogAligned: boolean,
   stable: boolean
 ): boolean {
@@ -325,9 +325,9 @@ function inspectionComplete(
 }
 
 function reflogInspectionProbe(
-  ordinal: RepositoryInspectionProbeV2,
-  raw: RepositoryInspectionProbeV2,
-  ordinalAfter: RepositoryInspectionProbeV2,
+  ordinal: RepositoryInspectionProbe,
+  raw: RepositoryInspectionProbe,
+  ordinalAfter: RepositoryInspectionProbe,
   aligned: ReturnType<typeof alignedReflogEntries>
 ) {
   return {
@@ -345,11 +345,11 @@ function reflogInspectionProbe(
   };
 }
 
-export async function collectRepositoryInspectionV2(
+export async function collectRepositoryInspection(
   execution: ProcessExecutionPort,
   topology: RepositoryWorktreeTopology,
   signal: AbortSignal
-): Promise<RepositoryInspectionV2> {
+): Promise<RepositoryInspection> {
   const initial = await repositoryStateProbes(execution, topology, signal);
   const ordinal = await reflogProbe(execution, topology, "ordinal", signal);
   const raw = await reflogProbe(execution, topology, "raw", signal);
@@ -363,8 +363,8 @@ export async function collectRepositoryInspectionV2(
     initial, unreachable, aligned.aligned, repositoryProbesStable(initial, final)
   );
   const reflog = reflogInspectionProbe(ordinal, raw, ordinalAfter, aligned);
-  const base: RepositoryInspectionV2 = {
-    schemaVersion: 2,
+  const base: RepositoryInspection = {
+    schemaVersion: 1,
     repositoryRoot: ".",
     topology: topology.kind === "bare" ? "worktree" : topology.kind,
     complete,

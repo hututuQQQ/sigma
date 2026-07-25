@@ -8,11 +8,10 @@ import type {
   BudgetAmounts,
   BudgetLimits,
   PlanGraph,
-  PlanNodeOwner,
-  WorkspaceRestorationEvidenceV1
+  WorkspaceRestorationEvidence
 } from "./domain.js";
 import type { RunMode } from "./outcomes.js";
-import type { ExecutionIntentV1, ResolvedExecutionCapabilityV1 } from "./execution-v5.js";
+import type { ExecutionIntent, ResolvedExecutionCapability } from "./execution.js";
 
 export type ToolEffect =
   | "filesystem.read"
@@ -51,7 +50,7 @@ export interface ToolDescriptor {
   timeoutMs: number;
   idleTimeoutMs?: number;
   /** Trusted built-in declaration permitting broker-owned mutation journals. */
-  brokerMutationAuthority?: "repository_transaction_v2" | "disposable_enclosing_container_v1";
+  brokerMutationAuthority?: "repository_transaction" | "disposable_enclosing_container";
   prepare?(argumentsValue: JsonValue, context: ToolPreparationContext): Promise<ToolCallPlan> | ToolCallPlan;
 }
 
@@ -86,13 +85,13 @@ export interface ToolCallPlan {
   /** Runtime-authored proof that an out-of-process broker owns the complete
    * rollback journal. Only the structured repository transaction tool may set it. */
   mutationAuthority?:
-    | "broker_repository_transaction_v2"
-    | "disposable_enclosing_container_v1";
+    | "broker_repository_transaction"
+    | "disposable_enclosing_container";
   idempotence: "read_only" | "replay_safe" | "non_replayable";
-  /** V5 semantic process request and broker-resolved capability. Present for
+  /** Semantic process request and broker-resolved capability. Present for
    * process tools; filesystem grants are never model-authored. */
-  executionIntent?: ExecutionIntentV1;
-  executionCapability?: ResolvedExecutionCapabilityV1;
+  executionIntent?: ExecutionIntent;
+  executionCapability?: ResolvedExecutionCapability;
 }
 
 export interface ToolRequest {
@@ -120,17 +119,14 @@ export interface ToolReceipt {
   /** Optional structured result projected unchanged into the durable receipt
    * and model-visible receipt summary. output remains the text projection. */
   result?: JsonValue;
-  /** V3 typed outcome; optional only on legacy executor input and normalized before durable emission. */
-  outcome?: ToolOutcome;
+  outcome: ToolOutcome;
   observedEffects: ToolEffect[];
-  /** V3 exact post-execution effects. observedEffects remains as the V2 projection. */
-  actualEffects?: ToolEffect[];
+  actualEffects: ToolEffect[];
   workspaceDelta?: WorkspaceDelta;
   artifacts: string[];
   artifactRefs?: ArtifactRef[];
   diagnostics: string[];
-  /** Typed durable evidence. Optional only while V2 tool executors migrate. */
-  evidence?: EvidenceRecord[];
+  evidence: EvidenceRecord[];
   startedAt: string;
   completedAt: string;
 }
@@ -138,7 +134,7 @@ export interface ToolReceipt {
 /** Durable, replay-safe record of one tool call made inside an independent
  * verification session. The call and frozen plan are stored together so a
  * recovered reviewer can reuse the receipt without repeating side effects. */
-export interface ReviewerToolReceiptV1 {
+export interface ReviewerToolReceipt {
   schemaVersion: 1;
   reviewRequestId: string;
   call: ModelToolCall;
@@ -148,24 +144,24 @@ export interface ReviewerToolReceiptV1 {
 
 export interface RuntimeControlPort {
   readPlan(): Promise<PlanGraph>;
-  readWorkPlan(): Promise<ModelPlanProjectionV3>;
+  readWorkPlan(): Promise<ModelPlanProjection>;
   updatePlan(input: { expectedRevision: number; plan: PlanGraph }): Promise<PlanGraph>;
-  updateWorkPlan(input: ModelPlanUpdateV3 | ModelPlanUpdateV2): Promise<ModelPlanUpdateResultV3>;
+  updateWorkPlan(input: ModelPlanUpdate): Promise<ModelPlanUpdateResult>;
   readBudget(): Promise<BudgetLedgerState>;
   readWorkspaceFrontier(input?: {
     cursor?: string;
     limit?: number;
-  }): Promise<WorkspaceFrontierPageV1>;
+  }): Promise<WorkspaceFrontierPage>;
   readArtifact(input: {
     artifactId: string;
     offsetBytes?: number;
     maxBytes?: number;
-  }): Promise<ArtifactPageV1>;
+  }): Promise<ArtifactPage>;
   listCheckpoints(): Promise<CheckpointRef[]>;
   createCheckpoint(scopePaths: string[]): Promise<CheckpointRef>;
   restoreRunCheckpoint(checkpointId: string): Promise<CheckpointRef>;
-  restoreRunChanges(callId: string): Promise<WorkspaceRestorationEvidenceV1["data"]>;
-  confirmRunRestored(callId: string): Promise<WorkspaceRestorationEvidenceV1["data"]>;
+  restoreRunChanges(callId: string): Promise<WorkspaceRestorationEvidence["data"]>;
+  confirmRunRestored(callId: string): Promise<WorkspaceRestorationEvidence["data"]>;
   requestReview(): Promise<ReviewRequestResult>;
   loadSkill(qualifiedName: string): Promise<{ content: string; evidence: EvidenceRecord }>;
   resolveLoadedSkillResource(input: {
@@ -179,52 +175,31 @@ export interface RuntimeControlPort {
   rollbackChildPlanAssignment(childId: string, nodeIds: string[], previousPlan: PlanGraph): Promise<PlanGraph>;
 }
 
-export interface ModelPlanNodeUpdateV2 {
-  id: string;
-  title: string;
-  status: "pending" | "in_progress" | "blocked" | "completed" | "cancelled";
-  dependencies?: string[];
-  acceptanceCriteria?: string[];
-  evidenceIds?: string[];
-  blockedReason?: string;
-  reopenReason?: string;
-  /** One-release compatibility fields for the former model projection. */
-  owner?: PlanNodeOwner;
-  evidence?: PlanGraph["nodes"][number]["evidence"];
-}
-
-export interface ModelPlanUpdateV2 {
-  expectedRevision: number;
-  goal: string;
-  activeNodeId?: string;
-  nodes: ModelPlanNodeUpdateV2[];
-}
-
-export interface ModelPlanStepV3 {
+export interface ModelPlanStep {
   id?: string;
   step: string;
   status: "pending" | "in_progress" | "blocked" | "completed";
   blockedReason?: string;
 }
 
-export interface ModelPlanUpdateV3 {
+export interface ModelPlanUpdate {
   explanation?: string;
   goal?: string;
   acceptanceCriteria?: string[];
-  plan: ModelPlanStepV3[];
+  plan: ModelPlanStep[];
 }
 
-export interface ModelPlanProjectionV3 {
+export interface ModelPlanProjection {
   revision: number;
   goal: string;
   acceptanceCriteria: string[];
   activeStepId?: string;
-  plan: Array<Required<Pick<ModelPlanStepV3, "id" | "step" | "status">> & {
+  plan: Array<Required<Pick<ModelPlanStep, "id" | "step" | "status">> & {
     blockedReason?: string;
   }>;
 }
 
-export interface ModelPlanNormalizationWarningV3 {
+export interface ModelPlanNormalizationWarning {
   code:
     | "multiple_active_steps"
     | "active_step_selected"
@@ -237,13 +212,13 @@ export interface ModelPlanNormalizationWarningV3 {
   stepId?: string;
 }
 
-export interface ModelPlanUpdateResultV3 {
+export interface ModelPlanUpdateResult {
   status: "updated" | "normalized" | "no_change";
-  warnings: ModelPlanNormalizationWarningV3[];
-  plan: ModelPlanProjectionV3;
+  warnings: ModelPlanNormalizationWarning[];
+  plan: ModelPlanProjection;
 }
 
-export interface WorkspaceFrontierPageV1 {
+export interface WorkspaceFrontierPage {
   revision: number;
   stateDigest: string;
   frontierDigest: string;
@@ -261,7 +236,7 @@ export interface WorkspaceFrontierPageV1 {
   };
 }
 
-export interface ArtifactPageV1 {
+export interface ArtifactPage {
   artifactId: string;
   digest: string;
   totalBytes: number;

@@ -6,7 +6,7 @@ import type {
   ModelToolCall,
   ToolCallPlan,
   ToolReceipt,
-  ValidationClaimV1
+  ValidationClaim
 } from "agent-protocol";
 import { canonicalWorkspacePath, isInside } from "agent-platform";
 import { effectsOutsidePlan } from "./tool-evidence.js";
@@ -26,7 +26,7 @@ export interface FrozenValidationScope {
     subjects: string[];
     criterionIds: string[];
   };
-  claim: Omit<ValidationClaimV1, "status">;
+  claim: Omit<ValidationClaim, "status">;
 }
 
 function portable(value: string): string {
@@ -115,7 +115,7 @@ function projectRootForCall(workspaceRoot: string, call: ModelToolCall): { absol
 function validationClaim(
   workspaceRoot: string,
   call: ModelToolCall
-): Omit<ValidationClaimV1, "status"> {
+): Omit<ValidationClaim, "status"> {
   const command = invocation(call);
   const semantic = semanticValidationCommand(command.executable, command.args, command.shellScript);
   const executable = semantic.executable;
@@ -201,7 +201,7 @@ export async function assertTransactionIsolationPlanAllowed(
   session: RuntimeSession,
   plan: ToolCallPlan
 ): Promise<void> {
-  if (plan.mutationAuthority === "disposable_enclosing_container_v1") return;
+  if (plan.mutationAuthority === "disposable_enclosing_container") return;
   const scope = activeConflictScope(session);
   if (scope?.length && plan.exactEffects.includes("filesystem.write")
     && !plan.exactEffects.includes("repository.write")) {
@@ -356,7 +356,7 @@ export async function assertReceiptWithinPlan(
 ): Promise<void> {
   const outside = effectsOutsidePlan(receipt, plan);
   const changedPaths = receiptChangedPaths(receipt);
-  if (plan.mutationAuthority === "disposable_enclosing_container_v1") {
+  if (plan.mutationAuthority === "disposable_enclosing_container") {
     assertEnclosingReceiptWithinPlan(outside, changedPaths, plan);
     return;
   }

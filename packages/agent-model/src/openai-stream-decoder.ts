@@ -73,9 +73,7 @@ export class StreamDecoder {
         ...(this.reasoningObserved ? { reasoningContent: this.reasoningContent } : {}),
         ...(calls.length ? { toolCalls: calls } : {})
       },
-      finishReason: normalizedFinishReason(this.finish, calls.length > 0),
-      inputTokens: this.inputTokens,
-      outputTokens: this.outputTokens
+      finishReason: normalizedFinishReason(this.finish, calls.length > 0)
     } };
   }
 

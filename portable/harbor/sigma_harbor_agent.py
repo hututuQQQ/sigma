@@ -1021,8 +1021,6 @@ class SigmaCliHarborAgent(BaseAgent):
             self.managed_environment_mode,
             "--output-format",
             "stream-json",
-            "--output-schema",
-            "3",
             "--stream-json-max-line-bytes",
             "49152",
         ]

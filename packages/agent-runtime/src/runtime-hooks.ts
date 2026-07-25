@@ -14,7 +14,6 @@ import type { RuntimeSession } from "./types.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 
 export interface RuntimeHookCoordinatorOptions {
-  definitions: readonly HookDefinition[];
   runner: HookRunnerPort;
   agentProfileRunner?: HookRunnerPort;
   materializeWorkspaceHook?(
@@ -32,11 +31,8 @@ export class RuntimeHookCoordinator {
   private readonly dispatchers = new Map<string, HookDispatcher>();
   private readonly queues = new Map<string, Promise<void>>();
   private readonly activeDispatches = new AsyncLocalStorage<ReadonlySet<string>>();
-  private readonly definitionsById: ReadonlyMap<string, HookDefinition>;
 
-  constructor(private readonly options: RuntimeHookCoordinatorOptions) {
-    this.definitionsById = new Map(options.definitions.map((hook) => [hook.id, hook]));
-  }
+  constructor(private readonly options: RuntimeHookCoordinatorOptions) {}
 
   has(session: RuntimeSession, event: HookEvent): boolean {
     return this.definitions(session).some((hook) => hook.event === event);
@@ -83,6 +79,11 @@ export class RuntimeHookCoordinator {
     const runner: HookRunnerPort = {
       run: async (request, signal) => {
         const frozen = session.durable.frozenCustomization?.hooks.find((item) => item.id === request.hook.id);
+        if (!session.durable.frozenCustomization) {
+          throw Object.assign(new Error("Session customization is unavailable."), {
+            code: "unsupported_schema_version"
+          });
+        }
         let prepared: { definition: HookDefinition; cleanup(): Promise<void> } | undefined;
         if (frozen) {
           verifyFrozenWorkspaceHookTrust(session.identity.workspacePath, frozen);
@@ -121,15 +122,12 @@ export class RuntimeHookCoordinator {
   }
 
   private definitions(session: RuntimeSession): readonly HookDefinition[] {
-    if (session.durable.frozenCustomization) {
-      return session.durable.frozenCustomization.hooks.map((item) => item.definition);
+    if (!session.durable.frozenCustomization) {
+      throw Object.assign(new Error("Session customization is unavailable."), {
+        code: "unsupported_schema_version"
+      });
     }
-    if (!session.services.profile) return this.options.definitions;
-    return session.services.profile.profile.hooks.map((id) => {
-      const hook = this.definitionsById.get(id);
-      if (!hook) throw new Error(`Frozen Agent Profile hook '${id}' is unavailable.`);
-      return hook;
-    });
+    return session.durable.frozenCustomization.hooks.map((item) => item.definition);
   }
 
   private async dispatchNow(

@@ -78,7 +78,7 @@ if (args[0] === "session" && args[1] === "cancel") {
 } else {
   let seq = 0;
   const emit = (type, payload = {}) => console.log(JSON.stringify({ kind: "event", event: {
-    schemaVersion: 3, seq: ++seq, eventId: "event-" + seq, sessionId: "fake-session", runId: "fake-run",
+    schemaVersion: 1, seq: ++seq, eventId: "event-" + seq, sessionId: "fake-session", runId: "fake-run",
     occurredAt: new Date().toISOString(), type, authority: "runtime", payload
   }}));
   emit("run.started", { mode: "change" });

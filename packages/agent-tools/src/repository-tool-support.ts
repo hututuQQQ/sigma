@@ -66,12 +66,15 @@ export function repositoryToolResult(
   evidence: InputAccessEvidence[] = [],
   structuredResult?: JsonValue
 ): ToolReceipt {
+  const effects: ToolReceipt["observedEffects"] = ["filesystem.read"];
   return {
     callId: request.callId,
     ok,
     output,
+    outcome: { status: ok ? "succeeded" : "failed", output, diagnosticCodes: diagnostics },
     ...(structuredResult === undefined ? {} : { result: structuredResult }),
-    observedEffects: ["filesystem.read"],
+    observedEffects: effects,
+    actualEffects: effects,
     artifacts,
     diagnostics,
     evidence,

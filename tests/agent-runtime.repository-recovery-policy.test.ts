@@ -55,13 +55,6 @@ function preparation(session = runtimeSessionFixture()) {
   ];
   return {
     session,
-    forecast: {
-      stage: "normal" as const,
-      remainingMs: 1,
-      usableMs: 0,
-      nextModelEstimateMs: 180_000,
-      settlementReserveMs: 10_000
-    },
     turnId: 1,
     descriptors,
     capabilities: { skillsAvailable: false, executableSkillResourcesLoaded: false },

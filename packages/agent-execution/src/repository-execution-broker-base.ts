@@ -1,17 +1,17 @@
 import type {
-  RepositoryMetadataLeaseRequestV1,
-  RepositoryMetadataLeaseV1
+  RepositoryMetadataLeaseRequest,
+  RepositoryMetadataLease
 } from "./repository-metadata-lease-types.js";
 import type {
-  RepositoryRunBaselineRequestV1,
-  RepositoryRunBaselineResultV1,
-  RepositoryTransactionBeginRequestV2,
-  RepositoryTransactionBoundRequestV2,
-  RepositoryTransactionContinueRequestV2,
-  RepositoryTransactionLeaseRequestV2,
-  RepositoryTransactionLeaseV2,
-  RepositoryTransactionRecoverRequestV2,
-  RepositoryTransactionResultV2
+  RepositoryRunBaselineRequest,
+  RepositoryRunBaselineResult,
+  RepositoryTransactionBeginRequest,
+  RepositoryTransactionBoundRequest,
+  RepositoryTransactionContinueRequest,
+  RepositoryTransactionLeaseRequest,
+  RepositoryTransactionLease,
+  RepositoryTransactionRecoverRequest,
+  RepositoryTransactionResult
 } from "./repository-transaction-types.js";
 import type {
   RepositoryBrokerRequestOptions,
@@ -29,84 +29,84 @@ export abstract class RepositoryExecutionBrokerBase implements RepositoryExecuti
   ): Promise<unknown>;
 
   async acquireRepositoryMetadataLease(
-    request: RepositoryMetadataLeaseRequestV1,
+    request: RepositoryMetadataLeaseRequest,
     options?: RepositoryBrokerRequestOptions
-  ): Promise<RepositoryMetadataLeaseV1> {
+  ): Promise<RepositoryMetadataLease> {
     return await this.repositoryOperation(
       "acquireRepositoryMetadataLease", request, options
-    ) as RepositoryMetadataLeaseV1;
+    ) as RepositoryMetadataLease;
   }
 
   async acquireRepositoryTransactionLease(
-    request: RepositoryTransactionLeaseRequestV2,
+    request: RepositoryTransactionLeaseRequest,
     options?: RepositoryBrokerRequestOptions
-  ): Promise<RepositoryTransactionLeaseV2> {
+  ): Promise<RepositoryTransactionLease> {
     return await this.repositoryOperation(
       "acquireRepositoryTransactionLease", request, options
-    ) as RepositoryTransactionLeaseV2;
+    ) as RepositoryTransactionLease;
   }
 
   async beginRepositoryTransaction(
-    request: RepositoryTransactionBeginRequestV2,
+    request: RepositoryTransactionBeginRequest,
     options?: RepositoryBrokerRequestOptions
-  ): Promise<RepositoryTransactionResultV2> {
+  ): Promise<RepositoryTransactionResult> {
     return await this.repositoryOperation(
       "beginRepositoryTransaction", request, options
-    ) as RepositoryTransactionResultV2;
+    ) as RepositoryTransactionResult;
   }
 
   async continueRepositoryTransaction(
-    request: RepositoryTransactionContinueRequestV2,
+    request: RepositoryTransactionContinueRequest,
     options?: RepositoryBrokerRequestOptions
-  ): Promise<RepositoryTransactionResultV2> {
+  ): Promise<RepositoryTransactionResult> {
     return await this.repositoryOperation(
       "continueRepositoryTransaction", request, options
-    ) as RepositoryTransactionResultV2;
+    ) as RepositoryTransactionResult;
   }
 
   async abortRepositoryTransaction(
-    request: RepositoryTransactionBoundRequestV2,
+    request: RepositoryTransactionBoundRequest,
     options?: RepositoryBrokerRequestOptions
-  ): Promise<RepositoryTransactionResultV2> {
+  ): Promise<RepositoryTransactionResult> {
     return await this.repositoryOperation(
       "abortRepositoryTransaction", request, options
-    ) as RepositoryTransactionResultV2;
+    ) as RepositoryTransactionResult;
   }
 
   async recoverRepositoryTransactions(
-    request: RepositoryTransactionRecoverRequestV2,
+    request: RepositoryTransactionRecoverRequest,
     options?: RepositoryBrokerRequestOptions
-  ): Promise<RepositoryTransactionResultV2> {
+  ): Promise<RepositoryTransactionResult> {
     return await this.repositoryOperation(
       "recoverRepositoryTransactions", request, options
-    ) as RepositoryTransactionResultV2;
+    ) as RepositoryTransactionResult;
   }
 
   async sealRepositoryTransaction(
-    request: RepositoryTransactionBoundRequestV2,
+    request: RepositoryTransactionBoundRequest,
     options?: RepositoryBrokerRequestOptions
-  ): Promise<RepositoryTransactionResultV2> {
+  ): Promise<RepositoryTransactionResult> {
     return await this.repositoryOperation(
       "sealRepositoryTransaction", request, options
-    ) as RepositoryTransactionResultV2;
+    ) as RepositoryTransactionResult;
   }
 
   async restoreRepositoryRunBaseline(
-    request: RepositoryRunBaselineRequestV1,
+    request: RepositoryRunBaselineRequest,
     options?: RepositoryBrokerRequestOptions
-  ): Promise<RepositoryRunBaselineResultV1> {
+  ): Promise<RepositoryRunBaselineResult> {
     return await this.repositoryOperation(
       "restoreRepositoryRunBaseline", request, options
-    ) as RepositoryRunBaselineResultV1;
+    ) as RepositoryRunBaselineResult;
   }
 
   async releaseRepositoryRunBaseline(
-    request: RepositoryRunBaselineRequestV1,
+    request: RepositoryRunBaselineRequest,
     options?: RepositoryBrokerRequestOptions
-  ): Promise<RepositoryRunBaselineResultV1> {
+  ): Promise<RepositoryRunBaselineResult> {
     return await this.repositoryOperation(
       "releaseRepositoryRunBaseline", request, options
-    ) as RepositoryRunBaselineResultV1;
+    ) as RepositoryRunBaselineResult;
   }
 }
 

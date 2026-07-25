@@ -46,7 +46,7 @@ import type {
   ProcessHandoffResult,
   ProcessPollResult,
   ProcessSpawnRequest,
-  ScratchLeaseRequestV1, ScratchLeaseV1
+  ScratchLeaseRequest, ScratchLease
 } from "./types.js";
 import {
   invokeRepositoryOperation,
@@ -134,9 +134,9 @@ export class OwnedContainerExecutionBroker extends RepositoryExecutionBrokerBase
   }
 
   async acquireScratchLease(
-    request: ScratchLeaseRequestV1,
+    request: ScratchLeaseRequest,
     options?: BrokerRequestOptions
-  ): Promise<ScratchLeaseV1> {
+  ): Promise<ScratchLease> {
     const client = await this.attestedClient(options?.signal);
     if (!client.acquireScratchLease) {
       throw new ContainerUnavailableError("Owned OCI RuntimeSession scratch leases are unavailable.");

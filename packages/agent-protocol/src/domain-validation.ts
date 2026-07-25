@@ -3,7 +3,7 @@ import {
   type BudgetAmounts,
   type BudgetLedgerState,
   type BudgetLimits,
-  type BudgetMutationV1,
+  type BudgetMutation,
   type CheckpointRef,
   type EvidenceRecord,
   type EvidenceClaim,
@@ -11,7 +11,7 @@ import {
   type PlanGraph,
   type UsageRecord
 } from "./domain-types.js";
-import { budgetMutationV1Schema } from "./budget-mutation-schemas.js";
+import { budgetMutationSchema } from "./budget-mutation-schemas.js";
 import {
   budgetLedgerStateSchema,
   checkpointRefSchema,
@@ -21,8 +21,8 @@ import {
   usageRecordSchema
 } from "./domain-schemas.js";
 
-export const SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1 = "sigma.subject_attestation.v1";
-const NON_ACTIONABLE_DIAGNOSTIC_SOURCES = new Set([SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1]);
+export const SUBJECT_ATTESTATION_EVIDENCE_SOURCE = "sigma.subject_attestation";
+const NON_ACTIONABLE_DIAGNOSTIC_SOURCES = new Set([SUBJECT_ATTESTATION_EVIDENCE_SOURCE]);
 
 export function isEvidenceRecord(value: unknown): value is EvidenceRecord {
   return evidenceRecordSchema.safeParse(value).success;
@@ -70,10 +70,10 @@ function executedValidationSupportsClaim(evidence: Extract<EvidenceRecord, { kin
 }
 
 /** Returns whether an evidence record proves the typed claim attached to a
- * completion reference. An omitted claim is the legacy acceptance_met claim. */
+ * completion reference. */
 export function evidenceSupportsClaim(
   evidence: EvidenceRecord,
-  claim: EvidenceClaim = "acceptance_met"
+  claim: EvidenceClaim
 ): boolean {
   if (claim === "acceptance_met") {
     return evidence.status !== "failed"
@@ -109,8 +109,8 @@ export function isBudgetLedgerState(value: unknown): value is BudgetLedgerState 
   return budgetLedgerStateSchema.safeParse(value).success;
 }
 
-export function isBudgetMutationV1(value: unknown): value is BudgetMutationV1 {
-  return budgetMutationV1Schema.safeParse(value).success;
+export function isBudgetMutation(value: unknown): value is BudgetMutation {
+  return budgetMutationSchema.safeParse(value).success;
 }
 
 export function isCheckpointRef(value: unknown): value is CheckpointRef {

@@ -137,13 +137,17 @@ function descriptor(
 }
 
 function receipt(request: ToolRequest, startedAt: string, value: unknown, observedEffects: ToolEffect[] = ["agent.spawn"]): ToolReceipt {
+  const output = JSON.stringify(value);
   return {
     callId: request.callId,
     ok: true,
-    output: JSON.stringify(value),
+    output,
+    outcome: { status: "succeeded", output, diagnosticCodes: [] },
     observedEffects,
+    actualEffects: observedEffects,
     artifacts: [],
     diagnostics: [],
+    evidence: [],
     startedAt,
     completedAt: new Date().toISOString()
   };

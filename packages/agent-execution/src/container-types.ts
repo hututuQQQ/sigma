@@ -1,4 +1,4 @@
-import type { ScratchLeaseV1 } from "./scratch-lease-types.js";
+import type { ScratchLease } from "./scratch-lease-types.js";
 
 export type ContainerEngine = "auto" | "docker" | "podman";
 export type ResolvedContainerEngine = Exclude<ContainerEngine, "auto">;
@@ -31,7 +31,7 @@ export interface ContainerExecutionConfig {
 
 /** Launcher-owned proof. It is deliberately absent from CLI/config types so a
  * workspace, model, or evaluator cannot select a managed engine target. */
-export interface TrustedManagedContainerAttestationV1 {
+export interface TrustedManagedContainerAttestation {
   protocolVersion: 1;
   engine: ResolvedContainerEngine;
   selector: string;
@@ -43,12 +43,11 @@ export interface TrustedManagedContainerAttestationV1 {
   /** Digest of the exact root-owned, read-only helper tree executed in the managed target. */
   helperDigest: string;
   attestationDigest: string;
-  /** Optional launcher proof required only when managed environment mutation
-   * is enabled. Legacy read-only managed targets remain valid without it. */
-  managedEnvironment?: TrustedManagedEnvironmentProofV1;
+  /** Launcher proof required only when managed environment mutation is enabled. */
+  managedEnvironment?: TrustedManagedEnvironmentProof;
 }
 
-export interface TrustedManagedEnvironmentProofV1 {
+export interface TrustedManagedEnvironmentProof {
   protocolVersion: 1;
   targetAttestationDigest: string;
   targetId: string;
@@ -60,7 +59,7 @@ export interface TrustedManagedEnvironmentProofV1 {
   proofDigest: string;
 }
 
-export interface BrokerRuntimeClosureV1 {
+export interface BrokerRuntimeClosure {
   protocolVersion: 1;
   digest: string;
   complete: boolean;
@@ -72,7 +71,7 @@ export interface BrokerRuntimeClosureV1 {
   targetAttestationDigest: string;
 }
 
-export interface ManagedSessionBindingRequestV1 {
+export interface ManagedSessionBindingRequest {
   protocolVersion: 1;
   sessionId: string;
   workspace: string;
@@ -82,13 +81,13 @@ export interface ManagedSessionBindingRequestV1 {
 
 /** Runtime-issued session capability. Model and workspace data cannot create
  * or widen it; observable paths are target paths, never host mount sources. */
-export interface ManagedSessionBindingV1 extends ManagedSessionBindingRequestV1 {
+export interface ManagedSessionBinding extends ManagedSessionBindingRequest {
   bindingId: string;
   lifetime: "runtime_session";
   targetId: string;
   targetStartedAt: string;
   targetAttestationDigest: string;
   protectedPathsDigest: string;
-  runtimeClosure: BrokerRuntimeClosureV1;
-  scratchLease: ScratchLeaseV1;
+  runtimeClosure: BrokerRuntimeClosure;
+  scratchLease: ScratchLease;
 }

@@ -3,7 +3,7 @@ import type {
   BudgetAmounts,
   ContextItem,
   RuntimeBudgetBand,
-  RuntimePromptStateV2
+  RuntimePromptState
 } from "agent-protocol";
 import { approximateTokens, fitApproximateTokens } from "agent-context";
 import type { RuntimeSession } from "./types.js";
@@ -12,7 +12,7 @@ import { longHorizonLedger } from "./long-horizon-ledger.js";
 export const MAX_RUNTIME_PROMPT_FRAME_TOKENS = 8_192;
 const MAX_RUNTIME_PROMPT_FRAME_CONTENT_TOKENS = MAX_RUNTIME_PROMPT_FRAME_TOKENS - 64;
 
-type SectionName = keyof RuntimePromptStateV2["sectionDigests"];
+type SectionName = keyof RuntimePromptState["sectionDigests"];
 
 export interface RuntimePromptSectionInput {
   repository: readonly ContextItem[];
@@ -24,7 +24,7 @@ export interface RuntimePromptSectionInput {
 
 export interface RuntimePromptFrame {
   items: ContextItem[];
-  promptState: RuntimePromptStateV2;
+  promptState: RuntimePromptState;
   frameMode: "full" | "delta";
 }
 
@@ -136,7 +136,7 @@ export function materializeRuntimePromptFrame(
   const archiveSourceDigest = session.durable.state.contextArchive?.sourceDigest;
   const full = Object.keys(previous.sectionDigests).length === 0
     || previous.archiveSourceDigest !== archiveSourceDigest;
-  const nextDigests: RuntimePromptStateV2["sectionDigests"] = {
+  const nextDigests: RuntimePromptState["sectionDigests"] = {
     repository: repository.cacheKey!,
     completion: completion.cacheKey!,
     plan: plan.cacheKey!,
@@ -156,7 +156,7 @@ export function materializeRuntimePromptFrame(
   return {
     items: selected,
     promptState: {
-      schemaVersion: 2,
+      schemaVersion: 1,
       sectionDigests: nextDigests,
       budgetBand: band,
       ...(archiveSourceDigest ? { archiveSourceDigest } : {})

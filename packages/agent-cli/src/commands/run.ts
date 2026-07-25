@@ -86,7 +86,7 @@ function writeEvent(event: AgentEventEnvelope, config: CliConfig, stderr: NodeJS
   const format = config.outputFormat;
   if (format === "stream-json") {
     for (const line of outputJsonLines(
-      outputEvent(event, config.outputSchema), event.eventId, config.streamJsonMaxLineBytes
+      outputEvent(event), event.eventId, config.streamJsonMaxLineBytes
     )) stdout.write(`${line}\n`);
     return;
   }
@@ -160,9 +160,9 @@ function writeResult(
   const result = runResult(outcome, sessionId);
   if (config.outputFormat === "stream-json") {
     for (const line of outputJsonLines(
-      outputResult(result, config.outputSchema), `result:${sessionId}`, config.streamJsonMaxLineBytes
+      outputResult(result), `result:${sessionId}`, config.streamJsonMaxLineBytes
     )) stdout.write(`${line}\n`);
-  } else if (config.outputFormat === "json") stdout.write(`${JSON.stringify(outputResult(result, config.outputSchema))}\n`);
+  } else if (config.outputFormat === "json") stdout.write(`${JSON.stringify(outputResult(result))}\n`);
   else stdout.write(`\n${result.finalMessage}\n`);
 }
 
@@ -231,9 +231,9 @@ function writeNeedsInput(
   };
   if (config.outputFormat === "stream-json") {
     for (const line of outputJsonLines(
-      outputResult(result, config.outputSchema), "result:needs-input", config.streamJsonMaxLineBytes
+      outputResult(result), "result:needs-input", config.streamJsonMaxLineBytes
     )) stdout.write(`${line}\n`);
-  } else if (config.outputFormat === "json") stdout.write(`${JSON.stringify(outputResult(result, config.outputSchema))}\n`);
+  } else if (config.outputFormat === "json") stdout.write(`${JSON.stringify(outputResult(result))}\n`);
   else stderr.write(`${result.message}\n`);
 }
 
@@ -259,7 +259,7 @@ function errorMessage(error: unknown): string {
 
 function writeRunError(
   error: unknown,
-  output: Pick<CliConfig, "outputFormat" | "outputSchema" | "streamJsonMaxLineBytes"> | undefined,
+  output: Pick<CliConfig, "outputFormat" | "streamJsonMaxLineBytes"> | undefined,
   stdout: NodeJS.WritableStream,
   stderr: NodeJS.WritableStream
 ): void {
@@ -272,7 +272,7 @@ function writeRunError(
       finishReason: code,
       sessionId: "",
       finalMessage: message
-    }, output.outputSchema))}\n`);
+    }))}\n`);
     return;
   }
   if (output?.outputFormat !== "stream-json") {
@@ -280,7 +280,7 @@ function writeRunError(
     return;
   }
   for (const line of outputJsonLines(
-    outputError({ code, message }, output.outputSchema), `error:${code}`, output.streamJsonMaxLineBytes
+    outputError({ code, message }), `error:${code}`, output.streamJsonMaxLineBytes
   )) stdout.write(`${line}\n`);
 }
 
@@ -288,7 +288,7 @@ export async function runCommand(argv: string[], deps: RunCommandDeps = {}): Pro
   const stdin = deps.stdin ?? processStdin;
   const stdout = deps.stdout ?? processStdout;
   const stderr = deps.stderr ?? processStderr;
-  let errorOutput: Pick<CliConfig, "outputFormat" | "outputSchema" | "streamJsonMaxLineBytes"> | undefined;
+  let errorOutput: Pick<CliConfig, "outputFormat" | "streamJsonMaxLineBytes"> | undefined;
   try {
     if (argv.includes("--help") || argv.includes("-h")) {
       stdout.write(`Usage: agent ${deps.mode === "analyze" ? "inspect" : "run"} [instruction] [--workspace <path>] [--permission-mode ask|auto|deny] [--output-format text|json|stream-json]\n`);

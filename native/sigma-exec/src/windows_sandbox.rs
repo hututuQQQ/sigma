@@ -74,7 +74,7 @@ use windows_sys::Win32::System::Threading::{
     WaitForSingleObject,
 };
 
-const BASE_PROFILE: &str = "SigmaCode.Execution.v3";
+const BASE_PROFILE: &str = "SigmaCode.Execution";
 const INTERNAL_LAUNCHER: &str = "--internal-appcontainer-launcher";
 const INTERNAL_PROBE: &str = "--internal-appcontainer-probe";
 const INTERNAL_CONTAINMENT_PROBE: &str = "--internal-appcontainer-containment-probe";
@@ -89,11 +89,11 @@ const PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT: u32 = 1;
 const SECURITY_DESCRIPTOR_REVISION_VALUE: u32 = 1;
 const TOKEN_SECURITY_ATTRIBUTE_TYPE_INT64: u16 = 1;
 const TOKEN_SECURITY_ATTRIBUTE_TYPE_UINT64: u16 = 2;
-const RECOVERY_SCHEMA_VERSION: u32 = 3;
+const RECOVERY_SCHEMA_VERSION: u32 = 1;
 const RECOVERY_PRODUCT: &str = "sigma-exec";
-const ROOT_LEASE_RECOVERY_PRODUCT: &str = "sigma-exec-v5-root-lease";
+const ROOT_LEASE_RECOVERY_PRODUCT: &str = "sigma-exec-root-lease";
 const RECOVERY_DIRECTORY: &str = "sandbox-recovery";
-const RECOVERY_MUTEX_PREFIX: &str = "Global\\SigmaCode.sigma-exec.sandbox-acl.v3";
+const RECOVERY_MUTEX_PREFIX: &str = "Global\\SigmaCode.sigma-exec.sandbox-acl";
 const MAX_RECOVERY_JOURNAL_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RECOVERY_ENTRIES: usize = 100_000;
 const MAX_RECOVERY_SCAN_DEPTH: usize = 256;
@@ -140,7 +140,7 @@ struct TokenSecurityAttributesInformation {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RecoveryAclEntry {
     path: PathBuf,
     identity: RecoveryFileIdentity,
@@ -155,21 +155,21 @@ struct RecoveryAclEntry {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RecoveryFileIdentity {
     volume_serial_number: u64,
     file_id: [u8; 16],
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RecoveryRootIdentity {
     path: PathBuf,
     identity: RecoveryFileIdentity,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RecoverySnapshot {
     schema_version: u32,
     product: String,
@@ -561,7 +561,7 @@ pub(crate) fn revoke_workspace_lease(workspace: &Path) -> Result<Value, RpcError
 fn workspace_read_identity_digest(workspace: &RecoveryRootIdentity) -> String {
     let normalized = workspace.path.to_string_lossy().to_lowercase();
     let mut digest = Sha256::new();
-    digest.update(b"SigmaCode.WorkspaceRead.v5\0");
+    digest.update(b"SigmaCode.WorkspaceRead\0");
     digest.update(normalized.as_bytes());
     digest.update(workspace.identity.volume_serial_number.to_le_bytes());
     digest.update(workspace.identity.file_id);
@@ -573,7 +573,7 @@ fn workspace_read_profile_name(
     generation: u64,
 ) -> Result<String, RpcError> {
     let value = workspace_read_identity_digest(workspace);
-    Ok(format!("SigmaCode.Read.v5.{}.g{generation}", &value[..24]))
+    Ok(format!("SigmaCode.Read.{}.g{generation}", &value[..24]))
 }
 
 fn workspace_read_generation_path(recovery: &Path, workspace: &RecoveryRootIdentity) -> PathBuf {
@@ -900,7 +900,7 @@ fn secure_nonce(label: &str) -> Result<String, RpcError> {
     Ok(nonce)
 }
 
-/// V5 writer capability: journal and grant only declared roots. Windows may
+/// Writer capability: journal and grant only declared roots. Windows may
 /// propagate inheritable ACEs internally, but Sigma never enumerates the
 /// repository and the durable journal stays O(number of capability roots).
 /// The per-command profile is retired before recovery, so an interrupted ACL
@@ -3326,12 +3326,21 @@ fn validate_recovery_snapshot(
     snapshot: &RecoverySnapshot,
     journal_path: &Path,
 ) -> Result<(), RpcError> {
-    if snapshot.schema_version != RECOVERY_SCHEMA_VERSION
-        || (snapshot.product != RECOVERY_PRODUCT && snapshot.product != ROOT_LEASE_RECOVERY_PRODUCT)
-    {
+    if snapshot.schema_version != RECOVERY_SCHEMA_VERSION {
+        return Err(RpcError::new(
+            "unsupported_schema_version",
+            format!(
+                "unsupported_schema_version: path={} expected={} actual={}; existing data was not modified",
+                journal_path.display(),
+                RECOVERY_SCHEMA_VERSION,
+                snapshot.schema_version
+            ),
+        ));
+    }
+    if snapshot.product != RECOVERY_PRODUCT && snapshot.product != ROOT_LEASE_RECOVERY_PRODUCT {
         return Err(RpcError::new(
             "sandbox_recovery_failed",
-            "sandbox recovery journal has an unsupported schema or product",
+            "sandbox recovery journal has an unsupported product",
         ));
     }
     validate_ephemeral_profile_name(&snapshot.profile_name)?;
@@ -3482,7 +3491,7 @@ fn recover_stale_profiles(directory: &Path) -> Result<(), RpcError> {
             continue;
         }
         let sid = derive_profile_sid(&snapshot.profile_name)?;
-        // Retire V5 writer credentials before touching ACLs. If cleanup is
+        // Retire writer credentials before touching ACLs. If cleanup is
         // interrupted, the remaining SID grants cannot be used to mint a new
         // token and later repair can remove them without blocking execution.
         if snapshot.product == ROOT_LEASE_RECOVERY_PRODUCT {
@@ -3584,7 +3593,7 @@ fn cleanup_recovery_snapshot(snapshot: &RecoverySnapshot, sid: PSID) -> Result<(
             }
             if handle.is_none() {
                 // The sandbox cannot move a writable object outside its root,
-                // but the host can do so after a broker crash. Schema v3 did
+                // but the host can do so after a broker crash. The current schema does
                 // not persist an authenticated deletion witness or a trusted
                 // original-volume binding, so a complete scan of declared
                 // roots cannot distinguish deletion from an out-of-root move.
@@ -3597,7 +3606,7 @@ fn cleanup_recovery_snapshot(snapshot: &RecoverySnapshot, sid: PSID) -> Result<(
                 return Err(RpcError::new(
                     "sandbox_recovery_failed",
                     format!(
-                        "cannot safely recover relocated or deleted schema-v3 {access} target: '{}'",
+                        "cannot safely recover relocated or deleted {access} target: '{}'",
                         entry.path.display()
                     ),
                 ));
@@ -5574,13 +5583,13 @@ mod tests {
         let error = cleanup_recovery_snapshot(&journal.snapshot, null_mut())
             .expect_err("changed file identity must fail closed before ACL mutation");
         assert_eq!(error.code, "sandbox_recovery_failed");
-        assert!(error.message.contains("schema-v3 read target"));
+        assert!(error.message.contains("read target"));
         journal.remove().expect("remove recovery journal");
         std::fs::remove_dir_all(&root).expect("remove recovery fixture");
     }
 
     #[test]
-    fn recovery_retains_v3_journal_when_a_host_deleted_read_target_has_no_deletion_witness() {
+    fn recovery_retains_journal_when_a_host_deleted_read_target_has_no_deletion_witness() {
         let unique = ephemeral_profile_name()
             .expect("create deleted read target profile name")
             .replace('.', "-");
@@ -5610,7 +5619,7 @@ mod tests {
             .expect("grant deleted read target");
         std::fs::remove_file(&target).expect("host deletes read-only target after crash");
         let error = cleanup_recovery_snapshot(&journal.snapshot, sid)
-            .expect_err("schema v3 must not guess that a missing file ID proves deletion");
+            .expect_err("recovery must not guess that a missing file ID proves deletion");
         assert_eq!(error.code, "sandbox_recovery_failed");
         assert!(journal.path.is_file());
         journal.remove().expect("remove deleted read journal");
@@ -5618,7 +5627,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_retains_v3_journal_for_a_host_relocated_read_only_target() {
+    fn recovery_retains_journal_for_a_host_relocated_read_only_target() {
         let unique = ephemeral_profile_name()
             .expect("create relocated read target profile name")
             .replace('.', "-");
@@ -5652,7 +5661,7 @@ mod tests {
         std::fs::rename(&target, &relocated).expect("host relocates read-only target after crash");
         std::fs::create_dir(&target).expect("host replaces original read-only path");
         let error = cleanup_recovery_snapshot(&journal.snapshot, profile.sid)
-            .expect_err("schema v3 has no unique volume binding for relocated read recovery");
+            .expect_err("recovery has no unique volume binding for relocated read recovery");
         assert_eq!(error.code, "sandbox_recovery_failed");
         assert!(count_allowed_aces(&relocated, profile.sid) > 0);
         assert_tree_has_no_allowed_ace(&target, profile.sid);
@@ -5664,7 +5673,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_v3_claim_remains_reopenable_after_cleanup_fails_closed() {
+    fn stale_claim_remains_reopenable_after_cleanup_fails_closed() {
         let unique = ephemeral_profile_name()
             .expect("create stale claim profile name")
             .replace('.', "-");
@@ -5694,7 +5703,7 @@ mod tests {
         journal
             .apply(&plan, profile.sid)
             .expect("grant stale read target");
-        assert_eq!(journal.snapshot.schema_version, 3);
+        assert_eq!(journal.snapshot.schema_version, RECOVERY_SCHEMA_VERSION);
 
         std::fs::rename(&target, &relocated).expect("host relocates stale read target");
         std::fs::create_dir(&target).expect("host replaces stale read target");
@@ -5704,16 +5713,16 @@ mod tests {
         let canonical_path = journal.path.clone();
         let claim_path = recovery_claim_path(&canonical_path).expect("derive claim path");
         let first_error = recover_stale_profiles(&recovery)
-            .expect_err("first cleanup must fail closed for relocated schema-v3 target");
+            .expect_err("first cleanup must fail closed for a relocated target");
         assert_eq!(first_error.code, "sandbox_recovery_failed");
-        assert!(first_error.message.contains("schema-v3 read target"));
+        assert!(first_error.message.contains("read target"));
         assert!(!canonical_path.exists());
         assert!(claim_path.is_file());
 
         let second_error = recover_stale_profiles(&recovery)
             .expect_err("retained claim must be visible and fail closed on the next scan");
         assert_eq!(second_error.code, "sandbox_recovery_failed");
-        assert!(second_error.message.contains("schema-v3 read target"));
+        assert!(second_error.message.contains("read target"));
         assert!(!canonical_path.exists());
         assert!(claim_path.is_file());
 
@@ -6135,7 +6144,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_retains_v3_journal_for_a_host_deleted_complete_write_root() {
+    fn recovery_retains_journal_for_a_host_deleted_complete_write_root() {
         let unique = ephemeral_profile_name()
             .expect("create deleted write root profile name")
             .replace('.', "-");
@@ -6163,9 +6172,9 @@ mod tests {
         journal.apply(&plan, sid).expect("grant deleted write root");
         std::fs::remove_dir_all(&root).expect("host deletes complete write root after crash");
         let error = cleanup_recovery_snapshot(&journal.snapshot, sid)
-            .expect_err("schema-v3 cannot prove that the write root was deleted rather than moved");
+            .expect_err("recovery cannot prove that the write root was deleted rather than moved");
         assert_eq!(error.code, "sandbox_recovery_failed");
-        assert!(error.message.contains("schema-v3 write target"));
+        assert!(error.message.contains("write target"));
         assert!(
             journal.path.is_file(),
             "failed cleanup must retain its journal"
@@ -6177,7 +6186,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_retains_v3_journal_for_a_host_relocated_write_target() {
+    fn recovery_retains_journal_for_a_host_relocated_write_target() {
         let unique = ephemeral_profile_name()
             .expect("create relocated write profile name")
             .replace('.', "-");
@@ -6216,9 +6225,9 @@ mod tests {
             .expect("host relocates writable target outside its declared root");
 
         let error = cleanup_recovery_snapshot(&journal.snapshot, sid)
-            .expect_err("out-of-root relocation must retain schema-v3 recovery state");
+            .expect_err("out-of-root relocation must retain recovery state");
         assert_eq!(error.code, "sandbox_recovery_failed");
-        assert!(error.message.contains("schema-v3 write target"));
+        assert!(error.message.contains("write target"));
         assert!(
             count_exact_allowed_aces(&relocated, sid, target_entry.permissions, 0)
                 > target_entry.preexisting_ace_count

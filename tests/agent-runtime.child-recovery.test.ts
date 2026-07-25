@@ -35,6 +35,7 @@ import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { AgentSupervisor, type ChildSupervisorEvent, WorkspaceIsolationManager } from "../packages/agent-supervisor/src/index.js";
 import { EffectToolRegistry } from "../packages/agent-tools/src/index.js";
 import { afterEach, describe, expect, it } from "vitest";
+import { completeAgentEventPayload } from "./testkit/agent-event-fixtures.js";
 
 const fixtures: string[] = [];
 
@@ -336,15 +337,83 @@ describe("durable child identity and crash recovery", () => {
     });
 
     const childLedger = createBudgetLedger();
-    childLedger.consumed.inputTokens = 111;
-    childLedger.reserved.inputTokens = 17;
-    childLedger.consumed.toolCalls = 2;
-    childLedger.reserved.toolCalls = 1;
-    childLedger.reserved.children = 1;
-    await append(store, childSessionId, "child-run", 1, "budget.reserved", {
-      reservationId: "model", ledger: childLedger
+    const completedUsage = {
+      inputTokens: 111,
+      outputTokens: 0,
+      costMicroUsd: 0,
+      modelTurns: 0,
+      toolCalls: 2,
+      children: 0
+    };
+    const inFlightUsage = {
+      inputTokens: 17,
+      outputTokens: 0,
+      costMicroUsd: 0,
+      modelTurns: 0,
+      toolCalls: 1,
+      children: 1
+    };
+    const occurredAt = new Date().toISOString();
+    await append(store, childSessionId, "child-run", 1, "session.created",
+      completeAgentEventPayload("session.created", {
+        workspacePath: root,
+        mode: "change",
+        budgetLimits: childLedger.limits
+      }));
+    await append(store, childSessionId, "child-run", 2, "budget.reserved", {
+      reservationId: "completed-model",
+      mutation: {
+        schemaVersion: 1,
+        kind: "reserve",
+        reservation: {
+          reservationId: "completed-model",
+          ownerId: "model:completed",
+          status: "reserved",
+          requested: completedUsage,
+          consumed: emptyBudgetAmounts(),
+          createdAt: occurredAt
+        },
+        totals: {
+          consumed: emptyBudgetAmounts(),
+          reserved: completedUsage
+        }
+      }
     });
-    await append(store, childSessionId, "child-run", 2, "run.completed", {
+    await append(store, childSessionId, "child-run", 3, "budget.committed", {
+      reservationId: "completed-model",
+      mutation: {
+        schemaVersion: 1,
+        kind: "settle",
+        reservationId: "completed-model",
+        status: "committed",
+        consumed: completedUsage,
+        settledAt: occurredAt,
+        totals: {
+          consumed: completedUsage,
+          reserved: emptyBudgetAmounts()
+        }
+      }
+    });
+    await append(store, childSessionId, "child-run", 4, "budget.reserved", {
+      reservationId: "in-flight-tool",
+      mutation: {
+        schemaVersion: 1,
+        kind: "reserve",
+        reservation: {
+          reservationId: "in-flight-tool",
+          ownerId: "tool:in-flight",
+          status: "reserved",
+          requested: inFlightUsage,
+          consumed: emptyBudgetAmounts(),
+          createdAt: occurredAt
+        },
+        totals: {
+          consumed: completedUsage,
+          reserved: inFlightUsage
+        }
+      }
+    });
+    await append(store, childSessionId, "child-run", 5, "run.completed", {
       kind: "completed", message: "child model run ended", evidence: []
     });
 

@@ -6,15 +6,15 @@ export {
 } from "./configured-runtime.js";
 export { configuredExecutionBroker } from "./container-runtime-execution.js";
 export {
-  SUBJECT_ATTESTATION_SOURCE_V1,
-  SUBJECT_ATTESTOR_ID_V1,
-  assertSubjectAttestationContextV1,
-  assertSubjectProductAttestationV1,
-  createSubjectAttestationContextV1,
-  digestSubjectConfigurationV1,
-  type SubjectAttestationContextV1,
-  type SubjectAttestationV1,
-  type SubjectProductAttestationV1
+  SUBJECT_ATTESTATION_SOURCE,
+  SUBJECT_ATTESTOR_ID,
+  assertSubjectAttestationContext,
+  assertSubjectProductAttestation,
+  createSubjectAttestationContext,
+  digestSubjectConfiguration,
+  type SubjectAttestationContext,
+  type SubjectAttestation,
+  type SubjectProductAttestation
 } from "./subject-attestation.js";
 export {
   recoverInterruptedRepositoryTransactions,

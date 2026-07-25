@@ -1,6 +1,6 @@
 import type {
   JsonValue,
-  ModelPlanUpdateV3,
+  ModelPlanUpdate,
   ToolCallPlan,
   ToolDescriptor,
   ToolReceipt,
@@ -35,10 +35,12 @@ function descriptor(
 }
 
 function receipt(request: ToolRequest, startedAt: string, value: unknown, effects: ToolDescriptor["possibleEffects"]): ToolReceipt {
+  const output = JSON.stringify(value);
   return {
     callId: request.callId,
     ok: true,
-    output: JSON.stringify(value),
+    output,
+    outcome: { status: "succeeded", output, diagnosticCodes: [] },
     result: value as JsonValue,
     observedEffects: effects,
     actualEffects: effects,
@@ -116,7 +118,7 @@ function updatePlanTool(): RegisteredEffectTool {
           ? { acceptanceCriteria: input.acceptanceCriteria.filter((item): item is string => typeof item === "string") }
           : {}),
         plan: input.plan
-      } as unknown as ModelPlanUpdateV3);
+      } as unknown as ModelPlanUpdate);
       return receipt(request, startedAt, updated, ["runtime.control"]);
     }
   };

@@ -1,15 +1,13 @@
 import {
   isCompletionEligibleEvidence,
-  isPlanGraph,
   type BudgetAmounts,
   type BudgetLimits,
   type CheckpointRef,
   type PlanGraph,
-  type ModelPlanUpdateV2,
-  type ModelPlanUpdateV3,
-  type ModelPlanUpdateResultV3,
+  type ModelPlanUpdate,
+  type ModelPlanUpdateResult,
   type RuntimeControlPort,
-  type WorkspaceRestorationEvidenceV1
+  type WorkspaceRestorationEvidence
 } from "agent-protocol";
 import type { CheckpointReviewMaterial } from "agent-checkpoint";
 import type { ChildCheckpointRecovery, RuntimeSession } from "./types.js";
@@ -26,7 +24,6 @@ import { RuntimeRestorationControl } from "./runtime-restoration-control.js";
 import { RuntimeSkillControl } from "./runtime-skill-control.js";
 import { RuntimeInspectionControl } from "./runtime-inspection-control.js";
 import {
-  isLegacyPlanUpdate,
   modelPlanProjection,
   normalizedWorkPlan
 } from "./runtime-plan-normalization.js";
@@ -91,64 +88,18 @@ export class RuntimeControlService {
     );
   }
 
-  private planEvidence(
-    session: RuntimeSession,
-    evidenceIds: readonly string[]
-  ): PlanGraph["nodes"][number]["evidence"] {
-    const byId = new Map(session.durable.state.evidence
-      .filter((item) => isCompletionEligibleEvidence(
-        item, session.identity.sessionId, session.durable.runId
-      ))
-      .map((item) => [item.evidenceId, item] as const));
-    return evidenceIds.map((evidenceId) => {
-      const evidence = byId.get(evidenceId);
-      if (!evidence || evidence.status === "failed") {
-        throw Object.assign(
-          new Error(`Plan evidence '${evidenceId}' is missing, failed, or outside the current run.`),
-          { code: "plan_evidence_invalid" }
-        );
-      }
-      return {
-        evidenceId,
-        kind: evidence.kind
-      };
-    });
-  }
-
-  private assertModelPlanActivity(plan: PlanGraph): void {
-    const rootNodes = plan.nodes.filter((node) => node.owner.kind === "root");
-    const inProgress = rootNodes.filter((node) => node.status === "in_progress");
-    const byId = new Map(plan.nodes.map((node) => [node.id, node] as const));
-    const executablePending = rootNodes.filter((node) => node.status === "pending"
-      && node.dependencies.every((dependency) => byId.get(dependency)?.status === "completed"));
-    const hasExecutableWork = inProgress.length > 0 || executablePending.length > 0;
-    if (hasExecutableWork && (inProgress.length !== 1 || plan.activeNodeId !== inProgress[0]?.id)) {
-      throw Object.assign(
-        new Error("A plan with executable root work must have exactly one in_progress node and matching activeNodeId."),
-        { code: "plan_active_node_invalid" }
-      );
-    }
-    if (!hasExecutableWork && plan.activeNodeId !== undefined) {
-      throw Object.assign(
-        new Error("activeNodeId must be omitted when no root node is executable."),
-        { code: "plan_active_node_invalid" }
-      );
-    }
-  }
-
   async updateWorkPlan(
     session: RuntimeSession,
-    input: ModelPlanUpdateV3 | ModelPlanUpdateV2
-  ): Promise<ModelPlanUpdateResultV3> {
+    input: ModelPlanUpdate
+  ): Promise<ModelPlanUpdateResult> {
     return await this.serialPlan(session.identity.sessionId, async () =>
       await this.updateWorkPlanLocked(session, input));
   }
 
   private async updateWorkPlanLocked(
     session: RuntimeSession,
-    input: ModelPlanUpdateV3 | ModelPlanUpdateV2
-  ): Promise<ModelPlanUpdateResultV3> {
-    if (isLegacyPlanUpdate(input)) return await this.updateLegacyWorkPlanLocked(session, input);
+    input: ModelPlanUpdate
+  ): Promise<ModelPlanUpdateResult> {
     const current = session.durable.state.plan;
     const normalized = normalizedWorkPlan(current, input);
     if (!normalized.changed) {
@@ -169,43 +120,6 @@ export class RuntimeControlService {
       warnings: normalized.warnings,
       plan: modelPlanProjection(updated)
     };
-  }
-
-  private async updateLegacyWorkPlanLocked(
-    session: RuntimeSession,
-    input: ModelPlanUpdateV2
-  ): Promise<ModelPlanUpdateResultV3> {
-    const previousNodes = new Map(session.durable.state.plan.nodes.map((node) => [node.id, node] as const));
-    const nodes = input.nodes.map((node) => ({
-      id: node.id,
-      title: node.title,
-      dependencies: node.dependencies ?? [],
-      status: node.status,
-      owner: node.owner ?? previousNodes.get(node.id)?.owner ?? { kind: "root" as const },
-      acceptanceCriteria: node.acceptanceCriteria ?? [],
-      evidence: node.evidence ?? this.planEvidence(session, node.evidenceIds ?? []),
-      ...(node.blockedReason ? { blockedReason: node.blockedReason } : {}),
-      ...(node.reopenReason ? { reopenReason: node.reopenReason } : {})
-    }));
-    const plan = {
-      revision: input.expectedRevision + 1,
-      goal: input.goal,
-      ...(input.activeNodeId ? { activeNodeId: input.activeNodeId } : {}),
-      nodes
-    };
-    if (!isPlanGraph(plan)) {
-      throw Object.assign(new Error("Proposed work plan is invalid or cyclic."), {
-        code: "plan_invalid"
-      });
-    }
-    this.assertModelPlanActivity(plan);
-    const updated = await this.updatePlanLocked(
-      session,
-      input.expectedRevision,
-      plan,
-      false
-    );
-    return { status: "updated", warnings: [], plan: modelPlanProjection(updated) };
   }
 
   async updatePlan(
@@ -317,14 +231,14 @@ export class RuntimeControlService {
   async restoreRunChanges(
     session: RuntimeSession,
     callId: string
-  ): Promise<WorkspaceRestorationEvidenceV1["data"]> {
+  ): Promise<WorkspaceRestorationEvidence["data"]> {
     return await this.restoration.restoreRunChanges(session, callId);
   }
 
   async confirmRunRestored(
     session: RuntimeSession,
     callId: string
-  ): Promise<WorkspaceRestorationEvidenceV1["data"]> {
+  ): Promise<WorkspaceRestorationEvidence["data"]> {
     return await this.restoration.confirmRunRestored(session, callId);
   }
 

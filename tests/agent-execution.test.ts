@@ -175,7 +175,7 @@ const handle = request => {
     });
   } else if (request.method === "exec" && mode === "launch-failure") {
     ok(request, {
-      ...terminal("", "@@SIGMA_EXEC_INTERNAL_LAUNCH_FAILURE_V1@@private-nonce:{}"),
+      ...terminal("", "@@SIGMA_EXEC_INTERNAL_LAUNCH_FAILURE@@private-nonce:{}"),
       exitCode: 125,
       failure: {
         phase: "sandbox_launch", code: "sandbox_reparse_target_unresolvable",
@@ -490,7 +490,7 @@ describe("agent-execution protocol validation", () => {
     const base = { protocolVersion: 1, requestId: 1 };
     expect(parseBrokerResponse({ ...base, ok: true, result: {} })).toMatchObject({ ok: true });
     expect(parseBrokerResponse({ ...base, ok: false, error: { code: "denied", message: "no" } })).toMatchObject({ ok: false });
-    for (const value of [null, [], { ...base, protocolVersion: 2, ok: true }, { ...base, requestId: 0, ok: true },
+    for (const value of [null, [], { ...base, protocolVersion: 999, ok: true }, { ...base, requestId: 0, ok: true },
       { ...base, ok: "yes" }, { ...base, ok: true, error: {} }, { ...base, ok: false, result: {}, error: {} },
       { ...base, ok: false, error: { code: 1, message: "no" } }]) {
       expect(() => parseBrokerResponse(value)).toThrow(BrokerProtocolError);
@@ -499,14 +499,14 @@ describe("agent-execution protocol validation", () => {
 
   it("validates typed hello, doctor, process, and execution values", () => {
     expect(parseHello({ protocolVersion: 1, instanceId: "instance" })).toEqual({ instanceId: "instance" });
-    expect(() => parseHello({ protocolVersion: 2, instanceId: "instance" })).toThrow(BrokerProtocolError);
+    expect(() => parseHello({ protocolVersion: 999, instanceId: "instance" })).toThrow(BrokerProtocolError);
     expect(() => parseHello({ protocolVersion: 1, instanceId: "" })).toThrow(BrokerProtocolError);
     expect(() => parseHello({ protocolVersion: 1, instanceId: 1 })).toThrow(BrokerProtocolError);
     expect(() => parseHello({ protocolVersion: 1, instanceId: "instance", artifactRoot: 1 })).toThrow(BrokerProtocolError);
     expect(parseHandleId({ handleId: "process" })).toBe("process");
     expect(() => parseHandleId({ handleId: "" })).toThrow(BrokerProtocolError);
     const doctor = {
-      protocolVersion: 1, brokerVersion: "3", platform: "linux", architecture: "x64",
+      protocolVersion: 1, brokerVersion: "fixture", platform: "linux", architecture: "x64",
       sandbox: {
         available: true, backend: "test", selfTestPassed: true, setupRequired: false,
         hardening: {
@@ -604,7 +604,7 @@ describe("agent-execution protocol validation", () => {
       ...doctor,
       sandbox: { ...doctor.sandbox, hardening: { ...doctor.sandbox.hardening, landlockAbi: undefined } }
     }).sandbox.hardening).not.toHaveProperty("landlockAbi");
-    expect(() => parseDoctor({ ...doctor, protocolVersion: 2 })).toThrow(BrokerProtocolError);
+    expect(() => parseDoctor({ ...doctor, protocolVersion: 999 })).toThrow(BrokerProtocolError);
     for (const platform of ["unknown", "linux\nforged"]) {
       expect(() => parseDoctor({ ...doctor, platform })).toThrow(BrokerProtocolError);
     }
@@ -1161,22 +1161,12 @@ describe("SigmaExecBrokerClient", () => {
     await client.close();
   });
 
-  it("preserves the exit result when a legacy broker cannot project non-text output", async () => {
+  it("rejects non-text output that lacks the required byte-safe artifact", async () => {
     const client = new SigmaExecBrokerClient(fixtureOptions("decoding-error"));
     await client.connect();
-    const result = await client.execute({ ...spawnRequest(), timeoutMs: 500 });
-    expect(result).toMatchObject({
-      state: "exited",
-      exitCode: 0,
-      outputTruncated: true,
-      outputDecodingErrors: [{
-        stream: "stdout",
-        code: "invalid_output_encoding"
-      }]
-    });
-    expect(result.stdout).toContain("exact bytes were unavailable");
-    await expect(client.doctor()).resolves.toMatchObject({ brokerVersion: "fixture" });
-    await client.close();
+    await expect(client.execute({ ...spawnRequest(), timeoutMs: 500 }))
+      .rejects.toThrow(/require a matching byte-safe output artifact/u);
+    await expect(client.doctor()).rejects.toThrow(/closed/u);
   });
 
   it("returns non-text output as a releasable byte-safe artifact", async () => {
@@ -1260,7 +1250,7 @@ describe("SigmaExecBrokerClient", () => {
     await client.connect();
     await expect(client.spawn({
       ...spawnRequest(), policy: { ...requiredPolicy(), sandbox: "unsafe" }
-    })).rejects.toThrow(/removed in V5/u);
+    })).rejects.toThrow(/unavailable|required sandbox/u);
     await client.close();
     const unavailable = new SigmaExecBrokerClient(fixtureOptions("unavailable"));
     await expect(unavailable.connect()).rejects.toBeInstanceOf(SandboxUnavailableError);

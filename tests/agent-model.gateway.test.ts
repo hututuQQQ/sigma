@@ -189,47 +189,14 @@ describe("OpenAI-compatible model gateway", () => {
         ]
       },
       finishReason: "tool_calls",
-      inputTokens: 12,
-      outputTokens: 4,
-      usage: { cacheReadTokens: 5, reasoningTokens: 3 },
+      usage: {
+        inputTokens: 12,
+        outputTokens: 4,
+        cacheReadTokens: 5,
+        reasoningTokens: 3
+      },
       raw: { provider_meta: { finite: 1, infinite: null, unsupported: null, nested: [true] } }
     });
-  });
-
-  it("maps the legacy unsupported-tool-choice flag and rejects strict choices before fetch", async () => {
-    let fetchCalls = 0;
-    const gateway = createGateway((async () => {
-      fetchCalls += 1;
-      return jsonResponse("ok");
-    }) as typeof fetch, { wireProfile: { supportsToolChoice: false } });
-
-    await expect(gateway.complete({
-      messages: [{ role: "user", content: "use a tool" }],
-      tools: [{ name: "read_file", description: "Read a file", inputSchema: { type: "object" } }],
-      toolChoice: "required",
-      signal: new AbortController().signal
-    })).rejects.toMatchObject({
-      category: "configuration",
-      message: "OpenAI wire profile cannot honor toolChoice='required'."
-    });
-    expect(fetchCalls).toBe(0);
-  });
-
-  it("keeps the legacy supported-tool-choice flag equivalent to the always policy", async () => {
-    let body: Record<string, unknown> | undefined;
-    const gateway = createGateway((async (_url, init) => {
-      body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-      return jsonResponse("ok");
-    }) as typeof fetch, { wireProfile: { supportsToolChoice: true } });
-
-    await gateway.complete({
-      messages: [{ role: "user", content: "use a tool" }],
-      tools: [{ name: "read_file", description: "Read a file", inputSchema: { type: "object" } }],
-      toolChoice: "required",
-      signal: new AbortController().signal
-    });
-
-    expect(body).toMatchObject({ tool_choice: "required" });
   });
 
   it("rejects strict choices under the canonical never policy before fetch", async () => {
@@ -246,12 +213,6 @@ describe("OpenAI-compatible model gateway", () => {
       signal: new AbortController().signal
     })).rejects.toMatchObject({ category: "configuration" });
     expect(fetchCalls).toBe(0);
-  });
-
-  it("rejects conflicting legacy and canonical tool-choice settings", () => {
-    expect(() => createGateway((async () => jsonResponse("ok")) as typeof fetch, {
-      wireProfile: { supportsToolChoice: true, toolChoicePolicy: "never" }
-    })).toThrow(/conflicting tool choice settings/u);
   });
 
   it("requires a thinking mode for the non-thinking-only policy", () => {

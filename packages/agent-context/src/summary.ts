@@ -72,7 +72,7 @@ function semanticReceiptProjection(content: string): SemanticReceiptProjection |
   };
 }
 
-/** Extract the outcome-bearing portion of a durable V3 receipt. The full JSON
+/** Extract the outcome-bearing portion of a durable receipt. The full JSON
  * remains in raw history, while compaction prioritizes status, changed paths,
  * bounded output head/tail and evidence over call arguments or volatile IDs. */
 function semanticReceiptLine(content: string): string | null {

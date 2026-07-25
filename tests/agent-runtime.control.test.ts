@@ -64,7 +64,7 @@ function receipt(artifactId: string): ToolReceipt {
   };
 }
 
-describe("V9 runtime control tools", () => {
+describe("runtime control tools", () => {
   it("projects a low-friction plan schema and normalizes runtime-owned details", async () => {
     const updateDescriptor = registerBuiltinTools(new EffectToolRegistry()).modelDescriptors()
       .find((descriptor) => descriptor.name === "update_plan")!;
@@ -81,7 +81,7 @@ describe("V9 runtime control tools", () => {
     expect(stepSchema.properties).not.toHaveProperty("expectedRevision");
     expect(stepSchema.properties).not.toHaveProperty("evidenceIds");
 
-    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-plan-v8-"));
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-plan-"));
     temporaryRoots.push(root);
     const session = runtimeSessionFixture({ workspacePath: root });
     session.durable.state.evidence.push(commandEvidence(
@@ -134,21 +134,6 @@ describe("V9 runtime control tools", () => {
     expect(noActiveProvided.status).toBe("normalized");
     expect(noActiveProvided.plan.activeStepId).toBe("verify");
 
-    // The former revisioned shape remains a private one-release
-    // compatibility boundary, but is no longer advertised to the model.
-    const legacy = await control.updateWorkPlan({
-      expectedRevision: session.durable.state.plan.revision,
-      goal: "legacy caller",
-      activeNodeId: "legacy",
-      nodes: [
-        { id: "implement", title: "Implement", status: "completed" },
-        { id: "legacy", title: "Legacy", status: "in_progress" }
-      ]
-    });
-    expect(legacy.plan).toMatchObject({
-      goal: "legacy caller",
-      activeStepId: "legacy"
-    });
   });
 
   it("preserves runtime-owned dependency anchors during a model checklist rewrite", async () => {

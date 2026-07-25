@@ -28,24 +28,24 @@ import {
   createOptimizerObservations
 } from "../scripts/eval/optimizer-observation.mjs";
 import {
-  assertGenericConformanceEventStreamV1,
+  assertGenericConformanceEventStream,
   collectOptimizerObservations,
   deriveSubjectMetadataFromEvents,
   parseOptimizerObserveArgs
 } from "../scripts/eval/optimizer-observe.mjs";
 import {
-  assertOptimizationExperimentV1,
-  assertOptimizerClusterCardV1,
-  assertOptimizerObservationV1
+  assertOptimizationExperiment,
+  assertOptimizerClusterCard,
+  assertOptimizerObservation
 } from "../scripts/eval/optimizer-schema.mjs";
 import {
-  closeOptimizationExperimentV1,
-  createOptimizationExperimentV1,
+  closeOptimizationExperiment,
+  createOptimizationExperiment,
   decideFrozenOptimizationGate,
-  freezeOptimizationExperimentV1,
-  freezeRegisteredOptimizationExperimentV1,
+  freezeOptimizationExperiment,
+  freezeRegisteredOptimizationExperiment,
   readRegisteredOptimizationExperiments,
-  registerOptimizationExperimentV1,
+  registerOptimizationExperiment,
   resolveOptimizationExperimentRegistry,
   resolveOptimizationRepositoryStateRoot
 } from "../scripts/eval/optimization-experiment.mjs";
@@ -126,7 +126,7 @@ function attestationDiagnostic(overrides: Record<string, unknown> = {}) {
 
 function durableEvent(seq: number, type: Parameters<typeof completeAgentEventPayload>[0], payload: unknown) {
   return {
-    schemaVersion: 5,
+    schemaVersion: 1,
     seq,
     eventId: `event-${seq}`,
     sessionId: "session",
@@ -148,7 +148,7 @@ function attestationEvent(seq = 1, overrides: Record<string, unknown> = {}) {
     createdAt: `2026-07-13T00:00:0${seq}.000Z`,
     producer: { authority: "runtime", id: "subject-attestor" },
     summary: "Subject build identity was frozen before execution.",
-    data: { source: "sigma.subject_attestation.v1", diagnostic: attestationDiagnostic(overrides) }
+    data: { source: "sigma.subject_attestation", diagnostic: attestationDiagnostic(overrides) }
   });
 }
 
@@ -243,22 +243,22 @@ describe("optimizer one-way boundary", () => {
 
   it("rejects tainted identities, evaluator feedback, unknown fields, and absolute paths", () => {
     const [valid] = createOptimizerObservations(metrics(), observationMetadata());
-    expect(() => assertOptimizerObservationV1({ ...valid, scenarioId: "known-case" })).toThrow(/forbidden|unknown/iu);
-    expect(() => assertOptimizerObservationV1({ ...valid, verifier: { failure: "hidden" } })).toThrow(/forbidden/iu);
-    expect(() => assertOptimizerObservationV1({ ...valid, score: 1 })).toThrow(/forbidden/iu);
-    expect(() => assertOptimizerObservationV1({
+    expect(() => assertOptimizerObservation({ ...valid, scenarioId: "known-case" })).toThrow(/forbidden|unknown/iu);
+    expect(() => assertOptimizerObservation({ ...valid, verifier: { failure: "hidden" } })).toThrow(/forbidden/iu);
+    expect(() => assertOptimizerObservation({ ...valid, score: 1 })).toThrow(/forbidden/iu);
+    expect(() => assertOptimizerObservation({
       ...valid,
       subject: { ...valid.subject, model: "C:\\private\\model" }
     })).toThrow(/absolute|device/iu);
-    expect(() => assertOptimizerObservationV1({
+    expect(() => assertOptimizerObservation({
       ...valid,
       subject: { ...valid.subject, model: "/etc/private-model" }
     })).toThrow(/absolute|device/iu);
-    expect(() => assertOptimizerObservationV1({
+    expect(() => assertOptimizerObservation({
       ...valid,
       subject: { ...valid.subject, model: "scenario_id=hidden-case" }
     })).toThrow(/evaluator-only/iu);
-    expect(() => assertOptimizerObservationV1({
+    expect(() => assertOptimizerObservation({
       ...valid,
       subject: {
         ...valid.subject,
@@ -340,18 +340,18 @@ describe("optimizer one-way boundary", () => {
         provider: "deepseek", model: "deepseek/deepseek-v4-pro", turnId: 1, effectRevision: 0
       })
     ];
-    expect(assertGenericConformanceEventStreamV1(conformanceStream(events)).events).toHaveLength(3);
+    expect(assertGenericConformanceEventStream(conformanceStream(events)).events).toHaveLength(3);
     const tainted = [
       ...events,
       durableEvent(4, "tool.requested", {
         callId: "call", name: "read", arguments: { scenarioId: "hidden" }, turnId: 1, effectRevision: 0
       })
     ];
-    expect(() => assertGenericConformanceEventStreamV1(conformanceStream(tainted)))
+    expect(() => assertGenericConformanceEventStream(conformanceStream(tainted)))
       .toThrow(/evaluator-only/iu);
     const damaged = conformanceStream(events);
     damaged.records[0].checksum = sha("0");
-    expect(() => assertGenericConformanceEventStreamV1(damaged)).toThrow(/checksum mismatch/iu);
+    expect(() => assertGenericConformanceEventStream(damaged)).toThrow(/checksum mismatch/iu);
     expect(parseOptimizerObserveArgs([
       "--generic-only", "--conformance-events", "one.json", "--conformance-events", "two.json"
     ])).toMatchObject({ includeRealSessions: false, conformanceEventPaths: ["one.json", "two.json"] });
@@ -378,14 +378,14 @@ describe("optimizer one-way boundary", () => {
     const card = createOptimizerClusterCards(observations, [], { asOf: "2026-07-14T01:00:00.000Z" })[0];
     expect(card.eligibility).toEqual({ eligible: true, reason: "three_independent_observations" });
     expect(card.cardDigest).toMatch(/^[a-f0-9]{64}$/u);
-    expect(assertOptimizerClusterCardV1(structuredClone(card))).toEqual(card);
+    expect(assertOptimizerClusterCard(structuredClone(card))).toEqual(card);
     expect(createOptimizerClusterCards(observations.toReversed(), [], {
       asOf: "2026-07-14T01:01:00.000Z"
     })[0].cardDigest).toBe(card.cardDigest);
-    expect(() => assertOptimizerClusterCardV1({
+    expect(() => assertOptimizerClusterCard({
       ...card, eligibility: { eligible: false, reason: "insufficient_evidence" }
     })).toThrow(/canonical hash/iu);
-    const active = [createOptimizationExperimentV1({
+    const active = [createOptimizationExperiment({
       ...experimentInput(), clusterId: card.clusterId, eligibilityClaimDigest: card.cardDigest
     })];
     expect(createOptimizerClusterCards(observations, active, { asOf: "2026-07-14T01:00:00.000Z" })[0].eligibility)
@@ -477,9 +477,9 @@ describe("optimizer one-way boundary", () => {
   });
 });
 
-describe("OptimizationExperimentV1", () => {
+describe("OptimizationExperiment", () => {
   it("preregisters and freezes one general candidate with mandatory fairness and guardrails", () => {
-    const experiment = createOptimizationExperimentV1(experimentInput());
+    const experiment = createOptimizationExperiment(experimentInput());
     expect(experiment).toMatchObject({
       closedAt: null,
       eligibilityClaimDigest: sha("f"),
@@ -488,28 +488,28 @@ describe("OptimizationExperimentV1", () => {
     expect(experiment.guardrails.map((item: { metric: string }) => item.metric)).toEqual([
       "correctness", "safety", "delivery"
     ]);
-    const frozen = freezeOptimizationExperimentV1(experiment, sha("9"), "2026-07-14T01:00:00.000Z");
+    const frozen = freezeOptimizationExperiment(experiment, sha("9"), "2026-07-14T01:00:00.000Z");
     expect(frozen).toMatchObject({ status: "frozen", candidate: { candidateDigest: sha("9") } });
   });
 
   it("rejects evaluator modification scope and tainted experiment fields", () => {
-    const valid = createOptimizationExperimentV1(experimentInput());
-    expect(() => assertOptimizationExperimentV1({
+    const valid = createOptimizationExperiment(experimentInput());
+    expect(() => assertOptimizationExperiment({
       ...valid,
       modificationScope: { allowedGlobs: ["scripts/eval/**"] }
     })).toThrow(/may not target/iu);
-    expect(() => assertOptimizationExperimentV1({
+    expect(() => assertOptimizationExperiment({
       ...valid,
       modificationScope: { allowedGlobs: ["tests/bench/**"] }
     })).toThrow(/may not target/iu);
-    expect(() => assertOptimizationExperimentV1({ ...valid, reward: 1 })).toThrow(/forbidden/iu);
-    expect(() => assertOptimizationExperimentV1({
+    expect(() => assertOptimizationExperiment({ ...valid, reward: 1 })).toThrow(/forbidden/iu);
+    expect(() => assertOptimizationExperiment({
       ...valid, hypothesis: "Tune behavior for scenario_id=private-case."
     })).toThrow(/evaluator-only|canonical hash/iu);
-    expect(() => assertOptimizationExperimentV1({
+    expect(() => assertOptimizationExperiment({
       ...valid, hypothesis: "Changed after registration without changing the identity hash."
     })).toThrow(/canonical hash/iu);
-    expect(() => createOptimizationExperimentV1({
+    expect(() => createOptimizationExperiment({
       ...experimentInput(),
       primaryMetric: { ...experimentInput().primaryMetric, minimumRelativeChange: 0.19 }
     })).toThrow(/at least 20%/iu);
@@ -518,18 +518,18 @@ describe("OptimizationExperimentV1", () => {
   it("allows at most one registered active experiment per cluster", async () => {
     const card = eligibleBlockerCard();
     const registry = await createTrustedRegistry(card);
-    const first = createOptimizationExperimentV1({
+    const first = createOptimizationExperiment({
       ...experimentInput(), clusterId: card.clusterId, eligibilityClaimDigest: card.cardDigest
     });
-    const second = createOptimizationExperimentV1({
+    const second = createOptimizationExperiment({
       ...experimentInput(),
       clusterId: card.clusterId,
       eligibilityClaimDigest: card.cardDigest,
       createdAt: "2026-07-14T00:01:00.000Z",
       hypothesis: "A second concurrent hypothesis must not enter the active queue."
     });
-    await registerOptimizationExperimentV1(first, registry);
-    await expect(registerOptimizationExperimentV1(second, registry)).rejects.toThrow(/active experiment already exists/iu);
+    await registerOptimizationExperiment(first, registry);
+    await expect(registerOptimizationExperiment(second, registry)).rejects.toThrow(/active experiment already exists/iu);
     await expect(readRegisteredOptimizationExperiments(registry)).resolves.toHaveLength(1);
   });
 
@@ -537,26 +537,26 @@ describe("OptimizationExperimentV1", () => {
     const missingRoot = await mkdtemp(path.join(os.tmpdir(), "sigma-missing-card-"));
     temporary.push(missingRoot);
     const missingRegistry = path.join(missingRoot, "optimizer", "experiments");
-    await expect(registerOptimizationExperimentV1(
-      createOptimizationExperimentV1(experimentInput()), missingRegistry
+    await expect(registerOptimizationExperiment(
+      createOptimizationExperiment(experimentInput()), missingRegistry
     )).rejects.toThrow(/trusted cluster card/iu);
 
     const card = eligibleBlockerCard();
     const registry = await createTrustedRegistry(card);
-    const first = createOptimizationExperimentV1({
+    const first = createOptimizationExperiment({
       ...experimentInput(), clusterId: card.clusterId, eligibilityClaimDigest: card.cardDigest
     });
-    await registerOptimizationExperimentV1(first, registry);
-    const closed = await closeOptimizationExperimentV1(
+    await registerOptimizationExperiment(first, registry);
+    const closed = await closeOptimizationExperiment(
       first, "rejected", registry, "2026-07-14T01:05:00.000Z"
     );
     expect(closed).toMatchObject({ status: "rejected", closedAt: "2026-07-14T01:05:00.000Z" });
-    const reused = createOptimizationExperimentV1({
+    const reused = createOptimizationExperiment({
       ...experimentInput(), clusterId: card.clusterId, eligibilityClaimDigest: card.cardDigest,
       createdAt: "2026-07-14T01:06:00.000Z",
       hypothesis: "A consumed eligibility snapshot cannot authorize another candidate."
     });
-    await expect(registerOptimizationExperimentV1(reused, registry)).rejects.toThrow(/already been consumed/iu);
+    await expect(registerOptimizationExperiment(reused, registry)).rejects.toThrow(/already been consumed/iu);
   });
 
   it("requires new post-close evidence before a cluster can qualify again", async () => {
@@ -568,12 +568,12 @@ describe("OptimizationExperimentV1", () => {
     const initial = createOptimizerClusterCards(old, [], { asOf: "2026-07-14T01:00:00.000Z" })[0];
     expect(initial.eligibility).toEqual({ eligible: true, reason: "three_independent_observations" });
     const registry = await createTrustedRegistry(initial);
-    const experiment = createOptimizationExperimentV1({
+    const experiment = createOptimizationExperiment({
       ...experimentInput(), clusterId: initial.clusterId, eligibilityClaimDigest: initial.cardDigest,
       createdAt: "2026-07-14T01:01:00.000Z"
     });
-    await registerOptimizationExperimentV1(experiment, registry);
-    const closed = await closeOptimizationExperimentV1(
+    await registerOptimizationExperiment(experiment, registry);
+    const closed = await closeOptimizationExperiment(
       experiment, "rejected", registry, "2026-07-14T01:05:00.000Z"
     );
     const twoNew = [
@@ -598,7 +598,7 @@ describe("OptimizationExperimentV1", () => {
   });
 
   it("applies the frozen binary and continuous three-pair rules without repair feedback", () => {
-    const binary = freezeOptimizationExperimentV1(createOptimizationExperimentV1(experimentInput("binary")), sha("8"));
+    const binary = freezeOptimizationExperiment(createOptimizationExperiment(experimentInput("binary")), sha("8"));
     const binaryPairs = [
       { validity: "valid", baseline: { primary: false, dimensions: passingDimensions }, candidate: { primary: true, dimensions: passingDimensions } },
       { validity: "valid", baseline: { primary: false, dimensions: passingDimensions }, candidate: { primary: true, dimensions: passingDimensions } },
@@ -606,7 +606,7 @@ describe("OptimizationExperimentV1", () => {
     ];
     expect(decideFrozenOptimizationGate(binary, binaryPairs)).toMatchObject({ decision: "accepted", summary: { wins: 2, losses: 0 } });
 
-    const continuous = freezeOptimizationExperimentV1(createOptimizationExperimentV1(experimentInput()), sha("7"));
+    const continuous = freezeOptimizationExperiment(createOptimizationExperiment(experimentInput()), sha("7"));
     const continuousPairs = [10, 20, 30].map((baseline) => ({
       validity: "valid",
       baseline: { primary: baseline, dimensions: { ...passingDimensions } },
@@ -674,7 +674,7 @@ describe("OptimizationExperimentV1", () => {
       schedule: "seeded_round_robin", abOrder: "interleaved_baseline_first"
     };
     const controlScenario = {
-      schemaVersion: 2,
+      schemaVersion: 1,
       id: "opaque-case",
       title: "Generic aggregate behavior",
       suites: ["quick"],
@@ -706,7 +706,7 @@ describe("OptimizationExperimentV1", () => {
         evaluation: { provider: "deepseek", model: "deepseek-v4-pro" }
       })}\n`);
       await writeFile(path.join(directory, "test-fixtures", "agent-evals", "manifest.json"), `${JSON.stringify({
-        schemaVersion: 2, frozenRunPolicies: { quick: policy }, scenarios: [controlScenario]
+        schemaVersion: 1, frozenRunPolicies: { quick: policy }, scenarios: [controlScenario]
       })}\n`);
       await execFile("git", ["init", "--quiet"], { cwd: directory });
       await execFile("git", ["config", "user.name", "Sigma Test"], { cwd: directory });
@@ -717,7 +717,7 @@ describe("OptimizationExperimentV1", () => {
     const baseDigest = (await computeProductDigest(baseline)).digest;
     const candidateDigest = (await computeProductDigest(candidate)).digest;
     const card = eligibleBlockerCard();
-    const registered = createOptimizationExperimentV1({
+    const registered = createOptimizationExperiment({
       ...experimentInput(), baseDigest, clusterId: card.clusterId, eligibilityClaimDigest: card.cardDigest
     });
     const registry = path.join(vaultRoot, "optimizer", "experiments");
@@ -726,8 +726,8 @@ describe("OptimizationExperimentV1", () => {
       path.join(vaultRoot, "optimizer", "clusters", `${card.clusterId}.json`),
       `${JSON.stringify(card, null, 2)}\n`
     );
-    await registerOptimizationExperimentV1(registered, registry);
-    const frozen = await freezeRegisteredOptimizationExperimentV1(
+    await registerOptimizationExperiment(registered, registry);
+    const frozen = await freezeRegisteredOptimizationExperiment(
       registered, candidateDigest, registry, "2026-07-14T01:00:00.000Z"
     );
     const experimentPath = path.join(vaultRoot, "experiment.json");
@@ -762,7 +762,7 @@ describe("OptimizationExperimentV1", () => {
         const attemptId = `${runId}-attempt`;
         const expectedAttempt = expected.attempts[0];
         const compatibility = {
-          schemaVersion: 2, kind: "eval_run", runId,
+          schemaVersion: 1, kind: "eval_run", runId,
           suite: expected.suite, repeat: expected.repeat,
           frozenRunPolicy: expected.frozenRunPolicy,
           scheduleDigest: expected.scheduleDigest,
@@ -780,7 +780,7 @@ describe("OptimizationExperimentV1", () => {
           },
           scenarios: expected.scenarios,
           attempts: [{
-            schemaVersion: 2, kind: "eval_attempt", runId, attemptId,
+            schemaVersion: 1, kind: "eval_attempt", runId, attemptId,
             scenarioId: expectedAttempt.scenarioId, suites: ["quick"], repetition: 1,
             startedAt: "2026-07-14T01:00:00.000Z", finishedAt: "2026-07-14T01:00:01.000Z",
             validity: "valid",
@@ -831,10 +831,7 @@ describe("OptimizationExperimentV1", () => {
             artifacts: {}
           }]
         };
-        await writeFile(path.join(runDir, "run.json"), `${JSON.stringify({
-          ...compatibility,
-          sourceSchemaVersion: 2
-        })}\n`);
+        await writeFile(path.join(runDir, "run.json"), `${JSON.stringify(compatibility)}\n`);
         return {
           exitCode: 0, contained: true, noOrphans: true,
           sourceArtifactDigest: build.artifactDigest, retried: false
@@ -862,7 +859,7 @@ describe("OptimizationExperimentV1", () => {
       (entry: { path: string }) => entry.path === "run/run.json"
     );
     expect(JSON.parse(Buffer.from(runEvidence.contentBase64, "base64").toString("utf8"))).toMatchObject({
-      schemaVersion: 2, kind: "eval_run"
+      schemaVersion: 1, kind: "eval_run"
     });
     expect((await readdir(path.join(vaultRoot, "archives"))).filter((entry) => /^[a-f0-9]{64}$/u.test(entry)))
       .toHaveLength(6);

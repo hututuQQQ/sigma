@@ -6,7 +6,7 @@ import type {
 } from "agent-protocol";
 import type {
   ReviewerInput,
-  ReviewerToolCheckV1
+  ReviewerToolCheck
 } from "./reviewer-contracts.js";
 import { reviewerResponseObject } from "./reviewer-response-object.js";
 
@@ -110,15 +110,7 @@ function criterionReference(
       ? { criterion, evidence }
       : undefined;
   }
-  const legacyCriterion = typeof item.criterion === "string"
-    ? item.criterion.trim()
-    : "";
-  const legacyEvidence = optionalEvidenceIds(item.evidence);
-  return legacyCriterion.length > 0
-    && indexedCriteria.includes(legacyCriterion)
-    && legacyEvidence !== undefined
-    ? { criterion: legacyCriterion, evidence: legacyEvidence }
-    : undefined;
+  return undefined;
 }
 
 function parsedCriterion(
@@ -332,7 +324,7 @@ export function reviewEvidence(
   input: ReviewerInput,
   reviewerId: string,
   response: ModelResponse,
-  checks: readonly ReviewerToolCheckV1[] = []
+  checks: readonly ReviewerToolCheck[] = []
 ): ReviewEvidence {
   const result = parsedReviewResult(input, response);
   const runtimeEvidenceIds = [...new Set([
@@ -363,7 +355,7 @@ export function reviewEvidence(
         ? "Independent reviewer approved the change."
         : "Independent reviewer requested changes.",
     data: {
-      schemaVersion: 3,
+      schemaVersion: 1,
       reviewerId,
       verdict: result.verdict,
       findings: result.findings,

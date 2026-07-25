@@ -47,13 +47,20 @@ function blockedReceipt(
   startedAt: string,
   value: BlockedReport | null
 ): ToolReceipt {
+  const ok = value !== null;
+  const output = value ? JSON.stringify(value) : "Blocked report does not match the required schema.";
+  const effects: ToolReceipt["observedEffects"] = value ? ["outcome.report_blocked"] : [];
+  const diagnostics = value ? [] : ["invalid_blocked_report"];
   return {
     callId: request.callId,
-    ok: value !== null,
-    output: value ? JSON.stringify(value) : "Blocked report does not match the required schema.",
-    observedEffects: value ? ["outcome.report_blocked"] : [],
+    ok,
+    output,
+    outcome: { status: ok ? "succeeded" : "failed", output, diagnosticCodes: diagnostics },
+    observedEffects: effects,
+    actualEffects: effects,
     artifacts: [],
-    diagnostics: value ? [] : ["invalid_blocked_report"],
+    diagnostics,
+    evidence: [],
     startedAt,
     completedAt: new Date().toISOString()
   };
@@ -114,15 +121,22 @@ function requestUserInputTool(): RegisteredEffectTool {
       const startedAt = new Date().toISOString();
       const input = record(request.arguments);
       const message = typeof input?.message === "string" ? input.message.trim() : "";
+      const ok = message.length > 0;
+      const output = message
+        ? JSON.stringify({ message })
+        : "User-input request requires a non-empty message.";
+      const effects: ToolReceipt["observedEffects"] = message ? ["outcome.request_input"] : [];
+      const diagnostics = message ? [] : ["invalid_user_input_request"];
       return {
         callId: request.callId,
-        ok: message.length > 0,
-        output: message
-          ? JSON.stringify({ message })
-          : "User-input request requires a non-empty message.",
-        observedEffects: message ? ["outcome.request_input"] : [],
+        ok,
+        output,
+        outcome: { status: ok ? "succeeded" : "failed", output, diagnosticCodes: diagnostics },
+        observedEffects: effects,
+        actualEffects: effects,
         artifacts: [],
-        diagnostics: message ? [] : ["invalid_user_input_request"],
+        diagnostics,
+        evidence: [],
         startedAt,
         completedAt: new Date().toISOString()
       };

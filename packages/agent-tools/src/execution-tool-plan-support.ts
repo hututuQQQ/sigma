@@ -1,6 +1,6 @@
 import path from "node:path";
 import type {
-  ExecutionIntentV1,
+  ExecutionIntent,
   JsonValue,
   LoadedSkillResourceAccess,
   ToolCallPlan
@@ -42,7 +42,7 @@ export function plannedProcessMode(
 
 export function executionInvocation(
   input: Record<string, JsonValue>
-): ExecutionIntentV1["invocation"] {
+): ExecutionIntent["invocation"] {
   const executable = typeof input.executable === "string"
     ? input.executable
     : typeof input.shell === "string" ? input.shell : "";
@@ -57,10 +57,10 @@ export function executionInvocation(
 }
 
 function executionPurpose(
-  invocation: ExecutionIntentV1["invocation"],
+  invocation: ExecutionIntent["invocation"],
   validation: boolean,
   background: boolean
-): ExecutionIntentV1["purpose"] {
+): ExecutionIntent["purpose"] {
   const command = [invocation.executable, ...invocation.args].join(" ").toLowerCase();
   if (background) return "serve";
   if (/\b(?:build|tsc)\b/u.test(command)) return "build";
@@ -142,7 +142,7 @@ export function planReadsExternal(
 }
 
 export function assembledExecutionPlan(input: {
-  invocation: ExecutionIntentV1["invocation"];
+  invocation: ExecutionIntent["invocation"];
   mutation: MutationContract;
   readPaths: string[];
   networkMode: ToolCallPlan["network"];
@@ -168,7 +168,7 @@ export function assembledExecutionPlan(input: {
     processMode: input.processMode,
     checkpointScope: input.mutation.writeRoots,
     ...(input.mutation.scope === "enclosing_container"
-      ? { mutationAuthority: "disposable_enclosing_container_v1" as const }
+      ? { mutationAuthority: "disposable_enclosing_container" as const }
       : {}),
     idempotence: input.validation && !writes ? "replay_safe" : "non_replayable",
     executionIntent: {

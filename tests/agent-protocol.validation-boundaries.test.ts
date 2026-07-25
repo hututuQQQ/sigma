@@ -7,7 +7,9 @@ import {
   assertMcpPersistentEffectsAllowed,
   assertMcpWriteRootsEmpty,
   assertSnapshotEnvelope,
+  emptyRuntimePromptState,
   isAgentEventEnvelope,
+  isRuntimePromptState,
   isSnapshotEnvelope,
   validateAgentEventEnvelope
 } from "../packages/agent-protocol/src/index.js";
@@ -34,7 +36,14 @@ describe("strict current-version validation boundaries", () => {
     ]));
     expect(() => assertSnapshotEnvelope(null)).toThrow(SnapshotValidationError);
     expect(isSnapshotEnvelope(null)).toBe(false);
-    expect(() => assertSnapshotEnvelope({ schemaVersion: 4 })).toThrow(/sessionId/u);
+    expect(() => assertSnapshotEnvelope({ schemaVersion: 999 })).toThrow(
+      expect.objectContaining({
+        code: "unsupported_schema_version",
+        path: "schemaVersion",
+        expected: 1,
+        actual: 999
+      })
+    );
   });
 
   it("rejects every cross-envelope authority and scope violation", () => {
@@ -55,10 +64,31 @@ describe("strict current-version validation boundaries", () => {
     }))).toBe(true);
   });
 
-  it("requires event V7 for durable tool-result pruning boundaries", () => {
+  it("requires schema 1 for durable tool-result pruning boundaries", () => {
     const current = validAgentEventFixture("context.tool_results_pruned");
     expect(isAgentEventEnvelope(current)).toBe(true);
-    expect(isAgentEventEnvelope({ ...current, schemaVersion: 6 })).toBe(false);
+    expect(isAgentEventEnvelope({ ...current, schemaVersion: 999 })).toBe(false);
+  });
+
+  it("accepts only the closed schema 1 runtime prompt state", () => {
+    const digest = "a".repeat(64);
+    const current = {
+      ...emptyRuntimePromptState(),
+      sectionDigests: { repository: digest },
+      archiveSourceDigest: digest
+    };
+    expect(isRuntimePromptState(current)).toBe(true);
+    expect(isRuntimePromptState({ ...current, schemaVersion: 999 })).toBe(false);
+    expect(isRuntimePromptState({
+      ...current,
+      sectionDigests: { ...current.sectionDigests, unknown: digest }
+    })).toBe(false);
+    expect(isRuntimePromptState({
+      ...current,
+      sectionDigests: { repository: "not-a-digest" }
+    })).toBe(false);
+    expect(isRuntimePromptState({ ...current, budgetBand: 75 })).toBe(false);
+    expect(isRuntimePromptState({ ...current, archiveSourceDigest: "not-a-digest" })).toBe(false);
   });
 
   it("enforces plan graph invariants and paired skill manifest fields", () => {
@@ -77,7 +107,7 @@ describe("strict current-version validation boundaries", () => {
       ] }
     ];
     for (const plan of invalidPlans) expect(isAgentEventEnvelope(planEvent(plan))).toBe(false);
-    // V9 deliberately treats the plan as low-friction working memory. A
+    // The current plan is low-friction working memory. A
     // completed checklist item no longer needs to carry completion evidence;
     // validation and review are tracked in their own ledgers.
     expect(isAgentEventEnvelope(planEvent({
@@ -98,13 +128,13 @@ describe("strict current-version validation boundaries", () => {
     expect(() => assertMcpWriteRootsEmpty("server", [])).not.toThrow();
   });
 
-  it("accepts a complete current snapshot and rejects legacy snapshots at the public boundary", () => {
+  it("accepts a complete schema 1 snapshot and rejects an unknown schema", () => {
     expect(isSnapshotEnvelope({
-      schemaVersion: SNAPSHOT_SCHEMA_VERSION, storeLayoutVersion: 5, sessionId: "session", seq: 0,
+      schemaVersion: SNAPSHOT_SCHEMA_VERSION, sessionId: "session", seq: 0,
       createdAt: fixtureOccurredAt, state: { ok: true }
     })).toBe(true);
     expect(isSnapshotEnvelope({
-      schemaVersion: SNAPSHOT_SCHEMA_VERSION - 1, storeLayoutVersion: 5, sessionId: "session", seq: 0,
+      schemaVersion: 999, sessionId: "session", seq: 0,
       createdAt: fixtureOccurredAt, state: { ok: true }
     })).toBe(false);
   });

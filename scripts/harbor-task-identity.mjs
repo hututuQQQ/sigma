@@ -75,7 +75,7 @@ export function validateExternalTaskRecord(value, index, baseDir = process.cwd()
     throw new Error(`tasks-file[${index}] must be an object.`);
   }
   const allowed = new Set([
-    "name", "path", "git_url", "git_commit_id", "provenance_source", "source"
+    "name", "path", "git_url", "git_commit_id", "provenance_source"
   ]);
   const unknown = Object.keys(value).filter((key) => !allowed.has(key));
   if (unknown.length > 0) {
@@ -98,18 +98,12 @@ export function validateExternalTaskRecord(value, index, baseDir = process.cwd()
   }
 
   const provenance = nonEmptyString(value.provenance_source);
-  const legacyProvenance = nonEmptyString(value.source);
-  if (provenance && legacyProvenance && provenance !== legacyProvenance) {
-    throw new Error(`tasks-file[${index}] source and provenance_source conflict.`);
-  }
   return {
     ...(name ? { name } : {
       path: gitUrl ? portableRepositoryPath(taskPath) : canonicalPath(taskPath, baseDir)
     }),
     ...(gitUrl ? { git_url: gitUrl, git_commit_id: gitCommit } : {}),
-    ...(provenance || legacyProvenance
-      ? { provenance_source: provenance ?? legacyProvenance }
-      : {})
+    ...(provenance ? { provenance_source: provenance } : {})
   };
 }
 
@@ -156,7 +150,7 @@ export function harborTaskExecutionIdentitySha256(task) {
 export function taskSelectionIdentity(task) {
   return {
     execution: harborTaskExecutionIdentity(task),
-    provenance_source: nonEmptyString(task.provenance_source) ?? nonEmptyString(task.source) ?? null
+    provenance_source: nonEmptyString(task.provenance_source) ?? null
   };
 }
 
@@ -173,7 +167,7 @@ export function assertUniqueHarborTaskExecutionIdentities(tasks) {
   }
 }
 
-export function buildResolvedTaskAttestationV2({
+export function buildResolvedTaskAttestation({
   jobConfigSha256,
   taskSelectionSha256,
   selectedTasks,
@@ -184,7 +178,7 @@ export function buildResolvedTaskAttestationV2({
     throw new Error("Resolved task attestation count does not match the frozen selection.");
   }
   return {
-    schema_version: 2,
+    schema_version: 1,
     job_config_sha256: jobConfigSha256,
     task_selection_sha256: taskSelectionSha256,
     tasks: selectedTasks.map((task, index) => {

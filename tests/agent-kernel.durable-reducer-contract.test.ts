@@ -60,7 +60,7 @@ function diagnostic(id: string, producer: "runtime" | "tool" = "runtime"): Evide
   };
 }
 
-describe("V6 durable reducer contract", () => {
+describe("durable reducer contract", () => {
   it("requires matching evidence authority, producer, session, and run", () => {
     let state = initial();
     state = apply(state, "evidence.recorded", diagnostic("runtime"), "runtime");

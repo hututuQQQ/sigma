@@ -79,7 +79,7 @@ export function strictCompletionDecision(
       authority: "verification_verdict",
       code: "verification_unavailable",
       message: `Strict completion verification was unavailable: ${
-        state.review?.summary ?? "no current V3 reviewer evidence"
+        state.review?.summary ?? "no current reviewer evidence"
       }.`
     };
   }

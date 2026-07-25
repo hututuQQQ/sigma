@@ -177,16 +177,10 @@ export function narrowAgentProfile(
   parent: ResolvedAgentProfile,
   requested: ResolvedAgentProfile
 ): ResolvedAgentProfile {
-  // Profiles frozen before customization V4 do not carry an assurance block.
-  // A missing child block inherits the parent limits; it must not silently
-  // expand to the current defaults when the parent was explicitly tighter.
-  const parentAssurance: ProfileAssurancePolicy = {
-    ...DEFAULT_PROFILE_ASSURANCE,
-    ...(parent.assurancePolicy ?? {})
-  };
+  const parentAssurance: ProfileAssurancePolicy = { ...parent.assurancePolicy };
   const requestedAssurance: ProfileAssurancePolicy = {
     ...parentAssurance,
-    ...(requested.assurancePolicy ?? {})
+    ...requested.assurancePolicy
   };
   const toolAllow = assertProfileNarrowing(
     parent,
@@ -238,9 +232,6 @@ function parseBudget(value: unknown, label: string): ProfileBudget {
 function parseMutationPolicy(value: unknown, label: string): ProfileMutationPolicy {
   if (value === undefined) return defaultMutationPolicy();
   const policy = objectValue(value, label);
-  if (Object.hasOwn(policy, "review_non_documentation_changes")) {
-    throw new Error(`${label}.review_non_documentation_changes was removed in V4; use review_mode = "off", "advisory", or "required".`);
-  }
   rejectUnknown(policy, MUTATION_KEYS, label);
   return {
     requirePlanBeforeMutation: booleanValue(policy.require_plan_before_mutation, false, `${label}.require_plan_before_mutation`),

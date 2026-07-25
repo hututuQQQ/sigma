@@ -283,7 +283,6 @@ timeout_ms = 5000
         }
       };
       const coordinator = new RuntimeHookCoordinator({
-        definitions: [],
         runner,
         materializeWorkspaceHook: async (current, hook) =>
           await materializer.materialize(current.identity.workspacePath, current.identity.sessionId, hook),
@@ -370,7 +369,10 @@ required = true
 
   it("persists lifecycle events and durable provenance for pre-model context", async () => {
     const events: Array<{ type: string; payload: unknown }> = [];
-    const session = runtimeSessionFixture({ workspacePath: process.cwd() });
+    const session = runtimeSessionFixture({
+      workspacePath: process.cwd(),
+      durable: { frozenCustomization: await freezeSessionCustomization({ hooks: [commandHook] }) }
+    });
     const runner: HookRunnerPort = {
       run: vi.fn(async () => ({
         ok: true,
@@ -379,7 +381,6 @@ required = true
       }))
     };
     const coordinator = new RuntimeHookCoordinator({
-      definitions: [commandHook],
       runner,
       emit: async (current, type, _authority, payload) => {
         events.push({ type, payload });
@@ -399,7 +400,10 @@ required = true
 
   it("persists failed gates and rejects recursive events", async () => {
     const eventTypes: string[] = [];
-    const session = runtimeSessionFixture({ sessionId: "session-recursive" });
+    const session = runtimeSessionFixture({
+      sessionId: "session-recursive",
+      durable: { frozenCustomization: await freezeSessionCustomization({ hooks: [commandHook] }) }
+    });
     const coordinatorRef: { current?: RuntimeHookCoordinator } = {};
     const runner: HookRunnerPort = {
       run: async () => {
@@ -408,7 +412,6 @@ required = true
       }
     };
     const coordinator = new RuntimeHookCoordinator({
-      definitions: [commandHook],
       runner,
       emit: async (current, type) => {
         eventTypes.push(type);

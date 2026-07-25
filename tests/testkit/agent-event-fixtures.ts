@@ -1,14 +1,16 @@
 import {
   EVENT_SCHEMA_VERSION,
   createBudgetLedger,
-  emptyLongHorizonStateV1,
-  emptyReasoningTrajectoryStateV1,
+  emptyLongHorizonState,
+  emptyReasoningTrajectoryState,
   type AgentEventPayloadMap,
   type AgentEventType,
   type CheckpointRef,
   type EvidenceRecord,
   type UsageRecord
 } from "../../packages/agent-protocol/src/index.js";
+import { freezeSessionCustomization } from "../../packages/agent-extensions/src/index.js";
+import { ContentAddressedArtifactStore } from "../../packages/agent-store/src/index.js";
 
 export const fixtureOccurredAt = "2026-07-10T00:00:00.000Z";
 const turn = { turnId: 1, effectRevision: 0 } as const;
@@ -26,7 +28,7 @@ export function evidenceFixture(
   };
   if (kind === "review") return {
     ...base, kind, producer: { authority: "runtime" }, data: {
-      reviewerId: "reviewer", verdict: "approved", findings: [],
+      schemaVersion: 1, reviewerId: "reviewer", verdict: "approved", findings: [],
       frontierRevision: 1, stateDigest: "a".repeat(64)
     }
   };
@@ -57,12 +59,44 @@ export function checkpointFixture(status: CheckpointRef["status"]): CheckpointRe
   };
 }
 
+export async function persistEmptyCustomization(
+  storeRootDir: string,
+  sessionId: string
+): Promise<{
+  digest: string;
+  artifactId: string;
+  skillCount: 0;
+  hookCount: 0;
+  profileCount: 0;
+}> {
+  const customization = await freezeSessionCustomization({});
+  const artifactId = await new ContentAddressedArtifactStore(storeRootDir)
+    .put(sessionId, customization.canonicalJson);
+  return {
+    digest: customization.digest,
+    artifactId,
+    skillCount: 0,
+    hookCount: 0,
+    profileCount: 0
+  };
+}
+
 const ledger = createBudgetLedger();
+const zeroBudget = { ...ledger.consumed };
+const reservation = {
+  reservationId: "reservation",
+  ownerId: "unbound",
+  status: "reserved" as const,
+  requested: zeroBudget,
+  consumed: zeroBudget,
+  createdAt: fixtureOccurredAt
+};
 const message = { role: "assistant", content: "done" } as const;
 const receipt = {
   callId: "call", name: "read", ok: true, output: "ok",
   outcome: { status: "succeeded", output: "ok", diagnosticCodes: [] },
-  observedEffects: ["filesystem.read"], artifacts: [], diagnostics: [],
+  observedEffects: ["filesystem.read"], actualEffects: ["filesystem.read"],
+  artifacts: [], diagnostics: [], evidence: [],
   startedAt: fixtureOccurredAt, completedAt: fixtureOccurredAt, ...turn
 } as const;
 const hookOutcome = {
@@ -72,7 +106,7 @@ const hookOutcome = {
 export const agentEventPayloadFixtures = {
   "session.created": {
     workspacePath: "D:/workspace", mode: "change", title: "task", writeScope: ["."],
-    strictWriteScope: true, modelRole: "orchestrator"
+    strictWriteScope: true, modelRole: "orchestrator", budgetLimits: ledger.limits
   },
   "run.started": { mode: "change", deadlineAt: fixtureOccurredAt },
   "run.suspended": { kind: "needs_input", requestId: "input", message: "choose" },
@@ -94,7 +128,7 @@ export const agentEventPayloadFixtures = {
     prefixMessageCount: 1,
     cacheMode: "prefix_cache",
     promptState: {
-      schemaVersion: 2,
+      schemaVersion: 1,
       sectionDigests: {},
       budgetBand: 100
     },
@@ -109,7 +143,7 @@ export const agentEventPayloadFixtures = {
   "tool.requested": { callId: "call", name: "read", arguments: {}, ...turn },
   "tool.approval_requested": {
     requestId: "call", callId: "call", toolName: "read", arguments: {}, effects: ["filesystem.read"],
-    plan, reason: "approval", ...turn
+    plan, reason: "approval", approvalMode: "human", ...turn
   },
   "tool.approval_resolved": { requestId: "call", callId: "call", decision: "allow", ...turn },
   "tool.started": { callId: "call", name: "read", ...turn },
@@ -132,7 +166,7 @@ export const agentEventPayloadFixtures = {
     prunedTokens: 20_000
   },
   "context.reasoning_trajectory_tombstoned": {
-    state: emptyReasoningTrajectoryStateV1(),
+    state: emptyReasoningTrajectoryState(),
     newlyTombstoned: 0
   },
   "child.spawned": { childId: "child", payload: { status: "queued" } },
@@ -168,13 +202,37 @@ export const agentEventPayloadFixtures = {
   },
   "plan.updated": { previousRevision: 0, plan: { revision: 1, goal: "goal", nodes: [] } },
   "long_horizon.updated": {
-    state: emptyLongHorizonStateV1(),
-    reason: "migration_initialized"
+    state: emptyLongHorizonState(),
+    reason: "batch_settled"
   },
-  "budget.reserved": { reservationId: "reservation", ledger },
-  "budget.reservation_bound": { reservationId: "reservation", ownerId: "owner", ledger },
-  "budget.committed": { reservationId: "reservation", ledger },
-  "budget.released": { reservationId: "reservation", ledger },
+  "budget.reserved": {
+    reservationId: "reservation",
+    mutation: {
+      schemaVersion: 1, kind: "reserve", reservation,
+      totals: { consumed: zeroBudget, reserved: zeroBudget }
+    }
+  },
+  "budget.reservation_bound": {
+    reservationId: "reservation",
+    ownerId: "owner",
+    mutation: { schemaVersion: 1, kind: "bind", reservationId: "reservation", ownerId: "owner" }
+  },
+  "budget.committed": {
+    reservationId: "reservation",
+    mutation: {
+      schemaVersion: 1, kind: "settle", reservationId: "reservation", status: "committed",
+      consumed: zeroBudget, settledAt: fixtureOccurredAt,
+      totals: { consumed: zeroBudget, reserved: zeroBudget }
+    }
+  },
+  "budget.released": {
+    reservationId: "reservation",
+    mutation: {
+      schemaVersion: 1, kind: "settle", reservationId: "reservation", status: "released",
+      consumed: zeroBudget, settledAt: fixtureOccurredAt,
+      totals: { consumed: zeroBudget, reserved: zeroBudget }
+    }
+  },
   "budget.exhausted": { dimension: "toolCalls", requested: 1, available: 0 },
   "budget.overrun": {
     reservationId: "reservation", dimensions: [{
@@ -182,7 +240,14 @@ export const agentEventPayloadFixtures = {
       limit: 1, consumed: 2, overLimit: 1
     }]
   },
-  "budget.limit_increased": { previousLimits: ledger.limits, increase: { toolCalls: 1 }, ledger },
+  "budget.limit_increased": {
+    mutation: {
+      schemaVersion: 1,
+      kind: "limit",
+      increase: { ...zeroBudget, toolCalls: 1, maxDepth: 0 },
+      limits: ledger.limits
+    }
+  },
   "checkpoint.created": checkpointFixture("open"),
   "checkpoint.sealed": checkpointFixture("sealed"),
   "checkpoint.restored": checkpointFixture("restored"),

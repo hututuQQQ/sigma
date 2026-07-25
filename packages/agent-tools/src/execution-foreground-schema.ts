@@ -31,10 +31,6 @@ export function writeContractProperties(
       description: enclosing
         ? "Exact files or narrow paths approved to change. Use canonical absolute paths for enclosing-container changes. External changes persist only for the disposable task container and are independently reviewed."
         : "Exact files or narrow paths approved to change. New parent directories needed to create an approved path are implicit; other changes are rolled back."
-    },
-    writePaths: {
-      type: "array", items: { type: "string" }, minItems: 1, uniqueItems: true,
-      description: "Deprecated compatibility alias that supplies both sandbox/checkpoint roots and approved changes."
     }
   };
 }

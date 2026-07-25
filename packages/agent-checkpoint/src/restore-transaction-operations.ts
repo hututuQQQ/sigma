@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdir, rename, rm, stat } from "node:fs/promises";
+import { chmod, lstat, mkdir, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import { durableReplaceFile, pinWorkspaceTransactionDirectories, syncDirectory } from "agent-platform";
 import { assertRestoreImage, restoreImageFromManifest } from "./restore-image-identity.js";
@@ -32,15 +32,13 @@ function operationPaths(current: CheckpointManifest, desired: CheckpointManifest
 }
 
 async function windowsSymlinkType(
-  options: RestoreTransactionOptions,
   entry: CheckpointEntry
 ): Promise<"file" | "junction" | undefined> {
   if (process.platform !== "win32" || entry.kind !== "symlink") return undefined;
-  if (entry.linkType) return entry.linkType === "directory" ? "junction" : "file";
-  // Compatibility for checkpoints captured before linkType was persisted.
-  const originalTarget = path.resolve(options.workspacePath, path.dirname(entry.path), entry.linkTarget!);
-  const info = await stat(originalTarget).catch(() => null);
-  return info?.isDirectory() ? "junction" : "file";
+  if (!entry.linkType) {
+    throw new CheckpointConflictError(`Checkpoint symlink type is missing: ${entry.path}`);
+  }
+  return entry.linkType === "directory" ? "junction" : "file";
 }
 
 async function stageOperation(
@@ -54,7 +52,7 @@ async function stageOperation(
   for (const entry of entries) {
     const suffix = entry.path === operation.path ? "" : path.posix.relative(operation.path, entry.path);
     const target = suffix ? path.join(operation.stagePath, ...suffix.split("/")) : operation.stagePath;
-    await stageRestoreEntry(options.readCas, target, entry, await windowsSymlinkType(options, entry));
+    await stageRestoreEntry(options.readCas, target, entry, await windowsSymlinkType(entry));
   }
   for (const entry of [...entries].reverse()) {
     if (entry.kind !== "directory") continue;
@@ -120,7 +118,7 @@ function journalValue(
       ...(desired.has(entryPath) ? { desiredMode: desired.get(entryPath) } : {})
     }));
   return JSON.stringify({
-    schemaVersion: 4,
+    schemaVersion: 1,
     phase,
     finalization: options.finalization,
     directoryModes,

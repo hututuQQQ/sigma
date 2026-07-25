@@ -37,7 +37,6 @@ export function sanitizeEvaluationStatusReport(report) {
   const mutation = report?.mutationDiscipline ?? {};
   return {
     schemaVersion: 1,
-    sourceSchemaVersion: report?.sourceSchemaVersion ?? "unavailable",
     suite: typeof report?.suite === "string" ? report.suite : "unavailable",
     repeat: countOrUnavailable(report?.repeat),
     status: typeof report?.status === "string" ? report.status : "unavailable",
@@ -87,7 +86,7 @@ function metricCoverageComplete(report, validAttempts) {
 function weeklyReportConclusive(report) {
   const validity = report.validity;
   const dimensionStatuses = DIMENSIONS.map((name) => statusOrUnavailable(report?.dimensions?.[name]));
-  return report.sourceSchemaVersion === 2
+  return report.schemaVersion === 1
     && report.repeat === 3
     && Number.isSafeInteger(validity?.valid) && validity.valid > 0
     && validity.invalid === 0 && validity.notObserved === 0 && validity.missing === 0
@@ -106,7 +105,7 @@ export function buildSanitizedEvaluationStatus(reports, options = {}) {
     && JSON.stringify(observedSuites) === JSON.stringify([...expectedSuites].sort());
   const platforms = new Set(reports.map((report) => `${report?.subject?.platform ?? ""}:${report?.subject?.arch ?? ""}`));
   const complete = suitesComplete && platforms.size === 1 && (mode === "nightly"
-    ? reports.every((report) => report?.sourceSchemaVersion === 2 && report?.repeat === 1)
+    ? reports.every((report) => report?.schemaVersion === 1 && report?.repeat === 1)
     : reports.every(weeklyReportConclusive));
   return {
     schemaVersion: 1,

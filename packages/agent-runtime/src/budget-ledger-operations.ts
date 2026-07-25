@@ -2,7 +2,7 @@ import type {
   BudgetAmounts,
   BudgetLedgerState,
   BudgetLimits,
-  BudgetMutationV1,
+  BudgetMutation,
   BudgetReservation
 } from "agent-protocol";
 import { emptyBudgetAmounts } from "agent-protocol";
@@ -83,7 +83,7 @@ export function settledBudgetMutation(
   reservationId: string,
   status: "committed" | "released",
   consumed: BudgetAmounts
-): Extract<BudgetMutationV1, { kind: "settle" }> {
+): Extract<BudgetMutation, { kind: "settle" }> {
   const settledAt = ledger.reservations.find((item) => item.reservationId === reservationId)?.settledAt;
   if (!settledAt) throw new Error(`Settled budget reservation '${reservationId}' has no settlement timestamp.`);
   return {

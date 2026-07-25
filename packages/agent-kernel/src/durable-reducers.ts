@@ -2,16 +2,16 @@ import {
   isCheckpointRef,
   isEvidenceRecord,
   isPlanGraph,
-  isLongHorizonStateV2,
-  isReasoningTrajectoryStateV1,
-  isToolResultPruneStateV1,
+  isLongHorizonState,
+  isReasoningTrajectoryState,
+  isToolResultPruneState,
   isUsageRecord,
   type AgentEventEnvelope,
   type AgentEventType,
   type ContextItem,
   type EvidenceRecord,
   type JsonValue,
-  type ReviewerToolReceiptV1
+  type ReviewerToolReceipt
 } from "agent-protocol";
 import { durableBudgetReducers } from "./durable-budget-reducers.js";
 import {
@@ -137,12 +137,12 @@ const planUpdated: KernelEventReducer = (state, _event, payload) => {
 };
 
 const longHorizonUpdated: KernelEventReducer = (state, event, payload) => {
-  if (event.authority !== "runtime" || !isLongHorizonStateV2(payload.state)) return state;
+  if (event.authority !== "runtime" || !isLongHorizonState(payload.state)) return state;
   return { ...state, longHorizon: payload.state };
 };
 
 const reviewToolCompleted: KernelEventReducer = (state, event, payload) => {
-  const item = payload as unknown as ReviewerToolReceiptV1;
+  const item = payload as unknown as ReviewerToolReceipt;
   if (event.authority !== "runtime"
     || item.schemaVersion !== 1
     || typeof item.reviewRequestId !== "string"
@@ -160,7 +160,7 @@ const reviewToolCompleted: KernelEventReducer = (state, event, payload) => {
 
 const reasoningTrajectoryTombstoned: KernelEventReducer = (state, event, payload) => {
   if (event.authority !== "runtime"
-    || !isReasoningTrajectoryStateV1(payload.state)) return state;
+    || !isReasoningTrajectoryState(payload.state)) return state;
   return { ...state, reasoningTrajectory: payload.state };
 };
 
@@ -314,7 +314,7 @@ const contextCompacted: KernelEventReducer = (state, event, payload) => {
 };
 
 const toolResultsPruned: KernelEventReducer = (state, event, payload) => {
-  if (event.authority !== "runtime" || !isToolResultPruneStateV1(payload.state)) return state;
+  if (event.authority !== "runtime" || !isToolResultPruneState(payload.state)) return state;
   const current = state.toolResultPrune;
   if (current && current.archiveSourceDigest === payload.state.archiveSourceDigest
     && payload.state.coveredBlocks < current.coveredBlocks) return state;

@@ -21,7 +21,7 @@ pub(crate) struct AcquireRepositoryMetadataLeaseParams {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct RepositoryMetadataLeaseV1 {
+pub(crate) struct RepositoryMetadataLease {
     protocol_version: u32,
     lease_id: String,
     repository_root: PathBuf,
@@ -35,7 +35,7 @@ pub(crate) struct RepositoryMetadataLeaseV1 {
 
 #[derive(Clone)]
 struct LeaseRecord {
-    lease: RepositoryMetadataLeaseV1,
+    lease: RepositoryMetadataLease,
 }
 
 #[derive(Default)]
@@ -47,7 +47,7 @@ impl RepositoryMetadataLeases {
     pub(crate) fn acquire(
         &self,
         params: AcquireRepositoryMetadataLeaseParams,
-    ) -> Result<RepositoryMetadataLeaseV1, RpcError> {
+    ) -> Result<RepositoryMetadataLease, RpcError> {
         if params.network != NetworkMode::None {
             return Err(RpcError::new(
                 "policy_denied",
@@ -68,7 +68,7 @@ impl RepositoryMetadataLeases {
         git_dir: PathBuf,
         common_dir: PathBuf,
         executable: PathBuf,
-    ) -> Result<RepositoryMetadataLeaseV1, RpcError> {
+    ) -> Result<RepositoryMetadataLease, RpcError> {
         let executable_sha256 = pinned_executable_sha256(&executable)?;
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -78,7 +78,7 @@ impl RepositoryMetadataLeases {
             "repository-metadata-{}-{nonce}",
             LEASE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         );
-        let lease = RepositoryMetadataLeaseV1 {
+        let lease = RepositoryMetadataLease {
             protocol_version: 1,
             lease_id: lease_id.clone(),
             repository_root,
@@ -104,7 +104,7 @@ impl RepositoryMetadataLeases {
         repository_root: &Path,
         git_dir: &Path,
         executable: &Path,
-    ) -> Result<RepositoryMetadataLeaseV1, RpcError> {
+    ) -> Result<RepositoryMetadataLease, RpcError> {
         let repository_root = canonical_directory(repository_root, "repository root")?;
         let git_dir = canonical_directory(git_dir, "Git directory")?;
         validate_topology(&repository_root, &git_dir, &git_dir)?;
@@ -296,7 +296,7 @@ fn topology_argument(args: &[String], name: &str) -> Result<Option<PathBuf>, Rpc
 
 fn validate_git_invocation(
     params: &ProcessParams,
-    lease: &RepositoryMetadataLeaseV1,
+    lease: &RepositoryMetadataLease,
 ) -> Result<(), RpcError> {
     let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
     let expected_prefix = [

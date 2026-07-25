@@ -39,7 +39,7 @@ export type ConfigValue = ConfigScalar | string[] | McpServerConfigValue[]
   | ModelSpecConfigValue[] | ModelRouteConfigValue[];
 export interface ConfigField<T extends ConfigValue = ConfigValue> {
   key: string;
-  flag: string;
+  flag?: string;
   shortFlag?: string;
   kind?: "value" | "boolean" | "repeatable";
   env?: string;
@@ -57,7 +57,7 @@ export interface ConfigSources {
   home?: Record<string, unknown>;
 }
 export type ResolvedConfig = Record<string, ConfigValue>;
-export const CONFIG_SCHEMA_VERSION = 5 as const;
+export const CONFIG_SCHEMA_VERSION = 1 as const;
 function stringValue(raw: unknown, key: string, allowEmpty = false): string {
   if (typeof raw !== "string" || (!allowEmpty && !raw.trim())) throw new Error(`Configuration '${key}' requires a${allowEmpty ? "" : " non-empty"} string.`);
   return raw;
@@ -142,9 +142,11 @@ const booleanField = (key: string, flag: string, description: string, shortFlag?
   key, flag, shortFlag, kind: "boolean", description, defaultValue: false, parse: (raw) => booleanValue(raw, key), hidden: true
 });
 export const SIGMA_CONFIG_SCHEMA: readonly ConfigField[] = [
-  { key: "configSchemaVersion", flag: "config-schema-version", toml: "schema_version", description: "Configuration schema version", defaultValue: CONFIG_SCHEMA_VERSION, parse: (raw) => {
-    const value = numberValue(raw, "configSchemaVersion", 2, CONFIG_SCHEMA_VERSION);
-    if (!Number.isInteger(value)) throw new Error("Configuration 'configSchemaVersion' requires an integer.");
+  { key: "configSchemaVersion", toml: "schema_version", description: "Configuration schema version", defaultValue: CONFIG_SCHEMA_VERSION, parse: (raw) => {
+    const value = numberValue(raw, "configSchemaVersion");
+    if (value !== CONFIG_SCHEMA_VERSION) {
+      throw new Error(`unsupported_schema_version: config expected ${CONFIG_SCHEMA_VERSION}, received ${String(value)}`);
+    }
     return value;
   }, hidden: true },
   { key: "provider", flag: "provider", env: "SIGMA_PROVIDER", toml: "model.provider", description: "Model provider", defaultValue: "deepseek", parse: (raw) => enumValue(raw, "provider", ["deepseek", "glm"] as const) },
@@ -184,11 +186,6 @@ export const SIGMA_CONFIG_SCHEMA: readonly ConfigField[] = [
   { key: "checkpointMaxFiles", flag: "checkpoint-max-files", env: "SIGMA_CHECKPOINT_MAX_FILES", toml: "checkpoint.max_files", description: "Maximum files in a mutation checkpoint", defaultValue: 250_000, parse: (raw) => numberValue(raw, "checkpointMaxFiles", 1) },
   { key: "checkpointMaxBytes", flag: "checkpoint-max-bytes", env: "SIGMA_CHECKPOINT_MAX_BYTES", toml: "checkpoint.max_bytes", description: "Maximum checkpoint preimage bytes", defaultValue: 2_147_483_648, parse: (raw) => numberValue(raw, "checkpointMaxBytes", 1) },
   { key: "outputFormat", flag: "output-format", env: "SIGMA_OUTPUT_FORMAT", toml: "ui.output_format", description: "CLI output format", defaultValue: "text", parse: (raw) => enumValue(raw, "outputFormat", ["text", "json", "stream-json"] as const) },
-  { key: "outputSchema", flag: "output-schema", env: "SIGMA_OUTPUT_SCHEMA", toml: "ui.output_schema", description: "JSON output schema version", defaultValue: 3, parse: (raw) => {
-    const value = numberValue(raw, "outputSchema", 2, 3);
-    if (value !== 2 && value !== 3) throw new Error("Configuration 'outputSchema' must be 2 or 3.");
-    return value;
-  } },
   { key: "streamJsonMaxLineBytes", flag: "stream-json-max-line-bytes", env: "SIGMA_STREAM_JSON_MAX_LINE_BYTES", toml: "ui.stream_json_max_line_bytes", description: "Optional maximum JSONL record size before base64 chunk framing (0 disables framing)", defaultValue: 0, parse: (raw) => {
     const value = numberValue(raw, "streamJsonMaxLineBytes", 0);
     if (!Number.isInteger(value) || (value > 0 && value < 4_096))
@@ -222,8 +219,6 @@ export const SIGMA_CONFIG_SCHEMA: readonly ConfigField[] = [
   booleanField("dryRun", "dry-run", "Validate without writing"),
   { ...booleanField("restore", "restore", "Safely restore an interrupted checkpoint"), hidden: true },
   { ...booleanField("keep", "keep", "Keep an interrupted checkpoint delta"), hidden: true },
-  booleanField("check", "check", "Check whether migration is required"),
-  booleanField("write", "write", "Write a migration result"),
   booleanField("all", "all", "Select all records"),
   { key: "initProfile", flag: "init-profile", description: "Initialization profile", defaultValue: "local", parse: (raw) => enumValue(raw, "initProfile", ["local", "team", "ci"] as const), hidden: true },
   { key: "limit", flag: "limit", description: "Result count limit", defaultValue: 20, parse: (raw) => numberValue(raw, "limit", 1, 1_000), hidden: true },
@@ -303,7 +298,7 @@ function restrictWorkspaceValue(field: ConfigField, baseline: ConfigValue, works
 }
 
 export function resolveConfig(sources: ConfigSources, schema = SIGMA_CONFIG_SCHEMA): ResolvedConfig {
-  const knownFlags = new Set(schema.map((field) => field.flag));
+  const knownFlags = new Set(schema.flatMap((field) => field.flag ? [field.flag] : []));
   for (const flag of Object.keys(sources.flags ?? {})) {
     if (!knownFlags.has(flag)) throw new Error(`Unknown option '--${flag}'.`);
   }
@@ -311,7 +306,7 @@ export function resolveConfig(sources: ConfigSources, schema = SIGMA_CONFIG_SCHE
   validateTomlKeys(sources.home, schema, "home");
   const result: ResolvedConfig = {};
   for (const field of schema) {
-    const explicit = sources.flags?.[field.flag]
+    const explicit = (field.flag ? sources.flags?.[field.flag] : undefined)
       ?? (field.env ? sources.env?.[field.env] : undefined);
     if (explicit !== undefined) {
       result[field.key] = field.parse(explicit);
@@ -326,18 +321,23 @@ export function resolveConfig(sources: ConfigSources, schema = SIGMA_CONFIG_SCHE
   return result;
 }
 interface ParsedFlagToken {
-  field: ConfigField;
+  field: ConfigField & { flag: string };
   inline: string | undefined;
 }
-function flagIndex(schema: readonly ConfigField[]): Map<string, ConfigField> {
-  const byFlag = new Map<string, ConfigField>();
+function flagIndex(schema: readonly ConfigField[]): Map<string, ConfigField & { flag: string }> {
+  const byFlag = new Map<string, ConfigField & { flag: string }>();
   for (const field of schema) {
-    byFlag.set(field.flag, field);
-    if (field.shortFlag) byFlag.set(field.shortFlag, field);
+    if (!field.flag) continue;
+    const cliField = field as ConfigField & { flag: string };
+    byFlag.set(field.flag, cliField);
+    if (field.shortFlag) byFlag.set(field.shortFlag, cliField);
   }
   return byFlag;
 }
-function parseFlagToken(item: string, byFlag: ReadonlyMap<string, ConfigField>): ParsedFlagToken {
+function parseFlagToken(
+  item: string,
+  byFlag: ReadonlyMap<string, ConfigField & { flag: string }>
+): ParsedFlagToken {
   const long = item.startsWith("--");
   const [name, inline] = item.slice(long ? 2 : 1).split("=", 2);
   const field = byFlag.get(name);
@@ -345,7 +345,7 @@ function parseFlagToken(item: string, byFlag: ReadonlyMap<string, ConfigField>):
   return { field, inline };
 }
 
-function storeFlag(flags: Record<string, unknown>, field: ConfigField, raw: string): void {
+function storeFlag(flags: Record<string, unknown>, field: ConfigField & { flag: string }, raw: string): void {
   if (field.kind !== "repeatable") {
     flags[field.flag] = raw;
     return;

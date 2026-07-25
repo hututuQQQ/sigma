@@ -14,7 +14,7 @@ import { configureWindowsConsoleUtf8 } from "../packages/agent-tui/src/component
 
 function event(seq: number, type: AgentEventEnvelope["type"], payload: AgentEventEnvelope["payload"]): AgentEventEnvelope {
   return {
-    schemaVersion: 2, seq, eventId: `e-${seq}`, sessionId: "session", runId: "run",
+    schemaVersion: 1, seq, eventId: `e-${seq}`, sessionId: "session", runId: "run",
     occurredAt: new Date(seq).toISOString(), type, authority: "runtime", payload
   };
 }

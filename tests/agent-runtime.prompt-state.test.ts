@@ -30,7 +30,7 @@ function item(id: string, provenance: string, content: string, priority = 1): Co
   };
 }
 
-describe("V8 incremental runtime prompt state", () => {
+describe("incremental runtime prompt state", () => {
   it("bounds a ten-thousand-path frontier and pages the full set outside the prompt", () => {
     const session = runtimeSessionFixture();
     session.durable.state.mutationFrontier = {
@@ -184,7 +184,7 @@ describe("V8 incremental runtime prompt state", () => {
       producer: { authority: "runtime", id: "reviewer" },
       summary: "Repair required.",
       data: {
-        schemaVersion: 3,
+        schemaVersion: 1,
         reviewerId: "reviewer",
         verdict: "changes_requested",
         findings: [{
