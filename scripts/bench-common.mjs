@@ -1696,6 +1696,21 @@ function agentExceptionFromTrial(trialResult, exceptionMessage) {
   };
 }
 
+function trialFailedBeforeAgentStart(trialResult) {
+  return Boolean(
+    trialResult?.exception_info
+    && trialResult?.environment_setup
+    && Object.hasOwn(trialResult, "agent_setup")
+    && trialResult.agent_setup === null
+    && Object.hasOwn(trialResult, "agent_execution")
+    && trialResult.agent_execution === null
+    && Object.hasOwn(trialResult, "verifier")
+    && trialResult.verifier === null
+    && trialResult.agent_result == null
+    && trialResult.verifier_result == null
+  );
+}
+
 async function readHarborTrialResults(runDir, jobsDir) {
   const resultFiles = await listJsonFiles(jobsDir);
   const results = [];
@@ -2161,7 +2176,9 @@ function mergeHarborTrialResult(task, trialResult) {
       traceEvents: trialResult?.agent_trace_events ?? [],
       logText: exceptionMessage,
       exitCode: 1,
-      failureKind: agentMetadata.failure_kind ?? task.failure_category
+      failureKind: trialFailedBeforeAgentStart(trialResult)
+        ? "infrastructure_incomplete"
+        : agentMetadata.failure_kind ?? task.failure_category
     });
     next.last_error = exceptionMessage;
     next.failure_signals = collectFailureSignals({

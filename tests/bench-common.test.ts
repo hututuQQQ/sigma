@@ -1283,6 +1283,56 @@ describe("benchmark report generation", () => {
     expect(await readFile(path.join(runDir, "report.md"), "utf8")).toContain("## Verifier Failures");
   });
 
+  it("excludes Harbor environment failures that occur before agent startup", async () => {
+    const runDir = await mkdtemp(path.join(os.tmpdir(), "sigma-bench-environment-infra-"));
+    await writeFile(path.join(runDir, "config.json"), `${JSON.stringify({
+      run_id: "environment-infra-run",
+      provider: "deepseek",
+      model: "model",
+      dataset: terminalBenchDataset,
+      k: 1,
+      exit_code: 0,
+      status: "passed"
+    })}\n`, "utf8");
+    for (const name of ["harbor.stdout.log", "harbor.stderr.log", "result.raw.log"]) {
+      await writeFile(path.join(runDir, name), "", "utf8");
+    }
+    const trialDir = path.join(runDir, "harbor-jobs", "job-1", "trial-1");
+    await mkdir(trialDir, { recursive: true });
+    await writeFile(path.join(trialDir, "result.json"), `${JSON.stringify({
+      trial_name: "trial-1",
+      task_name: "registry/task-one",
+      exception_info: {
+        exception_type: "RuntimeError",
+        exception_message: "Environment orchestration failed before the agent started."
+      },
+      agent_result: null,
+      verifier_result: null,
+      environment_setup: {
+        started_at: "2026-07-06T00:00:00.000Z",
+        finished_at: "2026-07-06T00:00:01.000Z"
+      },
+      agent_setup: null,
+      agent_execution: null,
+      verifier: null
+    })}\n`, "utf8");
+    await writeHarborJobResult(path.dirname(trialDir), 1, 1);
+
+    const report = await generateBenchReport(runDir);
+
+    expect(report.tasks[0]).toMatchObject({
+      status: "infra_failed",
+      failure_category: "infrastructure_incomplete",
+      agent_outcome: "infrastructure_incomplete",
+      verifier_outcome: "not_run",
+      validity: "infra_failed",
+      suggested_owner: "environment"
+    });
+    expect(report.counts.infra_failed).toBe(1);
+    expect(report.validity).toEqual({ valid: 0, infra_failed: 1 });
+    expect(report.effective_correctness).toEqual({ passed: 0, total: 0, pass_rate: null });
+  });
+
   it("excludes verifier setup failures from effective correctness", async () => {
     const runDir = await mkdtemp(path.join(os.tmpdir(), "sigma-bench-verifier-infra-"));
     await writeFile(path.join(runDir, "config.json"), `${JSON.stringify({
