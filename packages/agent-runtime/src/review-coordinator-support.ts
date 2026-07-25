@@ -99,6 +99,7 @@ export function reviewReadiness(
   const broadWaiver = profileReviewMode(session) !== "required"
     && mutationEvidence.some((item) =>
       item.kind === "user_waiver"
+      && item.runId === session.durable.runId
       && item.data.scope === "review"
       && !item.data.checkpointId);
   const environmentMutations = broadWaiver

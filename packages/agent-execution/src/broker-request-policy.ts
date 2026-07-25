@@ -66,8 +66,7 @@ function executionRoots(
   policy: ExecutionPolicy,
   toolchains: NormalizedTrustedToolchain[],
   verifiedExecutables: string[],
-  backend: "native" | "oci",
-  targetPlatform: string
+  backend: "native" | "oci"
 ): string[] {
   const explicit = policy.executionRoots ?? [];
   assertAbsoluteRoots(explicit, "executionRoots");
@@ -76,8 +75,7 @@ function executionRoots(
     ...explicit.map(comparablePath),
     ...toolchains.flatMap((toolchain) => toolchain.executionRoots)
   ]);
-  const windowsTarget = targetPlatform === "windows" || targetPlatform === "win32";
-  if (backend === "native" && windowsTarget && path.isAbsolute(command.executable)
+  if (backend === "native" && path.isAbsolute(command.executable)
     && !explicit.some((root) => pathWithin(command.executable, root))
     && !toolchains.some((toolchain) => samePath(toolchain.executable, command.executable))
     && !verifiedExecutables.some((candidate) => samePath(candidate, command.executable))) {
@@ -260,8 +258,7 @@ function wirePolicy(
   options: SigmaExecBrokerClientOptions,
   toolchains: NormalizedTrustedToolchain[],
   verifiedExecutables: string[],
-  executableSha256: string | undefined,
-  target: VerifiedTargetExecutableEnvironment | undefined
+  executableSha256: string | undefined
 ): Record<string, unknown> {
   assertAbsoluteRoots(policy.readRoots, "readRoots");
   assertAbsoluteRoots(policy.writeRoots, "writeRoots");
@@ -276,8 +273,7 @@ function wirePolicy(
     policy,
     toolchains,
     verifiedExecutables,
-    backend,
-    target?.platform ?? process.platform
+    backend
   );
   const runtimeRoots = toolchains
     .filter((toolchain) => samePath(toolchain.executable, command.executable))
@@ -347,8 +343,7 @@ export function requestParams(
       options,
       toolchains,
       verifiedExecutables,
-      executableSha256,
-      target
+      executableSha256
     ),
     maxOutputBytes: positiveInteger(request.maxOutputBytes, DEFAULT_MAX_OUTPUT_BYTES, "maxOutputBytes"),
     ...("lifecycle" in request ? { lifecycle: request.lifecycle ?? "session" } : {}),

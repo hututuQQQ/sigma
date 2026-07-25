@@ -5,6 +5,7 @@ import {
   STORE_LAYOUT_VERSION,
   createBudgetLedger,
   type AgentEventEnvelope,
+  type AssuranceResourcePolicyV1,
   type BudgetLimits,
   type ContextItem,
   type JsonValue,
@@ -36,6 +37,7 @@ import {
   type ApprovalBinding,
   type RecoveredApprovalMetadata
 } from "./approval-binding.js";
+import { assurancePolicyFromState } from "./assurance-policy.js";
 
 export interface RestoredSessionData {
   workspacePath: string;
@@ -57,14 +59,16 @@ function freshState(
   event: AgentEventEnvelope,
   mode: RunMode,
   runDeadlineMs: number,
-  budgetLimits?: BudgetLimits
+  budgetLimits?: BudgetLimits,
+  assurancePolicy?: AssuranceResourcePolicyV1
 ): KernelState {
   const state = createKernelState({
     sessionId,
     runId: event.runId || randomUUID(),
     mode,
     startedAt: event.occurredAt,
-    deadlineAt: new Date(Date.now() + runDeadlineMs).toISOString()
+    deadlineAt: new Date(Date.now() + runDeadlineMs).toISOString(),
+    ...(assurancePolicy ? { assurancePolicy } : {})
   });
   if (budgetLimits) state.budget = createBudgetLedger(budgetLimits);
   return state;
@@ -79,7 +83,14 @@ function eventRunMode(event: AgentEventEnvelope, fallback: RunMode): RunMode {
 function nextRun(state: KernelState, event: AgentEventEnvelope, runDeadlineMs: number): KernelState {
   if (event.runId === state.runId || event.type !== "run.started") return state;
   return {
-    ...freshState(state.sessionId, event, eventRunMode(event, state.mode), runDeadlineMs),
+    ...freshState(
+      state.sessionId,
+      event,
+      eventRunMode(event, state.mode),
+      runDeadlineMs,
+      undefined,
+      assurancePolicyFromState(state)
+    ),
     messages: state.messages,
     lastSeq: state.lastSeq,
     plan: state.plan,
@@ -255,7 +266,8 @@ function initializeFromCreated(
       event,
       accumulator.metadata.mode,
       runDeadlineMs,
-      accumulator.metadata.budgetLimits
+      accumulator.metadata.budgetLimits,
+      accumulator.metadata.assurancePolicy
     );
   }
 }

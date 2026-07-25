@@ -341,6 +341,7 @@ export function isRuntimePromptStateV2(value: unknown): value is RuntimePromptSt
 }
 
 export {
+  isAssuranceResourcePolicyV1,
   isAssuranceReserveStateV2,
   isLongHorizonStateV1,
   isLongHorizonStateV2,

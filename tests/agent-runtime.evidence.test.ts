@@ -18,6 +18,7 @@ import type {
   WorkspaceDeltaEvidence
 } from "../packages/agent-protocol/src/index.js";
 import { completionFailure } from "../packages/agent-runtime/src/effect-helpers.js";
+import { completionGateDecision } from "../packages/agent-runtime/src/completion-evidence-gate.js";
 import { assuranceRequirement, validationClaimSatisfies } from "../packages/agent-runtime/src/assurance-engine.js";
 import { evidenceLedger } from "../packages/agent-runtime/src/model-evidence-ledger.js";
 import { beginNextRun } from "../packages/agent-runtime/src/run-transitions.js";
@@ -348,6 +349,51 @@ describe("V5 assurance-coordinated mutation completion", () => {
     expect(evidenceLedger(active).content).toContain(
       "enclosing-container changed paths: 1"
     );
+  });
+
+  it("does not carry a broad reviewer waiver across follow-up runs", () => {
+    const active = session([]);
+    const environment: EvidenceRecord = {
+      evidenceId: "current-environment-change",
+      sessionId: "session",
+      runId: "run",
+      kind: "diagnostic",
+      status: "passed",
+      createdAt: now,
+      producer: { authority: "tool", id: "exec" },
+      summary: "container path changed",
+      data: {
+        source: "enclosing_container_mutation",
+        diagnostic: {
+          schemaVersion: 1,
+          scope: "enclosing_container",
+          callId: "exec",
+          declaredPaths: ["/etc/example.conf"],
+          resultDigest: "c".repeat(64),
+          ok: true,
+          effects: ["filesystem.write"]
+        }
+      }
+    };
+    active.durable.state.mutationEvidence.push(
+      waiver("prior-run-waiver", "prior-run"),
+      environment
+    );
+    active.durable.state.mutationFrontier = {
+      revision: 1,
+      baselineManifestDigest: "0".repeat(64),
+      currentStateDigest: "c".repeat(64),
+      changedPaths: [],
+      environmentChangedPaths: ["/etc/example.conf"],
+      sourceCheckpointIds: []
+    };
+
+    expect(reviewReadiness(active, "completion").environmentMutations)
+      .toContainEqual(expect.objectContaining({ evidenceId: "current-environment-change" }));
+    expect(completionGateDecision(active)).toMatchObject({
+      action: "fail",
+      code: "verification_unavailable"
+    });
   });
 
   it("does not let a generic acceptance claim replace explicit semantic claims", () => {
@@ -1769,6 +1815,46 @@ describe.skip("V3 run-scoped completion evidence", () => {
     expect(active.durable.state.evidence).toEqual([]);
     expect(active.durable.state.receipts).toEqual([]);
     expect(active.durable.state.checkpointHead).toBeUndefined();
+  });
+
+  it("preserves the frozen assurance policy while resetting per-run usage", () => {
+    const policy = {
+      budgetPercent: 17,
+      reviewRounds: 3,
+      repairRounds: 2,
+      reviewerMaxTurns: 5,
+      reviewerMaxToolCalls: 9,
+      repairMaxTurns: 4,
+      repairMaxToolCalls: 7,
+      strategistMode: "off" as const,
+      duplicateThreshold: 5,
+      strategyRemainingPercent: 31
+    };
+    const state = createKernelState({
+      sessionId: "session",
+      runId: "run",
+      mode: "change",
+      startedAt: now,
+      deadlineAt: now,
+      assurancePolicy: policy
+    });
+    state.longHorizon.assurance.reviewerCalls = 2;
+    state.longHorizon.assurance.repairEpisodes = 1;
+    state.longHorizon.assurance.auxiliaryInputTokens = 100;
+    const active = runtimeSessionFixture({ state });
+
+    beginNextRun(active, "change", 60_000);
+
+    expect(active.durable.state.longHorizon.assurance).toMatchObject({
+      ...policy,
+      maxAuxiliaryCalls: 15,
+      maxAuxiliaryBudgetBps: 1_700,
+      reviewerCalls: 0,
+      repairEpisodes: 0,
+      auxiliaryInputTokens: 0,
+      protectedRepairTurnsRemaining: 8,
+      protectedToolCallsRemaining: 14
+    });
   });
 
   it("retains unresolved mutation obligations across a follow-up run", () => {

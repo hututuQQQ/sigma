@@ -235,6 +235,19 @@ export const strategyResetV2Schema = z.object({
   }
 });
 
+export const assuranceResourcePolicySchema = z.object({
+  budgetPercent: z.number().int().min(1).max(100),
+  reviewRounds: z.number().int().min(1).max(8),
+  repairRounds: z.number().int().min(0).max(4),
+  reviewerMaxTurns: z.number().int().min(1).max(32),
+  reviewerMaxToolCalls: z.number().int().min(0).max(128),
+  repairMaxTurns: z.number().int().min(1).max(32),
+  repairMaxToolCalls: z.number().int().min(0).max(128),
+  strategistMode: z.enum(["off", "on_demand", "adaptive"]),
+  duplicateThreshold: z.number().int().min(2).max(16),
+  strategyRemainingPercent: z.number().int().min(1).max(100)
+}).strict();
+
 export const longHorizonStateV2Schema = z.object({
   schemaVersion: z.literal(2),
   goalEpoch: z.number().int().nonnegative(),
@@ -250,18 +263,8 @@ export const longHorizonStateV2Schema = z.object({
   strategyRequested: z.boolean(),
   resourceBandTriggered: z.boolean(),
   strategy: strategyResetV2Schema.optional(),
-  assurance: z.object({
+  assurance: assuranceResourcePolicySchema.extend({
     schemaVersion: z.literal(2),
-    budgetPercent: z.number().int().min(1).max(100),
-    reviewRounds: z.number().int().min(1).max(8),
-    repairRounds: z.number().int().min(0).max(4),
-    reviewerMaxTurns: z.number().int().min(1).max(32),
-    reviewerMaxToolCalls: z.number().int().min(0).max(128),
-    repairMaxTurns: z.number().int().min(1).max(32),
-    repairMaxToolCalls: z.number().int().min(0).max(128),
-    strategistMode: z.enum(["off", "on_demand", "adaptive"]),
-    duplicateThreshold: z.number().int().min(2).max(16),
-    strategyRemainingPercent: z.number().int().min(1).max(100),
     maxAuxiliaryCalls: z.number().int().nonnegative(),
     maxAuxiliaryBudgetBps: z.number().int().min(100).max(10_000),
     strategistCalls: z.number().int().nonnegative(),

@@ -119,27 +119,17 @@ describe("OCI executable request resolution", () => {
 });
 
 describe("native executable authority", () => {
-  it("defers an absolute Linux primary to the connected sandbox", () => {
-    const executable = path.resolve("fixture-system", "tool");
-    const params = requestParams(
-      request(executable),
-      options("native"),
-      normalizeTrustedToolchains([]),
-      [],
-      { platform: "linux", searchPaths: [] }
-    ) as { command: { executable: string } };
-
-    expect(params.command.executable).toBe(executable);
-  });
-
-  it("keeps the Windows client precheck for its narrower native sandbox", () => {
-    const executable = path.resolve("fixture-system", "tool.exe");
-    expect(() => requestParams(
-      request(executable),
-      options("native"),
-      normalizeTrustedToolchains([]),
-      [],
-      { platform: "win32", searchPaths: [] }
-    )).toThrow(expect.objectContaining({ code: "executable_unavailable" }));
-  });
+  it.each(["linux", "win32"] as const)(
+    "requires an exact trusted native primary for a %s target",
+    (platform) => {
+      const executable = path.resolve("fixture-system", "tool");
+      expect(() => requestParams(
+        request(executable),
+        options("native"),
+        normalizeTrustedToolchains([]),
+        [],
+        { platform, searchPaths: [] }
+      )).toThrow(expect.objectContaining({ code: "executable_unavailable" }));
+    }
+  );
 });

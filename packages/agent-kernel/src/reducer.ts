@@ -219,17 +219,13 @@ const diagnostic: EventReducer = (state, _event, payload) => {
     });
   }
   if (payload.kind === "recovery.retry_model") {
-    const message = text(payload.message);
     return {
       ...state,
       phase: "ready_model",
       activeModelTurn: undefined,
       activeModelSemanticDelta: undefined,
       proposedOutcome: undefined,
-      outcome: undefined,
-      ...(message
-        ? { messages: [...state.messages, { role: "developer" as const, content: message }] }
-        : {})
+      outcome: undefined
     };
   }
   if (payload.kind === "completion.advisory") {

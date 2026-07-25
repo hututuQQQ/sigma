@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { dateTimeSchema, nonEmptyStringSchema } from "./domain-schemas.js";
 import {
+  assuranceResourcePolicySchema,
   contextItemSchema,
   runtimePromptStateV2Schema,
   durableToolReceiptShape,
@@ -208,6 +209,7 @@ export const coreEventPayloadSchemas = {
     strictWriteScope: z.boolean(),
     modelRole: sharedSchemas.modelExecutionRoleSchema,
     budgetLimits: sharedSchemas.budgetLimitsSchema.optional(),
+    assurancePolicy: assuranceResourcePolicySchema.optional(),
     parentSessionId: nonEmptyStringSchema.optional()
   }).strict(),
   "run.started": z.object({ mode: runModeSchema, deadlineAt: dateTimeSchema }).strict(),

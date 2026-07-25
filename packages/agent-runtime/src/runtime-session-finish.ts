@@ -191,7 +191,7 @@ export async function finishRuntimeSession(
     const decision = completionGateDecision(session);
     if (decision.action === "continue") {
       await options.events.emit(session, "diagnostic", "runtime", {
-        kind: "recovery.retry_model",
+        kind: "completion.advisory",
         message: decision.message
       });
       return false;

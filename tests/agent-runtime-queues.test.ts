@@ -1288,6 +1288,18 @@ describe("runtime queues and non-blocking instruction steering", () => {
     const firstRunId = "first-run";
     const currentRunId = "current-run";
     const deadlineAt = new Date(Date.now() + 30_000).toISOString();
+    const assurancePolicy = {
+      budgetPercent: 19,
+      reviewRounds: 3,
+      repairRounds: 2,
+      reviewerMaxTurns: 5,
+      reviewerMaxToolCalls: 10,
+      repairMaxTurns: 4,
+      repairMaxToolCalls: 6,
+      strategistMode: "on_demand" as const,
+      duplicateThreshold: 4,
+      strategyRemainingPercent: 30
+    };
     let seq = 0;
     const append = async (
       runId: string,
@@ -1308,7 +1320,11 @@ describe("runtime queues and non-blocking instruction steering", () => {
       await store.append(stored, seq);
       seq += 1;
     };
-    await append(firstRunId, "session.created", { workspacePath: workspace, mode: initialMode });
+    await append(firstRunId, "session.created", {
+      workspacePath: workspace,
+      mode: initialMode,
+      assurancePolicy
+    });
     await append(firstRunId, "run.started", { mode: initialMode, deadlineAt });
     await append(firstRunId, "user.message", { text: "first run" });
     await append(firstRunId, "model.started", { turnId: 1, effectRevision: 3 });
@@ -1343,7 +1359,8 @@ describe("runtime queues and non-blocking instruction steering", () => {
           runId: firstRunId,
           mode: initialMode,
           startedAt: new Date().toISOString(),
-          deadlineAt
+          deadlineAt,
+          assurancePolicy
         }),
         phase: "terminal" as const,
         revision: seq,
@@ -1366,6 +1383,11 @@ describe("runtime queues and non-blocking instruction steering", () => {
     const restored = await restoreStoredSession(store, sessionId, 30_000);
     expect(restored.mode).toBe(currentMode);
     expect(restored.state).toMatchObject({ runId: currentRunId, mode: currentMode, phase: "ready_model" });
+    expect(restored.state.longHorizon.assurance).toMatchObject({
+      ...assurancePolicy,
+      reviewerCalls: 0,
+      repairEpisodes: 0
+    });
   });
 
   it("enforces child write scope before a shared-workspace mutation", async () => {

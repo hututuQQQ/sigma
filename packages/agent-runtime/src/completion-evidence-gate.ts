@@ -214,6 +214,7 @@ function currentReviewWaiver(session: RuntimeSession): boolean {
     (session.durable.state.mutationFrontier.environmentChangedPaths?.length ?? 0) > 0;
   const broadWaiver = evidence.some((item) =>
     item.kind === "user_waiver"
+    && item.runId === session.durable.runId
     && item.data.scope === "review"
     && !item.data.checkpointId);
   return (unresolved.length > 0 || environmentChanged)

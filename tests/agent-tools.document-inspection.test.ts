@@ -18,6 +18,10 @@ import {
   MAX_DOCUMENT_INSPECTION_BYTES,
   registerBuiltinTools
 } from "../packages/agent-tools/src/index.js";
+import {
+  boundedPdfRenderGeometry,
+  MAX_PDF_RENDER_PIXELS
+} from "../packages/agent-tools/src/document-inspection-pdf.js";
 
 const temporaryPaths: string[] = [];
 
@@ -180,6 +184,14 @@ function scannedTextPdf(text: string): Buffer {
 }
 
 describe("local PDF document inspection", () => {
+  it("keeps giant-page OCR canvases below the final integer pixel cap", () => {
+    const geometry = boundedPdfRenderGeometry(100_000, 100_000);
+    expect(geometry.scale).toBeLessThan(0.5);
+    expect(geometry.width * geometry.height).toBeLessThanOrEqual(MAX_PDF_RENDER_PIXELS);
+    expect(() => boundedPdfRenderGeometry(Number.POSITIVE_INFINITY, 100))
+      .toThrow(expect.objectContaining({ code: "document_inspection_render_too_large" }));
+  });
+
   it("registers an objective read-only, offline tool contract", async () => {
     const workspace = await temporaryDirectory("sigma-document-contract-");
     await writeFile(path.join(workspace, "input.pdf"), textPdf(["Contract sample"]));

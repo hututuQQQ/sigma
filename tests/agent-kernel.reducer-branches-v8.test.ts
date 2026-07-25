@@ -284,10 +284,18 @@ describe("agent-kernel reducer branch contracts", () => {
       failureKind: "blocked",
       failureCode: "missing"
     });
-    state = apply(ready(), "diagnostic", {
+    state = ready();
+    const messagesBeforeRetry = state.messages;
+    state = apply(state, "diagnostic", {
       kind: "recovery.retry_model", message: "retry"
     });
-    expect(state.messages.at(-1)?.content).toBe("retry");
+    expect(state.messages).toBe(messagesBeforeRetry);
+    for (let index = 0; index < 100_000; index += 1) {
+      state = apply(state, "diagnostic", {
+        kind: "recovery.retry_model", message: `retry-${index}`
+      });
+    }
+    expect(state.messages).toBe(messagesBeforeRetry);
     state = apply(state, "diagnostic", {
       kind: "completion.advisory", message: "repair"
     });

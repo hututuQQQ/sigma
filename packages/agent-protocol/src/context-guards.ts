@@ -1,4 +1,5 @@
 import type {
+  AssuranceResourcePolicyV1,
   AssuranceReserveStateV1,
   AssuranceReserveStateV2,
   ContextArchiveV1,
@@ -181,20 +182,28 @@ function isBoundedInteger(value: unknown, minimum: number, maximum: number): boo
     && Number(value) <= maximum;
 }
 
+export function isAssuranceResourcePolicyV1(
+  value: unknown
+): value is AssuranceResourcePolicyV1 {
+  const policy = record(value);
+  return Boolean(policy
+    && isPercentage(policy.budgetPercent)
+    && isBoundedInteger(policy.reviewRounds, 1, 8)
+    && isBoundedInteger(policy.repairRounds, 0, 4)
+    && isBoundedInteger(policy.reviewerMaxTurns, 1, 32)
+    && isBoundedInteger(policy.reviewerMaxToolCalls, 0, 128)
+    && isBoundedInteger(policy.repairMaxTurns, 1, 32)
+    && isBoundedInteger(policy.repairMaxToolCalls, 0, 128)
+    && ["off", "on_demand", "adaptive"].includes(String(policy.strategistMode))
+    && isBoundedInteger(policy.duplicateThreshold, 2, 16)
+    && isPercentage(policy.strategyRemainingPercent));
+}
+
 function validAssurancePolicyV2(
   reserve: Record<string, unknown>,
   strategistCapacity: number
 ): boolean {
-  return isPercentage(reserve.budgetPercent)
-    && isBoundedInteger(reserve.reviewRounds, 1, 8)
-    && isBoundedInteger(reserve.repairRounds, 0, 4)
-    && isBoundedInteger(reserve.reviewerMaxTurns, 1, 32)
-    && isBoundedInteger(reserve.reviewerMaxToolCalls, 0, 128)
-    && isBoundedInteger(reserve.repairMaxTurns, 1, 32)
-    && isBoundedInteger(reserve.repairMaxToolCalls, 0, 128)
-    && ["off", "on_demand", "adaptive"].includes(String(reserve.strategistMode))
-    && isBoundedInteger(reserve.duplicateThreshold, 2, 16)
-    && isPercentage(reserve.strategyRemainingPercent)
+  return isAssuranceResourcePolicyV1(reserve)
     && isNonNegativeInteger(reserve.maxAuxiliaryCalls)
     && Number(reserve.maxAuxiliaryCalls)
       === Number(reserve.reviewRounds) * Number(reserve.reviewerMaxTurns)

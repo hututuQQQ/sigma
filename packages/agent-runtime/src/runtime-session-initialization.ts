@@ -11,6 +11,7 @@ import {
 import type { StartSession } from "agent-protocol";
 import type { RuntimeAgentProfile, RuntimeSession } from "./types.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
+import { assurancePolicyFromState } from "./assurance-policy.js";
 import { persistFrozenWorkspaceHookAssets } from "./frozen-hook-assets.js";
 import { emitSubjectAttestationV1, type SubjectAttestationContextV1 } from "./subject-attestation.js";
 
@@ -137,7 +138,8 @@ export async function initializeRuntimeSession(
     strictWriteScope: session.identity.strictWriteScope,
     modelRole: session.services.modelRole,
     ...(session.identity.parentSessionId ? { parentSessionId: session.identity.parentSessionId } : {}),
-    budgetLimits: session.durable.state.budget.limits
+    budgetLimits: session.durable.state.budget.limits,
+    assurancePolicy: assurancePolicyFromState(session.durable.state)
   });
   await emitSubjectAttestationV1(session, options.subjectAttestation, options.emit);
   await emitResolvedProfile(session, options);

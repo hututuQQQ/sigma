@@ -13,6 +13,7 @@ const HOST_CONTROL_SOCKETS: &[&str] = &[
     "/run/containerd/containerd.sock",
     "/run/podman/podman.sock",
 ];
+const DISPOSABLE_WRITABLE_FILESYSTEMS: &[&str] = &["tmpfs", "devtmpfs", "devpts", "mqueue", "proc"];
 // Harbor grants the outer task container CAP_SYS_ADMIN solely so bubblewrap
 // can create a nested mount/user namespace. The command still runs inside
 // that nested namespace, and the attestation below independently requires a
@@ -73,12 +74,20 @@ pub(crate) fn require_enclosing_container_boundary() -> Result<(), RpcError> {
 
 fn inspect_inner() -> Result<EnclosingContainerBoundary, String> {
     let marker = trusted_container_marker()?;
-    let root_filesystem = root_filesystem_type()?;
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|error| format!("cannot read mount namespace: {error}"))?;
+    let mounts = parse_mountinfo(&mountinfo)?;
+    let root_mount = mounts
+        .iter()
+        .find(|mount| mount.mount_point == "/")
+        .ok_or_else(|| "root filesystem was not found in mountinfo".to_owned())?;
+    let root_filesystem = root_mount.filesystem_type.as_str();
     if root_filesystem != "overlay" && root_filesystem != "fuse-overlayfs" {
         return Err(format!(
             "root filesystem '{root_filesystem}' is not an attested copy-on-write container root"
         ));
     }
+    reject_writable_host_submounts(&mounts, root_mount)?;
     let effective_capabilities = effective_capabilities()?;
     let disallowed = DISALLOWED_CAPABILITIES
         .iter()
@@ -108,13 +117,15 @@ fn inspect_inner() -> Result<EnclosingContainerBoundary, String> {
 
     let marker_metadata = fs::metadata(&marker)
         .map_err(|error| format!("cannot re-inspect container marker: {error}"))?;
+    let mount_namespace_digest = format!("{:x}", Sha256::digest(mountinfo.as_bytes()));
     let material = format!(
-        "v1\0{}\0{}\0{}\0{}\0{:x}",
+        "v2\0{}\0{}\0{}\0{}\0{:x}\0{}",
         marker.display(),
         marker_metadata.dev(),
         marker_metadata.ino(),
         root_filesystem,
-        effective_capabilities
+        effective_capabilities,
+        mount_namespace_digest
     );
     let digest = format!("sha256:{:x}", Sha256::digest(material.as_bytes()));
     Ok(EnclosingContainerBoundary {
@@ -159,24 +170,65 @@ fn trusted_container_marker() -> Result<PathBuf, String> {
     })
 }
 
-fn root_filesystem_type() -> Result<String, String> {
-    parse_root_filesystem_type(
-        &fs::read_to_string("/proc/self/mountinfo")
-            .map_err(|error| format!("cannot read mount namespace: {error}"))?,
-    )
-    .ok_or_else(|| "root filesystem was not found in mountinfo".into())
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MountInfoEntry {
+    major_minor: String,
+    mount_point: String,
+    mount_options: String,
+    filesystem_type: String,
 }
 
-fn parse_root_filesystem_type(mountinfo: &str) -> Option<String> {
-    for line in mountinfo.lines() {
-        let fields = line.split_whitespace().collect::<Vec<_>>();
-        if fields.get(4).copied() != Some("/") {
-            continue;
-        }
-        let separator = fields.iter().position(|field| *field == "-")?;
-        return fields.get(separator + 1).map(|value| (*value).to_owned());
+impl MountInfoEntry {
+    fn writable(&self) -> bool {
+        self.mount_options.split(',').any(|option| option == "rw")
     }
-    None
+}
+
+fn parse_mountinfo(mountinfo: &str) -> Result<Vec<MountInfoEntry>, String> {
+    let mut mounts = Vec::new();
+    for (index, line) in mountinfo.lines().enumerate() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        let separator = fields
+            .iter()
+            .position(|field| *field == "-")
+            .ok_or_else(|| format!("mountinfo line {} has no field separator", index + 1))?;
+        if fields.len() < 6 || separator + 3 >= fields.len() {
+            return Err(format!("mountinfo line {} is incomplete", index + 1));
+        }
+        mounts.push(MountInfoEntry {
+            major_minor: fields[2].to_owned(),
+            mount_point: fields[4].to_owned(),
+            mount_options: fields[5].to_owned(),
+            filesystem_type: fields[separator + 1].to_owned(),
+        });
+    }
+    Ok(mounts)
+}
+
+#[cfg(test)]
+fn parse_root_filesystem_type(mountinfo: &str) -> Option<String> {
+    parse_mountinfo(mountinfo)
+        .ok()?
+        .into_iter()
+        .find_map(|mount| (mount.mount_point == "/").then_some(mount.filesystem_type))
+}
+
+fn reject_writable_host_submounts(
+    mounts: &[MountInfoEntry],
+    root: &MountInfoEntry,
+) -> Result<(), String> {
+    if let Some(mount) = mounts.iter().find(|mount| {
+        mount.mount_point != "/"
+            && mount.writable()
+            && mount.major_minor != root.major_minor
+            && !DISPOSABLE_WRITABLE_FILESYSTEMS.contains(&mount.filesystem_type.as_str())
+    }) {
+        return Err(format!(
+            "writable non-disposable submount '{}' ({}) prevents enclosing-container attestation",
+            mount.mount_point, mount.filesystem_type
+        ));
+    }
+    Ok(())
 }
 
 fn effective_capabilities() -> Result<u64, String> {
@@ -208,6 +260,39 @@ mod tests {
             parse_root_filesystem_type(input).as_deref(),
             Some("overlay")
         );
+    }
+
+    #[test]
+    fn rejects_writable_host_submounts_below_a_cow_root() {
+        let input = concat!(
+            "41 32 0:39 / / rw,relatime - overlay overlay rw,lowerdir=/lower\n",
+            "42 41 8:1 /host/project /workspace rw,relatime - ext4 /dev/sda1 rw\n",
+        );
+        let mounts = parse_mountinfo(input).expect("valid mountinfo");
+        let root = mounts
+            .iter()
+            .find(|mount| mount.mount_point == "/")
+            .expect("root mount");
+        assert_eq!(
+            reject_writable_host_submounts(&mounts, root),
+            Err("writable non-disposable submount '/workspace' (ext4) prevents enclosing-container attestation".into())
+        );
+    }
+
+    #[test]
+    fn permits_read_only_host_and_writable_disposable_submounts() {
+        let input = concat!(
+            "41 32 0:39 / / rw,relatime - overlay overlay rw,lowerdir=/lower\n",
+            "42 41 8:1 /host/project /workspace ro,relatime - ext4 /dev/sda1 rw\n",
+            "43 41 0:48 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n",
+            "44 41 0:49 / /dev rw,nosuid - tmpfs tmpfs rw,size=65536k\n",
+        );
+        let mounts = parse_mountinfo(input).expect("valid mountinfo");
+        let root = mounts
+            .iter()
+            .find(|mount| mount.mount_point == "/")
+            .expect("root mount");
+        assert_eq!(reject_writable_host_submounts(&mounts, root), Ok(()));
     }
 
     #[test]

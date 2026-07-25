@@ -8,7 +8,7 @@ import { LocalEnglishOcr, type OcrLayout } from "./local-ocr.js";
 import type { PlannedToolExecutionContext } from "./registry.js";
 
 const MAX_OCR_PAGES = 10;
-const MAX_RENDER_PIXELS = 16_000_000;
+export const MAX_PDF_RENDER_PIXELS = 16_000_000;
 const EMBEDDED_TEXT_THRESHOLD = 16;
 
 export type OcrMode = "auto" | "never" | "always";
@@ -59,15 +59,53 @@ function embeddedText(items: Awaited<ReturnType<PDFPageProxy["getTextContent"]>>
   return normalizeText(value);
 }
 
+function renderGeometryError(message: string): Error {
+  return Object.assign(new Error(message), {
+    code: "document_inspection_render_too_large"
+  });
+}
+
+export function boundedPdfRenderGeometry(
+  baseWidth: number,
+  baseHeight: number
+): { scale: number; width: number; height: number } {
+  if (![baseWidth, baseHeight].every((value) => Number.isFinite(value) && value > 0)) {
+    throw renderGeometryError("PDF page dimensions must be finite and positive.");
+  }
+  const scaleForCap =
+    Math.sqrt(MAX_PDF_RENDER_PIXELS) / Math.sqrt(baseWidth) / Math.sqrt(baseHeight);
+  let scale = Math.min(2, scaleForCap);
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const width = Math.max(1, Math.ceil(baseWidth * scale));
+    const height = Math.max(1, Math.ceil(baseHeight * scale));
+    const pixels = width * height;
+    if (Number.isSafeInteger(pixels) && pixels <= MAX_PDF_RENDER_PIXELS) {
+      return { scale, width, height };
+    }
+    const correction = Math.sqrt(MAX_PDF_RENDER_PIXELS / pixels);
+    if (!Number.isFinite(correction) || correction <= 0 || correction >= 1) break;
+    scale *= correction * 0.999_999;
+  }
+  throw renderGeometryError(
+    `PDF page cannot be rendered within the ${MAX_PDF_RENDER_PIXELS.toLocaleString("en-US")}-pixel safety cap.`
+  );
+}
+
 async function renderPage(page: PDFPageProxy): Promise<Buffer> {
   canvasRuntime ??= import("@napi-rs/canvas");
   const { createCanvas } = await canvasRuntime;
   const base = page.getViewport({ scale: 1 });
-  const basePixels = Math.max(1, base.width * base.height);
-  const scale = Math.max(0.5, Math.min(2, Math.sqrt(MAX_RENDER_PIXELS / basePixels)));
+  const geometry = boundedPdfRenderGeometry(base.width, base.height);
+  const { scale } = geometry;
   const viewport = page.getViewport({ scale });
   const width = Math.max(1, Math.ceil(viewport.width));
   const height = Math.max(1, Math.ceil(viewport.height));
+  if (!Number.isSafeInteger(width * height)
+    || width * height > MAX_PDF_RENDER_PIXELS) {
+    throw renderGeometryError(
+      "The scaled PDF viewport exceeds the render pixel safety cap."
+    );
+  }
   const canvas = createCanvas(width, height);
   const task = page.render({
     canvas: canvas as never,
