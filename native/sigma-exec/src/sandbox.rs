@@ -74,6 +74,13 @@ pub struct ExecutionPolicy {
     pub executable_sha256: Option<String>,
     #[serde(default)]
     pub protected_paths: Vec<PathBuf>,
+    /**
+     * Explicit authority to mutate declared paths in an independently
+     * attested disposable enclosing container. This never bypasses declared
+     * read/write roots or protected paths.
+     */
+    #[serde(default)]
+    pub enclosing_container_root: bool,
     #[serde(default)]
     pub disposable_workspace_root: Option<PathBuf>,
     #[serde(default)]
@@ -249,6 +256,16 @@ pub fn doctor_report() -> Value {
     let shells = verified_shells(&status);
     let executable_paths = executable_search_path_snapshot();
     let runtime_commands = runtime_command_snapshot(&executable_paths);
+    #[cfg(target_os = "linux")]
+    let enclosing_container_root =
+        crate::container_boundary::inspect_enclosing_container_boundary().report();
+    #[cfg(not(target_os = "linux"))]
+    let enclosing_container_root = json!({
+        "available": false,
+        "rootKind": "unavailable",
+        "attestationDigest": Value::Null,
+        "reason": "enclosing-container authority is supported only on Linux",
+    });
     json!({
         "protocolVersion": crate::protocol::PROTOCOL_VERSION,
         "brokerVersion": env!("CARGO_PKG_VERSION"),
@@ -287,6 +304,12 @@ pub fn doctor_report() -> Value {
             "shells": shells,
             "runtimeCommands": runtime_commands.commands,
             "runtimeCommandSnapshotComplete": runtime_commands.complete,
+            // The sandbox, rather than a client-side command-name allowlist,
+            // resolves and pins each requested executable before launch.
+            "directExecutableResolution": cfg!(target_os = "linux")
+                && status.available
+                && status.self_test_passed,
+            "enclosingContainerRoot": enclosing_container_root,
             // OCI clients reconstruct PATH from this target-observed value;
             // they never inherit the control process PATH.
             "executableSearchPaths": executable_paths.serialized,
@@ -482,6 +505,7 @@ fn linux_verified_bash() -> Option<PathBuf> {
                     execution_roots: Vec::new(),
                     executable_sha256: None,
                     protected_paths: Vec::new(),
+                    enclosing_container_root: false,
                     disposable_workspace_root: None,
                     read_only_validation_workspace_root: None,
                     scratch_lease_id: None,
@@ -562,6 +586,15 @@ pub fn build_command(
     scratch: Option<&ScratchLease>,
 ) -> Result<PreparedCommand, RpcError> {
     validate(params, allow_unsafe)?;
+    let scratch = if params.policy.enclosing_container_root {
+        // The explicitly declared enclosing-container write roots must refer
+        // to the outer disposable container itself. Mounting the ordinary
+        // session HOME or /tmp overlay here would silently discard mutations
+        // that the caller is authorized to persist for the task lifetime.
+        None
+    } else {
+        scratch
+    };
     #[cfg(not(target_os = "linux"))]
     if params.policy.disposable_workspace_root.is_some() {
         return Err(RpcError::new(
@@ -655,6 +688,29 @@ fn validate(params: &ProcessParams, _allow_unsafe: bool) -> Result<(), RpcError>
         return Err(RpcError::new(
             "policy_denied",
             "full network requires per-call approval",
+        ));
+    }
+    if params.policy.enclosing_container_root {
+        if params.policy.sandbox != SandboxMode::Required {
+            return Err(RpcError::new(
+                "policy_denied",
+                "enclosing-container authority requires the native sandbox",
+            ));
+        }
+        if params.policy.disposable_workspace_root.is_some()
+            || params.policy.read_only_validation_workspace_root.is_some()
+        {
+            return Err(RpcError::new(
+                "policy_denied",
+                "enclosing-container mutation cannot be combined with a validation overlay",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        crate::container_boundary::require_enclosing_container_boundary()?;
+        #[cfg(not(target_os = "linux"))]
+        return Err(RpcError::new(
+            "enclosing_container_unavailable",
+            "enclosing-container authority is supported only on Linux",
         ));
     }
     if params
@@ -828,9 +884,11 @@ fn validate_roots(params: &ProcessParams) -> Result<(), RpcError> {
         }
     }
     for execution_root in &execution_roots {
-        if write_roots.iter().any(|write_root| {
-            write_root.starts_with(execution_root) || execution_root.starts_with(write_root)
-        }) {
+        if !params.policy.enclosing_container_root
+            && write_roots.iter().any(|write_root| {
+                write_root.starts_with(execution_root) || execution_root.starts_with(write_root)
+            })
+        {
             return Err(RpcError::new(
                 "policy_denied",
                 "execution roots must not overlap writable roots",
@@ -848,6 +906,7 @@ fn validate_roots(params: &ProcessParams) -> Result<(), RpcError> {
     protected_paths.extend(
         minimal_roots(&read_roots)
             .into_iter()
+            .filter(|root| root.as_path() != Path::new("/"))
             .flat_map(|root| [root.join(".git"), root.join(".agent")]),
     );
     for protected in &protected_paths {
@@ -889,6 +948,7 @@ fn protected_path_candidates(params: &ProcessParams) -> Result<Vec<PathBuf>, Rpc
     candidates.extend(
         minimal_roots(&read_roots)
             .into_iter()
+            .filter(|root| root.as_path() != Path::new("/"))
             .flat_map(|root| [root.join(".git"), root.join(".agent")]),
     );
     let mut resolved = BTreeMap::<String, PathBuf>::new();
@@ -1136,6 +1196,23 @@ fn build_sandboxed_command(
     disposable_workspace: Option<&DisposableWorkspace>,
 ) -> Result<PreparedCommand, RpcError> {
     let bwrap = trusted_bwrap().map_err(|error| RpcError::new("sandbox_unavailable", error))?;
+    let helper = std::env::current_exe().map_err(|error| {
+        RpcError::new(
+            "sandbox_unavailable",
+            format!("cannot resolve sigma-exec hardening helper: {error}"),
+        )
+    })?;
+    let helper_source = PinnedMountSource::pin(&helper)?;
+    let enclosing_helper_source = params
+        .policy
+        .enclosing_container_root
+        .then(|| PinnedMountSource::pin(&helper))
+        .transpose()?;
+    let enclosing_bwrap_source = params
+        .policy
+        .enclosing_container_root
+        .then(|| PinnedMountSource::pin(&bwrap))
+        .transpose()?;
     let mut command = Command::new(bwrap);
     // Session processes retain bubblewrap's parent-death cleanup in addition
     // to the broker watchdog. A deliverable must survive only after the
@@ -1177,6 +1254,7 @@ fn build_sandboxed_command(
         &resolved_read_roots,
         &resolved_write_roots,
         &resolved_execution_roots,
+        params.policy.enclosing_container_root,
     )?;
     let resolved_protected_roots = resolve_protected(params, &resolved_read_roots)?;
     let read_roots = pin_resolved_mount_sources(resolved_read_roots)?;
@@ -1209,16 +1287,31 @@ fn build_sandboxed_command(
         &write_roots,
         &execution_roots,
         &protected_roots,
+        params.policy.enclosing_container_root,
     )?;
     let executable =
         authorize_linux_executable(params, &system_roots, &execution_roots, &runtime_cwd_source)?;
     let executable_destination = executable.source.destination().to_owned();
-    for parent in linux_system_mount_parents(&system_roots) {
-        command.arg("--dir").arg(parent);
-    }
-    for root in &system_roots {
-        let value = root.to_string_lossy();
-        command.args(["--ro-bind", value.as_ref(), value.as_ref()]);
+    let root_write = write_roots
+        .iter()
+        .find(|root| root.destination() == Path::new("/"));
+    let root_read = read_roots
+        .iter()
+        .find(|root| root.destination() == Path::new("/"));
+    let root_mount = root_write.or(root_read);
+    if let Some(root) = root_mount {
+        // A policy root at "/" must be the first filesystem layer. Applying
+        // it after /proc, /dev, scratch, or protected mounts would replace
+        // those isolation layers with objects from the enclosing namespace.
+        root.append_bind(&mut command, root_write.is_none());
+    } else {
+        for parent in linux_system_mount_parents(&system_roots) {
+            command.arg("--dir").arg(parent);
+        }
+        for root in &system_roots {
+            let value = root.to_string_lossy();
+            command.args(["--ro-bind", value.as_ref(), value.as_ref()]);
+        }
     }
     command.args(["--proc", "/proc", "--dev", "/dev"]);
     let scratch_home = scratch
@@ -1227,7 +1320,13 @@ fn build_sandboxed_command(
     let scratch_temp = scratch
         .map(|lease| PinnedMountSource::pin(lease.temp_source()))
         .transpose()?;
-    if let (Some(lease), Some(home), Some(temp)) =
+    if params.policy.enclosing_container_root {
+        // Preserve the task container's own /tmp. A declared /tmp or "/"
+        // write root below determines whether it is writable.
+        if root_mount.is_none() && Path::new("/tmp").exists() {
+            command.args(["--ro-bind", "/tmp", "/tmp"]);
+        }
+    } else if let (Some(lease), Some(home), Some(temp)) =
         (scratch, scratch_home.as_ref(), scratch_temp.as_ref())
     {
         home.append_bind_at(&mut command, false, lease.home_destination());
@@ -1235,13 +1334,25 @@ fn build_sandboxed_command(
     } else {
         command.args(["--tmpfs", "/tmp"]);
     }
-    bind_pinned_roots(&mut command, &read_roots, true, &system_roots);
-    bind_pinned_roots(&mut command, &write_roots, false, &[]);
-    bind_pinned_roots(&mut command, &execution_roots, true, &system_roots);
+    bind_pinned_roots(&mut command, &read_roots, true, &system_roots, true);
+    bind_pinned_roots(&mut command, &write_roots, false, &[], true);
+    bind_pinned_roots(&mut command, &execution_roots, true, &system_roots, false);
     if let (Some(workspace), Some(source)) = (disposable_workspace, disposable_source.as_ref()) {
         source.append_bind_at(&mut command, false, workspace.destination());
     }
-    bind_pinned_roots(&mut command, &protected_roots, true, &[]);
+    bind_pinned_roots(&mut command, &protected_roots, true, &[], false);
+    if params.policy.enclosing_container_root {
+        // Enclosing-container writes may legitimately include /usr or even
+        // the filesystem root. Keep the broker and bubblewrap entry points
+        // immutable inside every such command so one call cannot replace the
+        // isolation machinery used by a later call.
+        if let Some(source) = enclosing_helper_source.as_ref() {
+            source.append_bind(&mut command, true);
+        }
+        if let Some(source) = enclosing_bwrap_source.as_ref() {
+            source.append_bind(&mut command, true);
+        }
+    }
     runtime_cwd_source.append_bind_at(
         &mut command,
         true,
@@ -1278,13 +1389,6 @@ fn build_sandboxed_command(
             .args(["--setenv", "XDG_STATE_HOME"])
             .arg(home.join(".local/state"));
     }
-    let helper = std::env::current_exe().map_err(|error| {
-        RpcError::new(
-            "sandbox_unavailable",
-            format!("cannot resolve sigma-exec hardening helper: {error}"),
-        )
-    })?;
-    let helper_source = PinnedMountSource::pin(&helper)?;
     helper_source.append_bind_at(&mut command, true, Path::new(INTERNAL_HELPER_MOUNT));
     command.arg("--chdir").arg(&cwd).arg("--");
     command
@@ -1353,6 +1457,12 @@ fn build_sandboxed_command(
             runtime_cwd_source.raw_fd(),
             executable.source.raw_fd(),
         ])
+        .chain(
+            enclosing_helper_source
+                .iter()
+                .map(PinnedMountSource::raw_fd),
+        )
+        .chain(enclosing_bwrap_source.iter().map(PinnedMountSource::raw_fd))
         .chain(scratch_home.iter().map(PinnedMountSource::raw_fd))
         .chain(scratch_temp.iter().map(PinnedMountSource::raw_fd))
         .chain(disposable_source.iter().map(PinnedMountSource::raw_fd))
@@ -1370,6 +1480,16 @@ fn build_sandboxed_command(
             runtime_cwd_source.into_descriptor(),
             executable.source.into_descriptor(),
         ])
+        .chain(
+            enclosing_helper_source
+                .into_iter()
+                .map(PinnedMountSource::into_descriptor),
+        )
+        .chain(
+            enclosing_bwrap_source
+                .into_iter()
+                .map(PinnedMountSource::into_descriptor),
+        )
         .chain(
             scratch_home
                 .into_iter()
@@ -1437,6 +1557,7 @@ fn validate_resolved_root_relationships(
     read_roots: &[ResolvedMountSource],
     write_roots: &[ResolvedMountSource],
     execution_roots: &[ResolvedMountSource],
+    enclosing_container_root: bool,
 ) -> Result<(), RpcError> {
     for write_root in write_roots {
         if !read_roots.iter().any(|read_root| {
@@ -1451,14 +1572,16 @@ fn validate_resolved_root_relationships(
         }
     }
     for execution_root in execution_roots {
-        if write_roots.iter().any(|write_root| {
-            write_root
-                .destination()
-                .starts_with(execution_root.destination())
-                || execution_root
+        if !enclosing_container_root
+            && write_roots.iter().any(|write_root| {
+                write_root
                     .destination()
-                    .starts_with(write_root.destination())
-        }) {
+                    .starts_with(execution_root.destination())
+                    || execution_root
+                        .destination()
+                        .starts_with(write_root.destination())
+            })
+        {
             return Err(RpcError::new(
                 "policy_denied",
                 "a pinned execution root overlaps a writable root",
@@ -1556,6 +1679,7 @@ fn reject_internal_mount_conflicts(
     write_roots: &[PinnedMountSource],
     execution_roots: &[PinnedMountSource],
     protected_roots: &[PinnedMountSource],
+    enclosing_container_root: bool,
 ) -> Result<(), RpcError> {
     let reserved = [
         Path::new(INTERNAL_HELPER_MOUNT),
@@ -1568,6 +1692,9 @@ fn reject_internal_mount_conflicts(
             .chain(execution_roots)
             .chain(protected_roots)
         {
+            if enclosing_container_root && root.destination() == Path::new("/") {
+                continue;
+            }
             if root.occupies_destination(destination)? {
                 return Err(RpcError::new(
                     "policy_denied",
@@ -1588,8 +1715,12 @@ fn bind_pinned_roots(
     roots: &[PinnedMountSource],
     read_only: bool,
     covered_roots: &[PathBuf],
+    skip_root: bool,
 ) {
     for root in roots {
+        if skip_root && root.destination() == Path::new("/") {
+            continue;
+        }
         if covered_roots
             .iter()
             .any(|covered| root.destination().starts_with(covered))
@@ -1703,6 +1834,7 @@ fn resolve_protected(
         .collect::<Vec<_>>();
     let derived = minimal_roots(&read_paths)
         .into_iter()
+        .filter(|root| root.as_path() != Path::new("/"))
         .flat_map(|root| [root.join(".git"), root.join(".agent")]);
     let mut resolved = BTreeMap::<PathBuf, ResolvedMountSource>::new();
     for item in params.policy.protected_paths.iter().cloned().chain(derived) {
@@ -2090,6 +2222,7 @@ mod tests {
                 execution_roots: Vec::new(),
                 executable_sha256: None,
                 protected_paths: vec![root.join(".git"), root.join(".agent")],
+                enclosing_container_root: false,
                 disposable_workspace_root: None,
                 read_only_validation_workspace_root: None,
                 scratch_lease_id: None,

@@ -385,8 +385,10 @@ describe("Sigma architecture", () => {
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "verify result.txt" });
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "completed" });
-    expect(gateway.requests[1].messages.some((message) =>
+    expect(gateway.requests[0].messages.some((message) =>
       message.content.includes("completion_status"))).toBe(true);
+    expect(gateway.requests[1].messages.some((message) =>
+      message.content.includes("completion_status"))).toBe(false);
     expect(gateway.requests.flatMap((request) => request.messages)
       .every((message) => !message.content.includes("Current-run typed durable evidence ledger."))).toBe(true);
   });
@@ -592,6 +594,7 @@ describe("Sigma architecture", () => {
     const runtime = createRuntime({
       gateway: new FakeGateway([
         validationTurn("validate-restored-write", [{ path: "restored.txt", expected: "ok" }]),
+        { message: { role: "assistant", content: "restored" }, finishReason: "stop" },
         { message: { role: "assistant", content: "restored" }, finishReason: "stop" }
       ]),
       store: new SegmentedJsonlStore({ rootDir: storeRootDir }),

@@ -73,6 +73,11 @@ def current_doctor_payload(network_modes: list[str] | None = None) -> str:
         "capabilities": {
             "networkModes": network_modes or ["none", "full"],
             "processHandoff": True,
+            "enclosingContainerRoot": {
+                "available": True,
+                "rootKind": "container_cow",
+                "attestationDigest": "sha256:" + "2" * 64,
+            },
         },
         "checks": [],
     })
@@ -406,7 +411,8 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                     "command -v /usr/local/bin/agent >/dev/null 2>&1",
                     "/usr/local/bin/agent --help",
                     "/usr/local/bin/agent doctor --workspace /app --json --strict "
-                    "--execution-mode sandboxed --network full "
+                    "--execution-mode sandboxed --network full --read-scope host "
+                    "--write-scope enclosing-container "
                     "--managed-environment-mode disabled --check-api",
                 ],
             )

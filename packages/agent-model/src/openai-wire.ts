@@ -124,6 +124,7 @@ function wireControls(request: ModelRequest, hasTools: boolean, profile: OpenAIW
     return { ...(profile.thinking ? { thinking: profile.thinking } : {}), toolChoice: choice };
   }
   if (profile.toolChoicePolicy === "never") {
+    if (request.toolChoice === "none" && !hasTools) return {};
     if (strictChoice) {
       throw invalidToolChoice(`OpenAI wire profile cannot honor toolChoice='${request.toolChoice}'.`);
     }

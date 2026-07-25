@@ -1,17 +1,24 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import type { EvidenceRecord } from "../packages/agent-protocol/src/index.js";
+import type { EvidenceRecord, ReviewEvidence } from "../packages/agent-protocol/src/index.js";
 import {
-  completionCandidate,
-  completionGateDecision
+  completionReviewBlocker,
+  completionGateDecision,
+  explicitReviewGateDecision
 } from "../packages/agent-runtime/src/completion-evidence-gate.js";
-import { reviewBasisDigest } from "../packages/agent-runtime/src/mutation-evidence.js";
+import {
+  currentFrontierReview,
+  reviewBasisDigest
+} from "../packages/agent-runtime/src/mutation-evidence.js";
+import {
+  postReviewReceiptSummaries
+} from "../packages/agent-runtime/src/reviewer-post-repair-receipts.js";
 import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
 
 const NOW = "2026-07-23T00:00:00.000Z";
 const STATE_DIGEST = "a".repeat(64);
 
-function candidateSession(reviewMode: "advisory" | "required") {
+function candidateSession(reviewMode: "off" | "advisory" | "required") {
   const session = runtimeSessionFixture({
     services: {
       profile: {
@@ -76,27 +83,132 @@ function validation(session: ReturnType<typeof candidateSession>, status: "passe
   };
 }
 
+function review(
+  session: ReturnType<typeof candidateSession>,
+  id: string,
+  verdict: "approved" | "changes_requested",
+  actualCheck = false
+): ReviewEvidence {
+  const evidenceId = actualCheck ? `review-check:${id}` : `review-source:${id}`;
+  if (actualCheck) {
+    const requestId = `review-request:${id}`;
+    session.durable.state.reviewReceipts.push({
+      schemaVersion: 1,
+      reviewRequestId: requestId,
+      call: { id: `call:${id}`, name: "validate", arguments: { command: "check" } },
+      plan: {
+        exactEffects: ["process.spawn", "validation"],
+        readPaths: ["."],
+        writePaths: [],
+        network: "none",
+        processMode: "pipe",
+        checkpointScope: [],
+        idempotence: "replay_safe"
+      },
+      receipt: {
+        callId: `call:${id}`,
+        ok: true,
+        output: "review check passed",
+        outcome: {
+          status: "succeeded",
+          output: "review check passed",
+          diagnosticCodes: []
+        },
+        observedEffects: ["process.spawn", "validation"],
+        actualEffects: ["process.spawn", "validation"],
+        artifacts: [],
+        diagnostics: [],
+        evidence: [{
+          evidenceId,
+          sessionId: session.identity.sessionId,
+          runId: session.durable.runId,
+          kind: "diagnostic",
+          status: "passed",
+          createdAt: NOW,
+          producer: { authority: "tool", id: `call:${id}` },
+          summary: "review check passed",
+          data: { source: "reviewer:validate", diagnostic: { passed: true } }
+        }],
+        startedAt: NOW,
+        completedAt: NOW
+      }
+    });
+  } else if (verdict === "approved") {
+    session.durable.state.evidence.push({
+      evidenceId,
+      sessionId: session.identity.sessionId,
+      runId: session.durable.runId,
+      kind: "diagnostic",
+      status: "passed",
+      createdAt: NOW,
+      producer: { authority: "runtime", id: "review-fixture" },
+      summary: "durable review source",
+      data: { source: "review-fixture", diagnostic: { passed: true } }
+    });
+  }
+  return {
+    evidenceId: id,
+    sessionId: session.identity.sessionId,
+    runId: session.durable.runId,
+    kind: "review",
+    status: verdict === "approved" ? "passed" : "failed",
+    createdAt: NOW,
+    producer: { authority: "runtime", id: "reviewer" },
+    summary: verdict,
+    data: {
+      schemaVersion: 3,
+      reviewerId: "reviewer",
+      ...(actualCheck ? { reviewRequestId: `review-request:${id}` } : {}),
+      verdict,
+      findings: verdict === "changes_requested"
+        ? [{ actionable: true, severity: "error", summary: "Fix the defect." }]
+        : [],
+      criteria: [{
+        criterion: "Satisfy the durable user request.",
+        status: verdict === "approved" ? "satisfied" : "failed",
+        evidence: verdict === "approved" ? [evidenceId] : []
+      }],
+      requiredValidations: [],
+      frontierRevision: 1,
+      stateDigest: STATE_DIGEST,
+      reviewBasisDigest: reviewBasisDigest(session),
+      validationEvidenceIds: [],
+      durableEvidenceIds: verdict === "approved" ? [evidenceId] : [],
+      actualChecks: actualCheck ? [{
+        toolName: "validate",
+        evidenceIds: [evidenceId],
+        summary: "validate passed"
+      }] : []
+    }
+  };
+}
+
 describe("V6 Standard and Strict completion policy", () => {
   it("gives Standard one validation reminder and then completes honestly", () => {
-    const session = candidateSession("advisory");
+    const session = candidateSession("off");
     const first = completionGateDecision(session);
     expect(first).toMatchObject({ action: "continue" });
     if (first.action !== "continue") throw new Error("Expected an advisory.");
     session.durable.state.messages.push({ role: "developer", content: first.message });
     expect(completionGateDecision(session)).toEqual({
       action: "complete",
+      authority: "user_policy",
       validationStatus: "unverified",
       statusNote: "Validation status: not run for the current mutation frontier."
     });
   });
 
-  it("lets Standard report a recorded failed validation without a hidden repair mode", () => {
-    const session = candidateSession("advisory");
+  it("gives a failed validation one repair opportunity and then reports it honestly", () => {
+    const session = candidateSession("off");
     session.durable.state.evidence.push(validation(session, "failed"));
+    const first = completionGateDecision(session);
+    expect(first).toMatchObject({ action: "continue" });
+    if (first.action !== "continue") throw new Error("Expected a failed-validation advisory.");
+    session.durable.state.messages.push({ role: "developer", content: first.message });
     expect(completionGateDecision(session)).toMatchObject({
       action: "complete",
       validationStatus: "failed",
-      statusNote: expect.stringContaining("validation failed")
+      statusNote: expect.stringContaining("Validation status: failed")
     });
   });
 
@@ -108,41 +220,208 @@ describe("V6 Standard and Strict completion policy", () => {
     session.durable.state.messages.push({ role: "developer", content: first.message });
     expect(completionGateDecision(session)).toMatchObject({
       action: "fail",
-      code: "strict_policy_failure",
+      code: "verification_failed",
       message: expect.stringContaining("unchanged second stop")
     });
   });
 
-  it("requires Strict validation and reviewer approval for the same candidate", () => {
+  it("requires Strict reviewer approval backed by a reviewer-executed check", () => {
     const session = candidateSession("required");
-    const passed = validation(session, "passed");
-    session.durable.state.evidence.push(passed);
-    const candidate = completionCandidate(session)!;
-    const basis = reviewBasisDigest(session, undefined, candidate.digest);
-    session.durable.state.evidence.push({
-      evidenceId: "review",
-      sessionId: session.identity.sessionId,
-      runId: session.durable.runId,
-      kind: "review",
-      status: "passed",
-      createdAt: NOW,
-      producer: { authority: "runtime", id: "reviewer" },
-      summary: "approved",
-      data: {
-        reviewerId: "reviewer",
-        verdict: "approved",
-        findings: [],
-        frontierRevision: 1,
-        stateDigest: STATE_DIGEST,
-        reviewBasisDigest: basis,
-        validationEvidenceIds: [passed.evidenceId]
-      }
-    });
+    session.durable.state.evidence.push(review(session, "strict-review", "approved", true));
     expect(completionGateDecision(session)).toMatchObject({
       action: "complete",
       validationStatus: "passed",
-      statusNote: expect.stringContaining("approved")
+      statusNote: expect.stringContaining("reviewer-executed check")
     });
+  });
+
+  it("requires V9 reviewer approval for every Standard mutation completion", () => {
+    const missing = candidateSession("advisory");
+    expect(completionGateDecision(missing)).toMatchObject({
+      action: "fail",
+      code: "verification_unavailable"
+    });
+
+    const approved = candidateSession("advisory");
+    approved.durable.state.evidence.push(review(approved, "approved-review", "approved"));
+    expect(completionGateDecision(approved)).toMatchObject({
+      action: "complete",
+      statusNote: expect.stringContaining("reviewer approved")
+    });
+  });
+
+  it("allows one review repair, rejects an unchanged second stop, and rejects a failed re-review", () => {
+    const unchanged = candidateSession("advisory");
+    unchanged.durable.state.evidence.push(review(unchanged, "first-review", "changes_requested"));
+    const first = completionGateDecision(unchanged);
+    expect(first).toMatchObject({
+      action: "continue",
+      message: expect.stringContaining("single repair opportunity")
+    });
+    if (first.action !== "continue") throw new Error("Expected a review repair advisory.");
+    unchanged.durable.state.messages.push({ role: "developer", content: first.message });
+    expect(completionGateDecision(unchanged)).toMatchObject({
+      action: "fail",
+      code: "verification_failed",
+      message: expect.stringContaining("without changing")
+    });
+
+    const rereviewed = candidateSession("advisory");
+    rereviewed.durable.state.evidence.push(review(rereviewed, "first-review", "changes_requested"));
+    rereviewed.durable.state.plan = {
+      revision: 1,
+      goal: "Repair the reviewed change.",
+      activeNodeId: "repair",
+      nodes: [{
+        id: "repair",
+        title: "Repair",
+        dependencies: [],
+        status: "in_progress",
+        owner: { kind: "root" },
+        acceptanceCriteria: ["Satisfy the durable user request."],
+        evidence: []
+      }]
+    };
+    rereviewed.durable.state.evidence.push(review(rereviewed, "second-review", "changes_requested"));
+    expect(completionGateDecision(rereviewed)).toMatchObject({
+      action: "fail",
+      code: "verification_failed",
+      message: expect.stringContaining("after repair and re-review")
+    });
+  });
+
+  it("treats an explicit review as a one-repair protocol barrier", () => {
+    const session = candidateSession("advisory");
+    session.durable.state.evidence.push(
+      review(session, "explicit-first", "changes_requested")
+    );
+    const first = explicitReviewGateDecision(session);
+    expect(first).toMatchObject({
+      action: "continue",
+      authority: "verification_verdict"
+    });
+    if (first?.action !== "continue") throw new Error("Expected one repair opportunity.");
+    session.durable.state.messages.push({
+      role: "developer",
+      content: first.message
+    });
+    expect(explicitReviewGateDecision(session)).toMatchObject({
+      action: "fail",
+      code: "verification_failed",
+      authority: "verification_verdict"
+    });
+
+    const rereviewed = candidateSession("advisory");
+    rereviewed.durable.state.evidence.push(
+      review(rereviewed, "explicit-first", "changes_requested")
+    );
+    rereviewed.durable.state.plan = {
+      revision: 1,
+      goal: "Repair the reviewed change.",
+      activeNodeId: "repair",
+      nodes: [{
+        id: "repair",
+        title: "Repair",
+        dependencies: [],
+        status: "in_progress",
+        owner: { kind: "root" },
+        acceptanceCriteria: ["Satisfy the durable user request."],
+        evidence: []
+      }]
+    };
+    rereviewed.durable.state.evidence.push(
+      review(rereviewed, "explicit-second", "changes_requested")
+    );
+    expect(explicitReviewGateDecision(rereviewed)).toMatchObject({
+      action: "fail",
+      code: "verification_failed",
+      message: expect.stringContaining("after repair and re-review")
+    });
+  });
+
+  it("treats read-only process receipts as new post-review evidence", () => {
+    const session = candidateSession("advisory");
+    const rejected = review(session, "first-review", "changes_requested");
+    session.durable.state.evidence.push(rejected);
+    expect(currentFrontierReview(session)?.evidenceId).toBe(rejected.evidenceId);
+    session.durable.state.messages.push({
+      role: "assistant",
+      content: "",
+      toolCalls: [{
+        id: "repair-probe",
+        name: "shell",
+        arguments: { command: "run-current-check" }
+      }]
+    });
+
+    session.durable.state.receipts.push({
+      callId: "repair-probe",
+      ok: true,
+      output: "new objective evidence",
+      outcome: {
+        status: "succeeded",
+        output: "new objective evidence",
+        diagnosticCodes: []
+      },
+      observedEffects: ["process.spawn.readonly"],
+      actualEffects: ["process.spawn.readonly"],
+      artifacts: [],
+      diagnostics: ["exit_code=0"],
+      startedAt: NOW,
+      completedAt: "2026-07-23T00:00:01.000Z"
+    });
+
+    expect(reviewBasisDigest(session)).not.toBe(rejected.data.reviewBasisDigest);
+    expect(currentFrontierReview(session)).toBeUndefined();
+    expect(postReviewReceiptSummaries(session)).toEqual([expect.objectContaining({
+      callId: "repair-probe",
+      toolName: "shell",
+      ok: true,
+      argumentsPreview: "{\"command\":\"run-current-check\"}",
+      outputPreview: "new objective evidence",
+      effects: ["process.spawn.readonly"],
+      diagnostics: ["exit_code=0"]
+    })]);
+  });
+
+  it("honors a current-delta Standard review waiver but not in Strict mode", () => {
+    const standard = candidateSession("advisory");
+    standard.durable.state.evidence.push({
+      evidenceId: "delta",
+      sessionId: standard.identity.sessionId,
+      runId: standard.durable.runId,
+      kind: "workspace_delta",
+      status: "passed",
+      createdAt: NOW,
+      producer: { authority: "runtime", id: "checkpoint" },
+      summary: "changed",
+      data: {
+        checkpointId: "checkpoint",
+        delta: { added: [], modified: ["README.md"], deleted: [] }
+      }
+    }, {
+      evidenceId: "waiver",
+      sessionId: standard.identity.sessionId,
+      runId: standard.durable.runId,
+      kind: "user_waiver",
+      status: "informational",
+      createdAt: NOW,
+      producer: { authority: "user" },
+      summary: "waived",
+      data: { scope: "review", reason: "User explicitly waived independent review." }
+    });
+    expect(completionGateDecision(standard)).toMatchObject({
+      action: "complete",
+      statusNote: expect.stringContaining("explicitly waived")
+    });
+
+    const strict = candidateSession("required");
+    strict.durable.state.evidence.push(...standard.durable.state.evidence.map((item) => ({
+      ...item,
+      sessionId: strict.identity.sessionId,
+      runId: strict.durable.runId
+    })));
+    expect(completionGateDecision(strict)).toMatchObject({ action: "continue" });
   });
 
   it("uses structural frontier binding rather than command-name classification as completion authority", () => {
@@ -159,26 +438,9 @@ describe("V6 Standard and Strict completion policy", () => {
       status: "passed"
     };
     session.durable.state.evidence.push(passed);
-    const candidate = completionCandidate(session)!;
-    session.durable.state.evidence.push({
-      evidenceId: "structural-review",
-      sessionId: session.identity.sessionId,
-      runId: session.durable.runId,
-      kind: "review",
-      status: "passed",
-      createdAt: NOW,
-      producer: { authority: "runtime", id: "reviewer" },
-      summary: "approved",
-      data: {
-        reviewerId: "reviewer",
-        verdict: "approved",
-        findings: [],
-        frontierRevision: 1,
-        stateDigest: STATE_DIGEST,
-        reviewBasisDigest: reviewBasisDigest(session, undefined, candidate.digest),
-        validationEvidenceIds: [passed.evidenceId]
-      }
-    });
+    session.durable.state.evidence.push(
+      review(session, "structural-review", "approved", true)
+    );
     expect(completionGateDecision(session)).toMatchObject({
       action: "complete",
       validationStatus: "passed"
@@ -188,6 +450,9 @@ describe("V6 Standard and Strict completion policy", () => {
   it("keeps active processes and open checkpoints as hard completion invariants", () => {
     const processSession = candidateSession("advisory");
     processSession.durable.state.activeProcessIds = ["process-1"];
+    expect(completionReviewBlocker(processSession)).toContain(
+      "processes remain active"
+    );
     expect(completionGateDecision(processSession)).toMatchObject({
       action: "continue",
       message: expect.stringContaining("processes remain active")
@@ -205,6 +470,23 @@ describe("V6 Standard and Strict completion policy", () => {
     expect(completionGateDecision(checkpointSession)).toMatchObject({
       action: "continue",
       message: expect.stringContaining("open checkpoint")
+    });
+
+    const missingDeltaSession = candidateSession("advisory");
+    missingDeltaSession.durable.state.checkpointHead = {
+      checkpointId: "checkpoint",
+      sessionId: missingDeltaSession.identity.sessionId,
+      runId: missingDeltaSession.durable.runId,
+      status: "sealed",
+      preManifestDigest: "0".repeat(64),
+      postManifestDigest: "1".repeat(64),
+      createdAt: NOW,
+      sealedAt: NOW,
+      delta: { added: [], modified: ["README.md"], deleted: [] }
+    };
+    expect(completionGateDecision(missingDeltaSession)).toMatchObject({
+      action: "continue",
+      message: expect.stringContaining("no durable workspace-delta evidence")
     });
   });
 

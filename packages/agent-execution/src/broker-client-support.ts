@@ -2,7 +2,6 @@ import { BrokerTransport, takeCancelledTerminalResponse } from "./broker-transpo
 import {
   BrokerCancelledError,
   BrokerConnectionError,
-  BrokerOutputDecodingError,
   BrokerProtocolError,
   BrokerTimeoutError,
   SandboxUnavailableError,
@@ -260,33 +259,34 @@ export async function parsePostDispatchValue<T>(
   }
 }
 
-export function outputDecodingError(value: ProcessValue): BrokerOutputDecodingError | undefined {
-  const failure = (["stdout", "stderr"] as const).flatMap((stream) => {
+export function outputDecodingDiagnostics(
+  value: ProcessValue
+): NonNullable<ExecutionResult["outputDecodingErrors"]> {
+  return (["stdout", "stderr"] as const).flatMap((stream) => {
     const decodingError = value[stream].decodingError;
     return decodingError ? [{ stream, ...decodingError }] : [];
-  })[0];
-  return failure
-    ? new BrokerOutputDecodingError(failure.stream, failure.code, failure.message)
-    : undefined;
+  });
 }
 
-export async function rejectUndecodableExecution(
-  transport: BrokerTransport,
-  value: ReturnType<typeof parseExecutionValue>,
-  error: BrokerOutputDecodingError,
-  closeClient: () => Promise<void>
-): Promise<never> {
-  const artifactIds = value.outputArtifacts.map((artifact) => artifact.artifactId);
-  if (artifactIds.length === 0) throw error;
-  try {
-    await transport.request("artifact.release", { artifactIds }, { timeoutMs: 5_000 });
-  } catch (releaseError) {
-    attachBrokerLifecycleFailure(
-      error, releaseError, "Undecodable foreground output artifact release failed."
-    );
-    return await containPostDispatchFailure(error, closeClient);
+export function projectedOutputStream(
+  value: ProcessValue,
+  stream: "stdout" | "stderr",
+  redactor: SecretRedactor,
+  outputArtifacts: readonly ProcessOutputArtifact[]
+): string {
+  const chunk = value[stream];
+  const decodingError = chunk.decodingError;
+  if (!decodingError) {
+    return chunk.droppedBytes > 0
+      ? "[REDACTED:truncated-output]"
+      : redactor.redactText(chunk.data);
   }
-  throw error;
+  const prefix = redactor.redactText(chunk.data);
+  const artifact = outputArtifacts.find((item) => item.stream === stream);
+  const notice = artifact
+    ? `[NON_TEXT_${stream.toUpperCase()} preserved in '${artifact.name}'; bytes=${String(artifact.sizeBytes)}; sha256=${artifact.brokerSha256}]`
+    : `[NON_TEXT_${stream.toUpperCase()} could not be projected as UTF-8; exact bytes were unavailable from this broker]`;
+  return [prefix, notice].filter(Boolean).join("\n");
 }
 
 export function createProcessRedaction(
@@ -306,6 +306,7 @@ export function decodedExecutionResult(
   redactor: SecretRedactor,
   outputArtifacts: ProcessOutputArtifact[]
 ): ExecutionResult {
+  const outputDecodingErrors = outputDecodingDiagnostics(value);
   const failure = value.failure ? {
     ...value.failure,
     message: redactor.redactText(value.failure.message)
@@ -313,16 +314,16 @@ export function decodedExecutionResult(
   return {
     state: value.state, exitCode: value.exitCode, signal: value.signal, durationMs: value.durationMs,
     timedOut: value.timedOut, idleTimedOut: value.idleTimedOut, cancelled: value.cancelled,
-    stdout: value.stdout.droppedBytes > 0
-      ? "[REDACTED:truncated-output]" : redactor.redactText(value.stdout.data),
+    stdout: projectedOutputStream(value, "stdout", redactor, outputArtifacts),
     stderr: failure
       ? `sigma-exec sandbox launch failed [${failure.code}]: ${failure.message}`
-      : value.stderr.droppedBytes > 0
-      ? "[REDACTED:truncated-output]" : redactor.redactText(value.stderr.data),
+      : projectedOutputStream(value, "stderr", redactor, outputArtifacts),
     stdoutDroppedBytes: value.stdout.droppedBytes, stderrDroppedBytes: value.stderr.droppedBytes,
-    outputTruncated: value.stdout.droppedBytes > 0 || value.stderr.droppedBytes > 0,
+    outputTruncated: value.stdout.droppedBytes > 0 || value.stderr.droppedBytes > 0
+      || outputDecodingErrors.length > 0,
     ...(failure ? { failure } : {}),
-    ...(outputArtifacts.length > 0 ? { outputArtifacts } : {})
+    ...(outputArtifacts.length > 0 ? { outputArtifacts } : {}),
+    ...(outputDecodingErrors.length > 0 ? { outputDecodingErrors } : {})
   };
 }
 

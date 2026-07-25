@@ -77,6 +77,8 @@ export function brokerRuntimeEnvironment(report: BrokerDoctorReport): RuntimeEnv
     defaultShell: availableShells[0] ?? "none",
     availableShells,
     availableRuntimeCommands: verifiedRuntimeCommands(report),
+    directExecutableResolution:
+      report.capabilities.directExecutableResolution === true,
     executionCapabilitiesVerified: true
   };
 }

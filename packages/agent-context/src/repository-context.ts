@@ -19,10 +19,11 @@ import {
 } from "./repository-path-metadata.js";
 import { safeAutomaticFilePath } from "./repository-path-safety.js";
 import { readStableWorkspaceText } from "./repository-safe-read.js";
-import { approximateTokens, lexicalScore } from "./unicode.js";
+import { approximateTokens, fitApproximateTokens, lexicalScore } from "./unicode.js";
 
 const HOST_SNAPSHOT_TTL_MS = 5_000;
 const MAX_SNIPPET_BYTES = 256_000;
+export const MAX_REPOSITORY_CONTEXT_TOKENS = 4_096;
 
 interface CachedHostSnapshot {
   snapshot: RepositorySnapshot;
@@ -134,7 +135,7 @@ export class RepositoryContextProvider {
       || structure.budgetExceeded || rankedResult.budgetExceeded;
     const excerpt = gitBacked && query.trim()
       ? await snippets(resolved, snapshot.files, query, signal) : "";
-    const indexContent = [
+    const fullIndexContent = [
       `Repository files (${snapshot.files.length}${contextTruncated ? ", index truncated at safety limit" : ""}):`,
       gitBacked
         ? "Explicit Git-backed context may include bounded excerpts below."
@@ -145,13 +146,19 @@ export class RepositoryContextProvider {
       ...ranked.map((file) => `- ${escaped(file)}`),
       excerpt
     ].filter(Boolean).join("\n");
+    const fullDigest = digest(fullIndexContent);
+    const indexContent = fitApproximateTokens(
+      `${fullIndexContent}\nFull repository context digest: ${fullDigest}`,
+      MAX_REPOSITORY_CONTEXT_TOKENS
+    );
     const items: ContextItem[] = [{
-      id: `repo:index:${digest(indexContent)}`,
+      id: `repo:index:${fullDigest}`,
       authority: "tool",
       provenance: "incremental repository index",
       content: indexContent,
       tokenCount: approximateTokens(indexContent),
-      priority: 500
+      priority: 500,
+      cacheKey: fullDigest
     }];
     return items;
   }

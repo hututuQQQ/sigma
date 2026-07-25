@@ -33,6 +33,7 @@ function outputArtifact(stream: "stdout" | "stderr", content: string): ProcessOu
     sizeBytes: Buffer.byteLength(content),
     complete: true,
     redactionLossy: false,
+    mediaType: "text/plain; charset=utf-8",
     content: Buffer.from(content)
   };
 }
@@ -195,6 +196,59 @@ describe("execution output artifact receipts", () => {
       })
     })]);
     expect(released).toEqual([[artifact.brokerArtifactId], [artifact.brokerArtifactId]]);
+  });
+
+  it("keeps a successful command successful when stdout is non-text", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-binary-output-receipt-"));
+    const bytes = Buffer.from([0xff, 0x00, 0x41, 0x80]);
+    const artifact: ProcessOutputArtifact = {
+      brokerArtifactId: "stdout-binary",
+      name: "stdout-binary.log",
+      stream: "stdout",
+      brokerSha256: "b".repeat(64),
+      sizeBytes: bytes.byteLength,
+      complete: true,
+      redactionLossy: false,
+      mediaType: "application/octet-stream",
+      content: bytes
+    };
+    const execution: ExecutionResult = {
+      state: "exited", exitCode: 0, signal: null, durationMs: 1,
+      timedOut: false, idleTimedOut: false, cancelled: false,
+      stdout: "[NON_TEXT_STDOUT preserved]", stderr: "",
+      stdoutDroppedBytes: 0, stderrDroppedBytes: 0,
+      outputTruncated: true,
+      outputArtifacts: [artifact],
+      outputDecodingErrors: [{
+        stream: "stdout",
+        code: "invalid_output_encoding",
+        message: "not UTF-8"
+      }]
+    };
+    const poll: ProcessPollResult = {
+      ...execution, state: "exited",
+      handle: { id: "process", brokerInstanceId: "broker" }
+    };
+    const released: string[][] = [];
+    const tools = executionTools({
+      broker: broker(execution, poll, released),
+      sandboxMode: "required",
+      networkMode: "none"
+    });
+    const { context, artifacts } = await fixtureContext(workspace);
+    const receipt = await tools.find((tool) => tool.descriptor.name === "exec")!.execute(
+      request("binary-output", "exec", { executable: process.execPath }),
+      context
+    );
+
+    expect(receipt.ok).toBe(true);
+    expect(receipt.output).toContain("NON_TEXT_STDOUT");
+    expect(receipt.diagnostics).toContain("invalid_output_encoding:stdout");
+    expect(receipt.artifactRefs).toEqual([expect.objectContaining({
+      mediaType: "application/octet-stream"
+    })]);
+    expect(await artifacts.get("session", receipt.artifacts[0]!)).toEqual(bytes);
+    expect(released).toEqual([["stdout-binary"]]);
   });
 
   it("keeps background poll overflow auditable without embedding full bytes", async () => {

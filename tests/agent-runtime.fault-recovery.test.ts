@@ -182,6 +182,13 @@ class CountingReviewer implements AccountableReviewerPort {
   }
 
   private evidence(input: ReviewerInput): ReviewEvidence {
+    const evidenceIds = [
+      ...input.validations.map((item) => item.evidenceId),
+      ...input.workspaceDeltas.map((item) => item.evidenceId)
+    ];
+    const criteria = input.acceptanceCriteria?.length
+      ? input.acceptanceCriteria
+      : [input.goal];
     return {
       evidenceId: randomUUID(),
       sessionId: input.sessionId,
@@ -192,12 +199,21 @@ class CountingReviewer implements AccountableReviewerPort {
       producer: { authority: "runtime", id: this.reviewerId },
       summary: "Recovered durable delta approved.",
       data: {
+        schemaVersion: 3,
         reviewerId: this.reviewerId,
         verdict: "approved",
         findings: [],
+        criteria: criteria.map((criterion) => ({
+          criterion,
+          status: "satisfied",
+          evidence: [...evidenceIds]
+        })),
         frontierRevision: input.frontierRevision,
         stateDigest: input.stateDigest,
-        validationEvidenceIds: input.validations.map((item) => item.evidenceId)
+        reviewBasisDigest: input.reviewBasisDigest,
+        validationEvidenceIds: input.validations.map((item) => item.evidenceId),
+        durableEvidenceIds: evidenceIds,
+        actualChecks: []
       }
     };
   }
@@ -502,6 +518,8 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
     exitCode: null,
     termination: null,
     coveredPaths: ["target.ts"],
+    intent: null,
+    adapterInference: null,
     claim: {
       kind: "typecheck",
       commandDigest: "c".repeat(64),
@@ -516,10 +534,37 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
     frontierRevision: sealedFrontier.revision,
     stateDigest: sealedFrontier.currentStateDigest
   });
+  const readReceiptSignature = JSON.stringify({
+    callId: "read-proof",
+    ok: true,
+    outputDigest: createHash("sha256").update("inspected").digest("hex"),
+    resultDigest: createHash("sha256").update("null").digest("hex"),
+    outcome: { status: "succeeded", output: "ok", diagnosticCodes: [] },
+    observedEffects: ["filesystem.read"],
+    actualEffects: [],
+    workspaceDelta: null,
+    artifacts: [],
+    artifactRefs: [],
+    diagnostics: [],
+    startedAt: now,
+    completedAt: now
+  });
   const reviewBasisDigest = createHash("sha256").update(JSON.stringify({
     frontierRevision: sealedFrontier.revision,
     stateDigest: sealedFrontier.currentStateDigest,
-    validations: [validationSignature]
+    plan: {
+      goal: "Exercise durable recovery.",
+      activeNodeId: "root",
+      nodes: [{
+        id: "root",
+        title: "Perform one mutation",
+        status: "in_progress",
+        acceptanceCriteria: ["Mutation occurs at most once"],
+        blockedReason: null
+      }]
+    },
+    validations: [validationSignature],
+    receipts: [readReceiptSignature]
   })).digest("hex");
   const reviewRequestId = `review:${createHash("sha256").update(JSON.stringify({
     sessionId,
@@ -605,13 +650,21 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
     producer: { authority: "runtime", id: "fault-injection-reviewer" },
     summary: "Recovered delta approved.",
     data: {
+      schemaVersion: 3,
       reviewerId: "fault-injection-reviewer",
       verdict: "approved",
       findings: [],
+      criteria: [{
+        criterion: "Mutation occurs at most once",
+        status: "satisfied",
+        evidence: [`command-validation:${checkpoint.checkpointId}`]
+      }],
       frontierRevision: sealedFrontier.revision,
       stateDigest: sealedFrontier.currentStateDigest,
       reviewBasisDigest,
       validationEvidenceIds: [`command-validation:${checkpoint.checkpointId}`],
+      durableEvidenceIds: [`command-validation:${checkpoint.checkpointId}`],
+      actualChecks: [],
       checkpointId: checkpoint.checkpointId
     }
   });
@@ -764,14 +817,14 @@ describe("durable transaction fault-injection recovery", () => {
       decision: "keep"
     });
     await runtime.command({ type: "resume", sessionId: fixture.sessionId });
-    await expect(runtime.waitForOutcome(fixture.sessionId)).resolves.toMatchObject({ kind: "needs_input" });
+    await expect(runtime.waitForOutcome(fixture.sessionId)).resolves.toMatchObject({ kind: "completed" });
     expect(executions.count).toBe(0);
-    expect(reviewer.calls).toBe(0);
+    expect(reviewer.calls).toBe(1);
     const stored = await events(fixture.store, fixture.sessionId);
     expect(stored.filter((item) => item.type === "tool.failed"
       && JSON.stringify(item.payload).includes("recovery_result_lost_no_replay"))).toHaveLength(1);
-    expect(settledMutationReservations(stored, "budget.committed")).toBe(0);
-    expect(stored.filter((item) => item.type === "run.completed")).toHaveLength(0);
+    expect(settledMutationReservations(stored, "budget.committed")).toBe(1);
+    expect(stored.filter((item) => item.type === "run.completed")).toHaveLength(1);
   });
 
   it("restores an open mutation without replay, duplicate charge, or false completion", async () => {
@@ -806,15 +859,18 @@ describe("durable transaction fault-injection recovery", () => {
       const outcome = await runtime.waitForOutcome(fixture.sessionId);
       const stored = await events(fixture.store, fixture.sessionId);
       expect(executions.count).toBe(0);
-      expect(reviewer.calls).toBe(0);
-      const convergedCompletion = boundary === "validation_evidence"
-        || boundary === "review_started" || boundary === "review_completed";
-      if (boundary === "delta_evidence") {
-        expect(outcome).toMatchObject({ kind: "needs_input" });
+      const expectedReviewCalls = boundary === "review_started"
+        || boundary === "review_completed" ? 0 : 1;
+      expect(reviewer.calls).toBe(expectedReviewCalls);
+      if (boundary === "review_started") {
+        expect(outcome).toMatchObject({
+          kind: "recoverable_failure",
+          code: "verification_unavailable"
+        });
       } else {
-        expect(outcome.kind).toBe(convergedCompletion ? "completed" : "needs_input");
+        expect(outcome).toMatchObject({ kind: "completed" });
       }
-      if (convergedCompletion) expect(gateway.calls).toBe(1);
+      expect(gateway.calls).toBe(1);
 
       const checkpointId = fixture.checkpoint!.checkpointId;
       for (const evidenceId of [
@@ -825,22 +881,18 @@ describe("durable transaction fault-injection recovery", () => {
         expect(stored.filter((item) => item.type === "evidence.recorded"
           && (item.payload as { evidenceId?: string }).evidenceId === evidenceId)).toHaveLength(1);
       }
-      const mutationCommitted = boundary === "validation_evidence"
-        || boundary === "review_started" || boundary === "review_completed";
-      expect(settledMutationReservations(stored, "budget.committed")).toBe(mutationCommitted ? 1 : 0);
-      if (mutationCommitted) {
-        const reservationIds = mutationReservationIds(stored);
-        const reviewIndex = stored.findIndex((item) => item.type === "review.completed");
-        const commitIndex = stored.findIndex((item) => item.type === "budget.committed"
-          && reservationIds.has((item.payload as { reservationId?: string }).reservationId ?? ""));
-        if (reviewIndex >= 0) expect(commitIndex).toBeLessThan(reviewIndex);
-      }
+      expect(settledMutationReservations(stored, "budget.committed")).toBe(1);
+      const reservationIds = mutationReservationIds(stored);
+      const reviewIndex = stored.findIndex((item) => item.type === "review.completed");
+      const commitIndex = stored.findIndex((item) => item.type === "budget.committed"
+        && reservationIds.has((item.payload as { reservationId?: string }).reservationId ?? ""));
+      if (reviewIndex >= 0) expect(commitIndex).toBeLessThan(reviewIndex);
       expect(stored.filter((item) => item.type === "tool.approval_requested"
         && JSON.stringify(item.payload).includes("mutation-call"))).toHaveLength(0);
       expect(stored.filter((item) => item.type === "run.completed")).toHaveLength(
-        convergedCompletion ? 1 : 0
+        boundary === "review_started" ? 0 : 1
       );
-      expect(reviewer.inputs).toHaveLength(0);
+      expect(reviewer.inputs).toHaveLength(expectedReviewCalls);
     });
   }
 
@@ -850,7 +902,7 @@ describe("durable transaction fault-injection recovery", () => {
     await runtime.command({ type: "resume", sessionId: fixture.sessionId });
     await expect(runtime.waitForOutcome(fixture.sessionId)).resolves.toMatchObject({ kind: "completed" });
     expect(executions.count).toBe(0);
-    expect(reviewer.calls).toBe(0);
+    expect(reviewer.calls).toBe(1);
     expect(gateway.calls).toBe(0);
     const stored = await events(fixture.store, fixture.sessionId);
     expect(stored.filter((item) => item.type === "run.completed")).toHaveLength(1);

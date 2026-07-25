@@ -4,20 +4,21 @@ import os from "node:os";
 import path from "node:path";
 
 export const STORE_LAYOUT_VERSION = 5;
-const CURRENT_EVENT_SCHEMA_VERSION = 6;
-const EVENT_SCHEMA_VERSIONS = new Set([5, CURRENT_EVENT_SCHEMA_VERSION]);
-const CURRENT_SNAPSHOT_SCHEMA_VERSION = 7;
-const SNAPSHOT_SCHEMA_VERSIONS = new Set([5, 6, CURRENT_SNAPSHOT_SCHEMA_VERSION]);
+const CURRENT_EVENT_SCHEMA_VERSION = 9;
+const EVENT_SCHEMA_VERSIONS = new Set([5, 6, 7, 8, CURRENT_EVENT_SCHEMA_VERSION]);
+const CURRENT_SNAPSHOT_SCHEMA_VERSION = 10;
+const SNAPSHOT_SCHEMA_VERSIONS = new Set([5, 6, 7, 8, 9, CURRENT_SNAPSHOT_SCHEMA_VERSION]);
 const EVENT_TYPES = new Set([
   "session.created", "run.started", "run.suspended", "run.completed", "run.cancelled", "run.failed",
   "user.message", "user.steer", "user.follow_up", "model.started", "model.prompt_materialized",
   "model.delta", "model.reasoning_delta", "model.completed", "model.failed", "tool.requested",
   "tool.approval_requested", "tool.approval_resolved",
-  "tool.started", "tool.progress", "tool.completed", "tool.failed", "context.compacted", "child.spawned",
+  "tool.started", "tool.progress", "tool.completed", "tool.failed", "context.compacted",
+  "context.tool_results_pruned", "context.reasoning_trajectory_tombstoned", "child.spawned",
   "child.message", "child.completed", "diagnostic", "execution.planned", "execution.started", "execution.completed",
   "execution.failed", "process.spawned", "process.output", "process.exited", "process.lost", "evidence.recorded",
   "usage.recorded", "model.route_resolved", "model.route_failed", "profile.resolved", "customization.frozen",
-  "skill.loaded", "hook.started", "hook.completed", "hook.failed", "plan.updated", "budget.reserved",
+  "skill.loaded", "hook.started", "hook.completed", "hook.failed", "plan.updated", "long_horizon.updated", "budget.reserved",
   "budget.reservation_bound", "budget.committed", "budget.released", "budget.exhausted", "budget.overrun",
   "budget.limit_increased", "checkpoint.created", "checkpoint.sealed", "checkpoint.restored",
   "checkpoint.recovery_resolved", "review.started", "review.completed", "review.waived"
@@ -52,16 +53,45 @@ function jsonValue(value, seen = new Set()) {
   return valid;
 }
 
+function eventRecord(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
+
+function validEventIdentity(event) {
+  return [event.eventId, event.sessionId, event.runId]
+    .every((item) => typeof item === "string" && item.length > 0);
+}
+
+function validEventMetadata(event) {
+  return [
+    EVENT_SCHEMA_VERSIONS.has(event.schemaVersion),
+    Number.isSafeInteger(event.seq),
+    event.seq >= 1,
+    validEventIdentity(event),
+    validDate(event.occurredAt),
+    EVENT_TYPES.has(event.type),
+    AUTHORITIES.has(event.authority)
+  ].every(Boolean);
+}
+
+function eventTypeAllowedBySchema(event) {
+  if (event.schemaVersion === 5 && event.type === "model.prompt_materialized") return false;
+  if (event.schemaVersion < 7
+    && event.type === "context.tool_results_pruned") return false;
+  if (event.schemaVersion !== CURRENT_EVENT_SCHEMA_VERSION
+    && event.type === "long_horizon.updated") return false;
+  if (event.schemaVersion !== CURRENT_EVENT_SCHEMA_VERSION
+    && event.type === "context.reasoning_trajectory_tombstoned") return false;
+  return true;
+}
+
 export function assertV5EventEnvelope(event) {
-  const valid = event && typeof event === "object" && !Array.isArray(event)
-    && EVENT_SCHEMA_VERSIONS.has(event.schemaVersion)
-    && Number.isSafeInteger(event.seq) && event.seq >= 1
-    && [event.eventId, event.sessionId, event.runId].every((item) => typeof item === "string" && item.length > 0)
-    && validDate(event.occurredAt) && EVENT_TYPES.has(event.type) && AUTHORITIES.has(event.authority)
-    && !(event.schemaVersion === 5 && event.type === "model.prompt_materialized")
-    && jsonValue(event.payload);
-  if (!valid) throw new Error("Invalid supported AgentEventEnvelope.");
-  officialAssertAgentEventEnvelope?.(event);
+  const record = eventRecord(event);
+  if (!record || !validEventMetadata(record)
+    || !eventTypeAllowedBySchema(record) || !jsonValue(record.payload)) {
+    throw new Error("Invalid supported AgentEventEnvelope.");
+  }
+  officialAssertAgentEventEnvelope?.(record);
 }
 
 export function assertV5EventStream(input) {

@@ -240,6 +240,9 @@ describe("stable explicit workspace reads", () => {
     await writeFile(path.join(workspace, "invalid.txt"), Buffer.from([0xc3, 0x28]));
     await expect(readStableWorkspaceTextFile(
       workspace, "invalid.txt", new AbortController().signal
-    )).rejects.toMatchObject({ code: "workspace_read_invalid_utf8" });
+    )).rejects.toMatchObject({
+      code: "workspace_read_invalid_utf8",
+      message: expect.stringContaining("use inspect_image")
+    });
   });
 });

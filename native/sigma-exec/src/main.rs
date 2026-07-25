@@ -1,4 +1,6 @@
 #[cfg(target_os = "linux")]
+mod container_boundary;
+#[cfg(target_os = "linux")]
 mod linux_hardening;
 #[cfg(target_os = "linux")]
 mod linux_mount_source;

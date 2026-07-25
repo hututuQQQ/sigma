@@ -1,6 +1,8 @@
 import {
   EVENT_SCHEMA_VERSION,
   createBudgetLedger,
+  emptyLongHorizonStateV1,
+  emptyReasoningTrajectoryStateV1,
   type AgentEventPayloadMap,
   type AgentEventType,
   type CheckpointRef,
@@ -90,7 +92,13 @@ export const agentEventPayloadFixtures = {
     toolSchemaDigest: "a".repeat(64),
     requestDigest: "b".repeat(64),
     prefixMessageCount: 1,
-    cacheMode: "prefix_cache"
+    cacheMode: "prefix_cache",
+    promptState: {
+      schemaVersion: 2,
+      sectionDigests: {},
+      budgetBand: 100
+    },
+    frameMode: "full"
   },
   "model.delta": { turnId: 1, delta: "text" },
   "model.reasoning_delta": { turnId: 1, delta: "reasoning" },
@@ -113,6 +121,19 @@ export const agentEventPayloadFixtures = {
       id: "summary", authority: "runtime", provenance: "compaction", content: "summary",
       tokenCount: 2, priority: 1
     }, omittedHistoryTurns: 1
+  },
+  "context.tool_results_pruned": {
+    state: {
+      schemaVersion: 1,
+      coveredBlocks: 1,
+      sourceDigest: "a".repeat(64)
+    },
+    protectedTokens: 40_000,
+    prunedTokens: 20_000
+  },
+  "context.reasoning_trajectory_tombstoned": {
+    state: emptyReasoningTrajectoryStateV1(),
+    newlyTombstoned: 0
   },
   "child.spawned": { childId: "child", payload: { status: "queued" } },
   "child.message": { childId: "child", payload: { kind: "started" } },
@@ -146,6 +167,10 @@ export const agentEventPayloadFixtures = {
     outcome: { ...hookOutcome, status: "failed", reason: "failed" }
   },
   "plan.updated": { previousRevision: 0, plan: { revision: 1, goal: "goal", nodes: [] } },
+  "long_horizon.updated": {
+    state: emptyLongHorizonStateV1(),
+    reason: "migration_initialized"
+  },
   "budget.reserved": { reservationId: "reservation", ledger },
   "budget.reservation_bound": { reservationId: "reservation", ownerId: "owner", ledger },
   "budget.committed": { reservationId: "reservation", ledger },
@@ -163,6 +188,25 @@ export const agentEventPayloadFixtures = {
   "checkpoint.restored": checkpointFixture("restored"),
   "checkpoint.recovery_resolved": { checkpointId: "checkpoint", decision: "restore" },
   "review.started": { reviewerId: "reviewer", workspaceDeltaEvidenceIds: ["delta"] },
+  "review.tool_completed": {
+    schemaVersion: 1,
+    reviewRequestId: "review-request",
+    call: { id: "review-call", name: "read", arguments: { path: "README.md" } },
+    plan,
+    receipt: {
+      callId: "review-call",
+      ok: true,
+      output: "reviewed",
+      outcome: { status: "succeeded", output: "reviewed", diagnosticCodes: [] },
+      observedEffects: ["filesystem.read"],
+      actualEffects: ["filesystem.read"],
+      artifacts: [],
+      diagnostics: [],
+      evidence: [],
+      startedAt: fixtureOccurredAt,
+      completedAt: fixtureOccurredAt
+    }
+  },
   "review.completed": evidenceFixture("review"),
   "review.waived": evidenceFixture("user_waiver")
 } as const satisfies AgentEventPayloadMap;
@@ -203,6 +247,12 @@ export function completeAgentEventPayload(type: AgentEventType, payload: unknown
   });
   if (type === "run.started") baseline.deadlineAt = new Date(Date.now() + 60_000).toISOString();
   const completed = { ...baseline, ...supplied };
+  if (type === "model.completed" && completed.message
+    && typeof completed.message === "object" && !Array.isArray(completed.message)) {
+    const durableMessage = completed.message as Record<string, unknown>;
+    completed.text = typeof durableMessage.content === "string" ? durableMessage.content : "";
+    completed.toolCalls = Array.isArray(durableMessage.toolCalls) ? durableMessage.toolCalls : [];
+  }
   if (type === "review.completed" && completed.data && typeof completed.data === "object") {
     completed.data = {
       ...(completed.data as Record<string, unknown>),

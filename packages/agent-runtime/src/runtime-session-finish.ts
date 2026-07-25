@@ -158,6 +158,26 @@ async function finishPostCommit(
   resolveOutcomeWaiters(session, runId, outcome);
 }
 
+function withDecisionAuthority(outcome: RunOutcome): RunOutcome {
+  if (outcome.decisionAuthority) return outcome;
+  if (outcome.kind === "cancelled") {
+    return { ...outcome, decisionAuthority: "resource_boundary" };
+  }
+  if (outcome.kind === "needs_input") {
+    return { ...outcome, decisionAuthority: "user_policy" };
+  }
+  if (outcome.kind === "recoverable_failure"
+    && outcome.code === "budget_exhausted") {
+    return { ...outcome, decisionAuthority: "resource_boundary" };
+  }
+  if (outcome.kind === "recoverable_failure"
+    && ["verification_failed", "verification_unavailable", "strict_policy_failure"]
+      .includes(outcome.code)) {
+    return { ...outcome, decisionAuthority: "verification_verdict" };
+  }
+  return { ...outcome, decisionAuthority: "provider_protocol" };
+}
+
 export async function finishRuntimeSession(
   options: RuntimeSessionFinishOptions,
   session: RuntimeSession,
@@ -180,18 +200,24 @@ export async function finishRuntimeSession(
       ? {
           kind: "recoverable_failure",
           code: decision.code,
-          message: decision.message
+          message: decision.message,
+          decisionAuthority: decision.authority
         }
       : {
           ...outcome,
+          decisionAuthority: decision.authority,
           ...(decision.statusNote
             ? { message: `${outcome.message}\n\n${decision.statusNote}` }
             : {})
         };
   }
-  const hookedOutcome = await applyFinishHooks(options.hooks, session, coordinatedOutcome);
+  const hookedOutcome = withDecisionAuthority(
+    await applyFinishHooks(options.hooks, session, coordinatedOutcome)
+  );
   if (outcomeRevision !== undefined && session.durable.state.phase !== "outcome_pending") return false;
-  const finalOutcome = await settleBeforeTerminalEvent(options, session, hookedOutcome);
+  const finalOutcome = withDecisionAuthority(
+    await settleBeforeTerminalEvent(options, session, hookedOutcome)
+  );
   if (outcomeRevision !== undefined && session.durable.state.phase !== "outcome_pending") return false;
   const commitRevision = outcomeRevision === undefined ? undefined : session.durable.state.revision;
   const event = await emitOutcome(options, session, finalOutcome, commitRevision, suspensionContext);

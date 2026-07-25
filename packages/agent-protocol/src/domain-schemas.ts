@@ -28,6 +28,8 @@ export {
   nonEmptyStringSchema,
   nonNegativeIntegerSchema
 } from "./domain-schema-primitives.js";
+export * from "./budget-schemas.js";
+export { checkpointRefSchema } from "./checkpoint-ref-schema.js";
 
 const opaqueArtifactIdentitySchema = z.object({
   digest: z.string().regex(/^[a-f0-9]{64}$/u),
@@ -68,6 +70,9 @@ export const mutationFrontierSchema = z.object({
   baselineManifestDigest: digestSchema,
   currentStateDigest: digestSchema,
   changedPaths: z.array(nonEmptyStringSchema),
+  /** V10 compatibility field. Legacy snapshots omit it and materialize an
+   * empty environment frontier on their next durable update. */
+  environmentChangedPaths: z.array(nonEmptyStringSchema).optional(),
   sourceCheckpointIds: z.array(nonEmptyStringSchema),
   repositoryStateDigest: digestSchema.optional()
 }).strict();
@@ -89,6 +94,12 @@ export const validationEvidenceSchema = z.object({
   ...evidenceBaseShape,
   kind: z.literal("validation"),
   data: z.object({
+    schemaVersion: z.literal(2).optional(),
+    intent: z.object({
+      purpose: nonEmptyStringSchema.optional(),
+      subjects: z.array(nonEmptyStringSchema).max(128),
+      criterionIds: z.array(nonEmptyStringSchema).max(64)
+    }).strict().optional(),
     validator: nonEmptyStringSchema,
     command: z.string().optional(),
     exitCode: z.number().int().nullable().optional(),
@@ -103,10 +114,27 @@ export const validationEvidenceSchema = z.object({
       failureCode: nonEmptyStringSchema.optional()
     }).strict().optional(),
     artifactIds: z.array(z.string()).optional(),
+    output: z.object({
+      sha256: digestSchema,
+      byteLength: nonNegativeIntegerSchema,
+      preview: z.string(),
+      truncated: z.boolean()
+    }).strict().optional(),
     frontierRevision: nonNegativeIntegerSchema,
     stateDigest: digestSchema,
     coveredPaths: z.array(nonEmptyStringSchema),
     claim: z.object({
+      kind: z.enum(["probe", "syntax", "typecheck", "lint", "unit", "integration", "acceptance"]),
+      commandDigest: digestSchema,
+      subject: z.object({
+        projectId: z.string().optional(),
+        configPaths: z.array(z.string()),
+        selectedTests: z.array(z.string()),
+        exactFiles: z.array(z.string())
+      }).strict(),
+      status: z.enum(["passed", "failed", "unavailable"])
+    }).strict().optional(),
+    adapterInference: z.object({
       kind: z.enum(["probe", "syntax", "typecheck", "lint", "unit", "integration", "acceptance"]),
       commandDigest: digestSchema,
       subject: z.object({
@@ -147,13 +175,42 @@ export const reviewEvidenceSchema = z.object({
   ...evidenceBaseShape,
   kind: z.literal("review"),
   data: z.object({
+    schemaVersion: z.union([z.literal(2), z.literal(3)]).optional(),
     reviewerId: nonEmptyStringSchema,
-    verdict: z.enum(["approved", "changes_requested"]),
+    reviewRequestId: nonEmptyStringSchema.optional(),
+    verdict: z.enum(["approved", "changes_requested", "validation_required", "blocked"]),
     findings: z.array(jsonValueSchema),
+    criteria: z.array(z.object({
+      criterion: nonEmptyStringSchema, status: z.enum(["satisfied", "failed", "unverified"]),
+      evidence: z.array(nonEmptyStringSchema), summary: z.string().optional(),
+      coverage: z.object({
+        scope: z.enum(["complete", "partial", "unavailable"]), rationale: nonEmptyStringSchema,
+        checkedClaims: z.array(nonEmptyStringSchema).min(1).max(32), limitations: z.array(nonEmptyStringSchema).max(16),
+        falsificationAttempt: nonEmptyStringSchema }).strict().optional()
+    }).strict()).optional(),
+    requiredValidations: z.array(z.object({
+      purpose: nonEmptyStringSchema,
+      coveredPaths: z.array(nonEmptyStringSchema).optional(),
+      claimKind: z.enum([
+        "probe", "syntax", "typecheck", "lint", "unit", "integration", "acceptance"
+      ]).optional(),
+      commandSuggestion: z.string().optional()
+    }).strict()).optional(),
     frontierRevision: nonNegativeIntegerSchema,
     stateDigest: digestSchema,
     reviewBasisDigest: digestSchema.optional(),
+    completionCandidateDigest: digestSchema.optional(),
     validationEvidenceIds: z.array(z.string()).optional(),
+    durableEvidenceIds: z.array(nonEmptyStringSchema).optional(),
+    actualChecks: z.array(z.object({
+      toolName: nonEmptyStringSchema,
+      evidenceIds: z.array(nonEmptyStringSchema),
+      summary: z.string()
+    }).strict()).optional(),
+    evidenceReferenceResolution: z.object({
+      accepted: nonNegativeIntegerSchema,
+      dropped: nonNegativeIntegerSchema
+    }).strict().optional(),
     failureKind: z.enum(["infrastructure", "interrupted", "protocol"]).optional(),
     failureCode: z.enum([
       "review_scope_too_large", "review_protocol_invalid", "review_unavailable"
@@ -299,9 +356,6 @@ const planNodeSchema = z.object({
   if (node.status === "blocked" && !node.blockedReason) {
     context.addIssue({ code: "custom", path: ["blockedReason"], message: "Blocked plan nodes require a reason" });
   }
-  if (node.status === "completed" && node.evidence.length === 0) {
-    context.addIssue({ code: "custom", path: ["evidence"], message: "Completed plan nodes require evidence" });
-  }
 });
 
 function hasDependencyCycle(dependencies: ReadonlyMap<string, readonly string[]>): boolean {
@@ -344,46 +398,3 @@ export const planGraphSchema = z.object({
     context.addIssue({ code: "custom", path: ["nodes"], message: "Plan dependencies must be acyclic" });
   }
 });
-
-export const budgetAmountsSchema = z.object({
-  inputTokens: nonNegativeIntegerSchema,
-  outputTokens: nonNegativeIntegerSchema,
-  costMicroUsd: nonNegativeIntegerSchema,
-  modelTurns: nonNegativeIntegerSchema,
-  toolCalls: nonNegativeIntegerSchema,
-  children: nonNegativeIntegerSchema
-}).strict();
-
-export const budgetLimitsSchema = budgetAmountsSchema.extend({
-  maxDepth: nonNegativeIntegerSchema
-}).strict();
-
-export const budgetReservationSchema = z.object({
-  reservationId: nonEmptyStringSchema,
-  ownerId: nonEmptyStringSchema,
-  status: z.enum(["reserved", "committed", "released"]),
-  requested: budgetAmountsSchema,
-  consumed: budgetAmountsSchema,
-  createdAt: dateTimeSchema,
-  settledAt: dateTimeSchema.optional()
-}).strict();
-
-export const budgetLedgerStateSchema = z.object({
-  limits: budgetLimitsSchema,
-  consumed: budgetAmountsSchema,
-  reserved: budgetAmountsSchema,
-  reservations: z.array(budgetReservationSchema)
-}).strict();
-
-export const checkpointRefSchema = z.object({
-  checkpointId: nonEmptyStringSchema,
-  sessionId: nonEmptyStringSchema,
-  runId: nonEmptyStringSchema,
-  status: z.enum(["open", "sealed", "restored"]),
-  createdAt: dateTimeSchema,
-  sealedAt: dateTimeSchema.optional(),
-  restoredAt: dateTimeSchema.optional(),
-  preManifestDigest: nonEmptyStringSchema,
-  postManifestDigest: z.string().min(1).optional(),
-  delta: checkpointDeltaSchema.optional()
-}).strict();

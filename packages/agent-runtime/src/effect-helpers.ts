@@ -241,6 +241,7 @@ export async function writeScopeFailure(
   startedAt: string,
   plan?: ToolCallPlan
 ): Promise<ToolReceipt | null> {
+  if (plan?.mutationAuthority === "disposable_enclosing_container_v1") return null;
   if (!session.identity.strictWriteScope || !needsWriteScope(plan, descriptor)) return null;
   const input = structuredArguments(call);
   if (!input) return failed(call, startedAt, "Scoped writer tools require structured path arguments.", "write_scope_denied");

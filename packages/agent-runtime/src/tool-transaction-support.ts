@@ -21,7 +21,8 @@ interface NoChangePreparedTool {
 }
 
 export function delegatesWorkspaceMutation(plan: ToolCallPlan): boolean {
-  return plan.exactEffects.includes("agent.spawn") && plan.processMode === "background";
+  return plan.mutationAuthority === "disposable_enclosing_container_v1"
+    || (plan.exactEffects.includes("agent.spawn") && plan.processMode === "background");
 }
 
 export function isToolReceipt(value: object): value is ToolReceipt {
@@ -121,7 +122,9 @@ export async function createMutationCheckpoint(
   session: RuntimeSession,
   plan: ToolCallPlan
 ): Promise<CheckpointRef | undefined> {
-  if (plan.checkpointAction || plan.mutationAuthority === "broker_repository_transaction_v2") {
+  if (plan.checkpointAction
+    || plan.mutationAuthority === "broker_repository_transaction_v2"
+    || plan.mutationAuthority === "disposable_enclosing_container_v1") {
     return undefined;
   }
   if (!mutatingPlan(plan) || delegatesWorkspaceMutation(plan)) return undefined;

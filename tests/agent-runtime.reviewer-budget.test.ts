@@ -20,16 +20,41 @@ import {
   type WorkspaceDeltaEvidence
 } from "../packages/agent-protocol/src/index.js";
 import type { ModelRouteConstraints } from "../packages/agent-model/src/index.js";
-import { BudgetController, BudgetExceededError } from "../packages/agent-runtime/src/budget-controller.js";
+import { BudgetController } from "../packages/agent-runtime/src/budget-controller.js";
 import {
   goalReferencedWorkspaceReads,
   ReviewCoordinator
 } from "../packages/agent-runtime/src/review-coordinator.js";
+import { normalizeReview } from "../packages/agent-runtime/src/review-normalization.js";
 import { ModelReviewer, type ReviewerPort } from "../packages/agent-runtime/src/reviewer.js";
+import type {
+  ReviewerToolEnvironment,
+  ReviewerToolSessionPort
+} from "../packages/agent-runtime/src/reviewer-contracts.js";
 import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
 import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
 
 const now = "2026-07-11T00:00:00.000Z";
+
+function completeCoverage() {
+  return {
+    scope: "complete" as const,
+    rationale: "Independent current-frontier inspection covers the declared requirement.",
+    checkedClaims: ["The current frontier satisfies the declared requirement."],
+    limitations: [],
+    falsificationAttempt: "Ran an independent check intended to contradict the completion claim."
+  };
+}
+
+function unavailableCoverage() {
+  return {
+    scope: "unavailable" as const,
+    rationale: "No independent compatibility probe was available.",
+    checkedClaims: ["Whether the current frontier preserves compatibility."],
+    limitations: ["Compatibility remains unverified."],
+    falsificationAttempt: "Looked for an applicable independent compatibility check."
+  };
+}
 
 function workspaceReadReceipt(
   callId: string,
@@ -103,7 +128,17 @@ class ReviewerGateway implements ModelGateway {
 
   constructor(
     private readonly failure?: Error,
-    private readonly content = '{"verdict":"approved","findings":[]}',
+    private readonly content = JSON.stringify({
+      verdict: "approved",
+      findings: [],
+      criteria: [{
+        criterionIndex: 0,
+        status: "satisfied",
+        coverage: completeCoverage(),
+        evidenceIds: ["delta"]
+      }],
+      requiredValidations: []
+    }),
     private readonly reportedInputTokens = 80
   ) {}
 
@@ -191,6 +226,433 @@ class FallbackReviewerGateway extends ReviewerGateway {
       attempt: 1
     } as ModelResponse;
   }
+}
+
+class StructuredReviewerGateway implements ModelGateway {
+  readonly provider = "deepseek";
+  readonly model = "deepseek-v4-pro";
+  readonly capabilities: ModelCapabilities = {
+    contextWindowTokens: 32_000,
+    maxOutputTokens: 8_192,
+    tools: true,
+    parallelTools: false,
+    reasoning: true,
+    structuredOutput: false,
+    promptCache: true,
+    tokenizer: "approximate",
+    strictToolChoice: true,
+    strictToolChoiceDisablesReasoning: true
+  };
+  readonly requests: ModelRequest[] = [];
+
+  async complete(request: ModelRequest): Promise<ModelResponse> {
+    this.requests.push(request);
+    return {
+      message: {
+        role: "assistant",
+        content: "",
+        toolCalls: [{
+          id: "review-verdict",
+          name: "submit_verification",
+          arguments: {
+            verdict: "approved",
+            findings: [],
+            criteria: [{
+              criterionIndex: 0,
+              status: "satisfied",
+              coverage: completeCoverage(),
+              evidenceIds: ["validation"]
+            }],
+            requiredValidations: []
+          }
+        }]
+      },
+      finishReason: "tool_calls",
+      usage: {
+        inputTokens: 90,
+        outputTokens: 30,
+        reasoningTokens: 0,
+        cacheReadTokens: 80,
+        cacheWriteTokens: 0,
+        providerReported: true,
+        costMicroUsd: 5,
+        latencyMs: 1,
+        retryAttempt: 0
+      }
+    };
+  }
+
+  async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    yield { type: "done", response: await this.complete(request) };
+  }
+
+  async countTokens(): Promise<number> {
+    return 100;
+  }
+}
+
+class InspectOnceThenSubmitGateway implements ModelGateway {
+  readonly provider = "deepseek";
+  readonly model = "deepseek-v4-pro";
+  readonly capabilities: ModelCapabilities = {
+    contextWindowTokens: 32_000,
+    maxOutputTokens: 8_192,
+    tools: true,
+    parallelTools: false,
+    reasoning: true,
+    structuredOutput: false,
+    promptCache: true,
+    tokenizer: "approximate",
+    strictToolChoice: true,
+    strictToolChoiceDisablesReasoning: true
+  };
+  readonly requests: ModelRequest[] = [];
+
+  async complete(request: ModelRequest): Promise<ModelResponse> {
+    this.requests.push(request);
+    const canSubmit = request.tools.some((tool) =>
+      tool.name === "submit_verification");
+    return {
+      message: canSubmit
+        ? {
+            role: "assistant",
+            content: "",
+            toolCalls: [{
+              id: "review-verdict",
+              name: "submit_verification",
+              arguments: {
+                verdict: "approved",
+                findings: [],
+                criteria: [{
+                  criterionIndex: 0,
+                  status: "satisfied",
+                  coverage: completeCoverage()
+                }],
+                requiredValidations: []
+              }
+            }]
+          }
+        : {
+            role: "assistant",
+            content: "",
+            toolCalls: [{
+              id: "inspect-current-frontier",
+              name: "read",
+              arguments: { path: "source.txt" }
+            }]
+          },
+      finishReason: "tool_calls",
+      usage: {
+        inputTokens: 100,
+        outputTokens: 20,
+        reasoningTokens: 0,
+        cacheReadTokens: 90,
+        cacheWriteTokens: 0,
+        providerReported: true,
+        costMicroUsd: 5,
+        latencyMs: 1,
+        retryAttempt: 0
+      }
+    };
+  }
+
+  async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    yield { type: "done", response: await this.complete(request) };
+  }
+
+  async countTokens(): Promise<number> {
+    return 100;
+  }
+}
+
+class InspectThenSubmitGateway implements ModelGateway {
+  readonly provider = "deepseek";
+  readonly model = "deepseek-v4-pro";
+  readonly capabilities: ModelCapabilities = {
+    contextWindowTokens: 32_000,
+    maxOutputTokens: 8_192,
+    tools: true,
+    parallelTools: false,
+    reasoning: true,
+    structuredOutput: false,
+    promptCache: true,
+    tokenizer: "approximate",
+    strictToolChoice: true,
+    strictToolChoiceDisablesReasoning: true
+  };
+  readonly requests: ModelRequest[] = [];
+  private lastInspectionId = "";
+
+  constructor(private readonly narrateOnTurn?: number) {}
+
+  async complete(request: ModelRequest): Promise<ModelResponse> {
+    this.requests.push(request);
+    const turn = this.requests.length;
+    if (turn === this.narrateOnTurn && request.toolChoice !== "required") {
+      return {
+        message: {
+          role: "assistant",
+          content: "The inspected evidence is sufficient; I am ready to submit the verdict."
+        },
+        finishReason: "stop",
+        usage: {
+          inputTokens: 100,
+          outputTokens: 10,
+          reasoningTokens: 0,
+          cacheReadTokens: 90,
+          cacheWriteTokens: 0,
+          providerReported: true,
+          costMicroUsd: 5,
+          latencyMs: 1,
+          retryAttempt: 0
+        }
+      };
+    }
+    if (turn < 4) {
+      this.lastInspectionId = `inspect-${turn}`;
+      return {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{
+            id: this.lastInspectionId,
+            name: "read",
+            arguments: { path: `source-${turn}.txt` }
+          }]
+        },
+        finishReason: "tool_calls",
+        usage: {
+          inputTokens: 90,
+          outputTokens: 20,
+          reasoningTokens: 0,
+          cacheReadTokens: 80,
+          cacheWriteTokens: 0,
+          providerReported: true,
+          costMicroUsd: 5,
+          latencyMs: 1,
+          retryAttempt: 0
+        }
+      };
+    }
+    if (!request.messages.at(-1)?.content.includes(
+      "[verification_verdict_required]"
+    )) {
+      return {
+        message: {
+          role: "assistant",
+          content: "I finished inspecting the change."
+        },
+        finishReason: "stop",
+        usage: {
+          inputTokens: 100,
+          outputTokens: 10,
+          reasoningTokens: 0,
+          cacheReadTokens: 90,
+          cacheWriteTokens: 0,
+          providerReported: true,
+          costMicroUsd: 5,
+          latencyMs: 1,
+          retryAttempt: 0
+        }
+      };
+    }
+    return {
+      message: {
+        role: "assistant",
+        content: "",
+        toolCalls: [{
+          id: "review-verdict",
+          name: "submit_verification",
+          arguments: {
+            verdict: "approved",
+            findings: [],
+            criteria: [{
+              criterionIndex: 0,
+              status: "satisfied",
+              coverage: completeCoverage(),
+              evidenceIds: [`review-check:${this.lastInspectionId}`]
+            }],
+            requiredValidations: []
+          }
+        }]
+      },
+      finishReason: "tool_calls",
+      usage: {
+        inputTokens: 100,
+        outputTokens: 30,
+        reasoningTokens: 0,
+        cacheReadTokens: 90,
+        cacheWriteTokens: 0,
+        providerReported: true,
+        costMicroUsd: 5,
+        latencyMs: 1,
+        retryAttempt: 0
+      }
+    };
+  }
+
+  async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    yield { type: "done", response: await this.complete(request) };
+  }
+
+  async countTokens(): Promise<number> {
+    return 100;
+  }
+}
+
+class RecoverableVerdictProtocolGateway implements ModelGateway {
+  readonly provider = "deepseek";
+  readonly model = "deepseek-v4-pro";
+  readonly capabilities: ModelCapabilities = {
+    contextWindowTokens: 32_000,
+    maxOutputTokens: 8_192,
+    tools: true,
+    parallelTools: false,
+    reasoning: true,
+    structuredOutput: false,
+    promptCache: true,
+    tokenizer: "approximate",
+    strictToolChoice: true,
+    strictToolChoiceDisablesReasoning: true
+  };
+  readonly requests: ModelRequest[] = [];
+
+  constructor(private readonly failure: "mixed" | "malformed") {}
+
+  async complete(request: ModelRequest): Promise<ModelResponse> {
+    this.requests.push(request);
+    const usage = {
+      inputTokens: 100,
+      outputTokens: 20,
+      reasoningTokens: 0,
+      cacheReadTokens: 90,
+      cacheWriteTokens: 0,
+      providerReported: true,
+      costMicroUsd: 5,
+      latencyMs: 1,
+      retryAttempt: 0
+    };
+    if (this.requests.length === 1) {
+      return {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{
+            id: "inspect-before-verdict",
+            name: "read",
+            arguments: { path: "source.txt" }
+          }]
+        },
+        finishReason: "tool_calls",
+        usage
+      };
+    }
+    if (this.requests.length === 2) {
+      const submission = {
+        id: "early-verdict",
+        name: "submit_verification",
+        arguments: this.failure === "malformed"
+          ? "not-an-object"
+          : {
+              verdict: "approved",
+              findings: [],
+              criteria: [{
+                criterionIndex: 0,
+                status: "satisfied",
+                coverage: completeCoverage(),
+                evidenceIds: ["review-check:inspect-before-verdict"]
+              }],
+              requiredValidations: []
+            }
+      };
+      return {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: this.failure === "mixed"
+            ? [
+                submission,
+                {
+                  id: "unsafe-parallel-inspection",
+                  name: "read",
+                  arguments: { path: "another-source.txt" }
+                }
+              ]
+            : [submission]
+        },
+        finishReason: "tool_calls",
+        usage
+      };
+    }
+    return {
+      message: {
+        role: "assistant",
+        content: "",
+        toolCalls: [{
+          id: "recovered-verdict",
+          name: "submit_verification",
+          arguments: {
+            verdict: "approved",
+            findings: [],
+            criteria: [{
+              criterionIndex: 0,
+              status: "satisfied",
+              coverage: completeCoverage(),
+              evidenceIds: ["review-check:inspect-before-verdict"]
+            }],
+            requiredValidations: []
+          }
+        }]
+      },
+      finishReason: "tool_calls",
+      usage
+    };
+  }
+
+  async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    yield { type: "done", response: await this.complete(request) };
+  }
+
+  async countTokens(): Promise<number> {
+    return 100;
+  }
+}
+
+function inspectionEnvironment(): ReviewerToolEnvironment {
+  return {
+    definitions: () => [{
+      name: "read",
+      description: "Read a file for verification.",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: { path: { type: "string" } },
+        required: ["path"]
+      }
+    }],
+    async open(): Promise<ReviewerToolSessionPort> {
+      return {
+        definitions: () => [],
+        async execute(call) {
+          return {
+            message: {
+              role: "tool",
+              content: `inspected ${String(
+                (call.arguments as Record<string, JsonValue>).path
+              )}`,
+              toolCallId: call.id
+            },
+            check: {
+              toolName: call.name,
+              evidenceIds: [`review-check:${call.id}`],
+              summary: "Read completed."
+            }
+          };
+        },
+        async close() {}
+      };
+    }
+  };
 }
 
 function limits(overrides: Partial<BudgetLimits> = {}): BudgetLimits {
@@ -444,16 +906,23 @@ describe("independent reviewer budget accounting", () => {
     })]);
   });
 
-  it("rejects exhausted reviewer budget before invoking the model", async () => {
+  it("records typed review unavailability before invoking an unaffordable model", async () => {
     const target = runtimeSession(limits({ inputTokens: 119 }));
     const gateway = new ReviewerGateway();
     const { budgets, emit, events } = harness(target);
     const coordinator = new ReviewCoordinator(new ModelReviewer(gateway), emit, budgets);
 
-    await expect(coordinator.maybeReview(target, new AbortController().signal))
-      .rejects.toBeInstanceOf(BudgetExceededError);
+    await coordinator.maybeReview(target, new AbortController().signal);
     expect(gateway.calls).toBe(0);
-    expect(events).toContain("budget.exhausted");
+    expect(target.durable.state.evidence.find((item) => item.kind === "review"))
+      .toMatchObject({
+        status: "failed",
+        data: {
+          failureKind: "infrastructure",
+          failureCode: "review_unavailable"
+        }
+      });
+    expect(events).toContain("review.completed");
     expect(events).not.toContain("review.started");
   });
 
@@ -478,6 +947,660 @@ describe("independent reviewer budget accounting", () => {
       role: "reviewer", providerId: "deepseek", modelId: "deepseek-v4-pro"
     });
     expect(target.durable.state.evidence.find((item) => item.kind === "review")).toMatchObject({ status: "passed" });
+  });
+
+  it("lets the independent reviewer judge an unvalidated text mutation", async () => {
+    const target = runtimeSession();
+    target.durable.state.evidence = [delta()];
+    const gateway = new ReviewerGateway();
+    const { budgets, emit } = harness(target);
+
+    await new ReviewCoordinator(new ModelReviewer(gateway), emit, budgets)
+      .maybeReview(target, new AbortController().signal, true, "completion");
+
+    expect(gateway.calls).toBe(1);
+    expect(target.durable.state.evidence.find((item) => item.kind === "review")).toMatchObject({
+      status: "passed",
+      data: {
+        schemaVersion: 3,
+        verdict: "approved"
+      }
+    });
+  });
+
+  it("does not let runtime coverage or command classifiers override a reviewer verdict", async () => {
+    const narrowTarget = runtimeSession();
+    narrowTarget.durable.state.evidence = [delta(), validation([])];
+    const narrowGateway = new ReviewerGateway();
+    const narrowHarness = harness(narrowTarget);
+    await new ReviewCoordinator(
+      new ModelReviewer(narrowGateway),
+      narrowHarness.emit,
+      narrowHarness.budgets
+    ).maybeReview(narrowTarget, new AbortController().signal, true, "completion");
+    expect(narrowTarget.durable.state.evidence.find((item) => item.kind === "review"))
+      .toMatchObject({
+        status: "passed",
+        data: { schemaVersion: 3, verdict: "approved" }
+      });
+
+    const failedTarget = runtimeSession();
+    const failed = validation();
+    failed.status = "failed";
+    failed.summary = "Typecheck exited with errors.";
+    failed.data = {
+      ...failed.data,
+      exitCode: 1,
+      termination: {
+        state: "exited",
+        processStarted: true,
+        timedOut: false,
+        idleTimedOut: false,
+        cancelled: false
+      },
+      claim: { ...failed.data.claim!, status: "failed" }
+    };
+    failedTarget.durable.state.evidence = [delta(), failed];
+    const failedGateway = new ReviewerGateway();
+    const failedHarness = harness(failedTarget);
+    await new ReviewCoordinator(
+      new ModelReviewer(failedGateway),
+      failedHarness.emit,
+      failedHarness.budgets
+    ).maybeReview(failedTarget, new AbortController().signal, true, "completion");
+    expect(failedTarget.durable.state.evidence.find((item) => item.kind === "review"))
+      .toMatchObject({
+        status: "passed",
+        data: { schemaVersion: 3, verdict: "approved" }
+      });
+  });
+
+  it("requires the V3 reviewer to enumerate durable acceptance criteria", async () => {
+    const gateway = new ReviewerGateway(
+      undefined,
+      JSON.stringify({
+        verdict: "validation_required",
+        findings: [],
+        criteria: [{
+          criterion: "Preserve compatibility with the documented format.",
+          status: "unverified",
+          coverage: unavailableCoverage(),
+          evidence: [],
+          summary: "No compatibility probe was supplied."
+        }],
+        requiredValidations: [{
+          purpose: "Run the compatibility probe.",
+          claimKind: "acceptance"
+        }]
+      })
+    );
+
+    const result = await new ModelReviewer(gateway).review({
+      sessionId: "session",
+      runId: "run",
+      goal: "Change the parser and preserve compatibility with the documented format.",
+      acceptanceCriteria: ["Preserve compatibility with the documented format."],
+      frontierRevision: 1,
+      stateDigest: "a".repeat(64),
+      reviewBasisDigest: "b".repeat(64),
+      reviewMode: "completion",
+      workspaceDeltas: [delta()],
+      validations: []
+    }, new AbortController().signal);
+
+    expect(result).toMatchObject({
+      status: "failed",
+      data: {
+        schemaVersion: 3,
+        verdict: "changes_requested",
+        criteria: [expect.objectContaining({
+          criterion: "Preserve compatibility with the documented format.",
+          status: "unverified"
+        })]
+      }
+    });
+  });
+
+  it("uses the V3 submit tool without forcing an immediate verdict before inspection", async () => {
+    const gateway = new StructuredReviewerGateway();
+    const criterion = "Preserve compatibility with the documented format.";
+    const result = await new ModelReviewer(gateway).review({
+      sessionId: "session",
+      runId: "run",
+      goal: "Change the parser.",
+      acceptanceCriteria: [criterion],
+      frontierRevision: 1,
+      stateDigest: "a".repeat(64),
+      reviewBasisDigest: "b".repeat(64),
+      reviewMode: "completion",
+      workspaceDeltas: [delta()],
+      validations: [validation()]
+    }, new AbortController().signal);
+
+    expect(gateway.requests[0]).toMatchObject({
+      toolChoice: "auto",
+      maxOutputTokens: 2_048,
+      tools: [expect.objectContaining({ name: "submit_verification" })]
+    });
+    expect(JSON.stringify(gateway.requests[0]!.tools)).not.toContain("evidenceIds");
+    expect(gateway.requests[0]!.tools[0]!.inputSchema).toMatchObject({
+      properties: {
+        criteria: {
+          items: {
+            required: ["criterionIndex", "status", "coverage"],
+            properties: {
+              coverage: {
+                required: [
+                  "scope",
+                  "rationale",
+                  "checkedClaims",
+                  "limitations",
+                  "falsificationAttempt"
+                ]
+              }
+            }
+          }
+        }
+      }
+    });
+    expect(result).toMatchObject({
+      status: "passed",
+      data: {
+        verdict: "approved",
+        criteria: [{
+          criterion,
+          status: "satisfied",
+          evidence: ["validation"]
+        }]
+      }
+    });
+    expect(result.data).not.toHaveProperty("failureKind");
+    expect(result.data).not.toHaveProperty("failureCode");
+  });
+
+  it("binds authenticated review evidence without asking the model to copy opaque ids", async () => {
+    const criterion = "Preserve compatibility with the documented format.";
+    const gateway = new ReviewerGateway(undefined, JSON.stringify({
+      verdict: "approved",
+      findings: [],
+      criteria: [{
+        criterionIndex: 0,
+        status: "satisfied",
+        coverage: completeCoverage()
+      }],
+      requiredValidations: []
+    }));
+    const result = await new ModelReviewer(gateway).review({
+      sessionId: "session",
+      runId: "run",
+      goal: "Change the parser.",
+      acceptanceCriteria: [criterion],
+      frontierRevision: 1,
+      stateDigest: "a".repeat(64),
+      reviewBasisDigest: "b".repeat(64),
+      reviewMode: "completion",
+      workspaceDeltas: [delta()],
+      validations: [validation()]
+    }, new AbortController().signal);
+
+    expect(result).toMatchObject({
+      status: "passed",
+      data: {
+        verdict: "approved",
+        criteria: [{
+          criterion,
+          status: "satisfied",
+          evidence: ["validation", "delta"]
+        }],
+        durableEvidenceIds: ["validation", "delta"]
+      }
+    });
+  });
+
+  it.each([
+    {
+      name: "declared partial coverage",
+      coverage: {
+        scope: "partial",
+        rationale: "Only representative inputs were checked.",
+        checkedClaims: ["Representative inputs produce the expected result."],
+        limitations: ["Inputs outside the sample were not established."],
+        falsificationAttempt: "Checked boundary values within the available sample."
+      }
+    },
+    {
+      name: "declared complete coverage with a remaining limitation",
+      coverage: {
+        scope: "complete",
+        rationale: "The main path was checked.",
+        checkedClaims: ["The main path produces the expected result."],
+        limitations: ["Alternate inputs were not established."],
+        falsificationAttempt: "Tried one alternate input."
+      }
+    }
+  ])("keeps Strict verification from promoting $name", async ({ coverage }) => {
+    const criterion = "Preserve behavior for all supported inputs.";
+    const gateway = new ReviewerGateway(undefined, JSON.stringify({
+      verdict: "approved",
+      findings: [],
+      criteria: [{
+        criterionIndex: 0,
+        status: "satisfied",
+        coverage
+      }],
+      requiredValidations: []
+    }));
+
+    const result = await new ModelReviewer(gateway).review({
+      sessionId: "session",
+      runId: "run",
+      goal: "Change the implementation.",
+      acceptanceCriteria: [criterion],
+      frontierRevision: 1,
+      stateDigest: "a".repeat(64),
+      reviewBasisDigest: "b".repeat(64),
+      reviewMode: "completion",
+      verificationPolicy: "strict",
+      workspaceDeltas: [delta()],
+      validations: [validation()]
+    }, new AbortController().signal);
+
+    expect(result).toMatchObject({
+      status: "failed",
+      data: {
+        verdict: "changes_requested",
+        criteria: [{
+          criterion,
+          status: "unverified",
+          coverage: expect.objectContaining({ scope: "partial" })
+        }]
+      }
+    });
+    expect(result.data).not.toHaveProperty("failureCode");
+  });
+
+  it("keeps Standard approval structurally consistent with declared limitations", async () => {
+    const criterion = "Preserve behavior for all supported inputs.";
+    const coverage = {
+      scope: "partial" as const,
+      rationale:
+        "Boundary checks plus the implementation invariant cover every material behavior.",
+      checkedClaims: [
+        "Representative and boundary inputs preserve the documented behavior."
+      ],
+      limitations: [
+        "An inaccessible external reference was not compared byte-for-byte."
+      ],
+      falsificationAttempt:
+        "Tried malformed and boundary inputs and inspected the shared invariant."
+    };
+    const gateway = new ReviewerGateway(undefined, JSON.stringify({
+      verdict: "approved",
+      findings: [],
+      criteria: [{
+        criterionIndex: 0,
+        status: "satisfied",
+        coverage
+      }],
+      requiredValidations: []
+    }));
+
+    const result = await new ModelReviewer(gateway).review({
+      sessionId: "session",
+      runId: "run",
+      goal: "Change the implementation.",
+      acceptanceCriteria: [criterion],
+      frontierRevision: 1,
+      stateDigest: "a".repeat(64),
+      reviewBasisDigest: "b".repeat(64),
+      reviewMode: "completion",
+      verificationPolicy: "standard",
+      workspaceDeltas: [delta()],
+      validations: [validation()]
+    }, new AbortController().signal);
+
+    expect(result).toMatchObject({
+      status: "failed",
+      data: {
+        verdict: "changes_requested",
+        criteria: [{
+          criterion,
+          status: "unverified",
+          coverage: expect.objectContaining({
+            scope: "partial",
+            limitations: coverage.limitations
+          })
+        }]
+      }
+    });
+  });
+
+  it("conservatively requests repair when coverage is omitted for the durable user goal", async () => {
+    const gateway = new ReviewerGateway(undefined, JSON.stringify({
+      verdict: "approved",
+      findings: [],
+      criteria: [{ criterionIndex: 0, status: "satisfied" }],
+      requiredValidations: []
+    }));
+
+    const result = await new ModelReviewer(gateway).review({
+      sessionId: "session",
+      runId: "run",
+      goal: "Complete the durable user request.",
+      frontierRevision: 1,
+      stateDigest: "a".repeat(64),
+      reviewBasisDigest: "b".repeat(64),
+      reviewMode: "completion",
+      workspaceDeltas: [delta()],
+      validations: [validation()]
+    }, new AbortController().signal);
+
+    expect(result).toMatchObject({
+      status: "failed",
+      data: {
+        verdict: "changes_requested",
+        criteria: [{
+          criterion: "Complete the durable user request.",
+          status: "unverified",
+          coverage: expect.objectContaining({ scope: "unavailable" })
+        }]
+      }
+    });
+    expect(result.data).not.toHaveProperty("failureCode");
+  });
+
+  it("accepts an exact fenced JSON verdict when a provider omits the final tool call", async () => {
+    const criterion = "Preserve compatibility with the documented format.";
+    const gateway = new ReviewerGateway(undefined, `\`\`\`json
+${JSON.stringify({
+  verdict: "approved",
+  findings: [],
+  criteria: [{
+    criterionIndex: 0,
+    status: "satisfied",
+    coverage: completeCoverage()
+  }],
+  requiredValidations: []
+})}
+\`\`\``);
+
+    const result = await new ModelReviewer(gateway).review({
+      sessionId: "session",
+      runId: "run",
+      goal: "Change the parser.",
+      acceptanceCriteria: [criterion],
+      frontierRevision: 1,
+      stateDigest: "a".repeat(64),
+      reviewBasisDigest: "b".repeat(64),
+      reviewMode: "completion",
+      workspaceDeltas: [delta()],
+      validations: [validation()]
+    }, new AbortController().signal);
+
+    expect(result).toMatchObject({
+      status: "passed",
+      data: {
+        verdict: "approved",
+        criteria: [{
+          criterion,
+          status: "satisfied"
+        }]
+      }
+    });
+    expect(result.data).not.toHaveProperty("failureCode");
+  });
+
+  it("drops unknown legacy evidence references but still fails closed without authentic proof", () => {
+    const target = runtimeSession();
+    const raw = (evidence: string[]): ReviewEvidence => ({
+      evidenceId: "raw-review",
+      sessionId: "session",
+      runId: "run",
+      kind: "review",
+      status: "passed",
+      createdAt: now,
+      producer: { authority: "runtime", id: "reviewer" },
+      summary: "approved",
+      data: {
+        schemaVersion: 3,
+        reviewerId: "reviewer",
+        verdict: "approved",
+        findings: [],
+        criteria: [{
+          criterion: "Review the change",
+          status: "satisfied",
+          evidence
+        }],
+        requiredValidations: [],
+        frontierRevision: 1,
+        stateDigest: "a".repeat(64),
+        reviewBasisDigest: "b".repeat(64),
+        durableEvidenceIds: evidence
+      }
+    });
+
+    const redundant = normalizeReview(
+      target,
+      raw(["validation", "review-check:mistyped"]),
+      "b".repeat(64)
+    );
+    expect(redundant).toMatchObject({
+      status: "passed",
+      data: {
+        verdict: "approved",
+        criteria: [{
+          status: "satisfied",
+          evidence: ["validation"]
+        }],
+        durableEvidenceIds: ["validation"],
+        evidenceReferenceResolution: { accepted: 1, dropped: 1 }
+      }
+    });
+
+    const unsupported = normalizeReview(
+      target,
+      raw(["review-check:mistyped"]),
+      "b".repeat(64)
+    );
+    expect(unsupported).toMatchObject({
+      status: "failed",
+      data: {
+        verdict: "blocked",
+        failureKind: "protocol",
+        failureCode: "review_protocol_invalid",
+        evidenceReferenceResolution: { accepted: 0, dropped: 1 }
+      }
+    });
+  });
+
+  it("reserves the final active-review turn for a verdict after bounded inspection", async () => {
+    const gateway = new InspectThenSubmitGateway();
+    const criterion = "Preserve compatibility with the documented format.";
+    const result = await new ModelReviewer(
+      gateway,
+      "bounded-active-reviewer",
+      inspectionEnvironment(),
+      { maxTurns: 4, maxToolCalls: 12 }
+    ).review({
+      sessionId: "session",
+      runId: "run",
+      goal: "Change the parser.",
+      acceptanceCriteria: [criterion],
+      frontierRevision: 1,
+      stateDigest: "a".repeat(64),
+      reviewBasisDigest: "b".repeat(64),
+      reviewMode: "completion",
+      workspaceDeltas: [delta()],
+      validations: [validation()]
+    }, new AbortController().signal);
+
+    expect(gateway.requests).toHaveLength(4);
+    expect(gateway.requests.slice(0, 3).every((request) =>
+      request.toolChoice === "auto"
+      && request.tools.some((tool) => tool.name === "read"))).toBe(true);
+    expect(gateway.requests[3]).toMatchObject({
+      toolChoice: "required",
+      tools: [expect.objectContaining({ name: "submit_verification" })]
+    });
+    expect(gateway.requests[3]!.tools).toHaveLength(1);
+    expect(gateway.requests[3]!.messages.at(-1)).toMatchObject({
+      role: "developer",
+      content: expect.stringContaining("[verification_verdict_required]")
+    });
+    expect(result).toMatchObject({
+      status: "passed",
+      data: {
+        verdict: "approved",
+        criteria: [{
+          criterion,
+          status: "satisfied",
+          evidence: ["review-check:inspect-3"]
+        }]
+      }
+    });
+    expect(result.data.actualChecks).toHaveLength(3);
+    expect(result.data).not.toHaveProperty("failureCode");
+  });
+
+  it.each(["mixed", "malformed"] as const)(
+    "recovers an early %s verdict proposal in the reserved verdict-only turn",
+    async (failure) => {
+      const gateway = new RecoverableVerdictProtocolGateway(failure);
+      const criterion = "Preserve compatibility with the documented format.";
+      const result = await new ModelReviewer(
+        gateway,
+        "protocol-recovery-reviewer",
+        inspectionEnvironment(),
+        { maxTurns: 4, maxToolCalls: 12 }
+      ).review({
+        sessionId: "session",
+        runId: "run",
+        goal: "Change the parser.",
+        acceptanceCriteria: [criterion],
+        frontierRevision: 1,
+        stateDigest: "a".repeat(64),
+        reviewBasisDigest: "b".repeat(64),
+        reviewMode: "completion",
+        workspaceDeltas: [delta()],
+        validations: [validation()]
+      }, new AbortController().signal);
+
+      expect(gateway.requests).toHaveLength(3);
+      expect(gateway.requests[2]).toMatchObject({
+        toolChoice: "required",
+        tools: [expect.objectContaining({ name: "submit_verification" })]
+      });
+      expect(gateway.requests[2]!.tools).toHaveLength(1);
+      expect(result).toMatchObject({
+        status: "passed",
+        data: {
+          verdict: "approved",
+          criteria: [{
+            criterion,
+            status: "satisfied",
+            evidence: ["review-check:inspect-before-verdict"]
+          }],
+          actualChecks: [{
+            toolName: "read",
+            evidenceIds: ["review-check:inspect-before-verdict"]
+          }]
+        }
+      });
+      expect(result.data.actualChecks).toHaveLength(1);
+      expect(result.data).not.toHaveProperty("failureCode");
+    }
+  );
+
+  it("withholds the active-review verdict tool until one inspection is authenticated", async () => {
+    const gateway = new InspectOnceThenSubmitGateway();
+    const criterion = "Preserve compatibility with the documented format.";
+    const result = await new ModelReviewer(
+      gateway,
+      "inspection-required-reviewer",
+      inspectionEnvironment(),
+      { maxTurns: 2, maxToolCalls: 12 }
+    ).review({
+      sessionId: "session",
+      runId: "run",
+      goal: "Change the parser.",
+      acceptanceCriteria: [criterion],
+      frontierRevision: 1,
+      stateDigest: "a".repeat(64),
+      reviewBasisDigest: "b".repeat(64),
+      reviewMode: "completion",
+      verificationPolicy: "standard",
+      workspaceDeltas: [delta()],
+      validations: [validation()]
+    }, new AbortController().signal);
+
+    expect(gateway.requests).toHaveLength(2);
+    expect(gateway.requests[0]!.tools.map((tool) => tool.name)).toEqual([
+      "read"
+    ]);
+    expect(gateway.requests[0]!.toolChoice).toBe("auto");
+    expect(gateway.requests[1]).toMatchObject({
+      toolChoice: "required",
+      tools: [expect.objectContaining({ name: "submit_verification" })]
+    });
+    expect(gateway.requests[1]!.tools).toHaveLength(1);
+    expect(result).toMatchObject({
+      status: "passed",
+      data: {
+        verdict: "approved",
+        actualChecks: [{
+          toolName: "read",
+          evidenceIds: ["review-check:inspect-current-frontier"]
+        }]
+      }
+    });
+  });
+
+  it("does not treat an early natural-language review summary as the final verdict", async () => {
+    const gateway = new InspectThenSubmitGateway(3);
+    const criterion = "Preserve compatibility with the documented format.";
+    const result = await new ModelReviewer(
+      gateway,
+      "bounded-active-reviewer",
+      inspectionEnvironment(),
+      { maxTurns: 4, maxToolCalls: 12 }
+    ).review({
+      sessionId: "session",
+      runId: "run",
+      goal: "Change the parser.",
+      acceptanceCriteria: [criterion],
+      frontierRevision: 1,
+      stateDigest: "a".repeat(64),
+      reviewBasisDigest: "b".repeat(64),
+      reviewMode: "completion",
+      workspaceDeltas: [delta()],
+      validations: [validation()]
+    }, new AbortController().signal);
+
+    expect(gateway.requests).toHaveLength(4);
+    expect(gateway.requests[2]).toMatchObject({ toolChoice: "auto" });
+    expect(gateway.requests[3]).toMatchObject({
+      toolChoice: "required",
+      tools: [expect.objectContaining({ name: "submit_verification" })]
+    });
+    expect(gateway.requests[3]!.messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        role: "assistant",
+        content: expect.stringContaining("ready to submit")
+      })
+    ]));
+    expect(result).toMatchObject({
+      status: "passed",
+      data: {
+        verdict: "approved",
+        criteria: [{
+          criterion,
+          status: "satisfied",
+          evidence: ["review-check:inspect-2"]
+        }]
+      }
+    });
+    expect(result.data.actualChecks).toHaveLength(2);
+    expect(result.data).not.toHaveProperty("failureCode");
   });
 
   it("settles provider-reported reviewer usage above its reservation", async () => {
@@ -506,12 +1629,16 @@ describe("independent reviewer budget accounting", () => {
     expect(target.durable.state.usage[0]).toMatchObject({ role: "reviewer", providerReported: false });
     expect(target.durable.state.evidence.find((item) => item.kind === "review")).toMatchObject({
       status: "failed",
-      data: { verdict: "changes_requested" }
+      data: { verdict: "blocked", failureKind: "infrastructure" }
     });
   });
 
   it("reserves every fallback attempt before invocation and commits the attempts actually used", async () => {
-    const target = runtimeSession();
+    const target = runtimeSession(limits({
+      inputTokens: 2_000,
+      outputTokens: 2_000,
+      costMicroUsd: 2_000
+    }));
     const gateway = new FallbackReviewerGateway(target);
     const { budgets, emit } = harness(target);
 
@@ -691,7 +1818,8 @@ describe("independent reviewer budget accounting", () => {
     await new ReviewCoordinator(reviewer, emit).maybeReview(target, new AbortController().signal, true);
     await new ReviewCoordinator(reviewer, emit).maybeReview(target, new AbortController().signal, true);
 
-    expect(calls).toBe(4);
+    // V9 allows at most the initial review and one re-review for the run.
+    expect(calls).toBe(2);
   });
 
   it("refreshes a rejected review only for substantively new validation evidence", async () => {
@@ -752,7 +1880,7 @@ describe("independent reviewer budget accounting", () => {
     });
   });
 
-  it("fails closed for non-strict JSON and incomplete review material", async () => {
+  it("fails closed for decorated JSON and conservatively repairs incomplete review material", async () => {
     const input = {
       sessionId: "session", runId: "run", goal: "Review safely",
       frontierRevision: 1, stateDigest: "a".repeat(64),
@@ -763,7 +1891,14 @@ describe("independent reviewer budget accounting", () => {
       'Here is the result: {"verdict":"approved","findings":[]}'
     );
     const decorated = await new ModelReviewer(decoratedGateway).review(input, new AbortController().signal);
-    expect(decorated).toMatchObject({ status: "failed", data: { verdict: "changes_requested" } });
+    expect(decorated).toMatchObject({
+      status: "failed",
+      data: {
+        verdict: "blocked",
+        failureCode: "review_protocol_invalid"
+      }
+    });
+    expect(decorated.data).not.toHaveProperty("failureKind");
     expect(decoratedGateway.calls).toBe(1);
 
     const contradictoryGateway = new ReviewerGateway(
@@ -779,6 +1914,7 @@ describe("independent reviewer budget accounting", () => {
         findings: ["Fix the missing authorization check."]
       }
     });
+    expect(contradictory.data).not.toHaveProperty("failureCode");
 
     const truncatedDelta = delta();
     truncatedDelta.data.reviewDiff += "\n[review diff truncated]";
@@ -787,10 +1923,10 @@ describe("independent reviewer budget accounting", () => {
       ...input, workspaceDeltas: [truncatedDelta]
     }, new AbortController().signal);
     expect(truncated).toMatchObject({
-      status: "failed",
-      data: { verdict: "changes_requested", findings: [expect.stringContaining("truncated")] }
+      status: "passed",
+      data: { schemaVersion: 3, verdict: "approved" }
     });
-    expect(truncatedGateway.calls).toBe(0);
+    expect(truncatedGateway.calls).toBe(1);
 
     const binaryDelta = delta();
     binaryDelta.data.delta.modified = ["bin/tool"];
@@ -830,10 +1966,10 @@ describe("independent reviewer budget accounting", () => {
       ...input, workspaceDeltas: [binaryDelta], validations: []
     }, new AbortController().signal);
     expect(unvalidated).toMatchObject({
-      status: "failed",
-      data: { verdict: "changes_requested", findings: [expect.stringContaining("passed validation")] }
+      status: "passed",
+      data: { schemaVersion: 3, verdict: "approved" }
     });
-    expect(unvalidatedGateway.calls).toBe(0);
+    expect(unvalidatedGateway.calls).toBe(1);
   });
 
   it("reviews complete mixed evidence and preserves the full semantic goal", async () => {
@@ -887,7 +2023,7 @@ describe("independent reviewer budget accounting", () => {
     expect(gateway.calls).toBe(1);
   });
 
-  it("accepts content-omitted identities and returns a typed oversized-scope blocker", async () => {
+  it("lets the active reviewer page content-omitted and oversized change material", async () => {
     const item = delta();
     item.data.reviewDiff = "";
     item.data.reviewDiffPaths = [];
@@ -917,10 +2053,10 @@ describe("independent reviewer budget accounting", () => {
       workspaceDeltas: [item], validations: [validation()]
     }, new AbortController().signal);
     expect(blocked).toMatchObject({
-      status: "failed",
-      data: { verdict: "changes_requested", failureCode: "review_scope_too_large" }
+      status: "passed",
+      data: { schemaVersion: 3, verdict: "approved" }
     });
-    expect(blockedGateway.calls).toBe(0);
+    expect(blockedGateway.calls).toBe(1);
   });
 
   it.each([
@@ -947,7 +2083,7 @@ describe("independent reviewer budget accounting", () => {
       item.data.opaqueArtifacts = [{ path: "assets/blob.bin", after: { digest: afterDigest, sizeBytes: -1 } }];
     }, true],
     ["missing validation", (_item: WorkspaceDeltaEvidence) => undefined, false]
-  ])("fails closed for %s", async (
+  ])("does not let preflight semantics preempt the active reviewer for %s", async (
     _label,
     mutate: (item: WorkspaceDeltaEvidence) => void,
     includeValidation: boolean
@@ -966,11 +2102,14 @@ describe("independent reviewer budget accounting", () => {
       validations: includeValidation ? [validation(["src/code.ts", "assets/blob.bin"])] : []
     }, new AbortController().signal);
 
-    expect(result).toMatchObject({ status: "failed", data: { verdict: "changes_requested" } });
-    expect(gateway.calls).toBe(0);
+    expect(result).toMatchObject({
+      status: "passed",
+      data: { schemaVersion: 3, verdict: "approved" }
+    });
+    expect(gateway.calls).toBe(1);
   });
 
-  it("requires both identities before treating a modified opaque path as fully covered", async () => {
+  it("leaves incomplete opaque identity semantics to the active reviewer", async () => {
     const item = completeMixedDelta();
     item.data.delta = { added: [], modified: ["assets/blob.bin"], deleted: [] };
     item.data.reviewDiff = "";
@@ -987,11 +2126,11 @@ describe("independent reviewer budget accounting", () => {
       workspaceDeltas: [item], validations: [validation(["assets/blob.bin"])]
     }, new AbortController().signal);
 
-    expect(result).toMatchObject({ status: "failed", data: { verdict: "changes_requested" } });
-    expect(gateway.calls).toBe(0);
+    expect(result).toMatchObject({ status: "passed", data: { verdict: "approved" } });
+    expect(gateway.calls).toBe(1);
   });
 
-  it("does not accept failed validation as the opaque evidence binding", async () => {
+  it("does not let a failed validation automatically override the reviewer", async () => {
     const failedValidation = validation();
     failedValidation.status = "failed";
     const gateway = new ReviewerGateway();
@@ -1005,11 +2144,11 @@ describe("independent reviewer budget accounting", () => {
       } }]
     }, new AbortController().signal);
 
-    expect(result).toMatchObject({ status: "failed", data: { verdict: "changes_requested" } });
-    expect(gateway.calls).toBe(0);
+    expect(result).toMatchObject({ status: "passed", data: { verdict: "approved" } });
+    expect(gateway.calls).toBe(1);
   });
 
-  it("requires passed validation for complete text-only review material", async () => {
+  it("does not require a runtime-classified validation before active review", async () => {
     const item = delta();
     item.data.reviewDiffPaths = ["src/code.ts"];
     const gateway = new ReviewerGateway();
@@ -1021,9 +2160,9 @@ describe("independent reviewer budget accounting", () => {
     }, new AbortController().signal);
 
     expect(result).toMatchObject({
-      status: "failed",
-      data: { verdict: "changes_requested", findings: [expect.stringContaining("passed validation")] }
+      status: "passed",
+      data: { schemaVersion: 3, verdict: "approved" }
     });
-    expect(gateway.calls).toBe(0);
+    expect(gateway.calls).toBe(1);
   });
 });

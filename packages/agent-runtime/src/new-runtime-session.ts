@@ -26,7 +26,10 @@ export async function newRuntimeSession(
     runId,
     mode: input.mode,
     startedAt: now,
-    deadlineAt: new Date(Date.now() + runDeadlineMs).toISOString()
+    deadlineAt: new Date(Date.now() + runDeadlineMs).toISOString(),
+    ...(identity.profile
+      ? { assurancePolicy: { ...identity.profile.profile.assurancePolicy } }
+      : {})
   });
   if (budgetLimits) state.budget = createBudgetLedger(budgetLimits);
   const base = baseContext(environment);

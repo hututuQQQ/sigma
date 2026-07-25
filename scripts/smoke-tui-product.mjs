@@ -8,6 +8,7 @@ import {
   createSmokeExecutionBroker,
   fakeFinalTurn,
   fakeProcessValidationTurn,
+  fakeReviewerInspectionTurn,
   fakeReviewerTurn,
   fakeToolCall,
   fakeToolTurn,
@@ -55,6 +56,7 @@ async function main() {
       fakeToolTurn([fakeToolCall("write-smoke", "write", { path: "hello.txt", content: "hello world" })]),
       fakeProcessValidationTurn("validate-smoke", "hello.txt", "hello world"),
       fakeFinalTurn("TUI smoke completed."),
+      fakeReviewerInspectionTurn(),
       fakeReviewerTurn()
     ]);
   const composition = await createConfiguredRuntime(smokeRuntimeConfig(workspace), {

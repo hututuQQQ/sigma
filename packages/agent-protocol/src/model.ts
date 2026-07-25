@@ -31,6 +31,19 @@ export interface ModelCapabilities {
   structuredOutput: boolean;
   promptCache: boolean;
   tokenizer: "provider" | "approximate";
+  /**
+   * The active provider/wire profile can honor toolChoice="required".
+   * Optional so third-party gateways remain source compatible.
+   */
+  strictToolChoice?: boolean;
+  /**
+   * Thinking-mode tool calls must be replayed with the provider-returned
+   * reasoning field. Complete legacy/non-thinking blocks without that field
+   * are projected as one non-executable trajectory tombstone.
+   */
+  requiresToolCallReasoningReplay?: boolean;
+  /** A strict tool choice is implemented by temporarily disabling thinking. */
+  strictToolChoiceDisablesReasoning?: boolean;
 }
 
 export type ModelFinishReason = "stop" | "length" | "tool_calls" | "content_filter" | "protocol_error";

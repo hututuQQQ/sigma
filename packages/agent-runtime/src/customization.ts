@@ -1,5 +1,6 @@
 import os from "node:os";
 import {
+  DEFAULT_PROFILE_ASSURANCE,
   DEFAULT_PROFILE_BUDGET,
   HookCatalog,
   defaultHookRoots,
@@ -105,6 +106,7 @@ function builtinProfile(
       checkpointBeforeMutation: true,
       reviewMode: mode === "strict" ? "required" : "advisory"
     },
+    assurancePolicy: { ...DEFAULT_PROFILE_ASSURANCE },
     allowedChildProfiles: mode === "strict" ? ["strict"] : ["standard", "strict"]
   };
 }

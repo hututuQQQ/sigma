@@ -2,6 +2,8 @@ import type { BudgetAmounts } from "agent-protocol";
 import {
   historyAfterArchive,
   historyBlocks,
+  projectReasoningSafeHistory,
+  projectToolResultHistory,
   stableHistoryDigest
 } from "agent-context";
 import type { EffectRunnerOptions } from "./effect-runner.js";
@@ -75,7 +77,15 @@ export async function refreshContextArchive(
   const prepared = await prepareBudgetedModelTurn({
     ...input.preparation,
     available,
-    history: projection.history,
+    history: projectToolResultHistory(
+      projectReasoningSafeHistory(
+        projection.history,
+        input.session.durable.state.reasoningTrajectory,
+        input.session.services.gateway.capabilities.requiresToolCallReasoningReplay === true
+      ),
+      input.session.durable.state.toolResultPrune,
+      input.session.durable.state.contextArchive?.sourceDigest
+    ),
     archive: projection.archive?.item
   });
   return { prepared, available };

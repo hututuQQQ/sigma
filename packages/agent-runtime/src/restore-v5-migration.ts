@@ -1,6 +1,11 @@
 import {
   KERNEL_STATE_VERSION,
-  LEGACY_KERNEL_STATE_VERSION_V6
+  emptyLongHorizonStateV2,
+  emptyReasoningTrajectoryStateV1,
+  LEGACY_KERNEL_STATE_VERSION_V6,
+  LEGACY_KERNEL_STATE_VERSION_V7,
+  LEGACY_KERNEL_STATE_VERSION_V8,
+  LEGACY_KERNEL_STATE_VERSION_V9
 } from "agent-protocol";
 import {
   assertKernelInvariants,
@@ -138,19 +143,133 @@ function validatedState(state: KernelState, sessionId: string): KernelState | un
   }
 }
 
+function legacyAuditEvidence(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const evidence = value as Record<string, unknown>;
+  if (evidence.kind !== "review") return value;
+  const data = plainRecord(evidence.data);
+  // A review produced before Event V9 did not use the active-review V3
+  // provenance contract. Preserve it for audit, but make it impossible for a
+  // resumed V10 completion gate to mistake it for current approval.
+  return {
+    ...evidence,
+    data: {
+      ...data,
+      schemaVersion: 2,
+      reviewRequestId: undefined
+    }
+  };
+}
+
+function legacyAuditEvidenceList(value: unknown): unknown[] {
+  return Array.isArray(value) ? value.map(legacyAuditEvidence) : [];
+}
+
+function migrateV7Snapshot(
+  raw: Record<string, unknown>,
+  sessionId: string
+): KernelState | undefined {
+  return validatedState({
+    ...raw,
+    schemaVersion: KERNEL_STATE_VERSION,
+    promptState: {
+      schemaVersion: 2,
+      sectionDigests: {},
+      budgetBand: 100
+    },
+    lengthRecovery: {
+      schemaVersion: 1,
+      mode: raw.lastModelFinishReason === "length" && raw.lastModelHadToolCalls === true
+        ? "continue_after_tools"
+        : raw.lastModelFinishReason === "length"
+          ? "action_required"
+          : "none",
+      attempts: Number.isSafeInteger(raw.consecutiveLengthFinishes)
+        ? Number(raw.consecutiveLengthFinishes)
+        : 0
+    },
+    reviewReceipts: [],
+    evidence: legacyAuditEvidenceList(raw.evidence),
+    mutationEvidence: legacyAuditEvidenceList(raw.mutationEvidence),
+    longHorizon: emptyLongHorizonStateV2(),
+    reasoningTrajectory: emptyReasoningTrajectoryStateV1()
+  } as unknown as KernelState, sessionId);
+}
+
+function migrateV8Snapshot(
+  raw: Record<string, unknown>,
+  sessionId: string
+): KernelState | undefined {
+  return validatedState({
+    ...raw,
+    schemaVersion: KERNEL_STATE_VERSION,
+    promptState: {
+      schemaVersion: 2,
+      sectionDigests: {},
+      budgetBand: 100
+    },
+    reviewReceipts: [],
+    evidence: legacyAuditEvidenceList(raw.evidence),
+    mutationEvidence: legacyAuditEvidenceList(raw.mutationEvidence),
+    longHorizon: emptyLongHorizonStateV2(),
+    reasoningTrajectory: emptyReasoningTrajectoryStateV1()
+  } as unknown as KernelState, sessionId);
+}
+
+function migrateV6Snapshot(
+  raw: Record<string, unknown>,
+  sessionId: string
+): KernelState | undefined {
+  return validatedState({
+    ...raw,
+    schemaVersion: KERNEL_STATE_VERSION,
+    lastModelFinishReason: undefined,
+    consecutiveLengthFinishes: 0,
+    consecutiveLengthNoAction: 0,
+    lastModelHadToolCalls: false,
+    lengthRecovery: { schemaVersion: 1, mode: "none", attempts: 0 },
+    reviewReceipts: [],
+    evidence: legacyAuditEvidenceList(raw.evidence),
+    mutationEvidence: legacyAuditEvidenceList(raw.mutationEvidence),
+    promptState: {
+      schemaVersion: 2,
+      sectionDigests: {},
+      budgetBand: 100
+    },
+    longHorizon: emptyLongHorizonStateV2(),
+    reasoningTrajectory: emptyReasoningTrajectoryStateV1()
+  } as unknown as KernelState, sessionId);
+}
+
 export function migrateLegacySnapshot(
   raw: Record<string, unknown>,
   sessionId: string
 ): KernelState | undefined {
-  if (raw.schemaVersion === LEGACY_KERNEL_STATE_VERSION_V6) {
+  if (raw.schemaVersion === LEGACY_KERNEL_STATE_VERSION_V9) {
     return validatedState({
       ...raw,
       schemaVersion: KERNEL_STATE_VERSION,
-      lastModelFinishReason: undefined,
-      consecutiveLengthFinishes: 0,
-      consecutiveLengthNoAction: 0,
-      lastModelHadToolCalls: false
+      // V9's semantic 4/8/6 state is intentionally not migrated. The next
+      // model turn receives one complete V10 runtime frame.
+      promptState: {
+        schemaVersion: 2,
+        sectionDigests: {},
+        budgetBand: 100
+      },
+      reviewReceipts: [],
+      evidence: legacyAuditEvidenceList(raw.evidence),
+      mutationEvidence: legacyAuditEvidenceList(raw.mutationEvidence),
+      longHorizon: emptyLongHorizonStateV2()
     } as unknown as KernelState, sessionId);
+  }
+  if (raw.schemaVersion === LEGACY_KERNEL_STATE_VERSION_V8) {
+    return migrateV8Snapshot(raw, sessionId);
+  }
+  if (raw.schemaVersion === LEGACY_KERNEL_STATE_VERSION_V7) {
+    return migrateV7Snapshot(raw, sessionId);
+  }
+  if (raw.schemaVersion === LEGACY_KERNEL_STATE_VERSION_V6) {
+    return migrateV6Snapshot(raw, sessionId);
   }
   const legacy = decodeLegacyKernelStateV5(raw);
   if (!legacy) return undefined;
@@ -175,6 +294,17 @@ export function migrateLegacySnapshot(
     consecutiveLengthFinishes: 0,
     consecutiveLengthNoAction: 0,
     lastModelHadToolCalls: false,
+    lengthRecovery: { schemaVersion: 1, mode: "none", attempts: 0 },
+    reviewReceipts: [],
+    evidence: legacyAuditEvidenceList(raw.evidence),
+    mutationEvidence: legacyAuditEvidenceList(raw.mutationEvidence),
+    promptState: {
+      schemaVersion: 2,
+      sectionDigests: {},
+      budgetBand: 100
+    },
+    longHorizon: emptyLongHorizonStateV2(),
+    reasoningTrajectory: emptyReasoningTrajectoryStateV1(),
     phase: phaseAfterLegacyCompletion(raw, pendingTools, hadProtectedCompletion),
     ...(terminal ? {} : {
       proposedOutcome: undefined,

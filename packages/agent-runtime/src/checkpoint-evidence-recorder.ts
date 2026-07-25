@@ -7,6 +7,20 @@ import type {
 import type { RuntimeSession } from "./types.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 
+function reviewResourceFallback(error: unknown) {
+  if (!(error instanceof RangeError)) throw error;
+  return {
+    reviewDiff: "",
+    reviewDiffPaths: [],
+    opaqueArtifacts: [],
+    reviewProblem: {
+      code: "review_scope_too_large" as const,
+      message: "Checkpoint review material exceeded the local rendering resource boundary.",
+      action: "Inspect the authenticated changed paths with reviewer read tools."
+    }
+  };
+}
+
 export class CheckpointEvidenceRecorder {
   constructor(
     private readonly checkpoints: CheckpointManager,
@@ -97,7 +111,7 @@ export class CheckpointEvidenceRecorder {
     const existing = session.durable.state.evidence.find((item): item is WorkspaceDeltaEvidence =>
       item.kind === "workspace_delta" && item.evidenceId === evidenceId);
     if (existing) return existing;
-    const material = await this.checkpoints.reviewMaterial(sourceSessionId, sealed.checkpointId);
+    const material = await this.reviewMaterial(sourceSessionId, sealed.checkpointId);
     const evidence: WorkspaceDeltaEvidence = {
       evidenceId,
       sessionId: session.identity.sessionId,
@@ -184,7 +198,7 @@ export class CheckpointEvidenceRecorder {
     const existing = session.durable.state.evidence.find((item): item is WorkspaceDeltaEvidence =>
       item.kind === "workspace_delta" && item.data.checkpointId === checkpointId);
     if (existing) return existing;
-    const material = await this.checkpoints.reviewMaterial(session.identity.sessionId, checkpointId);
+    const material = await this.reviewMaterial(session.identity.sessionId, checkpointId);
     const evidence: WorkspaceDeltaEvidence = {
       evidenceId: `workspace-delta:${checkpointId}`,
       sessionId: session.identity.sessionId,
@@ -209,5 +223,13 @@ export class CheckpointEvidenceRecorder {
     };
     await this.emit(session, "evidence.recorded", "runtime", evidence);
     return evidence;
+  }
+
+  private async reviewMaterial(sessionId: string, checkpointId: string) {
+    try {
+      return await this.checkpoints.reviewMaterial(sessionId, checkpointId);
+    } catch (error) {
+      return reviewResourceFallback(error);
+    }
   }
 }

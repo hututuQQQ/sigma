@@ -5,7 +5,7 @@ import type {
   WorkspaceCustomizationTrustAttestation,
   WorkspaceMcpTrustAttestation
 } from "agent-config";
-import type { JsonValue, ModelGateway, RunStore, RuntimeClient } from "agent-protocol";
+import type { ModelGateway, RuntimeClient } from "agent-protocol";
 import type {
   BrokerDoctorReport,
   ContainerEngine,
@@ -19,23 +19,24 @@ import { AgentSupervisor, WorkspaceIsolationManager } from "agent-supervisor";
 import { ensurePrivateStateDirectory, isInside } from "agent-platform";
 import { closeMcpClients, connectMcpServers } from "./composition-mcp.js";
 import { createChildAgentFactory } from "./composition-supervision.js";
-import { createRuntime } from "./create-runtime.js";
 import type { InProcessRuntimeClient } from "./runtime-client.js";
-import type { ChildJoinSummary } from "./types.js";
-import { auditDurableChildren } from "./durable-children.js";
 import { verifyWorkspaceMcpTrust } from "./workspace-mcp-trust.js";
 import { runtimeStateRoot } from "./runtime-state.js";
 import { configuredExecutionBroker } from "./container-runtime-execution.js";
 import { resolveRuntimeCustomization, type RuntimeCustomization } from "./customization.js";
 import { BrokerCommandHookRunner } from "./hook-runner.js";
 import { frozenHookExecutionRoot } from "./frozen-hook-assets.js";
-import { ModelReviewer } from "./reviewer.js";
 import { verifyWorkspaceCustomizationTrust } from "./workspace-customization-trust.js";
-import { createRoleGateways, reviewerRouteId } from "./model-composition.js";
+import { createRoleGateways } from "./model-composition.js";
 import { createSubjectAttestationContextV1, type SubjectProductAttestationV1 } from "./subject-attestation.js";
 import { subjectConfigurationV1 } from "./subject-configuration.js";
 import { brokerRuntimeEnvironment } from "./execution-capabilities.js";
 import { createConfiguredTools } from "./configured-runtime-tools.js";
+import {
+  configuredMcpClients,
+  createComposedRuntime,
+  type RuntimeAssemblyPrepared
+} from "./configured-runtime-assembly.js";
 export interface RuntimeCompositionConfig {
   workspace: string;
   provider: "deepseek" | "glm";
@@ -60,6 +61,7 @@ export interface RuntimeCompositionConfig {
   containerImage?: string;
   managedEnvironmentMode?: "disabled" | "required";
   readScope?: "workspace" | "host";
+  writeScope?: "workspace" | "enclosing-container";
   networkMode?: "none" | "loopback" | "full";
   processHandoff?: "allow" | "deny";
   reviewerWaiver?: boolean;
@@ -96,33 +98,26 @@ export interface ConfiguredRuntime {
 }
 export interface RuntimeFactoryOptions { connectMcp?: boolean; surface?: "cli" | "tui"; interactiveApprovals?: boolean; }
 
-interface PreparedComposition {
+interface PreparedComposition extends RuntimeAssemblyPrepared {
   workspace: string;
-  storeRootDir: string;
-  customization: RuntimeCustomization;
-  execution: ExecutionBroker;
-  executionReport: BrokerDoctorReport;
-  hookRunner: HookRunnerPort;
 }
-async function joinChildren(supervisor: AgentSupervisor, store: RunStore, parentId: string, signal: AbortSignal): Promise<ChildJoinSummary> {
-  const jobs = await supervisor.joinParent(parentId, signal);
-  const evidence: JsonValue[] = jobs.map((job) => JSON.parse(JSON.stringify({
-    childId: job.id,
-    status: job.status,
-    outcome: job.result?.outcome.kind ?? null,
-    report: job.result?.report ?? null,
-    isolation: job.isolation ?? null,
-    error: job.error ?? null
-  })) as JsonValue);
-  const failures = jobs.flatMap((job) => {
-    if (job.status !== "completed" || job.result?.outcome.kind !== "completed") {
-      return [`Child ${job.id} ended as ${job.result?.outcome.kind ?? job.status}: ${job.error ?? "no report"}`];
-    }
-    return job.isolation?.kind === "git_worktree" && job.isolation.cleanup === "retained"
-      ? [`Child ${job.id} has an unintegrated worktree at ${job.isolation.worktreePath}`] : [];
-  });
-  const durable = await auditDurableChildren(store, parentId, new Set(jobs.map((job) => job.id)));
-  return { evidence: [...evidence, ...durable.evidence], failures: [...failures, ...durable.failures] };
+
+function configuredSubjectAttestation(
+  config: RuntimeCompositionConfig,
+  deps: RuntimeFactoryDeps,
+  options: RuntimeFactoryOptions,
+  executionReport: BrokerDoctorReport
+) {
+  if (deps.subjectProductAttestation && !options.surface) {
+    throw new Error("A trusted subject product attestation requires an explicit runtime surface.");
+  }
+  if (!deps.subjectProductAttestation || !options.surface) return undefined;
+  return createSubjectAttestationContextV1(
+    deps.subjectProductAttestation,
+    subjectConfigurationV1(config),
+    options.surface,
+    brokerRuntimeEnvironment(executionReport).platform
+  );
 }
 
 export async function createConfiguredRuntime(
@@ -131,62 +126,37 @@ export async function createConfiguredRuntime(
   options: RuntimeFactoryOptions = {}
 ): Promise<ConfiguredRuntime> {
   const prepared = await prepareComposition(config, deps, options);
-  const { workspace, storeRootDir, customization, execution, executionReport, hookRunner } = prepared;
+  const { workspace, storeRootDir, customization, execution, executionReport } = prepared;
   let mcpClients: Awaited<ReturnType<typeof connectMcpServers>> = [];
   try {
     const gateways = createRoleGateways(config, deps, customization);
-    if (deps.subjectProductAttestation && !options.surface) {
-      throw new Error("A trusted subject product attestation requires an explicit runtime surface.");
-    }
-    const subjectAttestation = deps.subjectProductAttestation && options.surface
-      ? createSubjectAttestationContextV1(
-        deps.subjectProductAttestation,
-        subjectConfigurationV1(config),
-        options.surface,
-        brokerRuntimeEnvironment(executionReport).platform
-      )
-      : undefined;
+    const subjectAttestation = configuredSubjectAttestation(
+      config,
+      deps,
+      options,
+      executionReport
+    );
     const runtimeReference: { current?: InProcessRuntimeClient } = {};
     const supervisor = createSupervisor(config, execution, runtimeReference);
     const tools = createConfiguredTools(config, execution, supervisor, executionReport, storeRootDir);
-    mcpClients = options.connectMcp === false
-      ? [] : await connectMcpServers(config.mcpServers, workspace, tools, execution);
-    const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
-    const runtime = createRuntime({
-      gateway: gateways.orchestrator,
-      store,
-      storeRootDir,
+    mcpClients = await configuredMcpClients(
+      options.connectMcp !== false,
+      config.mcpServers,
+      workspace,
       tools,
-      permissionMode: customization.permissionMode,
+      execution
+    );
+    const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
+    const runtime = createComposedRuntime({
+      config,
       interactiveApprovals: options.interactiveApprovals ?? options.surface !== "cli",
-      runDeadlineMs: config.runDeadlineSec * 1_000,
-      maxParallelTools: config.maxParallelTools,
-      budgetLimits: customization.budgetLimits,
-      checkpointMaxFiles: config.checkpoint?.maxFiles,
-      checkpointMaxBytes: config.checkpoint?.maxBytes,
-      profile: customization.profile,
-      profileSource: customization.profileSource,
-      availableProfiles: customization.availableProfiles,
-      gatewayForRole: gateways.forRole,
-      execution,
-      managedEnvironmentMode: config.managedEnvironmentMode ?? "disabled",
-      managedNetworkMode: config.networkMode ?? "full",
-      runtimeEnvironment: { ...brokerRuntimeEnvironment(executionReport), executionMode: config.executionMode ?? "sandboxed" },
+      prepared,
+      gateways,
+      tools,
+      store,
+      supervisor,
       subjectAttestation,
-      skills: customization.skills,
-      hooks: customization.hookDefinitions,
-      hookArtifacts: customization.hookArtifacts,
-      hookRunner,
-      agentProfileHookRunner: deps.agentProfileHookRunner,
-      reviewer: new ModelReviewer(gateways.reviewer, reviewerRouteId(customization.profile)),
-      reviewerForSession: (session) => new ModelReviewer(
-        gateways.forRole("reviewer", session.services.profile),
-        reviewerRouteId(session.services.profile)
-      ),
-      joinChildren: async (parentId, signal) => await joinChildren(supervisor, store, parentId, signal),
-      cancelChildren: async (parentId, reason) => await supervisor.cancelParent(parentId, reason),
-      hasActiveChildren: (parentId) => supervisor.list(parentId)
-        .some((child) => child.status === "queued" || child.status === "running")
+      agentProfileHookRunner: deps.agentProfileHookRunner
     });
     runtimeReference.current = runtime;
     return {
@@ -261,6 +231,7 @@ async function prepareComposition(
     const hookRunner = createHookRunner(config, deps, workspace, storeRootDir, customization, execution);
     const executionReport = await execution.connect();
     assertManagedRuntimeAvailable(config, execution, executionReport);
+    assertEnclosingContainerRuntimeAvailable(config, executionReport);
     return {
       workspace,
       storeRootDir,
@@ -271,6 +242,30 @@ async function prepareComposition(
     };
   } catch (error) {
     return await rethrowAfterCompositionClose([], execution, error);
+  }
+}
+
+function assertEnclosingContainerRuntimeAvailable(
+  config: RuntimeCompositionConfig,
+  report: BrokerDoctorReport
+): void {
+  if ((config.writeScope ?? "workspace") !== "enclosing-container") return;
+  if ((config.readScope ?? "workspace") !== "host") {
+    throw Object.assign(new Error(
+      "Enclosing-container write scope requires readScope=host so every declared mutation root can be inspected and reviewed."
+    ), { code: "enclosing_container_read_scope_required" });
+  }
+  const capability = report.capabilities.enclosingContainerRoot;
+  if (config.executionMode === "container"
+    || capability?.available !== true
+    || capability.rootKind !== "container_cow"
+    || !capability.attestationDigest) {
+    throw Object.assign(new Error(
+      "Enclosing-container write scope was requested, but the native broker could not attest a disposable copy-on-write container boundary."
+    ), {
+      code: "enclosing_container_unavailable",
+      reason: capability?.reason
+    });
   }
 }
 

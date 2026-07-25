@@ -167,6 +167,50 @@ async function flushModelStreamDeltas(
   state.lastFlush = Date.now();
 }
 
+async function consumeModelStream(
+  options: EffectRunnerOptions,
+  session: RuntimeSession,
+  turnId: number,
+  stream: AsyncIterable<ModelStreamEvent>,
+  state: ModelStreamState,
+  signal: AbortSignal
+): Promise<void> {
+  try {
+    for await (const event of stream) {
+      if (signal.aborted) throw signal.reason;
+      observeModelStreamEvent(state, event, session.services.gateway.provider, session.services.gateway.model);
+      if (Date.now() - state.lastFlush >= 33) {
+        await flushModelStreamDeltas(options, session, turnId, state);
+      }
+    }
+  } catch (error) {
+    // Preserve already-observed semantic metadata before propagating a stream failure.
+    await flushModelStreamDeltas(options, session, turnId, state);
+    throw error;
+  }
+}
+
+function validatedTrajectoryResponse(
+  session: RuntimeSession,
+  response: ModelResponse,
+  toolChoice: ModelRequest["toolChoice"]
+): ModelResponse {
+  const responseCalls = response.message.toolCalls?.length ?? 0;
+  const reasoningRequired =
+    session.services.gateway.capabilities.requiresToolCallReasoningReplay === true;
+  const strictTurnDisabledReasoning =
+    session.services.gateway.capabilities.strictToolChoiceDisablesReasoning === true
+    && toolChoice === "required";
+  if (responseCalls === 0 || !reasoningRequired || strictTurnDisabledReasoning
+    || response.message.reasoningContent !== undefined) return response;
+  throw Object.assign(new Error(
+    "The thinking provider returned tool calls without the replay-required reasoning field. The calls were not executed; a new trajectory is required."
+  ), {
+    code: "model_reasoning_trajectory_incomplete",
+    category: "protocol"
+  });
+}
+
 export async function streamModelResponse(
   options: EffectRunnerOptions,
   session: RuntimeSession,
@@ -195,17 +239,7 @@ export async function streamModelResponse(
   const stream = routeConstraints && gateway.streamWithConstraints
     ? gateway.streamWithConstraints(request, routeConstraints)
     : gateway.stream(request);
-  try {
-    for await (const event of stream) {
-      if (signal.aborted) throw signal.reason;
-      observeModelStreamEvent(state, event, session.services.gateway.provider, session.services.gateway.model);
-      if (Date.now() - state.lastFlush >= 33) await flushModelStreamDeltas(options, session, turnId, state);
-    }
-  } catch (error) {
-    // Preserve already-observed semantic metadata before propagating a stream failure.
-    await flushModelStreamDeltas(options, session, turnId, state);
-    throw error;
-  }
+  await consumeModelStream(options, session, turnId, stream, state, signal);
   if (!state.response) signal.throwIfAborted();
   await flushModelStreamDeltas(options, session, turnId, state);
   if (!state.response) {
@@ -215,5 +249,5 @@ export async function streamModelResponse(
       state
     );
   }
-  return state.response;
+  return validatedTrajectoryResponse(session, state.response, toolChoice);
 }

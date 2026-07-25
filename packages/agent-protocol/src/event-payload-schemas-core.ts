@@ -2,6 +2,7 @@ import { z } from "zod";
 import { dateTimeSchema, nonEmptyStringSchema } from "./domain-schemas.js";
 import {
   contextItemSchema,
+  runtimePromptStateV2Schema,
   durableToolReceiptShape,
   modelMessageSchema,
   modelToolCallSchema,
@@ -11,6 +12,14 @@ import {
   toolEffectSchema,
   turnSchema
 } from "./event-payload-schemas-foundation.js";
+
+const decisionAuthoritySchema = z.enum([
+  "safety_invariant",
+  "resource_boundary",
+  "provider_protocol",
+  "user_policy",
+  "verification_verdict"
+]);
 
 const suspensionSchema = z.object({
   kind: z.literal("needs_input").optional(),
@@ -25,7 +34,8 @@ const suspensionSchema = z.object({
   childId: nonEmptyStringSchema.optional(),
   processIds: z.array(nonEmptyStringSchema).optional(),
   turnId: z.number().int().positive().optional(),
-  effectRevision: z.number().int().nonnegative().optional()
+  effectRevision: z.number().int().nonnegative().optional(),
+  decisionAuthority: decisionAuthoritySchema.optional()
 }).strict();
 
 const approvalRequestedSchema = z.object({
@@ -102,6 +112,13 @@ const diagnosticSchema = z.discriminatedUnion("kind", [
     items: z.array(contextItemSchema)
   }).strict(),
   z.object({ kind: z.literal("recovery.retry_model"), message: nonEmptyStringSchema }).strict(),
+  z.object({ kind: z.literal("completion.advisory"), message: nonEmptyStringSchema }).strict(),
+  z.object({
+    kind: z.literal("assurance.review_transfer"),
+    sourceOutcomeCode: z.literal("budget_exhausted"),
+    message: nonEmptyStringSchema,
+    decisionAuthority: z.literal("resource_boundary")
+  }).strict(),
   z.object({
     kind: z.literal("runtime.dependency_observed"),
     protocolVersion: z.literal(1),
@@ -145,7 +162,8 @@ const diagnosticSchema = z.discriminatedUnion("kind", [
     stage: z.enum(["normal", "converge", "stop"]),
     budgetStage: z.enum(["normal", "converge", "terminal"]).optional(),
     remainingMs: z.number(),
-    nextModelEstimateMs: z.number().int().nonnegative(),
+    /** Present only in legacy telemetry; V7 does not forecast model latency. */
+    nextModelEstimateMs: z.number().int().nonnegative().optional(),
     outputReserveTokens: z.number().int().positive()
   }).strict(),
   z.object({
@@ -204,11 +222,13 @@ export const coreEventPayloadSchemas = {
       reviewSatisfied: z.literal(true),
       runCompleted: z.literal(true)
     }).strict().optional(),
+    decisionAuthority: decisionAuthoritySchema.optional(),
     outcomeRevision: z.number().int().nonnegative().optional()
   }).strict(),
   "run.cancelled": z.object({
     kind: z.literal("cancelled"),
     reason: z.string(),
+    decisionAuthority: decisionAuthoritySchema.optional(),
     outcomeRevision: z.number().int().nonnegative().optional()
   }).strict(),
   "run.failed": z.object({
@@ -218,6 +238,7 @@ export const coreEventPayloadSchemas = {
     resumeToken: z.string().optional(),
     failureKind: z.literal("blocked").optional(),
     failureCode: nonEmptyStringSchema.optional(),
+    decisionAuthority: decisionAuthoritySchema.optional(),
     outcomeRevision: z.number().int().nonnegative().optional()
   }).strict(),
   "user.message": z.object({ text: z.string() }).strict(),
@@ -234,7 +255,12 @@ export const coreEventPayloadSchemas = {
     toolSchemaDigest: z.string().regex(/^[a-f0-9]{64}$/u),
     requestDigest: z.string().regex(/^[a-f0-9]{64}$/u),
     prefixMessageCount: z.number().int().nonnegative(),
-    cacheMode: z.enum(["prefix_cache", "provider_window"])
+    cacheMode: z.enum(["prefix_cache", "provider_window"]),
+    /** Optional only while replaying an event-schema V6 session. */
+    promptState: runtimePromptStateV2Schema.optional(),
+    frameMode: z.enum(["full", "delta"]).optional(),
+    /** Durable record of the recovery policy actually sent to the provider. */
+    toolChoice: z.enum(["auto", "required", "none"]).nullable().optional()
   }).strict(),
   "model.delta": z.object({ turnId: z.number().int().positive(), delta: z.string() }).strict(),
   "model.reasoning_delta": z.object({ turnId: z.number().int().positive(), delta: z.string() }).strict(),
@@ -246,7 +272,22 @@ export const coreEventPayloadSchemas = {
     message: modelMessageSchema,
     toolCalls: z.array(modelToolCallSchema),
     usage: sharedSchemas.usageRecordSchema
-  }).strict(),
+  }).strict().superRefine((value, context) => {
+    if (value.message.content !== value.text) {
+      context.addIssue({
+        code: "custom",
+        path: ["message", "content"],
+        message: "The durable assistant message and completion text must be atomic"
+      });
+    }
+    if (JSON.stringify(value.message.toolCalls ?? []) !== JSON.stringify(value.toolCalls)) {
+      context.addIssue({
+        code: "custom",
+        path: ["message", "toolCalls"],
+        message: "The durable assistant reasoning/message and tool calls must be stored atomically"
+      });
+    }
+  }),
   "model.failed": z.object({
     ...turnSchema,
     code: nonEmptyStringSchema,
@@ -269,6 +310,24 @@ export const coreEventPayloadSchemas = {
   "tool.completed": z.object(durableToolReceiptShape).strict(),
   "tool.failed": z.object(durableToolReceiptShape).strict(),
   "context.compacted": z.object({ item: contextItemSchema, omittedHistoryTurns: z.number().int().nonnegative() }).strict(),
+  "context.tool_results_pruned": z.object({
+    state: z.object({
+      schemaVersion: z.literal(1),
+      coveredBlocks: z.number().int().nonnegative(),
+      sourceDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+      archiveSourceDigest: z.string().regex(/^[a-f0-9]{64}$/u).optional()
+    }).strict(),
+    protectedTokens: z.number().int().nonnegative(),
+    prunedTokens: z.number().int().nonnegative()
+  }).strict(),
+  "context.reasoning_trajectory_tombstoned": z.object({
+    state: z.object({
+      schemaVersion: z.literal(1),
+      blockDigests: z.array(z.string().regex(/^[a-f0-9]{64}$/u)).max(1_024),
+      sourceDigest: z.string().regex(/^[a-f0-9]{64}$/u)
+    }).strict(),
+    newlyTombstoned: z.number().int().nonnegative()
+  }).strict(),
   "child.spawned": z.object({ childId: nonEmptyStringSchema, payload: sharedSchemas.jsonValueSchema }).strict(),
   "child.message": z.object({ childId: nonEmptyStringSchema, payload: sharedSchemas.jsonValueSchema }).strict(),
   "child.completed": z.object({ childId: nonEmptyStringSchema, payload: sharedSchemas.jsonValueSchema }).strict(),

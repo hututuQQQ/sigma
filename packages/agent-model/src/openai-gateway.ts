@@ -89,14 +89,21 @@ export class OpenAIModelGateway implements ModelGateway {
     // non-ByteString header characters before the request reaches the provider.
     this.apiKey = options.apiKey?.trim();
     this.apiKeyName = options.apiKeyName;
-    this.capabilities = { ...defaultOpenAICapabilities, ...options.capabilities };
+    this.wireProfile = resolveWireProfile(options.wireProfile);
+    this.capabilities = {
+      ...defaultOpenAICapabilities,
+      ...options.capabilities,
+      strictToolChoice: this.wireProfile.toolChoicePolicy !== "never",
+      requiresToolCallReasoningReplay: this.wireProfile.thinking === "enabled",
+      strictToolChoiceDisablesReasoning:
+        this.wireProfile.toolChoicePolicy === "non_thinking_only"
+    };
     this.maxRetries = Math.max(0, Math.trunc(options.maxRetries ?? 2));
     this.requestTimeoutMs = Math.max(1, Math.trunc(options.requestTimeoutMs ?? 120_000));
     this.idleTimeoutMs = Math.max(1, Math.trunc(options.idleTimeoutMs ?? 45_000));
     this.activeStreamTimeoutMs = options.activeStreamTimeoutMs === undefined
       ? undefined : Math.max(1, Math.trunc(options.activeStreamTimeoutMs));
     this.fetchImpl = options.fetchImpl ?? fetch;
-    this.wireProfile = resolveWireProfile(options.wireProfile);
     this.retryableFinishReasons = new Set(this.wireProfile.retryableFinishReasons);
     this.pricing = options.pricing;
   }

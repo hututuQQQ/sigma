@@ -7,10 +7,21 @@ import {
   budgetSettleMutationV1Schema
 } from "./budget-mutation-schemas.js";
 import {
+  durableToolReceiptShape,
+  longHorizonStateV1Schema,
+  longHorizonStateV2Schema,
+  modelToolCallSchema,
   sourceSchema,
   sharedSchemas,
   toolCallPlanSchema
 } from "./event-payload-schemas-foundation.js";
+
+const {
+  name: _toolName,
+  turnId: _turnId,
+  effectRevision: _effectRevision,
+  ...reviewerReceiptShape
+} = durableToolReceiptShape;
 
 const budgetEventSchema = z.object({
   ledger: sharedSchemas.budgetLedgerStateSchema,
@@ -189,6 +200,20 @@ export const durableEventPayloadSchemas = {
     plan: sharedSchemas.planGraphSchema,
     previousRevision: z.number().int().nonnegative()
   }).strict(),
+  "long_horizon.updated": z.object({
+    state: z.union([longHorizonStateV1Schema, longHorizonStateV2Schema]),
+    reason: z.enum([
+      "batch_settled",
+      "strategy_reset",
+      "strategy_requested",
+      "input_request_audit",
+      "resource_band_triggered",
+      "action_required_consumed",
+      "review_accounted",
+      "repair_capacity_consumed",
+      "migration_initialized"
+    ])
+  }).strict(),
   "budget.reserved": z.union([budgetEventSchema, compactBudgetReserveEventSchema]),
   "budget.reservation_bound": z.union([z.object({
     ledger: sharedSchemas.budgetLedgerStateSchema,
@@ -229,6 +254,13 @@ export const durableEventPayloadSchemas = {
     requestId: nonEmptyStringSchema.optional(),
     workspaceDeltaEvidenceIds: z.array(nonEmptyStringSchema),
     validationEvidenceIds: z.array(nonEmptyStringSchema).optional()
+  }).strict(),
+  "review.tool_completed": z.object({
+    schemaVersion: z.literal(1),
+    reviewRequestId: nonEmptyStringSchema,
+    call: modelToolCallSchema,
+    plan: toolCallPlanSchema,
+    receipt: z.object(reviewerReceiptShape).strict()
   }).strict(),
   "review.completed": sharedSchemas.reviewEvidenceSchema,
   "review.waived": sharedSchemas.userWaiverEvidenceSchema

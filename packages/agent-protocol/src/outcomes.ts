@@ -2,10 +2,32 @@ import type { EvidenceRecord } from "./domain.js";
 
 export type RunMode = "analyze" | "change";
 
+export type DecisionAuthorityV1 =
+  | "safety_invariant"
+  | "resource_boundary"
+  | "provider_protocol"
+  | "user_policy"
+  | "verification_verdict";
+
 export type RunOutcome =
-  | { kind: "completed"; message: string; evidence: EvidenceRecord[] }
-  | { kind: "needs_input"; requestId: string; message: string }
-  | { kind: "cancelled"; reason: string }
+  | {
+    kind: "completed";
+    message: string;
+    evidence: EvidenceRecord[];
+    /** Optional on the wire only for replay compatibility with V9 and older logs. */
+    decisionAuthority?: DecisionAuthorityV1;
+  }
+  | {
+    kind: "needs_input";
+    requestId: string;
+    message: string;
+    decisionAuthority?: DecisionAuthorityV1;
+  }
+  | {
+    kind: "cancelled";
+    reason: string;
+    decisionAuthority?: DecisionAuthorityV1;
+  }
   | {
     kind: "recoverable_failure";
     code: string;
@@ -15,8 +37,14 @@ export type RunOutcome =
     failureKind?: "blocked";
     /** Stable structured code mirrored for external runners. */
     failureCode?: string;
+    decisionAuthority?: DecisionAuthorityV1;
   }
-  | { kind: "fatal"; code: string; message: string };
+  | {
+    kind: "fatal";
+    code: string;
+    message: string;
+    decisionAuthority?: DecisionAuthorityV1;
+  };
 
 export type RunCommand =
   | { type: "submit"; sessionId: string; text: string; mode?: RunMode }
@@ -41,7 +69,7 @@ export type RunCommand =
     type: "reviewer_waiver";
     sessionId: string;
     reason: string;
-    /** Defaults to the latest pending non-documentation checkpoint. */
+    /** Defaults to the next still-unassigned current-run mutation checkpoint. */
     checkpointId?: string;
   }
   | { type: "cancel"; sessionId: string; reason?: string }

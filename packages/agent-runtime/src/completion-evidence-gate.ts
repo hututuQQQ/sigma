@@ -1,22 +1,29 @@
-import { createHash } from "node:crypto";
+import { mutationFrontierHasChanges } from "agent-kernel";
 import {
-  type ModelToolCall,
-  type ToolDescriptor,
-  type ToolReceipt
-} from "agent-protocol";
+  completionAdvisory as advisory,
+  completionFindingText as findingText,
+  completionGateDigest as digest,
+  hasCompletionAdvisory as hasAdvisory,
+  type CompletionGateDecision
+} from "./completion-gate-common.js";
+import { strictCompletionDecision } from "./completion-gate-strict.js";
 import {
+  authenticCurrentReviewApproval,
   currentFrontierReview,
   currentFrontierValidationStatus,
-  reviewBasisDigest
+  sessionMutationEvidence,
+  unresolvedWorkspaceDeltas
 } from "./mutation-evidence.js";
-import { failed } from "./tool-receipt.js";
 import type { RuntimeSession } from "./types.js";
+import { reviewerWaivedDeltaIds } from "./review-waiver-policy.js";
+import { substantiveReview } from "./review-coordinator-support.js";
 
-const ADVISORY_PREFIX = "[sigma-completion-advisory:";
-
-function digest(value: unknown): string {
-  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
-}
+export { completionCandidate } from "./completion-gate-common.js";
+export { completionFailure } from "./completion-terminal-gate.js";
+export type {
+  CompletionCandidateV1,
+  CompletionGateDecision
+} from "./completion-gate-common.js";
 
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -24,39 +31,9 @@ function record(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function findingText(value: unknown): string {
-  if (typeof value === "string") return value;
-  try { return JSON.stringify(value); } catch { return String(value); }
-}
-
-export interface CompletionCandidateV1 {
-  answer: string;
-  digest: string;
-}
-
-export function completionCandidate(session: RuntimeSession): CompletionCandidateV1 | undefined {
-  const proposed = session.durable.state.proposedOutcome;
-  const answer = proposed?.kind === "completed"
-    ? proposed.message.trim()
-    : [...session.durable.state.messages].reverse().find((message) =>
-        message.role === "assistant"
-        && (message.toolCalls?.length ?? 0) === 0
-        && message.content.trim().length > 0)?.content.trim() ?? "";
-  return answer ? { answer, digest: digest({ answer }) } : undefined;
-}
-
 function reviewMode(session: RuntimeSession): "off" | "advisory" | "required" {
   return session.services.profile?.profile.mutationPolicy.reviewMode ?? "advisory";
 }
-
-export type CompletionGateDecision =
-  | {
-      action: "complete";
-      validationStatus: "not_needed" | "passed" | "failed" | "unverified";
-      statusNote?: string;
-    }
-  | { action: "continue"; basisDigest: string; message: string }
-  | { action: "fail"; code: "strict_policy_failure"; message: string };
 
 function unresolvedRepositoryTransactions(session: RuntimeSession): string[] {
   const open = new Set<string>();
@@ -72,7 +49,20 @@ function unresolvedRepositoryTransactions(session: RuntimeSession): string[] {
   return [...open];
 }
 
-function hardInvariantMessage(session: RuntimeSession): string | undefined {
+function sealedMutationEvidenceMissing(session: RuntimeSession): boolean {
+  const head = session.durable.state.checkpointHead;
+  if (head?.status !== "sealed" || !head.delta
+    || head.delta.added.length + head.delta.modified.length + head.delta.deleted.length === 0) {
+    return false;
+  }
+  return ![...session.durable.state.mutationEvidence, ...session.durable.state.evidence]
+    .some((item) => item.kind === "workspace_delta"
+      && item.data.checkpointId === head.checkpointId);
+}
+
+export function completionReviewBlocker(
+  session: RuntimeSession
+): string | undefined {
   const approvals = session.durable.state.pendingTools.filter((item) =>
     item.approval === "pending");
   if (approvals.length > 0 || session.interaction.approvals.size > 0) {
@@ -86,6 +76,9 @@ function hardInvariantMessage(session: RuntimeSession): string | undefined {
     || session.recovery.openCheckpointRecovery) {
     return "Completion is blocked by an open checkpoint. Restore it or explicitly keep and seal it first.";
   }
+  if (sealedMutationEvidenceMissing(session)) {
+    return "Completion is blocked because the latest sealed mutation checkpoint has no durable workspace-delta evidence.";
+  }
   const transactions = unresolvedRepositoryTransactions(session);
   if (transactions.length > 0) {
     return "Completion is blocked by an uncommitted repository transaction. Continue or abort it first. "
@@ -97,146 +90,279 @@ function hardInvariantMessage(session: RuntimeSession): string | undefined {
   return undefined;
 }
 
-function hasAdvisory(session: RuntimeSession, basisDigest: string): boolean {
-  const marker = `${ADVISORY_PREFIX}${basisDigest}]`;
-  return session.durable.state.messages.some((message) =>
-    message.role === "developer" && message.content.includes(marker));
+type StandardValidationKind = "not_needed" | "passed" | "failed" | "incomplete" | "unverified";
+type FrontierValidation = ReturnType<typeof currentFrontierValidationStatus>;
+type PlanNode = RuntimeSession["durable"]["state"]["plan"]["nodes"][number];
+
+function standardValidationKind(
+  changedPathCount: number,
+  validation: FrontierValidation
+): StandardValidationKind {
+  if (changedPathCount === 0) return "not_needed";
+  if (validation.passed) return "passed";
+  if (validation.latestFailed) return "failed";
+  return validation.hasRecord ? "incomplete" : "unverified";
 }
 
-function advisory(basisDigest: string, body: string): CompletionGateDecision {
-  return {
-    action: "continue",
-    basisDigest,
-    message: `${ADVISORY_PREFIX}${basisDigest}]\n${body}`
-  };
-}
-
-function standardDecision(session: RuntimeSession): CompletionGateDecision {
+function standardBasisDigest(
+  session: RuntimeSession,
+  incompleteNodes: readonly PlanNode[],
+  validationKind: StandardValidationKind,
+  validation: FrontierValidation
+): string {
   const frontier = session.durable.state.mutationFrontier;
-  if (frontier.changedPaths.length === 0) {
-    return { action: "complete", validationStatus: "not_needed" };
-  }
-  const validation = currentFrontierValidationStatus(session);
-  if (!validation.hasRecord) {
-    const basisDigest = digest({
-      profile: "standard",
-      kind: "validation_missing",
-      frontierRevision: frontier.revision,
-      stateDigest: frontier.currentStateDigest
-    });
-    if (!hasAdvisory(session, basisDigest)) {
-      return advisory(
-        basisDigest,
-        "The current mutation frontier has no validation record. This is a one-time advisory, not a hidden completion gate. "
-          + "Validate if useful, or stop naturally again to finish with an explicit unverified status. "
-          + "All permitted tools remain available."
-      );
-    }
-    return {
-      action: "complete",
-      validationStatus: "unverified",
-      statusNote: "Validation status: not run for the current mutation frontier."
-    };
-  }
-  if (validation.passed) {
-    return {
-      action: "complete",
-      validationStatus: "passed",
-      statusNote: "Validation status: passed for the current mutation frontier."
-    };
-  }
-  const failedEvidence = validation.latestFailed;
-  return {
-    action: "complete",
-    validationStatus: failedEvidence ? "failed" : "unverified",
-    statusNote: failedEvidence
-      ? `Validation status: failed for the current mutation frontier (${failedEvidence.summary}).`
-      : "Validation status: recorded but incomplete for the current mutation frontier."
-  };
-}
-
-function strictState(session: RuntimeSession) {
-  const frontier = session.durable.state.mutationFrontier;
-  const validation = currentFrontierValidationStatus(session);
-  const candidate = completionCandidate(session);
-  const review = currentFrontierReview(session, candidate?.digest);
-  return {
-    frontier,
-    candidate,
-    review,
-    validationSatisfied: validation.passed,
-    reviewSatisfied: review?.status === "passed" && review.data.verdict === "approved"
-  };
-}
-
-type StrictState = ReturnType<typeof strictState>;
-
-function strictBasisDigest(session: RuntimeSession, state: StrictState): string {
   return digest({
-    profile: "strict",
-    frontierRevision: state.frontier.revision,
-    stateDigest: state.frontier.currentStateDigest,
-    candidateDigest: state.candidate?.digest ?? null,
-    reviewBasisDigest: reviewBasisDigest(session, undefined, state.candidate?.digest),
-    validationSatisfied: state.validationSatisfied,
-    reviewStatus: state.review?.status ?? null,
-    reviewVerdict: state.review?.data.verdict ?? null,
-    findings: state.review?.data.findings ?? []
+    profile: "standard",
+    planRevision: session.durable.state.plan.revision,
+    incompleteNodes: incompleteNodes.map((node) => ({
+      id: node.id, status: node.status, blockedReason: node.blockedReason ?? null
+    })),
+    frontierRevision: frontier.revision,
+    stateDigest: frontier.currentStateDigest,
+    validationKind,
+    latestValidationId: validation.validations.at(-1)?.evidenceId ?? null
   });
 }
 
-function strictMissing(state: StrictState): string[] {
-  const missing: string[] = [];
-  if (!state.validationSatisfied) {
-    missing.push(
-      `successful validation bound to frontier ${state.frontier.revision}/${state.frontier.currentStateDigest}`
-    );
+function repairIssues(
+  incompleteNodes: readonly PlanNode[],
+  validationKind: StandardValidationKind,
+  validation: FrontierValidation
+): string[] {
+  const issues: string[] = [];
+  if (incompleteNodes.length > 0) {
+    issues.push(`the durable plan still has ${incompleteNodes.length} unfinished node(s): ${incompleteNodes
+      .slice(0, 12).map((node) => `${node.id}[${node.status}]`).join(", ")}`);
   }
-  if (!state.candidate) missing.push("a non-empty completion candidate");
-  if (!state.reviewSatisfied) {
-    missing.push("reviewer approval bound to this same completion candidate");
+  if (validationKind === "unverified") {
+    issues.push("the current mutation frontier has not been validated");
+  } else if (validationKind === "failed") {
+    issues.push(`the latest current-frontier validation failed${validation.latestFailed
+      ? ` (${validation.latestFailed.summary})` : ""}`);
+  } else if (validationKind === "incomplete") {
+    issues.push("current-frontier validation records are incomplete");
   }
-  return missing;
+  return issues;
 }
 
-function strictFindings(state: StrictState): string {
-  const findings = state.review?.data.findings ?? [];
-  return findings.length > 0
-    ? ` Reviewer findings: ${findings.slice(0, 20).map(findingText).join("; ")}.`
-    : "";
+function completionStatusNote(
+  session: RuntimeSession,
+  incompleteNodes: readonly PlanNode[],
+  validationKind: StandardValidationKind,
+  validation: FrontierValidation
+): string | undefined {
+  const planNote = incompleteNodes.length > 0
+    ? `Plan status: incomplete (${incompleteNodes.length} unfinished node(s)).`
+    : session.durable.state.plan.nodes.length > 0 ? "Plan status: complete." : undefined;
+  let validationNote: string | undefined;
+  if (validationKind === "passed") {
+    validationNote = "Validation status: passed for the current mutation frontier.";
+  } else if (validationKind === "failed") {
+    validationNote = `Validation status: failed for the current mutation frontier${validation.latestFailed
+      ? ` (${validation.latestFailed.summary})` : ""}.`;
+  } else if (validationKind === "incomplete") {
+    validationNote = "Validation status: recorded but incomplete for the current mutation frontier.";
+  } else if (validationKind === "unverified") {
+    validationNote = "Validation status: not run for the current mutation frontier.";
+  }
+  const note = [planNote, validationNote].filter(Boolean).join(" ");
+  return note || undefined;
 }
 
-function strictDecision(session: RuntimeSession): CompletionGateDecision {
-  const state = strictState(session);
-  if (state.frontier.changedPaths.length === 0) {
-    return { action: "complete", validationStatus: "not_needed" };
-  }
-  if (state.validationSatisfied && state.reviewSatisfied) {
-    return {
-      action: "complete",
-      validationStatus: "passed",
-      statusNote: "Strict completion policy: current-frontier validation passed and the completion candidate was approved."
-    };
-  }
-  const basisDigest = strictBasisDigest(session, state);
-  const missing = strictMissing(state);
-  const findings = strictFindings(state);
-  if (!hasAdvisory(session, basisDigest)) {
+function publicValidationStatus(
+  validationKind: StandardValidationKind
+): Extract<CompletionGateDecision, { action: "complete" }>["validationStatus"] {
+  if (validationKind === "not_needed" || validationKind === "passed") return validationKind;
+  return validationKind === "failed" ? "failed" : "unverified";
+}
+
+function standardUncheckedDecision(session: RuntimeSession): CompletionGateDecision {
+  const frontier = session.durable.state.mutationFrontier;
+  const validation = currentFrontierValidationStatus(session);
+  const incompleteNodes = session.durable.state.plan.nodes.filter((node) =>
+    node.status === "pending" || node.status === "in_progress" || node.status === "blocked");
+  const validationKind = standardValidationKind(
+    mutationFrontierHasChanges(frontier) ? 1 : 0,
+    validation
+  );
+  const needsRepair = incompleteNodes.length > 0
+    || !["not_needed", "passed"].includes(validationKind);
+  const basisDigest = standardBasisDigest(session, incompleteNodes, validationKind, validation);
+  if (needsRepair && !hasAdvisory(session, basisDigest)) {
+    const issues = repairIssues(incompleteNodes, validationKind, validation);
     return advisory(
       basisDigest,
-      `Strict completion requirements are not yet satisfied: ${missing.join("; ")}.${findings} `
-        + "Address the evidence or findings and then stop naturally again. All permitted safety and development tools remain available."
+      `Before natural completion, ${issues.join("; ")}. This is one repair opportunity for this unchanged plan/frontier basis. `
+        + "Use the highest-value validation or finish/update the plan if that advances the user's goal. "
+        + "All permitted tools remain available; stopping again without a state change is allowed and will be reported explicitly."
+    );
+  }
+  const statusNote = completionStatusNote(session, incompleteNodes, validationKind, validation);
+  return {
+    action: "complete",
+    authority: "user_policy",
+    validationStatus: publicValidationStatus(validationKind),
+    ...(statusNote ? { statusNote } : {})
+  };
+}
+
+function currentReviewWaiver(session: RuntimeSession): boolean {
+  const evidence = sessionMutationEvidence(session);
+  const waived = reviewerWaivedDeltaIds(evidence);
+  const unresolved = unresolvedWorkspaceDeltas(session);
+  const environmentChanged =
+    (session.durable.state.mutationFrontier.environmentChangedPaths?.length ?? 0) > 0;
+  const broadWaiver = evidence.some((item) =>
+    item.kind === "user_waiver"
+    && item.data.scope === "review"
+    && !item.data.checkpointId);
+  return (unresolved.length > 0 || environmentChanged)
+    && (broadWaiver
+      || (!environmentChanged
+        && unresolved.every((item) => waived.has(item.evidenceId))));
+}
+
+function reviewRepairDetails(
+  review: NonNullable<ReturnType<typeof currentFrontierReview>>
+): string {
+  const findings = review.data.findings.slice(0, 20).map(findingText);
+  const criteria = (review.data.criteria ?? [])
+    .filter((item) => item.status !== "satisfied")
+    .slice(0, 20)
+    .map((item) => `${item.criterion} [${item.status}]${item.summary ? `: ${item.summary}` : ""}`);
+  const validations = (review.data.requiredValidations ?? [])
+    .slice(0, 12)
+    .map((item) => item.purpose);
+  return [
+    ...(findings.length > 0 ? [`findings: ${findings.join("; ")}`] : []),
+    ...(criteria.length > 0 ? [`acceptance gaps: ${criteria.join("; ")}`] : []),
+    ...(validations.length > 0 ? [`validation targets: ${validations.join("; ")}`] : [])
+  ].join(" ");
+}
+
+function unavailableReviewDecision(
+  review: ReturnType<typeof currentFrontierReview>
+): CompletionGateDecision | undefined {
+  if (!review) {
+    return {
+      action: "fail",
+      authority: "verification_verdict",
+      code: "verification_unavailable",
+      message: "The run changed the workspace, but no independent completion review could be produced for the current frontier. The result is incomplete and is not reported as verified."
+    };
+  }
+  if (review.data.failureKind || review.data.verdict === "blocked") {
+    return {
+      action: "fail",
+      authority: "verification_verdict",
+      code: "verification_unavailable",
+      message: `Independent completion review was unavailable (${review.summary}). The result is incomplete and is not reported as verified.`
+    };
+  }
+  if (review.data.verdict === "approved") {
+    return {
+      action: "fail",
+      authority: "provider_protocol",
+      code: "verification_unavailable",
+      message: "Independent completion review claimed approval without valid durable V3 evidence provenance. The result is incomplete and is not reported as verified."
+    };
+  }
+  return undefined;
+}
+
+function reviewRepairDecision(
+  session: RuntimeSession,
+  review: NonNullable<ReturnType<typeof currentFrontierReview>>
+): Extract<CompletionGateDecision, { action: "continue" | "fail" }> {
+  const frontier = session.durable.state.mutationFrontier;
+  const reviewAttempts = session.durable.state.evidence.filter((item) =>
+    item.kind === "review" && item.runId === session.durable.runId
+      && substantiveReview(item)).length;
+  const reviewRounds =
+    session.services.profile?.profile.assurancePolicy?.reviewRounds ?? 2;
+  const basisDigest = digest({
+    kind: "verification_repair",
+    frontierRevision: frontier.revision,
+    stateDigest: frontier.currentStateDigest,
+    planRevision: session.durable.state.plan.revision,
+    reviewEvidenceId: review.evidenceId,
+    reviewVerdict: review.data.verdict
+  });
+  const details = reviewRepairDetails(review);
+  if (reviewAttempts < reviewRounds && !hasAdvisory(session, basisDigest)) {
+    return advisory(
+      basisDigest,
+      `Independent completion review did not approve this result (${review.data.verdict}). `
+        + `${details || review.summary} This is the single repair opportunity. `
+        + "Address the actionable findings or run the requested validation, update the work plan if facts changed, and then stop naturally again.",
+      "verification_verdict"
     );
   }
   return {
     action: "fail",
-    code: "strict_policy_failure",
-    message: `Strict completion policy remained unsatisfied after an unchanged second stop: ${missing.join("; ")}.${findings}`
+    authority: "verification_verdict",
+    code: "verification_failed",
+    message: reviewAttempts >= reviewRounds
+      ? `Independent completion review still did not approve after repair and re-review. ${details || review.summary}`
+      : `The task stopped again without changing the frontier, validation, or plan after review requested repair. ${details || review.summary}`
   };
 }
 
+/**
+ * Explicit review is a protocol barrier. Once it yields the same unresolved
+ * verdict after the one repair opportunity, or consumes the final substantive
+ * review round, the runtime must not silently reopen ordinary solving.
+ */
+export function explicitReviewGateDecision(
+  session: RuntimeSession
+): Extract<CompletionGateDecision, { action: "continue" | "fail" }> | undefined {
+  const review = currentFrontierReview(session);
+  if (!review || review.data.verdict === "approved" || !substantiveReview(review)) {
+    return undefined;
+  }
+  return reviewRepairDecision(session, review);
+}
+
+function standardReviewedDecision(session: RuntimeSession): CompletionGateDecision {
+  const frontier = session.durable.state.mutationFrontier;
+  const validation = currentFrontierValidationStatus(session);
+  const validationKind = standardValidationKind(
+    mutationFrontierHasChanges(frontier) ? 1 : 0,
+    validation
+  );
+  if (!mutationFrontierHasChanges(frontier)) {
+    return standardUncheckedDecision(session);
+  }
+  if (currentReviewWaiver(session)) {
+    return {
+      action: "complete",
+      authority: "user_policy",
+      validationStatus: publicValidationStatus(validationKind),
+      statusNote: [
+        "Independent review was explicitly waived by the user for this Standard run.",
+        completionStatusNote(session, [], validationKind, validation)
+      ].filter(Boolean).join(" ")
+    };
+  }
+  const taskBasisReview = currentFrontierReview(session);
+  if (taskBasisReview?.status === "passed"
+    && authenticCurrentReviewApproval(session, taskBasisReview)) {
+    return {
+      action: "complete",
+      authority: "verification_verdict",
+      validationStatus: publicValidationStatus(validationKind),
+      statusNote: [
+        "Independent reviewer approved the current mutation frontier.",
+        completionStatusNote(session, [], validationKind, validation)
+      ].filter(Boolean).join(" ")
+    };
+  }
+  const unavailable = unavailableReviewDecision(taskBasisReview);
+  return unavailable ?? reviewRepairDecision(session, taskBasisReview!);
+}
+
 export function completionGateDecision(session: RuntimeSession): CompletionGateDecision {
-  const invariant = hardInvariantMessage(session);
+  const invariant = completionReviewBlocker(session);
   if (invariant) {
     const frontier = session.durable.state.mutationFrontier;
     const basisDigest = digest({
@@ -247,67 +373,13 @@ export function completionGateDecision(session: RuntimeSession): CompletionGateD
     });
     return advisory(
       basisDigest,
-      `${invariant} This is a deterministic safety/transaction invariant; all tools needed to settle it remain available.`
+      `${invariant} This is a deterministic safety/transaction invariant; all tools needed to settle it remain available.`,
+      "safety_invariant"
     );
   }
   return reviewMode(session) === "required"
-    ? strictDecision(session)
-    : standardDecision(session);
-}
-
-function commonTerminalFailure(
-  session: RuntimeSession,
-  call: ModelToolCall,
-  startedAt: string
-): ToolReceipt | null {
-  if (session.durable.state.activeProcessIds.length > 0) {
-    return failed(
-      call,
-      startedAt,
-      `Terminal outcome is blocked while background processes remain active: ${session.durable.state.activeProcessIds.join(", ")}.`,
-      "active_processes"
-    );
-  }
-  if (session.durable.state.checkpointHead?.status === "open"
-    || session.recovery.openCheckpointRecovery) {
-    return failed(
-      call,
-      startedAt,
-      "Terminal outcome is blocked until the open mutation checkpoint is restored or kept.",
-      "checkpoint_recovery_required"
-    );
-  }
-  if (unresolvedRepositoryTransactions(session).length > 0) {
-    return failed(
-      call,
-      startedAt,
-      "Terminal outcome is blocked until the open repository transaction is continued or aborted.",
-      "repository_transaction_open"
-    );
-  }
-  return null;
-}
-
-/**
- * Explicit terminal tools are checked only against hard lifecycle invariants.
- * Validation, review, recovery, and plan semantics remain model-owned.
- */
-export function completionFailure(
-  session: RuntimeSession,
-  call: ModelToolCall,
-  descriptor: ToolDescriptor,
-  startedAt: string
-): ToolReceipt | null {
-  const terminal = descriptor.possibleEffects.includes("outcome.propose")
-    || descriptor.possibleEffects.includes("outcome.report_blocked");
-  if (!terminal) return null;
-  if (descriptor.possibleEffects.includes("outcome.propose")) {
-    return failed(
-      call,
-      startedAt,
-      "Natural model stop is the completion protocol; no completion tool is registered in V6.",
-      "internal_tool_denied"
-    );
-  }
-  return commonTerminalFailure(session, call, startedAt);
+    ? strictCompletionDecision(session)
+    : reviewMode(session) === "off"
+      ? standardUncheckedDecision(session)
+      : standardReviewedDecision(session);
 }

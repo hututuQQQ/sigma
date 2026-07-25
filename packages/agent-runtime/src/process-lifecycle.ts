@@ -104,11 +104,12 @@ export async function recordProcessReceipt(
   receipt: ToolReceipt,
   emit: RuntimeEventEmitter
 ): Promise<void> {
-  if (call.name !== "process_spawn" && call.name !== "process_poll"
+  if (call.name !== "process_spawn" && call.name !== "environment_process_spawn"
+    && call.name !== "process_poll"
     && call.name !== "process_terminate" && call.name !== "process_handoff") return;
   const value = receiptOutput(receipt);
   const id = processId(value);
-  if (call.name === "process_spawn") {
+  if (call.name === "process_spawn" || call.name === "environment_process_spawn") {
     await recordSpawnedProcess(session, call, plan, value, id, emit);
     return;
   }

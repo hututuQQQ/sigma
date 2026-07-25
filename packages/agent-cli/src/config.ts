@@ -31,6 +31,7 @@ export interface CliConfig {
   executionMode: "sandboxed" | "container";
   managedEnvironmentMode: "disabled" | "required";
   readScope: "workspace" | "host";
+  writeScope: "workspace" | "enclosing-container";
   networkMode: "none" | "loopback" | "full";
   processHandoff: "allow" | "deny";
   reviewerWaiver: boolean;
@@ -227,6 +228,7 @@ function cliConfig(
     executionMode: values.executionMode as CliConfig["executionMode"],
     managedEnvironmentMode: values.managedEnvironmentMode as CliConfig["managedEnvironmentMode"],
     readScope: values.readScope as CliConfig["readScope"],
+    writeScope: values.writeScope as CliConfig["writeScope"],
     networkMode: values.networkMode as CliConfig["networkMode"],
     processHandoff: values.processHandoff as CliConfig["processHandoff"],
     reviewerWaiver: values.reviewerWaiver === true,

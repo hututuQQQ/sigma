@@ -21,6 +21,11 @@ export interface FrozenValidationScope {
   frontierRevision: number;
   stateDigest: string;
   coveredPaths: string[];
+  intent?: {
+    purpose?: string;
+    subjects: string[];
+    criterionIds: string[];
+  };
   claim: Omit<ValidationClaimV1, "status">;
 }
 
@@ -196,6 +201,7 @@ export async function assertTransactionIsolationPlanAllowed(
   session: RuntimeSession,
   plan: ToolCallPlan
 ): Promise<void> {
+  if (plan.mutationAuthority === "disposable_enclosing_container_v1") return;
   const scope = activeConflictScope(session);
   if (scope?.length && plan.exactEffects.includes("filesystem.write")
     && !plan.exactEffects.includes("repository.write")) {
@@ -215,20 +221,33 @@ export function validationScope(
   const frontier = session.durable.state.mutationFrontier;
   const workspaceRoot = path.resolve(session.identity.workspacePath);
   const claim = validationClaim(workspaceRoot, call);
-  const exact = new Set(claim.subject.exactFiles);
-  const project = claim.subject.projectId ?? ".";
-  const coveredPaths = claim.kind === "probe"
-    ? []
-    : exact.size > 0
-      ? frontier.changedPaths.filter((item) => exact.has(portable(item)))
-      : assurancePathsForClaim(
-          frontier.changedPaths.filter((item) => coveredByProject(item, project)),
-          claim.kind
-        );
+  const input = argumentObject(call.arguments);
+  const subjects = Array.isArray(input.subjects)
+    ? input.subjects.filter((item): item is string =>
+        typeof item === "string" && item.trim().length > 0).map((item) => portable(item.trim()))
+    : [];
+  const criterionIds = Array.isArray(input.criterionIds)
+    ? input.criterionIds.filter((item): item is string =>
+        typeof item === "string" && item.trim().length > 0).map((item) => item.trim())
+    : [];
+  const coveredPaths = frontier.changedPaths.filter((changedPath) =>
+    subjects.some((subject) => coveredByProject(changedPath, subject)));
   return {
     frontierRevision: frontier.revision,
     stateDigest: frontier.currentStateDigest,
     coveredPaths,
+    ...((typeof input.purpose === "string" && input.purpose.trim()) || subjects.length > 0
+      || criterionIds.length > 0
+      ? {
+          intent: {
+            ...(typeof input.purpose === "string" && input.purpose.trim()
+              ? { purpose: input.purpose.trim() }
+              : {}),
+            subjects,
+            criterionIds
+          }
+        }
+      : {}),
     claim
   };
 }
@@ -265,31 +284,89 @@ async function implicitAddedParentDirectory(
   );
 }
 
+type ReceiptChangedPath = {
+  path: string;
+  kind: "added" | "modified" | "deleted";
+};
+
+function receiptChangedPaths(receipt: ToolReceipt): ReceiptChangedPath[] {
+  if (!receipt.workspaceDelta) return [];
+  return [
+    ...receipt.workspaceDelta.added.map((item) => ({
+      path: item,
+      kind: "added" as const
+    })),
+    ...receipt.workspaceDelta.modified.map((item) => ({
+      path: item,
+      kind: "modified" as const
+    })),
+    ...receipt.workspaceDelta.deleted.map((item) => ({
+      path: item,
+      kind: "deleted" as const
+    }))
+  ];
+}
+
+function assertEnclosingReceiptWithinPlan(
+  outside: readonly string[],
+  changedPaths: readonly ReceiptChangedPath[],
+  plan: ToolCallPlan
+): void {
+  const declared = [...plan.writePaths, ...plan.checkpointScope];
+  const nonAbsolute = declared.some((item) => !path.isAbsolute(item));
+  if (outside.length === 0 && changedPaths.length === 0 && !nonAbsolute) return;
+  const details = [
+    ...(outside.length > 0 ? [`effects: ${outside.join(", ")}`] : []),
+    ...(changedPaths.length > 0
+      ? [`protected workspace paths changed: ${changedPaths.map((item) => item.path).join(", ")}`]
+      : []),
+    ...(nonAbsolute ? ["enclosing-container paths were not absolute"] : [])
+  ];
+  throw Object.assign(new Error(
+    `Tool observed effects outside its approved enclosing-container plan (${details.join("; ")}).`
+  ), { code: "effect_plan_violation" });
+}
+
+async function workspacePathsOutsidePlan(
+  session: RuntimeSession,
+  changedPaths: readonly ReceiptChangedPath[],
+  allowed: readonly string[]
+): Promise<string[]> {
+  const outside: string[] = [];
+  for (const item of changedPaths) {
+    const canonical = await canonicalWrittenObjectPath(
+      session.identity.workspacePath,
+      item.path
+    );
+    if (canonical && allowed.some((root) => isInside(root, canonical))) continue;
+    if (!await implicitAddedParentDirectory(
+      session.identity.workspacePath,
+      item,
+      canonical,
+      [...allowed]
+    )) outside.push(item.path);
+  }
+  return outside;
+}
+
 export async function assertReceiptWithinPlan(
   session: RuntimeSession,
   receipt: ToolReceipt,
   plan: ToolCallPlan
 ): Promise<void> {
   const outside = effectsOutsidePlan(receipt, plan);
-  const changedPaths = receipt.workspaceDelta ? [
-    ...receipt.workspaceDelta.added.map((item) => ({ path: item, kind: "added" as const })),
-    ...receipt.workspaceDelta.modified.map((item) => ({ path: item, kind: "modified" as const })),
-    ...receipt.workspaceDelta.deleted.map((item) => ({ path: item, kind: "deleted" as const }))
-  ] : [];
+  const changedPaths = receiptChangedPaths(receipt);
+  if (plan.mutationAuthority === "disposable_enclosing_container_v1") {
+    assertEnclosingReceiptWithinPlan(outside, changedPaths, plan);
+    return;
+  }
   const plannedWritePaths = plan.writePaths.length > 0
     ? plan.writePaths : plan.exactEffects.includes("filesystem.write") ? plan.checkpointScope : [];
   const allowedResults = await Promise.all(plannedWritePaths.map(async (item) =>
     await canonicalWrittenObjectPath(session.identity.workspacePath, item)));
   const invalidAllowed = plannedWritePaths.filter((_item, index) => !allowedResults[index]);
   const allowed = allowedResults.filter((item): item is string => Boolean(item));
-  const outsidePaths: string[] = [];
-  for (const item of changedPaths) {
-    const canonical = await canonicalWrittenObjectPath(session.identity.workspacePath, item.path);
-    if (canonical && allowed.some((root) => isInside(root, canonical))) continue;
-    if (!await implicitAddedParentDirectory(session.identity.workspacePath, item, canonical, allowed)) {
-      outsidePaths.push(item.path);
-    }
-  }
+  const outsidePaths = await workspacePathsOutsidePlan(session, changedPaths, allowed);
   if (outside.length === 0 && outsidePaths.length === 0 && invalidAllowed.length === 0) return;
   const details = [
     ...(outside.length > 0 ? [`effects: ${outside.join(", ")}`] : []),

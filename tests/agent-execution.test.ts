@@ -9,7 +9,6 @@ import {
   BrokerConnectionError,
   BrokerExecutableUnavailableError,
   BrokerFrameDecoder,
-  BrokerOutputDecodingError,
   BrokerPolicyError,
   BrokerProcessLostError,
   BrokerProtocolError,
@@ -152,7 +151,9 @@ const handle = request => {
       timedOut: false, idleTimedOut: false, cancelled: false
     });
   } else if (request.method === "exec" && (mode === "decoding-error-artifact" || mode === "bad-artifact")) {
-    const content = Buffer.from("broker-redacted output\n", "utf8");
+    const content = mode === "decoding-error-artifact"
+      ? Buffer.from([0xff, 0x00, 0x41, 0x80])
+      : Buffer.from("broker-redacted output\n", "utf8");
     const artifactPath = path.join(artifactRoot, "stdout-output.log");
     fs.writeFileSync(artifactPath, content, { mode: 0o600 });
     ok(request, {
@@ -422,6 +423,20 @@ describe("agent-execution environment and redaction", () => {
     const preservingPartial = new SecretRedactor({ token: "abcdef" }).createStream("length_preserving");
     expect(preservingPartial.push("abc", { final: true })).toBe("***");
     expect(preservingPartial.push("abc", { discontinuity: true })).toBe("***");
+    const binary = new SecretRedactor({ token: "secret-value" }).redactBytes(
+      Buffer.concat([
+        Buffer.from([0xff, 0x00]),
+        Buffer.from("secret-value", "utf8"),
+        Buffer.from([0x80])
+      ])
+    );
+    expect(Buffer.from(binary).includes(Buffer.from("secret-value"))).toBe(false);
+    expect(Buffer.from(binary).includes(Buffer.from("[REDACTED:token]"))).toBe(true);
+    const utf16Secret = Buffer.from("secret-value", "utf16le");
+    const utf16Redacted = new SecretRedactor({ token: "secret-value" })
+      .redactBytes(utf16Secret);
+    expect(Buffer.from(utf16Redacted).includes(utf16Secret)).toBe(false);
+    expect(Buffer.from(utf16Redacted).includes(Buffer.from("[REDACTED:token]"))).toBe(true);
   });
 
   it("validates and redacts every JSON-RPC structural string", () => {
@@ -507,6 +522,12 @@ describe("agent-execution protocol validation", () => {
       capabilities: {
         foreground: true, background: true, stdin: true, pty: false, networkModes: ["none"],
         executionRoots: true,
+        directExecutableResolution: true,
+        enclosingContainerRoot: {
+          available: true,
+          rootKind: "container_cow",
+          attestationDigest: `sha256:${"a".repeat(64)}`
+        },
         managedEnvironment: { available: true, prepare: true },
         shells: [{ kind: "bash", executable: "/bin/bash", verified: true }]
       }
@@ -524,6 +545,12 @@ describe("agent-execution protocol validation", () => {
     });
     expect(parsedDoctor.capabilities).toMatchObject({
       executionRoots: true,
+      directExecutableResolution: true,
+      enclosingContainerRoot: {
+        available: true,
+        rootKind: "container_cow",
+        attestationDigest: `sha256:${"a".repeat(64)}`
+      },
       managedEnvironment: { available: true, prepare: true },
       shells: [{ kind: "bash", executable: "/bin/bash", verified: true }]
     });
@@ -531,6 +558,29 @@ describe("agent-execution protocol validation", () => {
       ...doctor,
       capabilities: { ...doctor.capabilities, managedEnvironment: { available: true, prepare: "yes" } }
     })).toThrow(BrokerProtocolError);
+    expect(() => parseDoctor({
+      ...doctor,
+      capabilities: { ...doctor.capabilities, directExecutableResolution: "yes" }
+    })).toThrow(BrokerProtocolError);
+    for (const enclosingContainerRoot of [
+      { available: true, rootKind: "container_cow" },
+      { available: false, rootKind: "container_cow" },
+      {
+        available: true,
+        rootKind: "unavailable",
+        attestationDigest: `sha256:${"a".repeat(64)}`
+      },
+      {
+        available: false,
+        rootKind: "unavailable",
+        attestationDigest: `sha256:${"a".repeat(64)}`
+      }
+    ]) {
+      expect(() => parseDoctor({
+        ...doctor,
+        capabilities: { ...doctor.capabilities, enclosingContainerRoot }
+      })).toThrow(BrokerProtocolError);
+    }
     expect(parseDoctor({
       ...doctor,
       platform: "windows",
@@ -1111,26 +1161,43 @@ describe("SigmaExecBrokerClient", () => {
     await client.close();
   });
 
-  it("rejects undecodable foreground output without closing the healthy broker", async () => {
+  it("preserves the exit result when a legacy broker cannot project non-text output", async () => {
     const client = new SigmaExecBrokerClient(fixtureOptions("decoding-error"));
     await client.connect();
-    const error = await client.execute({ ...spawnRequest(), timeoutMs: 500 }).catch((cause: unknown) => cause);
-    expect(error).toBeInstanceOf(BrokerOutputDecodingError);
-    expect(error).toMatchObject({
-      code: "invalid_output_encoding",
-      data: { stream: "stdout", diagnosticCode: "invalid_output_encoding" }
+    const result = await client.execute({ ...spawnRequest(), timeoutMs: 500 });
+    expect(result).toMatchObject({
+      state: "exited",
+      exitCode: 0,
+      outputTruncated: true,
+      outputDecodingErrors: [{
+        stream: "stdout",
+        code: "invalid_output_encoding"
+      }]
     });
+    expect(result.stdout).toContain("exact bytes were unavailable");
     await expect(client.doctor()).resolves.toMatchObject({ brokerVersion: "fixture" });
     await client.close();
   });
 
-  it("releases overflow artifacts before rejecting undecodable foreground output", async () => {
+  it("returns non-text output as a releasable byte-safe artifact", async () => {
     const artifactRoot = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-artifacts-decode-release-"));
     const artifactPath = path.join(artifactRoot, "stdout-output.log");
     const client = new SigmaExecBrokerClient(fixtureOptions("decoding-error-artifact", {}, artifactRoot));
     await client.connect();
-    await expect(client.execute({ ...spawnRequest(), timeoutMs: 500 }))
-      .rejects.toBeInstanceOf(BrokerOutputDecodingError);
+    const result = await client.execute({ ...spawnRequest(), timeoutMs: 500 });
+    expect(result.stdout).toContain("NON_TEXT_STDOUT");
+    expect(result.outputDecodingErrors).toEqual([expect.objectContaining({
+      stream: "stdout",
+      code: "invalid_output_encoding"
+    })]);
+    expect(result.outputArtifacts).toEqual([expect.objectContaining({
+      brokerArtifactId: "stdout-output",
+      mediaType: "application/octet-stream",
+      content: Buffer.from([0xff, 0x00, 0x41, 0x80])
+    })]);
+    await client.releaseOutputArtifacts(
+      result.outputArtifacts!.map((item) => item.brokerArtifactId)
+    );
     await expect(access(artifactPath)).rejects.toThrow();
     await expect(client.doctor()).resolves.toMatchObject({ brokerVersion: "fixture" });
     await client.close();

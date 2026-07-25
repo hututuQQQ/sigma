@@ -348,6 +348,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toEqual({
       kind: "needs_input",
+      decisionAuthority: "user_policy",
       requestId: "typed-protected-input",
       message: "Which target should I change?"
     });
@@ -412,7 +413,10 @@ describe("runtime queues and non-blocking instruction steering", () => {
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect the requested file" });
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toEqual({
-      kind: "needs_input", requestId: "need-existing-path", message: "Which existing path should I inspect?"
+      kind: "needs_input",
+      decisionAuthority: "user_policy",
+      requestId: "need-existing-path",
+      message: "Which existing path should I inspect?"
     });
     expect(gateway.requests).toHaveLength(2);
     expect(gateway.requests[1].toolChoice).toBeUndefined();
@@ -444,6 +448,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toEqual({
       kind: "recoverable_failure",
       code: "reported_blocked",
+      decisionAuthority: "provider_protocol",
       failureKind: "blocked",
       failureCode: "validation_failed",
       message: "The validation was executed and failed; that result is reported honestly.\nRecovery attempted: The requested validation was run once."
@@ -468,6 +473,13 @@ describe("runtime queues and non-blocking instruction steering", () => {
         finishReason: "tool_calls"
       },
       validationTurn("validate-readme-failure", [{ path: "README.md", expected: "# Different\n" }]),
+      {
+        message: {
+          role: "assistant",
+          content: "The documentation change is applied; validation ran and failed, and that failure is reported."
+        },
+        finishReason: "stop"
+      },
       {
         message: {
           role: "assistant",
@@ -633,9 +645,106 @@ describe("runtime queues and non-blocking instruction steering", () => {
     const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "change it" });
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toEqual({
-      kind: "needs_input", requestId: "need-target", message: "Which target should I change?"
+      kind: "needs_input",
+      decisionAuthority: "user_policy",
+      requestId: "need-target",
+      message: "Which target should I change?"
     });
   });
+
+  it("gives a fresh strategist one audit before suspending open planned work for input", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-audited-request-input-"));
+    const gateway = new ScriptedGateway([
+      {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{
+            id: "open-plan",
+            name: "update_plan",
+            arguments: {
+              goal: "Complete the requested work.",
+              plan: [{
+                id: "resolve",
+                step: "Resolve the remaining fact.",
+                status: "in_progress"
+              }]
+            }
+          }]
+        },
+        finishReason: "tool_calls"
+      },
+      {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{
+            id: "premature-input",
+            name: "request_user_input",
+            arguments: { message: "Please provide the remaining fact." }
+          }]
+        },
+        finishReason: "tool_calls"
+      },
+      {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{
+            id: "close-plan",
+            name: "update_plan",
+            arguments: {
+              goal: "Complete the requested work.",
+              plan: [{
+                id: "resolve",
+                step: "Resolve the remaining fact.",
+                status: "completed"
+              }]
+            }
+          }]
+        },
+        finishReason: "tool_calls"
+      },
+      completion("continued after the independent input audit")
+    ]);
+    const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
+    const runtime = createRuntime({
+      gateway,
+      store,
+      storeRootDir: path.join(workspace, ".agent"),
+      tools: registerBuiltinTools(new EffectToolRegistry()),
+      permissionMode: "auto",
+      runDeadlineMs: 60_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+    await runtime.command({
+      type: "submit",
+      sessionId: session.sessionId,
+      text: "Complete the work autonomously when the facts are derivable."
+    });
+
+    const outcome = await runtime.waitForOutcome(session.sessionId);
+    expect(outcome).toMatchObject({ kind: "completed" });
+    expect(outcome.kind === "completed" ? outcome.message : "").toContain(
+      "continued after the independent input audit"
+    );
+    const events = await storedEvents(store, session.sessionId);
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "long_horizon.updated",
+      payload: expect.objectContaining({ reason: "input_request_audit" })
+    }));
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "long_horizon.updated",
+      payload: expect.objectContaining({
+        reason: "strategy_reset",
+        state: expect.objectContaining({
+          strategy: expect.objectContaining({ trigger: "input_request" })
+        })
+      })
+    }));
+    expect(events.filter((event) =>
+      event.type === "run.suspended")).toHaveLength(0);
+  }, 30_000);
 
   it("supports a direct input request after evidence on an ordinary model turn", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-evidenced-request-input-"));
@@ -672,6 +781,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect, then change the selected target" });
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toEqual({
       kind: "needs_input",
+      decisionAuthority: "user_policy",
       requestId: "need-target-after-evidence",
       message: "Which target should I change?"
     });
@@ -730,7 +840,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     await expect(readFile(path.join(workspace, "b.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("allows repeated successful reads until the model naturally stops", async () => {
+  it("turns a fourth exact no-progress call into a durable pivot receipt", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-repeated-batch-"));
     await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
     const gateway = new ScriptedGateway([
@@ -752,7 +862,10 @@ describe("runtime queues and non-blocking instruction steering", () => {
     });
     const events = await storedEvents(store, session.sessionId);
     const receipts = events.filter((event) => event.type === "tool.completed");
-    expect(receipts).toHaveLength(8);
+    const suppressed = events.filter((event) => event.type === "tool.failed"
+      && (event.payload as { diagnostics?: string[] }).diagnostics?.includes("repeated_tool_call"));
+    expect(receipts).toHaveLength(6);
+    expect(suppressed).toHaveLength(2);
     expect(receipts.every((event) => (event.payload as { outcome?: unknown }).outcome
       && (event.payload as { outcome: { status?: unknown } }).outcome.status === "succeeded")).toBe(true);
     const restored = await restoreStoredSession(store, session.sessionId, 10_000);
@@ -1750,7 +1863,12 @@ describe("runtime queues and non-blocking instruction steering", () => {
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "run both effects" });
     await expect(Promise.race([
       durableBoundary,
-      new Promise((_, reject) => setTimeout(() => reject(new Error("Fast receipt was not durable while approval waited.")), 2_000))
+      // The approval remains unresolved, so a serialized batch still cannot
+      // satisfy this boundary. Allow enough wall time for a saturated CI host
+      // to flush the independently completed durable event.
+      new Promise((_, reject) => setTimeout(() => reject(
+        new Error("Fast receipt was not durable while approval waited.")
+      ), 10_000))
     ])).resolves.toBeUndefined();
     await expect(readFile(path.join(workspace, "fast.txt"), "utf8")).resolves.toBe("fast_side_effect");
     expect((await storedEvents(store, session.sessionId)).some((event) => event.type === "tool.completed"

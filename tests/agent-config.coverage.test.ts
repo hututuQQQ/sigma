@@ -41,35 +41,57 @@ describe("agent-config single-source schema", () => {
     const values = resolveConfig({
       home: {
         permissions: { mode: "deny" },
-        security: { read_scope: "workspace", network: "none", process_handoff: "deny" },
+        security: {
+          read_scope: "workspace",
+          write_scope: "workspace",
+          network: "none",
+          process_handoff: "deny"
+        },
         budget: { max_input_tokens: 1_000, max_tool_calls: 20 }, checkpoint: { max_files: 100 }
       },
       workspace: {
         permissions: { mode: "auto" },
-        security: { read_scope: "host", network: "full", process_handoff: "allow" },
+        security: {
+          read_scope: "host",
+          write_scope: "enclosing-container",
+          network: "full",
+          process_handoff: "allow"
+        },
         budget: { max_input_tokens: 2_000, max_tool_calls: 10 }, checkpoint: { max_files: 200 },
         agents: { max_parallel: 2 }
       }
     });
     expect(values).toMatchObject({
-      permissionMode: "deny", readScope: "workspace", networkMode: "none", processHandoff: "deny",
+      permissionMode: "deny", readScope: "workspace", writeScope: "workspace",
+      networkMode: "none", processHandoff: "deny",
       maxInputTokens: 1_000, maxToolCalls: 10, checkpointMaxFiles: 100, maxParallelAgents: 2
     });
 
     const narrowed = resolveConfig({
       home: {
         permissions: { mode: "auto" },
-        security: { read_scope: "host", network: "full", process_handoff: "allow" },
+        security: {
+          read_scope: "host",
+          write_scope: "enclosing-container",
+          network: "full",
+          process_handoff: "allow"
+        },
         budget: { max_input_tokens: 2_000 }
       },
       workspace: {
         permissions: { mode: "ask" },
-        security: { read_scope: "workspace", network: "none", process_handoff: "deny" },
+        security: {
+          read_scope: "workspace",
+          write_scope: "workspace",
+          network: "none",
+          process_handoff: "deny"
+        },
         budget: { max_input_tokens: 1_000 }
       }
     });
     expect(narrowed).toMatchObject({
-      permissionMode: "ask", readScope: "workspace", networkMode: "none", processHandoff: "deny",
+      permissionMode: "ask", readScope: "workspace", writeScope: "workspace",
+      networkMode: "none", processHandoff: "deny",
       maxInputTokens: 1_000
     });
 
@@ -91,6 +113,8 @@ describe("agent-config single-source schema", () => {
     const field = (key: string) => SIGMA_CONFIG_SCHEMA.find((item) => item.key === key)!;
     expect(() => field("permissionMode").parse("yolo")).toThrow("must be one of");
     expect(field("permissionMode").parse("workspace-auto")).toBe("workspace-auto");
+    expect(field("writeScope").parse("enclosing-container")).toBe("enclosing-container");
+    expect(() => field("writeScope").parse("host")).toThrow("must be one of");
     expect(() => field("provider").parse("other")).toThrow("must be one of");
     expect(() => field("workspace").parse(1)).toThrow("string");
     expect(() => field("workspace").parse(" ")).toThrow("non-empty");

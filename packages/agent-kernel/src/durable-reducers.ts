@@ -2,15 +2,23 @@ import {
   isCheckpointRef,
   isEvidenceRecord,
   isPlanGraph,
+  isLongHorizonStateV2,
+  isReasoningTrajectoryStateV1,
+  isToolResultPruneStateV1,
   isUsageRecord,
   type AgentEventEnvelope,
   type AgentEventType,
   type ContextItem,
   type EvidenceRecord,
-  type JsonValue
+  type JsonValue,
+  type ReviewerToolReceiptV1
 } from "agent-protocol";
 import { durableBudgetReducers } from "./durable-budget-reducers.js";
-import { frontierAfterCheckpoint, frontierAfterEvidence } from "./mutation-frontier.js";
+import {
+  frontierAfterCheckpoint,
+  frontierAfterEvidence,
+  isEnclosingContainerMutationEvidence
+} from "./mutation-frontier.js";
 import type { KernelEventReducer } from "./durable-reducer-types.js";
 import type { KernelState, PendingTool } from "./state.js";
 
@@ -80,7 +88,8 @@ function restoredFrontier(
   if (data.frontierRevision !== frontier.revision
     || data.frontierStateDigest !== frontier.currentStateDigest
     || data.baselineManifestDigest !== data.currentManifestDigest
-    || !repositoryRestored) return state;
+    || !repositoryRestored
+    || (frontier.environmentChangedPaths?.length ?? 0) > 0) return state;
   return {
     ...state,
     mutationEvidence: state.mutationEvidence.filter((item) =>
@@ -91,6 +100,7 @@ function restoredFrontier(
       baselineManifestDigest: data.currentManifestDigest,
       currentStateDigest: data.currentManifestDigest,
       changedPaths: [],
+      environmentChangedPaths: [],
       sourceCheckpointIds: []
     }
   };
@@ -100,6 +110,7 @@ const evidenceRecorded: KernelEventReducer = (state, event) => {
   const evidence = event.payload;
   if (!isEvidenceRecord(evidence) || !canRecordEvidence(state, event, evidence)) return state;
   const mutationEvidence = MUTATION_EVIDENCE_KINDS.has(evidence.kind)
+    || isEnclosingContainerMutationEvidence(evidence)
     ? [...state.mutationEvidence, evidence]
     : state.mutationEvidence;
   const next = {
@@ -123,6 +134,34 @@ const planUpdated: KernelEventReducer = (state, _event, payload) => {
     || payload.previousRevision !== state.plan.revision
     || payload.plan.revision !== state.plan.revision + 1) return state;
   return { ...state, plan: payload.plan };
+};
+
+const longHorizonUpdated: KernelEventReducer = (state, event, payload) => {
+  if (event.authority !== "runtime" || !isLongHorizonStateV2(payload.state)) return state;
+  return { ...state, longHorizon: payload.state };
+};
+
+const reviewToolCompleted: KernelEventReducer = (state, event, payload) => {
+  const item = payload as unknown as ReviewerToolReceiptV1;
+  if (event.authority !== "runtime"
+    || item.schemaVersion !== 1
+    || typeof item.reviewRequestId !== "string"
+    || typeof item.call?.id !== "string"
+    || typeof item.receipt?.callId !== "string"
+    || item.call.id !== item.receipt.callId
+    || state.reviewReceipts.some((prior) =>
+      prior.reviewRequestId === item.reviewRequestId
+      && prior.call.id === item.call.id)) return state;
+  return {
+    ...state,
+    reviewReceipts: [...state.reviewReceipts, item]
+  };
+};
+
+const reasoningTrajectoryTombstoned: KernelEventReducer = (state, event, payload) => {
+  if (event.authority !== "runtime"
+    || !isReasoningTrajectoryStateV1(payload.state)) return state;
+  return { ...state, reasoningTrajectory: payload.state };
 };
 
 function pruneRestoredCheckpointEvidence(
@@ -274,10 +313,21 @@ const contextCompacted: KernelEventReducer = (state, event, payload) => {
   };
 };
 
+const toolResultsPruned: KernelEventReducer = (state, event, payload) => {
+  if (event.authority !== "runtime" || !isToolResultPruneStateV1(payload.state)) return state;
+  const current = state.toolResultPrune;
+  if (current && current.archiveSourceDigest === payload.state.archiveSourceDigest
+    && payload.state.coveredBlocks < current.coveredBlocks) return state;
+  return { ...state, toolResultPrune: payload.state };
+};
+
 export const durableReducers: Partial<Record<AgentEventType, KernelEventReducer>> = {
   "evidence.recorded": evidenceRecorded,
   "usage.recorded": usageRecorded,
   "plan.updated": planUpdated,
+  "long_horizon.updated": longHorizonUpdated,
+  "review.tool_completed": reviewToolCompleted,
+  "context.reasoning_trajectory_tombstoned": reasoningTrajectoryTombstoned,
   ...durableBudgetReducers,
   "checkpoint.created": checkpointUpdated,
   "checkpoint.sealed": checkpointUpdated,
@@ -292,5 +342,6 @@ export const durableReducers: Partial<Record<AgentEventType, KernelEventReducer>
   "process.exited": processSettled,
   "process.lost": processSettled,
   "process.handed_off": processSettled,
-  "context.compacted": contextCompacted
+  "context.compacted": contextCompacted,
+  "context.tool_results_pruned": toolResultsPruned
 };

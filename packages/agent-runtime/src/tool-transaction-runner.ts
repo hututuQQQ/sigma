@@ -1,4 +1,5 @@
 import type { CheckpointRef, ModelToolCall, ToolCallPlan, ToolDescriptor, ToolReceipt } from "agent-protocol";
+import { mutationFrontierHasChanges } from "agent-kernel";
 import { isToolAllowed, prepareToolCallPlan, ResourceLockManager } from "agent-tools";
 import {
   completionFailure,
@@ -38,6 +39,12 @@ import type { PreparedTool, TransactionState } from "./tool-transaction-types.js
 import { recordRuntimeDependencyFailure } from "./runtime-dependency-observation.js";
 import { toolRuntimeContext } from "./repository-recovery-context.js";
 import { normalizeToolTransactionReceipt } from "./tool-receipt-normalization.js";
+import { materializeLargeToolArtifacts } from "./large-tool-artifacts.js";
+import { repeatedExactCallFailure } from "./repeated-tool-call-guard.js";
+import {
+  availableOrchestratorBudget,
+  reviewRepairActive
+} from "./assurance-budget.js";
 export class ToolTransactionRunner {
   private readonly locks = new ResourceLockManager();
   private readonly workspaceLease = new WorkspaceMutationLease();
@@ -46,7 +53,7 @@ export class ToolTransactionRunner {
   constructor(
     private readonly options: Pick<
       EffectRunnerOptions,
-      "runtime" | "permissionMode" | "emit" | "finish" | "control" | "budgets" | "hooks"
+      "runtime" | "permissionMode" | "emit" | "finish" | "control" | "budgets" | "hooks" | "createArtifact"
     >,
     private readonly execution: ToolExecutionMonitor
   ) {
@@ -110,6 +117,8 @@ export class ToolTransactionRunner {
     await this.options.emit(session, "execution.planned", "runtime", {
       executionId: call.id, toolCallId: call.id, plan
     });
+    const repeatFailure = repeatedExactCallFailure(session, call, startedAt);
+    if (repeatFailure) return repeatFailure;
     const gateFailure = await this.preflight(session, call, descriptor, plan, startedAt);
     return gateFailure ?? {
       ...attempt, descriptor, plan, startedAt,
@@ -155,6 +164,17 @@ export class ToolTransactionRunner {
   ): Promise<ToolReceipt> {
     const { call, plan, startedAt } = prepared;
     try {
+      if (!reviewRepairActive(session)
+        && mutationFrontierHasChanges(session.durable.state.mutationFrontier)
+        && availableOrchestratorBudget(session).toolCalls < 1) {
+        return failed(
+          call,
+          startedAt,
+          "The ordinary solving tool-call budget is exhausted; protected verification and repair capacity remains isolated.",
+          "budget_exhausted"
+        );
+      }
+      await this.consumeRepairToolCapacity(session);
       await this.options.hooks.dispatch(session, "pre_tool", {
         sessionId: session.identity.sessionId,
         runId: session.durable.runId,
@@ -193,6 +213,34 @@ export class ToolTransactionRunner {
       );
       return failedExternalInputReceipt(session, call, plan, receipt, code);
     }
+  }
+
+  private async consumeRepairToolCapacity(
+    session: RuntimeSession
+  ): Promise<void> {
+    return await this.locks.withLocks(
+      [`assurance-repair-capacity:${session.identity.sessionId}`],
+      async () => {
+        if (!reviewRepairActive(session)) return;
+        const state = session.durable.state.longHorizon;
+        if (state.assurance.protectedToolCallsRemaining <= 0) return;
+        await this.options.emit(session, "long_horizon.updated", "runtime", {
+          state: {
+            ...state,
+            assurance: {
+              ...state.assurance,
+              repairEpisodes: Math.min(
+                state.assurance.repairRounds,
+                Math.max(1, state.assurance.repairEpisodes)
+              ),
+              protectedToolCallsRemaining:
+                state.assurance.protectedToolCallsRemaining - 1
+            }
+          },
+          reason: "repair_capacity_consumed"
+        });
+      }
+    );
   }
 
   private async runReserved(
@@ -274,7 +322,17 @@ export class ToolTransactionRunner {
       await assertReceiptWithinPlan(session, receipt, plan);
       if (checkpoint) await this.options.control.sealCheckpoint(session, checkpoint.checkpointId);
       await recordProcessReceipt(session, call, plan, receipt, this.options.emit);
-      const normalizedReceipt = normalizeToolTransactionReceipt(session, prepared, receipt);
+      const materializedReceipt = await materializeLargeToolArtifacts(
+        session.identity.sessionId,
+        descriptor.name,
+        receipt,
+        this.options.createArtifact
+      );
+      const normalizedReceipt = normalizeToolTransactionReceipt(
+        session,
+        prepared,
+        materializedReceipt
+      );
       await this.options.emit(session, "execution.completed", "runtime", {
         executionId: call.id,
         evidenceIds: (normalizedReceipt.evidence ?? []).map((item) => item.evidenceId)
@@ -287,40 +345,55 @@ export class ToolTransactionRunner {
         code: executionFailureCode(error),
         message: error instanceof Error ? error.message : String(error)
       });
-      if (checkpoint) {
-        try {
-          const recovery = await this.options.control.recoverOpen(session);
-          if (recovery.kind === "needs_input") {
-            session.recovery.openCheckpointRecovery = {
-              checkpointId: recovery.checkpointId,
-              currentManifestDigest: recovery.currentManifestDigest
-            };
-            if (executionFailureCode(error) === "effect_plan_violation"
-              && recovery.checkpointId === checkpoint.checkpointId) {
-              await this.options.control.restorePolicyViolation(
-                session,
-                recovery.checkpointId,
-                recovery.currentManifestDigest
-              );
-              session.recovery.openCheckpointRecovery = undefined;
-            }
-          }
-        } catch (recoveryError) {
-          session.recovery.openCheckpointRecovery ??= {
-            checkpointId: checkpoint.checkpointId,
-            // A preimage digest cannot authorize keeping/restoring a changed
-            // postimage; it only provides a fail-closed placeholder until a
-            // later inspection refreshes the recovery state.
-            currentManifestDigest: checkpoint.preManifestDigest
-          };
-          throw Object.assign(new AggregateError(
-            [error],
-            "Failed to settle the mutation checkpoint after tool failure.",
-            { cause: recoveryError }
-          ), { code: "checkpoint_recovery_failed" });
-        }
-      }
+      if (checkpoint) await this.settleCheckpointAfterFailure(session, checkpoint, error);
       throw error;
+    }
+  }
+
+  private async settleCheckpointAfterFailure(
+    session: RuntimeSession,
+    checkpoint: CheckpointRef,
+    executionError: unknown
+  ): Promise<void> {
+    try {
+      const recovery = await this.options.control.recoverOpen(session);
+      if (recovery.kind !== "needs_input") return;
+      session.recovery.openCheckpointRecovery = {
+        checkpointId: recovery.checkpointId,
+        currentManifestDigest: recovery.currentManifestDigest
+      };
+      if (executionFailureCode(executionError) === "effect_plan_violation"
+        && recovery.checkpointId === checkpoint.checkpointId) {
+        await this.options.control.restorePolicyViolation(
+          session,
+          recovery.checkpointId,
+          recovery.currentManifestDigest
+        );
+        session.recovery.openCheckpointRecovery = undefined;
+      }
+    } catch (recoveryError) {
+      const durableHead = session.durable.state.checkpointHead;
+      if (durableHead?.checkpointId === checkpoint.checkpointId
+        && durableHead.status === "sealed") {
+        session.recovery.openCheckpointRecovery = undefined;
+        throw Object.assign(new AggregateError(
+          [executionError],
+          "The mutation checkpoint is sealed, but its evidence could not be reconciled.",
+          { cause: recoveryError }
+        ), { code: "checkpoint_evidence_failed" });
+      }
+      session.recovery.openCheckpointRecovery ??= {
+        checkpointId: checkpoint.checkpointId,
+        // A preimage digest cannot authorize keeping/restoring a changed
+        // postimage; it only provides a fail-closed placeholder until a later
+        // inspection refreshes the recovery state.
+        currentManifestDigest: checkpoint.preManifestDigest
+      };
+      throw Object.assign(new AggregateError(
+        [executionError],
+        "Failed to settle the mutation checkpoint after tool failure.",
+        { cause: recoveryError }
+      ), { code: "checkpoint_recovery_failed" });
     }
   }
 

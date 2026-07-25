@@ -29,6 +29,12 @@ import type { ShellKind } from "./environment.js";
 export interface ProcessExecutionPort {
   readonly lostProcessHandles?: readonly ProcessHandle[];
   execute(request: ExecutionRequest, options?: BrokerRequestOptions): Promise<ExecutionResult>;
+  /**
+   * Observe an already-started process without creating a new model action.
+   * Runtimes use this optional lifecycle capability to settle session-owned
+   * background work at a hard solver-budget boundary before verification.
+   */
+  poll?(handle: ProcessHandle, options?: BrokerRequestOptions): Promise<ProcessPollResult>;
   terminate?(handle: ProcessHandle, options?: BrokerRequestOptions): Promise<ProcessPollResult>;
   handoff?(handle: ProcessHandle, options?: BrokerRequestOptions): Promise<ProcessHandoffResult>;
   releaseOutputArtifacts?(artifactIds: string[]): Promise<void>;

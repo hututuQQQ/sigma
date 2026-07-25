@@ -1,8 +1,7 @@
-import type { BudgetReservation, ValidationEvidence, WorkspaceDeltaEvidence } from "agent-protocol";
+import type { BudgetReservation, WorkspaceDeltaEvidence } from "agent-protocol";
 import type { BudgetController } from "./budget-controller.js";
 import { sessionMutationEvidence } from "./mutation-evidence.js";
 import type { RuntimeSession } from "./types.js";
-import { validationExecutionCoversDelta } from "./validation-policy.js";
 
 const PREFIX = "mutation-tool:";
 
@@ -60,11 +59,12 @@ function mutationReservationSatisfied(
     return session.recovery.openCheckpointRecovery?.checkpointId !== mutation.checkpointId
       && session.durable.state.receipts.some((item) => item.callId === mutation.callId);
   }
-  const evidence = sessionMutationEvidence(session);
-  const validations = evidence.filter((item): item is ValidationEvidence =>
-    item.kind === "validation");
-  if (deltas.some((delta) => !validations.some((item) => validationExecutionCoversDelta(item, delta)))) return false;
-  return true;
+  // A mutation reservation accounts for the objective tool side effect, not
+  // for a runtime opinion about whether a later command semantically validates
+  // it. The sealed checkpoint delta and its durable receipt are the authority
+  // for settling the tool-call unit; completion coverage belongs exclusively
+  // to independent verification.
+  return session.durable.state.receipts.some((item) => item.callId === mutation.callId);
 }
 
 function mutationDeltas(session: RuntimeSession, checkpointId: string): WorkspaceDeltaEvidence[] {

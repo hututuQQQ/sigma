@@ -43,12 +43,15 @@ export interface StableWorkspaceReadOptions {
 /** Exact bytes and text metadata captured under one stable workspace-path
  * lease. `byteLength` and `sha256` describe the original bytes, not a
  * re-encoded approximation of `content`. */
-export interface StableWorkspaceTextRead {
-  content: string;
+export interface StableWorkspaceBinaryRead {
   bytes: Buffer;
   byteLength: number;
-  endsWithNewline: boolean;
   sha256: string;
+}
+
+export interface StableWorkspaceTextRead extends StableWorkspaceBinaryRead {
+  content: string;
+  endsWithNewline: boolean;
 }
 
 interface CapturedPath {
@@ -222,7 +225,12 @@ function decodeUtf8(bytes: Buffer, requested: string): string {
   try {
     return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
   } catch (error) {
-    throw readError("workspace_read_invalid_utf8", requested, "the file is not valid UTF-8 text", error);
+    throw readError(
+      "workspace_read_invalid_utf8",
+      requested,
+      "the file is not valid UTF-8 text; use inspect_image for a supported image",
+      error
+    );
   }
 }
 
@@ -279,12 +287,12 @@ async function stableReadLocation(
   return { root: external ? path.parse(target).root : workspaceRoot, target };
 }
 
-export async function readStableWorkspaceTextFile(
+export async function readStableWorkspaceFile(
   workspace: string,
   requested: string,
   signal: AbortSignal,
   options: StableWorkspaceReadOptions = {}
-): Promise<StableWorkspaceTextRead> {
+): Promise<StableWorkspaceBinaryRead> {
   signal.throwIfAborted();
   const maxBytes = stableReadLimit(options.maxBytes);
   const { root, target } = await stableReadLocation(
@@ -294,7 +302,7 @@ export async function readStableWorkspaceTextFile(
   const captured = await capturedPaths(requests, maxBytes, requested, signal);
   let lease: WorkspaceTransactionDirectoryLease | undefined;
   let primary: unknown;
-  let result: StableWorkspaceTextRead | undefined;
+  let result: StableWorkspaceBinaryRead | undefined;
   try {
     lease = await pinWorkspaceTransactionPaths(requests);
     await verifyCapturedPaths(captured, lease, maxBytes, requested, signal);
@@ -303,12 +311,9 @@ export async function readStableWorkspaceTextFile(
       const bytes = await readPinnedBytes(
         target, captured.at(-1)!.state, lease, maxBytes, requested, signal
       );
-      const content = decodeUtf8(bytes, requested);
       result = {
-        content,
         bytes,
         byteLength: bytes.byteLength,
-        endsWithNewline: content.endsWith("\n") || content.endsWith("\r"),
         sha256: createHash("sha256").update(bytes).digest("hex")
       };
     } finally {
@@ -321,4 +326,19 @@ export async function readStableWorkspaceTextFile(
   }
   await closeLease(lease, primary, requested);
   return result!;
+}
+
+export async function readStableWorkspaceTextFile(
+  workspace: string,
+  requested: string,
+  signal: AbortSignal,
+  options: StableWorkspaceReadOptions = {}
+): Promise<StableWorkspaceTextRead> {
+  const loaded = await readStableWorkspaceFile(workspace, requested, signal, options);
+  const content = decodeUtf8(loaded.bytes, requested);
+  return {
+    ...loaded,
+    content,
+    endsWithNewline: content.endsWith("\n") || content.endsWith("\r")
+  };
 }

@@ -1,3 +1,9 @@
+import type {
+  BrokerEnclosingContainerRootCapability,
+  BrokerManagedEnvironmentCapability,
+  BrokerVerifiedShell
+} from "./broker-capability-types.js";
+
 export const BROKER_PROTOCOL_VERSION = 1 as const;
 export const DEFAULT_MAX_FRAME_BYTES = 8 * 1024 * 1024;
 export const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
@@ -31,6 +37,9 @@ export interface ExecutionPolicy {
   /** Read/execute-only roots for explicitly trusted absolute executables. */
   executionRoots?: string[];
   protectedPaths?: string[];
+  /** Explicit authority for declared mutations in a native-broker-attested
+   * disposable enclosing container. It does not broaden read/write roots. */
+  enclosingContainerRoot?: boolean;
   /** Trusted validation adapter request: mount a broker-owned writable copy at
    * this exact in-sandbox path and discard it when the process exits. */
   disposableWorkspaceRoot?: string;
@@ -72,13 +81,11 @@ export interface ProcessHandle {
   systemProcessId?: number;
   lifecycle?: ProcessLifecycle;
 }
-
 export interface ProcessHandoffResult {
   handle: ProcessHandle;
   handoffId: string;
   systemProcessId?: number;
 }
-
 export interface ProcessOutput {
   stdout: string;
   stderr: string;
@@ -87,16 +94,18 @@ export interface ProcessOutput {
   outputTruncated: boolean;
   /** Full redacted output captured when the bounded tail overflowed. */
   outputArtifacts?: ProcessOutputArtifact[];
+  /** Non-text streams preserved in outputArtifacts rather than failed. */
+  outputDecodingErrors?: Array<{
+    stream: "stdout" | "stderr"; code: "invalid_output_encoding" | "encoding_lossy"; message: string;
+  }>;
   /** Authenticated native launch failure, when the sandbox launcher never reached the user process. */
   failure?: ProcessLaunchFailureV1;
 }
-
 export interface ProcessLaunchFailureV1 {
   phase: "sandbox_launch";
   code: string;
   message: string;
 }
-
 export interface ProcessOutputArtifact {
   brokerArtifactId: string;
   name: string;
@@ -105,6 +114,7 @@ export interface ProcessOutputArtifact {
   sizeBytes: number;
   complete: boolean;
   redactionLossy: boolean;
+  mediaType: "text/plain; charset=utf-8" | "application/octet-stream";
   content: Uint8Array;
 }
 
@@ -165,6 +175,9 @@ export interface BrokerCapabilities {
   /** True only when omission proves unavailability in this connection's bounded
    * executable namespace (the target-PATH probe for OCI, the manifest allowlist for native). */
   runtimeCommandSnapshotComplete?: boolean;
+  /** The sandbox resolves and pins executables; command lists are hints. */
+  directExecutableResolution?: boolean;
+  enclosingContainerRoot?: BrokerEnclosingContainerRootCapability;
   /** Absolute PATH entries observed by the broker process. OCI clients use
    * this connection-bound value instead of inheriting the control process's
    * PATH when the target resolves a bare executable name. */
@@ -175,18 +188,7 @@ export interface BrokerCapabilities {
   runtimeDataDigest?: string;
   /** Connection-bound closure of the authenticated target runtime. */
   runtimeClosure?: BrokerRuntimeClosureV1;
-  managedEnvironment?: {
-    available: boolean;
-    prepare: boolean;
-  };
-}
-
-export interface BrokerVerifiedShell {
-  kind: "powershell" | "cmd" | "bash";
-  executable: string;
-  verified: true;
-  /** The sandbox has proved that the shell can launch separately trusted executables. */
-  supportsChildProcesses?: boolean;
+  managedEnvironment?: BrokerManagedEnvironmentCapability;
 }
 
 export interface BrokerDoctorReport {

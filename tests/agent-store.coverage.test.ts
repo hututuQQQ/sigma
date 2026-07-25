@@ -5,6 +5,9 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   EVENT_SCHEMA_VERSION,
+  LEGACY_SNAPSHOT_SCHEMA_VERSION_V7,
+  LEGACY_SNAPSHOT_SCHEMA_VERSION_V8,
+  LEGACY_SNAPSHOT_SCHEMA_VERSION_V9,
   SNAPSHOT_SCHEMA_VERSION,
   STORE_LAYOUT_VERSION,
   type AgentEventEnvelope
@@ -184,6 +187,44 @@ describe("agent-store V5 durability", () => {
     const sink = new JsonlEvaluationSink(root);
     await sink.append({ schemaVersion: 1, reportId: "one", occurredAt: "now", evaluator: "human", payload: null });
     expect(await store.listSessions()).toHaveLength(1);
+  });
+
+  it("recovers every V7-V9 snapshot migration boundary without rewriting it", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-legacy-snapshots-"));
+    const store = new SegmentedJsonlStore({ rootDir: root });
+    const versions = [
+      LEGACY_SNAPSHOT_SCHEMA_VERSION_V7,
+      LEGACY_SNAPSHOT_SCHEMA_VERSION_V8,
+      LEGACY_SNAPSHOT_SCHEMA_VERSION_V9
+    ] as const;
+    for (const version of versions) {
+      const sessionId = `legacy-snapshot-${version}`;
+      await store.append(event(sessionId, 1, "session.created") as never, 0);
+      const snapshot = {
+        schemaVersion: version,
+        storeLayoutVersion: STORE_LAYOUT_VERSION,
+        sessionId,
+        seq: 1,
+        createdAt: new Date(1_700_000_000_000 + version).toISOString(),
+        state: { migratedFrom: version }
+      };
+      const checksum = createHash("sha256")
+        .update(JSON.stringify(snapshot))
+        .digest("hex");
+      const target = path.join(
+        sessionDirectory(root, sessionId),
+        "snapshots",
+        snapshotName(1)
+      );
+      await mkdir(path.dirname(target), { recursive: true });
+      await writeFile(target, JSON.stringify({ checksum, snapshot }), "utf8");
+      await expect(store.latestSnapshot(sessionId)).resolves.toMatchObject({
+        schemaVersion: version,
+        sessionId,
+        state: { migratedFrom: version }
+      });
+      expect(JSON.parse(await readFile(target, "utf8"))).toEqual({ checksum, snapshot });
+    }
   });
 
   it("uses stores/v5 while preserving V2, V3, and V4 directories byte-for-byte", async () => {

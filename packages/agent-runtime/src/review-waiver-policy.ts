@@ -1,6 +1,6 @@
 import type { EvidenceRecord, WorkspaceDeltaEvidence } from "agent-protocol";
 
-/** Assign each user waiver to at most one non-documentation delta. An explicit
+/** Assign each user waiver to at most one mutation delta. An explicit
  * checkpoint target wins; otherwise event order deterministically consumes the
  * waiver on the first still-unassigned reviewable delta in the run. */
 export function reviewerWaivedDeltaIds(evidence: readonly EvidenceRecord[]): ReadonlySet<string> {

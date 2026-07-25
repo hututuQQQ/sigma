@@ -294,8 +294,6 @@ describe("protocol enum and invariant contracts", () => {
     const cases = [
       [{ revision: 1, goal: "goal", nodes: [{ ...node, status: "blocked" }] },
         ["payload", "plan", "nodes", 0, "blockedReason"], "Blocked plan nodes require a reason"],
-      [{ revision: 1, goal: "goal", nodes: [{ ...node, status: "completed" }] },
-        ["payload", "plan", "nodes", 0, "evidence"], "Completed plan nodes require evidence"],
       [{ revision: 1, goal: "goal", activeNodeId: "missing", nodes: [node] },
         ["payload", "plan", "activeNodeId"], "Active plan node does not exist"],
       [{ revision: 1, goal: "goal", nodes: [node, { ...node }] },
@@ -311,6 +309,10 @@ describe("protocol enum and invariant contracts", () => {
         previousRevision: 0, plan,
       }))).toContainEqual({ path, code: "custom", message });
     }
+    expect(validateAgentEventEnvelope(eventWithPayload("plan.updated", {
+      previousRevision: 0,
+      plan: { revision: 1, goal: "goal", nodes: [{ ...node, status: "completed" }] },
+    }))).toEqual([]);
     const scopeCases = [
       [{ ...validAgentEventFixture("checkpoint.recovery_resolved"), authority: "runtime" },
         { path: ["authority"], code: "invalid_authority", message: "Checkpoint recovery requires user authority" }],

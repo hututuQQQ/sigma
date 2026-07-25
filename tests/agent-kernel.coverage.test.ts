@@ -1,14 +1,17 @@
 import { describe, expect, it } from "vitest";
 import {
   EVENT_SCHEMA_VERSION,
+  createBudgetLedger,
   type AgentEventEnvelope,
   type AgentEventType,
+  type EvidenceRecord,
   type JsonValue
 } from "../packages/agent-protocol/src/index.js";
 import {
   acceptMutationFrontier,
   assertKernelInvariants,
   createKernelState,
+  decodeLegacyKernelStateV5,
   decide,
   emptyMutationFrontier,
   evolve,
@@ -18,6 +21,11 @@ import {
   isTerminal,
   type KernelState
 } from "../packages/agent-kernel/src/index.js";
+import {
+  checkpointFixture,
+  evidenceFixture,
+  usageFixture
+} from "./testkit/agent-event-fixtures.js";
 
 const NOW = "2026-07-23T00:00:00.000Z";
 
@@ -108,6 +116,32 @@ function settle(
   });
 }
 
+function pendingTool(callId = "call") {
+  return {
+    request: { callId, name: "read", arguments: {} },
+    modelTurn: { turnId: 1, effectRevision: 0 },
+    approval: "not_required" as const,
+    started: false
+  };
+}
+
+function workspaceEvidence(id = "workspace"): EvidenceRecord {
+  return {
+    evidenceId: id,
+    sessionId: "session",
+    runId: "run",
+    kind: "workspace_delta",
+    status: "passed",
+    createdAt: NOW,
+    producer: { authority: "runtime" },
+    summary: "changed",
+    data: {
+      checkpointId: "checkpoint",
+      delta: { added: ["a.ts"], modified: [], deleted: [] }
+    }
+  };
+}
+
 describe("agent-kernel V7 protocol behavior", () => {
   it("records every call in a mixed batch without interpreting its semantics", () => {
     let state = apply(initial(), "user.message", { text: "Inspect or ask." });
@@ -121,7 +155,7 @@ describe("agent-kernel V7 protocol behavior", () => {
     assertKernelInvariants(state);
   });
 
-  it("proposes natural text directly and bounds truncated-response continuation", () => {
+  it("proposes natural text directly and permits one bounded action recovery", () => {
     const prepared = apply(initial(), "user.message", { text: "Answer." });
     const natural = complete(start(prepared, 1), {
       message: { role: "assistant", content: "Done." },
@@ -152,19 +186,45 @@ describe("agent-kernel V7 protocol behavior", () => {
       consecutiveLengthNoAction: 1
     });
     expect(length.messages.at(-1)?.content).toContain("action-oriented");
-    length = complete(start(length, 4), {
-      message: { role: "assistant", content: "still partial" },
+    const strictStop = complete(start(length, 4), {
+      message: { role: "assistant", content: "I stopped instead." },
       toolCalls: [],
-      finishReason: "length"
+      finishReason: "stop"
+    });
+    expect(strictStop.proposedOutcome).toMatchObject({
+      kind: "recoverable_failure",
+      code: "model_action_recovery_failed"
     });
     length = complete(start(length, 5), {
-      message: { role: "assistant", content: "still truncated" },
+      message: { role: "assistant", content: "still partial" },
       toolCalls: [],
       finishReason: "length"
     });
     expect(length.proposedOutcome).toMatchObject({
       kind: "recoverable_failure",
-      code: "model_output_truncated"
+      code: "model_action_recovery_failed"
+    });
+
+    let bounded = complete(start(prepared, 6), {
+      message: { role: "assistant", content: "partial" },
+      toolCalls: [],
+      finishReason: "length"
+    });
+    bounded = start(bounded, 7);
+    bounded = apply(bounded, "model.prompt_materialized", {
+      ...bounded.activeModelTurn!,
+      messages: [],
+      toolChoice: "none"
+    });
+    expect(bounded.lengthRecovery.mode).toBe("bounded_answer");
+    bounded = complete(bounded, {
+      message: { role: "assistant", content: "Small complete answer." },
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    expect(bounded.proposedOutcome).toMatchObject({
+      kind: "completed",
+      message: "Small complete answer."
     });
   });
 
@@ -315,5 +375,188 @@ describe("agent-kernel V7 protocol behavior", () => {
       ...state,
       activeProcessIds: ["same", "same"]
     })).toThrow("Duplicate active process IDs");
+  });
+
+  it("rejects malformed and cross-scope durable ledgers", () => {
+    const state = initial();
+    expect(() => assertKernelInvariants({ ...state, schemaVersion: 7 } as KernelState))
+      .toThrow("schema version");
+    expect(() => assertKernelInvariants({ ...state, plan: {} } as KernelState))
+      .toThrow("plan graph");
+    expect(() => assertKernelInvariants({ ...state, budget: {} } as KernelState))
+      .toThrow("budget ledger");
+    expect(() => assertKernelInvariants({ ...state, checkpointHead: {} } as KernelState))
+      .toThrow("checkpoint head");
+    expect(() => assertKernelInvariants({
+      ...state, checkpointHead: { ...checkpointFixture("sealed"), sessionId: "other" }
+    })).toThrow("checkpoint head");
+    expect(() => assertKernelInvariants({
+      ...state, checkpointHead: { ...checkpointFixture("sealed"), runId: "other" }
+    })).toThrow("checkpoint head");
+    expect(() => assertKernelInvariants({ ...state, evidence: [{}] } as KernelState))
+      .toThrow("evidence ledger");
+    expect(() => assertKernelInvariants({ ...state, mutationEvidence: [{}] } as KernelState))
+      .toThrow("mutation evidence ledger");
+    expect(() => assertKernelInvariants({
+      ...state, mutationEvidence: [{ ...workspaceEvidence(), sessionId: "other" }]
+    })).toThrow("active session");
+    expect(() => assertKernelInvariants({
+      ...state, evidence: [{ ...evidenceFixture(), sessionId: "other" }]
+    })).toThrow("active session and run");
+    expect(() => assertKernelInvariants({
+      ...state, evidence: [{ ...evidenceFixture(), runId: "other" }]
+    })).toThrow("active session and run");
+  });
+
+  it("rejects duplicate durable evidence, usage, and reservations", () => {
+    const state = initial();
+    const waiver = evidenceFixture("user_waiver");
+    expect(() => assertKernelInvariants({
+      ...state,
+      evidence: [waiver, { ...waiver, evidenceId: "second-waiver" }]
+    })).toThrow("at most one user waiver");
+    const diagnostic = evidenceFixture();
+    expect(() => assertKernelInvariants({ ...state, evidence: [diagnostic, diagnostic] }))
+      .toThrow("Duplicate kernel evidence");
+    const mutation = workspaceEvidence();
+    expect(() => assertKernelInvariants({
+      ...state, mutationEvidence: [mutation, mutation]
+    })).toThrow("Duplicate kernel mutation evidence");
+    expect(() => assertKernelInvariants({ ...state, usage: [{}] } as KernelState))
+      .toThrow("usage ledger");
+    const usage = usageFixture();
+    expect(() => assertKernelInvariants({ ...state, usage: [usage, usage] }))
+      .toThrow("Duplicate kernel usage");
+    const budget = createBudgetLedger();
+    const zero = { inputTokens: 0, outputTokens: 0, costMicroUsd: 0, modelTurns: 0, toolCalls: 0, children: 0 };
+    budget.reserved = { ...zero, inputTokens: 1 };
+    budget.reservations = [{
+      reservationId: "reservation",
+      ownerId: "owner",
+      status: "reserved",
+      requested: { ...zero, inputTokens: 1 },
+      consumed: zero,
+      createdAt: NOW
+    }];
+    expect(() => assertKernelInvariants({ ...state, budget })).not.toThrow();
+    expect(() => assertKernelInvariants({
+      ...state, budget: { ...budget, reservations: [budget.reservations[0]!, budget.reservations[0]!] }
+    })).toThrow("Duplicate budget reservation");
+    expect(() => assertKernelInvariants({
+      ...state, budget: { ...budget, reserved: zero }
+    })).toThrow("does not match its active reservations");
+    expect(() => assertKernelInvariants({ ...state, contextArchive: {} } as KernelState))
+      .toThrow("context archive");
+  });
+
+  it("rejects malformed tool ledgers and contradictory phases", () => {
+    const state = initial();
+    const pending = pendingTool();
+    expect(() => assertKernelInvariants({
+      ...state, pendingTools: [pending, pending], toolCallIds: ["call"]
+    })).toThrow("Duplicate pending");
+    expect(() => assertKernelInvariants({
+      ...state, toolCallIds: ["call", "call"]
+    })).toThrow("Duplicate run tool");
+    expect(() => assertKernelInvariants({
+      ...state,
+      pendingTools: [{ ...pending, modelTurn: { turnId: 1.5, effectRevision: 0 } }],
+      toolCallIds: ["call"]
+    })).toThrow("valid originating model turn");
+    expect(() => assertKernelInvariants({
+      ...state,
+      pendingTools: [{ ...pending, modelTurn: { turnId: 1, effectRevision: 0.5 } }],
+      toolCallIds: ["call"]
+    })).toThrow("valid originating model turn");
+    expect(() => assertKernelInvariants({ ...state, pendingTools: [pending] }))
+      .toThrow("run tool-call ledger");
+    expect(() => assertKernelInvariants({
+      ...state, phase: "model_in_flight", activeModelTurn: undefined
+    })).toThrow("active model turn");
+    expect(() => assertKernelInvariants({
+      ...state, activeModelTurn: { turnId: 1, effectRevision: 0 }
+    })).toThrow("active model turn");
+    expect(() => assertKernelInvariants({
+      ...state, activeModelSemanticDelta: true
+    })).toThrow("semantic delta");
+  });
+
+  it("rejects contradictory terminal and proposed outcomes", () => {
+    const state = initial();
+    expect(() => assertKernelInvariants({ ...state, phase: "terminal" }))
+      .toThrow("requires an outcome");
+    expect(() => assertKernelInvariants({
+      ...state, outcome: { kind: "cancelled", reason: "no" }
+    })).toThrow("cannot have a terminal outcome");
+    expect(() => assertKernelInvariants({
+      ...state,
+      phase: "needs_input",
+      outcome: { kind: "needs_input", requestId: "input", message: "choose" }
+    })).not.toThrow();
+    expect(() => assertKernelInvariants({
+      ...state, phase: "outcome_pending", proposedOutcome: undefined
+    })).toThrow("proposed outcome");
+    expect(() => assertKernelInvariants({
+      ...state, proposedOutcome: { kind: "completed", message: "done", evidence: [] }
+    })).toThrow("proposed outcome");
+  });
+
+  it("validates V8 optional deadline, recovery, prompt, and frozen state", () => {
+    const state = initial();
+    expect(isKernelState(null)).toBe(false);
+    expect(isKernelState([])).toBe(false);
+    expect(isKernelState({ ...state, deadlineRemainingMs: 1 })).toBe(true);
+    expect(isKernelState({ ...state, deadlineRemainingMs: 0 })).toBe(false);
+    expect(isKernelState({ ...state, lastModelFinishReason: "length" })).toBe(true);
+    expect(isKernelState({ ...state, lastModelFinishReason: "unknown" })).toBe(false);
+    expect(isKernelState({
+      ...state,
+      lengthRecovery: { schemaVersion: 1, mode: "action_required", attempts: 1 }
+    })).toBe(true);
+    expect(isKernelState({ ...state, lengthRecovery: {} })).toBe(false);
+    expect(isKernelState({
+      ...state,
+      toolResultPrune: { schemaVersion: 1, coveredBlocks: 2, sourceDigest: "a".repeat(64) },
+      activeModelSemanticDelta: false
+    })).toBe(true);
+    expect(isKernelState({ ...state, toolResultPrune: {} })).toBe(false);
+    expect(isKernelState({ ...state, activeModelSemanticDelta: "yes" })).toBe(false);
+    const frozen = {
+      artifactId: "artifact",
+      digest: "digest",
+      source: "workspace" as const,
+      qualifiedName: "skill"
+    };
+    expect(isKernelState({
+      ...state,
+      frozenProfile: frozen,
+      frozenCustomization: {
+        artifactId: "d".repeat(64),
+        digest: "e".repeat(64)
+      },
+      frozenSkills: [{
+        ...frozen,
+        executionManifestArtifactId: "b".repeat(64),
+        executionManifestDigest: "c".repeat(64)
+      }]
+    })).toBe(true);
+    expect(isKernelState({ ...state, frozenProfile: {} })).toBe(false);
+    expect(isKernelState({ ...state, frozenCustomization: {} })).toBe(false);
+    expect(isKernelState({ ...state, frozenSkills: [{}] })).toBe(false);
+  });
+
+  it("decodes only valid legacy V5 completion drafts", () => {
+    expect(decodeLegacyKernelStateV5(null)).toBeNull();
+    expect(decodeLegacyKernelStateV5([])).toBeNull();
+    expect(decodeLegacyKernelStateV5({ schemaVersion: 6 })).toBeNull();
+    expect(decodeLegacyKernelStateV5({
+      schemaVersion: 5,
+      taskControl: { schemaVersion: 1 }
+    })).toBeNull();
+    expect(decodeLegacyKernelStateV5({ schemaVersion: 5 })).toEqual({});
+    expect(decodeLegacyKernelStateV5({
+      schemaVersion: 5,
+      completionRepair: { answer: " repaired " }
+    })).toEqual({ completionDraft: "repaired" });
   });
 });

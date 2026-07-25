@@ -1791,7 +1791,44 @@ describe("benchmark report generation", () => {
           metadata: { event_type: "usage.recorded", inputTokens: 10, outputTokens: 3 },
           sigma_event: {
             type: "usage.recorded",
-            payload: { inputTokens: 10, outputTokens: 3, cacheReadTokens: 1, cacheWriteTokens: 0 }
+            payload: {
+              role: "orchestrator",
+              providerReported: true,
+              inputTokens: 10,
+              outputTokens: 3,
+              cacheReadTokens: 1,
+              cacheWriteTokens: 0
+            }
+          }
+        }),
+        JSON.stringify({
+          type: "usage",
+          metadata: { event_type: "usage.recorded", inputTokens: 20, outputTokens: 1 },
+          sigma_event: {
+            type: "usage.recorded",
+            payload: {
+              role: "orchestrator",
+              providerReported: true,
+              inputTokens: 20,
+              outputTokens: 1,
+              cacheReadTokens: 18,
+              cacheWriteTokens: 0
+            }
+          }
+        }),
+        JSON.stringify({
+          type: "usage",
+          metadata: { event_type: "usage.recorded", inputTokens: 30, outputTokens: 0 },
+          sigma_event: {
+            type: "usage.recorded",
+            payload: {
+              role: "orchestrator",
+              providerReported: false,
+              inputTokens: 30,
+              outputTokens: 0,
+              cacheReadTokens: 0,
+              cacheWriteTokens: 0
+            }
           }
         }),
         JSON.stringify({
@@ -1830,7 +1867,16 @@ describe("benchmark report generation", () => {
       input_tokens: 20,
       output_tokens: 5,
       duration_ms: 1234,
+      provider_reported_input_tokens: 30,
+      provider_reported_cache_read_tokens: 19,
+      warm_provider_input_tokens: 20,
+      warm_provider_cache_read_tokens: 18,
+      provider_reported_model_records: 2,
       failure_category: "agent_timeout"
+    });
+    expect(report).toMatchObject({
+      provider_cache_read_ratio: 19 / 30,
+      warm_provider_cache_read_ratio: 18 / 20
     });
   });
 

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import type { CheckpointManager } from "../packages/agent-checkpoint/src/index.js";
 import {
@@ -5,7 +6,8 @@ import {
   isPlanGraph,
   type AgentEventEnvelope,
   type BudgetLimits,
-  type PlanGraph
+  type PlanGraph,
+  type ToolReceipt
 } from "../packages/agent-protocol/src/index.js";
 import {
   BudgetController,
@@ -13,6 +15,10 @@ import {
 } from "../packages/agent-runtime/src/budget-controller.js";
 import { assertPlanTransition } from "../packages/agent-runtime/src/plan-policy.js";
 import { RuntimeControlService } from "../packages/agent-runtime/src/runtime-control.js";
+import { evidenceLedger } from "../packages/agent-runtime/src/model-evidence-ledger.js";
+import { planLedger } from "../packages/agent-runtime/src/model-plan-ledger.js";
+import { progressCheckpoints } from "../packages/agent-runtime/src/progress-checkpoint.js";
+import { materializeRuntimePromptFrame } from "../packages/agent-runtime/src/runtime-prompt-state.js";
 import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
 import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
 
@@ -187,6 +193,79 @@ describe("V3 plan and budget invariant properties", () => {
         toolCalls: 0,
         children: 0
       });
+    }
+  });
+
+  it("keeps randomized runtime frames bounded and progress checkpoints semantically non-terminating", () => {
+    const next = random(0x56_38_70_72);
+    for (let iteration = 0; iteration < 200; iteration += 1) {
+      const target = session(`prompt-property-${iteration}`);
+      const pathCount = Math.floor(next() * 20_000);
+      target.durable.state.mutationFrontier = {
+        revision: iteration,
+        baselineManifestDigest: "a".repeat(64),
+        currentStateDigest: createHash("sha256").update(`state-${iteration}`).digest("hex"),
+        changedPaths: Array.from({ length: pathCount }, (_value, index) =>
+          `generated/${iteration}/${index}/${"x".repeat(Math.floor(next() * 80))}.ts`),
+        sourceCheckpointIds: []
+      };
+      const rounds = Math.floor(next() * 18);
+      target.durable.state.messages.push({ role: "user", content: "property task" });
+      for (let round = 0; round < rounds; round += 1) {
+        const callId = `property-${iteration}-${round}`;
+        const kind = Math.floor(next() * 4);
+        const name = kind === 0 ? "read" : kind === 1 ? "edit" : kind === 2 ? "validate" : "update_plan";
+        target.durable.state.messages.push({
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: callId, name, arguments: {} }]
+        });
+        const receipt: ToolReceipt = {
+          callId,
+          ok: true,
+          output: name,
+          outcome: { status: "succeeded", output: name, diagnosticCodes: [] },
+          observedEffects: name === "edit" ? ["filesystem.write"]
+            : name === "validate" ? ["validation"] : ["filesystem.read"],
+          actualEffects: name === "edit" ? ["filesystem.write"]
+            : name === "validate" ? ["validation"] : ["filesystem.read"],
+          ...(name === "edit"
+            ? { workspaceDelta: { added: [], modified: [`file-${round}.ts`], deleted: [] } }
+            : {}),
+          artifacts: [],
+          diagnostics: [],
+          evidence: [],
+          startedAt: "2026-01-01T00:00:00.000Z",
+          completedAt: "2026-01-01T00:00:01.000Z"
+        };
+        target.durable.state.receipts.push(receipt);
+      }
+      const before = JSON.stringify(target.durable.state);
+      progressCheckpoints(target);
+      expect(JSON.stringify(target.durable.state)).toBe(before);
+      expect(target.durable.state.outcome).toBeUndefined();
+      expect(target.durable.state.proposedOutcome).toBeUndefined();
+
+      const frame = materializeRuntimePromptFrame(target, {
+        inputTokens: 50_000,
+        outputTokens: 10_000,
+        costMicroUsd: 1_000_000,
+        modelTurns: 50,
+        toolCalls: 100,
+        children: 4
+      }, {
+        repository: [{
+          id: "repository",
+          authority: "runtime",
+          provenance: "property repository",
+          content: "r".repeat(Math.floor(next() * 40_000)),
+          tokenCount: 10_000,
+          priority: 1
+        }],
+        completion: evidenceLedger(target),
+        plan: planLedger(target)
+      });
+      expect(frame.items.reduce((total, item) => total + item.tokenCount, 0)).toBeLessThanOrEqual(8_128);
     }
   });
 });

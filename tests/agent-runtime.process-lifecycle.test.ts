@@ -8,6 +8,7 @@ import type {
 import { createKernelState } from "../packages/agent-kernel/src/index.js";
 import { completionGateDecision } from "../packages/agent-runtime/src/completion-evidence-gate.js";
 import { terminateRunProcesses } from "../packages/agent-runtime/src/process-cleanup.js";
+import { settleBudgetBoundaryProcesses } from "../packages/agent-runtime/src/process-budget-settlement.js";
 import { finishRuntimeSession } from "../packages/agent-runtime/src/runtime-session-finish.js";
 import type { ProcessExecutionPort } from "../packages/agent-platform/src/index.js";
 import {
@@ -64,6 +65,190 @@ function recorder(): {
 }
 
 describe("durable process lifecycle events", () => {
+  it("settles progressing session processes at a solver-budget boundary without terminating them", async () => {
+    const target = runtimeSessionFixture({
+      execution: {
+        processHandles: new Map([[
+          "process-build",
+          { id: "process-build", brokerInstanceId: "broker-1", lifecycle: "session" }
+        ]])
+      }
+    });
+    target.durable.state.activeProcessIds.push("process-build");
+    const recorded = recorder();
+    const terminate = vi.fn();
+    const releaseOutputArtifacts = vi.fn(async () => undefined);
+    const createArtifact = vi.fn(async () => "settled-output-artifact");
+    const brokerArtifact = {
+      brokerArtifactId: "broker-output-1",
+      name: "stdout.txt",
+      stream: "stdout" as const,
+      brokerSha256: "a".repeat(64),
+      sizeBytes: 5,
+      complete: true,
+      redactionLossy: false,
+      mediaType: "text/plain; charset=utf-8" as const,
+      content: Buffer.from("full\n", "utf8")
+    };
+    let polls = 0;
+    const execution = {
+      execute: async () => { throw new Error("not used"); },
+      poll: async (handle) => {
+        polls += 1;
+        return polls === 1
+          ? {
+              handle,
+              state: "running" as const,
+              exitCode: null,
+              signal: null,
+              durationMs: 10,
+              stdout: "building\n",
+              stderr: "",
+              stdoutDroppedBytes: 0,
+              stderrDroppedBytes: 0,
+              outputTruncated: false,
+              outputArtifacts: [brokerArtifact]
+            }
+          : {
+              handle,
+              state: "exited" as const,
+              exitCode: 0,
+              signal: null,
+              durationMs: 20,
+              stdout: "done\n",
+              stderr: "",
+              stdoutDroppedBytes: 0,
+              stderrDroppedBytes: 0,
+              outputTruncated: false,
+              outputArtifacts: [brokerArtifact]
+            };
+      },
+      terminate,
+      releaseOutputArtifacts
+    } satisfies ProcessExecutionPort;
+
+    await expect(settleBudgetBoundaryProcesses(
+      target,
+      new AbortController().signal,
+      {
+        execution,
+        emit: recorded.emit,
+        createArtifact
+      }
+    )).resolves.toEqual({ attempted: 1, settled: 1, unavailable: false });
+
+    expect(polls).toBe(2);
+    expect(terminate).not.toHaveBeenCalled();
+    expect(createArtifact).toHaveBeenCalledTimes(1);
+    expect(releaseOutputArtifacts).toHaveBeenCalledTimes(1);
+    expect(releaseOutputArtifacts).toHaveBeenCalledWith(["broker-output-1"]);
+    expect(target.execution.processHandles.size).toBe(0);
+    expect(recorded.events).toEqual(expect.arrayContaining([
+      {
+        type: "process.output",
+        payload: { processId: "process-build", stream: "stdout", chunk: "building\n" }
+      },
+      {
+        type: "process.output",
+        payload: { processId: "process-build", stream: "stdout", chunk: "done\n" }
+      },
+      {
+        type: "process.exited",
+        payload: {
+          processId: "process-build",
+          exitCode: 0,
+          state: "exited",
+          reason: "budget_boundary_settlement"
+        }
+      }
+    ]));
+    expect(recorded.events).toContainEqual({
+      type: "evidence.recorded",
+      payload: expect.objectContaining({
+        kind: "diagnostic",
+        status: "passed",
+        data: expect.objectContaining({
+          source: "background_process_settlement",
+          diagnostic: expect.objectContaining({
+            outputArtifactIds: ["settled-output-artifact"]
+          })
+        })
+      })
+    });
+  });
+
+  it("records a failed lifecycle evidence item when polling loses a process", async () => {
+    const target = runtimeSessionFixture({
+      execution: {
+        processHandles: new Map([[
+          "process-lost",
+          { id: "process-lost", brokerInstanceId: "broker-1", lifecycle: "session" }
+        ]])
+      }
+    });
+    target.durable.state.activeProcessIds.push("process-lost");
+    const recorded = recorder();
+    const execution = {
+      execute: async () => { throw new Error("not used"); },
+      poll: async () => { throw new Error("broker disconnected"); }
+    } satisfies ProcessExecutionPort;
+
+    await expect(settleBudgetBoundaryProcesses(
+      target,
+      new AbortController().signal,
+      {
+        execution,
+        emit: recorded.emit,
+        createArtifact: async () => "unused"
+      }
+    )).resolves.toEqual({ attempted: 1, settled: 1, unavailable: false });
+
+    expect(recorded.events).toContainEqual({
+      type: "evidence.recorded",
+      payload: expect.objectContaining({
+        kind: "diagnostic",
+        status: "failed",
+        data: expect.objectContaining({
+          source: "background_process_settlement",
+          diagnostic: expect.objectContaining({
+            state: "lost",
+            failure: {
+              code: "process_poll_failed",
+              message: "broker disconnected"
+            }
+          })
+        })
+      })
+    });
+  });
+
+  it("does not wait on a deliverable process that requires an explicit handoff", async () => {
+    const target = runtimeSessionFixture({
+      execution: {
+        processHandles: new Map([[
+          "service",
+          { id: "service", brokerInstanceId: "broker-1", lifecycle: "deliverable" }
+        ]])
+      }
+    });
+    const poll = vi.fn();
+    const execution = {
+      execute: async () => { throw new Error("not used"); },
+      poll
+    } satisfies ProcessExecutionPort;
+    await expect(settleBudgetBoundaryProcesses(
+      target,
+      new AbortController().signal,
+      {
+        execution,
+        emit: recorder().emit,
+        createArtifact: async () => "unused"
+      }
+    )).resolves.toEqual({ attempted: 0, settled: 0, unavailable: false });
+    expect(poll).not.toHaveBeenCalled();
+    expect(target.execution.processHandles.has("service")).toBe(true);
+  });
+
   it("records background and PTY process handles", async () => {
     const recorded = recorder();
     await recordProcessReceipt(
@@ -80,6 +265,36 @@ describe("durable process lifecycle events", () => {
         executionId: "call-process_spawn",
         mode: "pty",
         lifecycle: "session",
+        brokerInstanceId: "broker-1"
+      }
+    }]);
+  });
+
+  it("tracks disposable-environment processes under the same lifecycle", async () => {
+    const target = runtimeSessionFixture();
+    const recorded = recorder();
+    await recordProcessReceipt(
+      target,
+      call("environment_process_spawn", { lifecycle: "deliverable" }),
+      plan("background"),
+      receipt({
+        id: "environment-service",
+        brokerInstanceId: "broker-1",
+        lifecycle: "deliverable"
+      }),
+      recorded.emit
+    );
+    expect(target.execution.processHandles.get("environment-service")).toMatchObject({
+      lifecycle: "deliverable",
+      brokerInstanceId: "broker-1"
+    });
+    expect(recorded.events).toEqual([{
+      type: "process.spawned",
+      payload: {
+        processId: "environment-service",
+        executionId: "call-environment_process_spawn",
+        mode: "background",
+        lifecycle: "deliverable",
         brokerInstanceId: "broker-1"
       }
     }]);

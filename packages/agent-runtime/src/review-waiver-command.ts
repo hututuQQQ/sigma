@@ -1,8 +1,11 @@
 import { randomUUID } from "node:crypto";
 import type { RunCommand, WorkspaceDeltaEvidence } from "agent-protocol";
-import { currentFrontierReview, sessionMutationEvidence } from "./mutation-evidence.js";
+import {
+  authenticCurrentReviewApproval,
+  currentFrontierReview,
+  sessionMutationEvidence
+} from "./mutation-evidence.js";
 import { reviewerWaivedDeltaIds } from "./review-waiver-policy.js";
-import { documentationOnly } from "./reviewer.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 import type { RuntimeSession } from "./types.js";
 
@@ -14,13 +17,14 @@ function commandError(code: string, message: string): Error {
 
 function pendingReviewDeltas(session: RuntimeSession): WorkspaceDeltaEvidence[] {
   const evidence = sessionMutationEvidence(session);
-  const reviewed = currentFrontierReview(session)?.status === "passed";
+  const reviewed = authenticCurrentReviewApproval(session, currentFrontierReview(session));
   const historicallyReviewedCheckpoints = new Set(evidence.flatMap((item) =>
-    item.kind === "review" && item.status === "passed" && item.data.verdict === "approved"
+    item.kind === "review" && item.data.schemaVersion === 3
+      && item.status === "passed" && item.data.verdict === "approved"
       && item.data.checkpointId ? [item.data.checkpointId] : []));
   const waived = reviewerWaivedDeltaIds(evidence);
   return evidence.filter((item): item is WorkspaceDeltaEvidence =>
-    item.kind === "workspace_delta" && item.status === "passed" && !documentationOnly(item)
+    item.kind === "workspace_delta" && item.status === "passed"
     && !reviewed && !historicallyReviewedCheckpoints.has(item.data.checkpointId)
     && !waived.has(item.evidenceId));
 }

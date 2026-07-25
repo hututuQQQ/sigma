@@ -1,4 +1,5 @@
 export * from "./broker-client.js";
+export * from "./broker-capability-types.js";
 export * from "./environment.js";
 export * from "./errors.js";
 export * from "./framing.js";

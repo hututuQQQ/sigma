@@ -53,13 +53,23 @@ export function runtimeFailureOutcome(error: unknown, signal: AbortSignal): RunO
     return {
       kind: "recoverable_failure",
       code: errorCode(error, "runtime_error"),
-      message: error instanceof Error ? error.message : String(error)
+      message: error instanceof Error ? error.message : String(error),
+      decisionAuthority: "provider_protocol"
     };
   }
   const reason = signal.reason instanceof Error ? signal.reason : new Error("Run cancelled.");
   return reason.name === "TimeoutError"
-    ? { kind: "recoverable_failure", code: "budget_exhausted", message: reason.message }
-    : { kind: "cancelled", reason: reason.message };
+    ? {
+        kind: "recoverable_failure",
+        code: "budget_exhausted",
+        message: reason.message,
+        decisionAuthority: "resource_boundary"
+      }
+    : {
+        kind: "cancelled",
+        reason: reason.message,
+        decisionAuthority: "resource_boundary"
+      };
 }
 
 export async function runRuntimeSession(options: RuntimeRunOptions, session: RuntimeSession): Promise<void> {
@@ -70,7 +80,8 @@ export async function runRuntimeSession(options: RuntimeRunOptions, session: Run
     await finishOrThrow(options, session, {
       kind: "recoverable_failure",
       code: "budget_exhausted",
-      message: `Run deadline ${session.durable.state.deadlineAt} has already elapsed.`
+      message: `Run deadline ${session.durable.state.deadlineAt} has already elapsed.`,
+      decisionAuthority: "resource_boundary"
     });
     session.execution.controller = null;
     return;
@@ -91,7 +102,8 @@ export async function runRuntimeSession(options: RuntimeRunOptions, session: Run
         message: runtimeLifecycleError(
           session,
           "Runtime effect processing became idle without a terminal outcome"
-        ).message
+        ).message,
+        decisionAuthority: "provider_protocol"
       });
     }
   } catch (error) {

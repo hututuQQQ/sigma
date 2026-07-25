@@ -54,6 +54,20 @@ function settledReviewRequestReceipt(session: RuntimeSession, receipt: ToolRecei
       diagnostics: []
     };
   }
+  if (review?.data.verdict === "validation_required") {
+    return {
+      ...receipt,
+      ok: false,
+      output: JSON.stringify({
+        status: "validation_required",
+        reviewState: "current",
+        reviewBasisDigest: basis,
+        criteria: review.data.criteria ?? [],
+        requiredValidations: review.data.requiredValidations ?? []
+      }),
+      diagnostics: ["review_validation_required"]
+    };
+  }
   if (review?.data.failureKind === "protocol") {
     return {
       ...receipt,
@@ -85,6 +99,7 @@ function projectedToolNames(
 }
 
 const TERMINAL_TOOL_NAMES = new Set(["report_blocked", "request_user_input"]);
+const BARRIER_TOOL_NAMES = new Set(["request_review"]);
 
 function violatesToolProjection(
   attempts: readonly ToolAttempt[],
@@ -92,7 +107,9 @@ function violatesToolProjection(
 ): boolean {
   const terminalCount = attempts.filter(({ call }) => TERMINAL_TOOL_NAMES.has(call.name)).length;
   const conflictingTerminalBatch = attempts.length > 1 && terminalCount > 0;
-  return terminalCount > 1 || conflictingTerminalBatch
+  const conflictingBarrierBatch = attempts.length > 1
+    && attempts.some(({ call }) => BARRIER_TOOL_NAMES.has(call.name));
+  return terminalCount > 1 || conflictingTerminalBatch || conflictingBarrierBatch
     || attempts.some((attempt) => !offeredNames.has(attempt.call.name));
 }
 
@@ -149,7 +166,7 @@ export class ToolBatchCoordinator {
         call,
         new Date().toISOString(),
         "Tool batch contains an unavailable tool or combines an explicit terminal action with another call. "
-          + "Use currently offered tool names and schemas, and issue terminal actions alone.",
+          + "Use currently offered tool names and schemas, and issue terminal or review-barrier actions alone.",
         "model_tool_policy_violation"
       ), modelTurn);
     }

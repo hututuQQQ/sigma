@@ -122,6 +122,7 @@ function review(deltaId: string): ReviewEvidence {
     producer: { authority: "runtime", id: "independent-reviewer" },
     summary: "First checkpoint approved.",
     data: {
+      schemaVersion: 3,
       reviewerId: "independent-reviewer",
       verdict: "approved",
       findings: [],

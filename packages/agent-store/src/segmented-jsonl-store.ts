@@ -23,6 +23,9 @@ import { segmentName, sessionDirectory, sessionsDirectory, snapshotName } from "
 import {
   isLegacySnapshotEnvelopeV5,
   isLegacySnapshotEnvelopeV6,
+  isLegacySnapshotEnvelopeV7,
+  isLegacySnapshotEnvelopeV8,
+  isLegacySnapshotEnvelopeV9,
   isSessionMetaV5,
   snapshotChecksum,
   type SessionMetaV5,
@@ -288,7 +291,10 @@ export class SegmentedJsonlStore implements RunStore {
         if (stored.snapshot?.schemaVersion === SNAPSHOT_SCHEMA_VERSION) {
           assertSnapshotEnvelope(stored.snapshot);
         } else if (!isLegacySnapshotEnvelopeV5(stored.snapshot)
-          && !isLegacySnapshotEnvelopeV6(stored.snapshot)) {
+          && !isLegacySnapshotEnvelopeV6(stored.snapshot)
+          && !isLegacySnapshotEnvelopeV7(stored.snapshot)
+          && !isLegacySnapshotEnvelopeV8(stored.snapshot)
+          && !isLegacySnapshotEnvelopeV9(stored.snapshot)) {
           continue;
         }
         if (stored.snapshot.sessionId === sessionId && snapshotChecksum(stored.snapshot) === stored.checksum) {

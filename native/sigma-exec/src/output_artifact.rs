@@ -40,7 +40,14 @@ impl RedactionConfig {
                     "artifact redaction values must be 4..65536 bytes and NUL-free",
                 ));
             }
-            values.push(secret.value.into_bytes());
+            values.push(secret.value.as_bytes().to_vec());
+            values.push(
+                secret
+                    .value
+                    .encode_utf16()
+                    .flat_map(u16::to_le_bytes)
+                    .collect(),
+            );
         }
         values.sort_by_key(|value| std::cmp::Reverse(value.len()));
         values.dedup();
@@ -239,7 +246,7 @@ impl OutputRedactor {
                 continue;
             }
             if *byte == b'\n' {
-                named.extend_from_slice(redact_named_line(&self.line).as_bytes());
+                named.extend_from_slice(&redact_named_line(&self.line));
                 named.push(b'\n');
                 self.line.clear();
             } else {
@@ -256,7 +263,7 @@ impl OutputRedactor {
                 named.extend_from_slice(b"[REDACTED:oversized-output-line]");
                 self.discard_line = false;
             } else if !self.line.is_empty() {
-                named.extend_from_slice(redact_named_line(&self.line).as_bytes());
+                named.extend_from_slice(&redact_named_line(&self.line));
                 self.line.clear();
             }
         }
@@ -309,40 +316,41 @@ impl LiteralRedactor {
     }
 }
 
-fn redact_named_line(input: &[u8]) -> String {
-    let text = String::from_utf8_lossy(input);
-    let bytes = text.as_bytes();
-    let mut output = String::with_capacity(text.len());
+fn redact_named_line(input: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(input.len());
     let mut cursor = 0;
     let mut index = 0;
-    while index < bytes.len() {
-        if !identifier_byte(bytes[index]) {
+    while index < input.len() {
+        if !identifier_byte(input[index]) {
             index += 1;
             continue;
         }
         let start = index;
-        while index < bytes.len() && identifier_byte(bytes[index]) {
+        while index < input.len() && identifier_byte(input[index]) {
             index += 1;
         }
-        let name = &text[start..index];
+        // Identifier bytes are ASCII by construction, so arbitrary bytes
+        // elsewhere in the line remain objective and never pass through a
+        // lossy text decoder.
+        let name = std::str::from_utf8(&input[start..index]).expect("ASCII identifier");
         if !secret_name(name) {
             continue;
         }
-        let Some((value_start, value_end, closing_quote)) = assignment_value(bytes, start, index)
+        let Some((value_start, value_end, closing_quote)) = assignment_value(input, start, index)
         else {
             continue;
         };
-        output.push_str(&text[cursor..start]);
-        output.push_str("[REDACTED_NAME]");
-        output.push_str(&text[index..value_start]);
-        output.push_str("[REDACTED]");
+        output.extend_from_slice(&input[cursor..start]);
+        output.extend_from_slice(b"[REDACTED_NAME]");
+        output.extend_from_slice(&input[index..value_start]);
+        output.extend_from_slice(REDACTED_VALUE);
         if let Some(quote) = closing_quote {
-            output.push(quote as char);
+            output.push(quote);
         }
         cursor = value_end;
         index = value_end;
     }
-    output.push_str(&text[cursor..]);
+    output.extend_from_slice(&input[cursor..]);
     output
 }
 
@@ -471,6 +479,29 @@ mod tests {
     }
 
     #[test]
+    fn preserves_arbitrary_bytes_around_named_secret_redaction() {
+        let input = [
+            &[0xff, 0x00, b'A', 0x80][..],
+            b" TOKEN=hidden",
+            &[0xfe, 0x01][..],
+        ]
+        .concat();
+        let mut redactor = OutputRedactor::new(RedactionConfig::default());
+        let output = redactor.push(&input, true);
+        assert!(output.starts_with(&[0xff, 0x00, b'A', 0x80, b' ']));
+        assert!(
+            output
+                .windows(b"[REDACTED_NAME]=[REDACTED]".len())
+                .any(|window| window == b"[REDACTED_NAME]=[REDACTED]")
+        );
+        assert!(
+            !output
+                .windows(b"hidden".len())
+                .any(|window| window == b"hidden")
+        );
+    }
+
+    #[test]
     fn oversized_lines_are_discarded_instead_of_leaking_unparsed_values() {
         let mut redactor = OutputRedactor::new(RedactionConfig::default());
         let value = vec![b'x'; MAX_REDACTION_LINE_BYTES + 1];
@@ -509,5 +540,32 @@ mod tests {
         assert!(!value.contains("visible"));
         assert!(value.contains("[REDACTED]"));
         assert!(!value.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn redacts_literal_secrets_in_raw_utf16le_artifacts() {
+        let secret = "secret-value";
+        let encoded = secret
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut redactor = OutputRedactor::new(
+            RedactionConfig::new(vec![RedactionSecret {
+                name: "provider".into(),
+                value: secret.into(),
+            }])
+            .unwrap(),
+        );
+        let output = redactor.push(&encoded, true);
+        assert!(
+            !output
+                .windows(encoded.len())
+                .any(|window| window == encoded)
+        );
+        assert!(
+            output
+                .windows(b"[REDACTED]".len())
+                .any(|window| window == b"[REDACTED]")
+        );
     }
 }

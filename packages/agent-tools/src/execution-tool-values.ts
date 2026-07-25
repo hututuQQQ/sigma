@@ -76,8 +76,9 @@ export function availableRuntimeCommands(options: ExecutionToolOptions): string[
 }
 
 export function executableCapabilityDescription(options: ExecutionToolOptions): string {
-  if (options.managedEnvironment === true) {
-    return "Bare executable aliases are resolved and authenticated inside the launcher-attested managed target. A missing alias returns a structured dependency observation; do not infer availability from stderr.";
+  if (options.managedEnvironment === true
+    || options.directExecutableResolution === true) {
+    return "Bare executable aliases and explicit paths are resolved, pinned, and authorized by the connected sandbox. A missing or unauthorized executable returns a structured dependency observation; do not infer availability from stderr.";
   }
   const commands = availableRuntimeCommands(options);
   const aliasDescription = commands.length > 0
@@ -97,6 +98,7 @@ export function executableCapabilitySchema(options: ExecutionToolOptions): JsonV
   return {
     type: "string",
     ...(options.managedEnvironment === true
+      || options.directExecutableResolution === true
       ? { anyOf: [managedAlias, explicitPath] }
       : commands.length > 0
       ? { anyOf: [{ type: "string", enum: commands }, explicitPath] }
@@ -112,7 +114,8 @@ export function assertAvailableExecutable(
   const requested = executionText(input, "executable");
   const explicitPath = (options.executionPlatform ?? process.platform) === "win32" ? /[\\/]/u : /\//u;
   if (explicitPath.test(requested)) return;
-  if (options.managedEnvironment === true
+  if ((options.managedEnvironment === true
+    || options.directExecutableResolution === true)
     && /^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/u.test(requested)) return;
   const windows = (options.executionPlatform ?? process.platform) === "win32";
   const key = windows ? requested.toLowerCase() : requested;

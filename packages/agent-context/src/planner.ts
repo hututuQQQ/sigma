@@ -1,14 +1,16 @@
 import type { ContextBudget, ContextItem, ModelMessage, ModelToolDefinition } from "agent-protocol";
 import {
   blockTokens,
-  contextOverflow,
   historyBlocks,
+  withoutUnneededHistoricalReasoning,
+  type HistoryBlock
+} from "./history-blocks.js";
+import {
+  contextOverflow,
   historySummaries,
   includeRecentHistory,
   MAXIMUM_HISTORY_SUMMARY_TOKENS,
-  selectMandatoryHistory,
-  withoutUnneededHistoricalReasoning,
-  type HistoryBlock
+  selectMandatoryHistory
 } from "./history-planning.js";
 import { approximateTokens } from "./unicode.js";
 export interface ContextPlan {
@@ -123,7 +125,7 @@ function arrangeMessages(
   const promptFrameMessages: ModelMessage[] = promptCache && dynamicSuffix.length > 0
     ? [{
         role: "developer",
-        content: "[runtime prompt frame; applies only to the immediately following assistant turn; a later frame supersedes it]"
+        content: "[runtime prompt frame; named runtime_state sections remain effective until a later update for that section; items marked turn-only apply only to the immediately following assistant turn]"
       }, ...dynamicSuffix.map(toContextMessage)]
     : [];
   const cacheFirst = [

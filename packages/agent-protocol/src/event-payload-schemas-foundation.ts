@@ -56,7 +56,10 @@ export const toolCallPlanSchema = z.object({
     kind: z.literal("restore"),
     checkpointId: nonEmptyStringSchema
   }).strict().optional(),
-  mutationAuthority: z.literal("broker_repository_transaction_v2").optional(),
+  mutationAuthority: z.enum([
+    "broker_repository_transaction_v2",
+    "disposable_enclosing_container_v1"
+  ]).optional(),
   idempotence: z.enum(["read_only", "replay_safe", "non_replayable"]),
   executionIntent: z.object({
     invocation: z.object({
@@ -122,6 +125,177 @@ export const contextItemSchema = z.object({
   priority: z.number().finite(),
   cacheKey: z.string().optional()
 }).strict();
+
+export const runtimePromptStateV2Schema = z.object({
+  schemaVersion: z.literal(2),
+  sectionDigests: z.object({
+    repository: z.string().regex(/^[a-f0-9]{64}$/u).optional(),
+    completion: z.string().regex(/^[a-f0-9]{64}$/u).optional(),
+    plan: z.string().regex(/^[a-f0-9]{64}$/u).optional(),
+    budget: z.string().regex(/^[a-f0-9]{64}$/u).optional(),
+    longHorizon: z.string().regex(/^[a-f0-9]{64}$/u).optional()
+  }).strict(),
+  budgetBand: z.union([
+    z.literal(100), z.literal(50), z.literal(25), z.literal(10), z.literal(0)
+  ]),
+  archiveSourceDigest: z.string().regex(/^[a-f0-9]{64}$/u).optional()
+}).strict();
+
+const strategyResetActionV1Schema = z.object({
+  title: nonEmptyStringSchema,
+  expectedSignal: nonEmptyStringSchema,
+  kind: z.enum(["inspect", "change", "validate", "ask"])
+}).strict();
+
+export const strategyResetV1Schema = z.object({
+  schemaVersion: z.literal(1),
+  basisDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+  establishedFacts: z.array(nonEmptyStringSchema).max(12),
+  lowYieldApproaches: z.array(nonEmptyStringSchema).max(8),
+  hypothesis: nonEmptyStringSchema,
+  nextActions: z.array(strategyResetActionV1Schema).min(1).max(3),
+  validationTarget: nonEmptyStringSchema.optional()
+}).strict();
+
+export const longHorizonStateV1Schema = z.object({
+  schemaVersion: z.literal(1),
+  goalEpoch: z.number().int().nonnegative(),
+  progressBasisDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+  settledBatchCount: z.number().int().nonnegative(),
+  noProgressBatches: z.number().int().nonnegative(),
+  maxNoProgressBatches: z.number().int().nonnegative(),
+  mutationBatchesWithoutValidation: z.number().int().nonnegative(),
+  recentOutcomes: z.array(z.object({
+    batch: z.number().int().nonnegative(),
+    toolNames: z.array(nonEmptyStringSchema).min(1),
+    callDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+    resultDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+    summary: z.string()
+  }).strict()).max(8),
+  stage: z.enum(["normal", "checkpoint", "strategy_required", "strategy_reset", "action_required"]),
+  validationDue: z.boolean(),
+  checkpointBasisDigest: z.string().regex(/^[a-f0-9]{64}$/u).optional(),
+  strategy: strategyResetV1Schema.optional(),
+  strategyResetBatchCount: z.number().int().nonnegative().optional(),
+  actionRequiredConsumed: z.boolean(),
+  assurance: z.object({
+    schemaVersion: z.literal(1),
+    maxAuxiliaryCalls: z.literal(3),
+    maxAuxiliaryBudgetBps: z.literal(2000),
+    strategistCalls: z.number().int().min(0).max(1),
+    reviewerCalls: z.number().int().min(0).max(2),
+    auxiliaryInputTokens: z.number().int().nonnegative(),
+    auxiliaryOutputTokens: z.number().int().nonnegative(),
+    auxiliaryCostMicroUsd: z.number().int().nonnegative(),
+    protectedRepairTurnsRemaining: z.number().int().min(0).max(2),
+    protectedToolCallsRemaining: z.number().int().min(0).max(4)
+  }).strict()
+}).strict()
+  .refine((state) => state.maxNoProgressBatches >= state.noProgressBatches, {
+    path: ["maxNoProgressBatches"],
+    message: "Maximum no-progress streak cannot be smaller than the current streak"
+  })
+  .refine((state) => state.assurance.strategistCalls + state.assurance.reviewerCalls <= 3, {
+    path: ["assurance"],
+    message: "At most three auxiliary calls are permitted"
+  });
+
+export const strategyResetV2Schema = z.object({
+  schemaVersion: z.literal(2),
+  basisDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+  establishedFacts: z.array(nonEmptyStringSchema).max(12),
+  falsifiedApproaches: z.array(nonEmptyStringSchema).max(8),
+  hypothesis: nonEmptyStringSchema,
+  nextDiscriminatingAction: nonEmptyStringSchema,
+  expectedSignal: nonEmptyStringSchema,
+  validationTarget: nonEmptyStringSchema.optional(),
+  decision: z.enum([
+    "continue_exploring",
+    "implement_candidate",
+    "revise_plan",
+    "validate_current",
+    "request_user_input"
+  ]).optional(),
+  decisionRationale: nonEmptyStringSchema.optional(),
+  trigger: z.enum([
+    "model_request",
+    "input_request",
+    "duplicate_result",
+    "evidence_window",
+    "resource_band"
+  ])
+}).strict().superRefine((strategy, context) => {
+  if ((strategy.decision === undefined)
+    !== (strategy.decisionRationale === undefined)) {
+    context.addIssue({
+      code: "custom",
+      path: ["decision"],
+      message: "Strategy decision and rationale must be provided together"
+    });
+  }
+});
+
+export const longHorizonStateV2Schema = z.object({
+  schemaVersion: z.literal(2),
+  goalEpoch: z.number().int().nonnegative(),
+  settledBatchCount: z.number().int().nonnegative(),
+  recentOutcomes: z.array(z.object({
+    batch: z.number().int().nonnegative(),
+    toolNames: z.array(nonEmptyStringSchema).min(1),
+    callDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+    resultDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+    summary: z.string()
+  }).strict()).max(8),
+  duplicateStreak: z.number().int().nonnegative(),
+  strategyRequested: z.boolean(),
+  resourceBandTriggered: z.boolean(),
+  strategy: strategyResetV2Schema.optional(),
+  assurance: z.object({
+    schemaVersion: z.literal(2),
+    budgetPercent: z.number().int().min(1).max(100),
+    reviewRounds: z.number().int().min(1).max(8),
+    repairRounds: z.number().int().min(0).max(4),
+    reviewerMaxTurns: z.number().int().min(1).max(32),
+    reviewerMaxToolCalls: z.number().int().min(0).max(128),
+    repairMaxTurns: z.number().int().min(1).max(32),
+    repairMaxToolCalls: z.number().int().min(0).max(128),
+    strategistMode: z.enum(["off", "on_demand", "adaptive"]),
+    duplicateThreshold: z.number().int().min(2).max(16),
+    strategyRemainingPercent: z.number().int().min(1).max(100),
+    maxAuxiliaryCalls: z.number().int().nonnegative(),
+    maxAuxiliaryBudgetBps: z.number().int().min(100).max(10_000),
+    strategistCalls: z.number().int().nonnegative(),
+    reviewerCalls: z.number().int().nonnegative(),
+    repairEpisodes: z.number().int().nonnegative(),
+    auxiliaryInputTokens: z.number().int().nonnegative(),
+    auxiliaryOutputTokens: z.number().int().nonnegative(),
+    auxiliaryCostMicroUsd: z.number().int().nonnegative(),
+    protectedRepairTurnsRemaining: z.number().int().nonnegative(),
+    protectedToolCallsRemaining: z.number().int().nonnegative()
+  }).strict()
+}).strict()
+  .refine((state) => state.duplicateStreak <= state.settledBatchCount, {
+    path: ["duplicateStreak"],
+    message: "Duplicate streak cannot exceed settled batch count"
+  })
+  .refine((state) => state.assurance.maxAuxiliaryBudgetBps
+    === state.assurance.budgetPercent * 100, {
+    path: ["assurance", "maxAuxiliaryBudgetBps"],
+    message: "Auxiliary budget basis points must match budgetPercent"
+  })
+  .refine((state) => state.assurance.maxAuxiliaryCalls
+    === state.assurance.reviewRounds * state.assurance.reviewerMaxTurns
+      + (state.assurance.strategistMode === "off" ? 0 : 1), {
+    path: ["assurance", "maxAuxiliaryCalls"],
+    message: "Auxiliary model-turn capacity must match review and strategist policy"
+  })
+  .refine((state) => state.assurance.strategistCalls
+    <= (state.assurance.strategistMode === "off" ? 0 : 1)
+    && state.assurance.reviewerCalls <= state.assurance.reviewRounds
+    && state.assurance.repairEpisodes <= state.assurance.repairRounds, {
+    path: ["assurance"],
+    message: "Assurance usage exceeds configured capacity"
+  });
 
 export const sharedSchemas = {
   budgetAmountsSchema,

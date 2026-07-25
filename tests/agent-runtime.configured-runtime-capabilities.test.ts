@@ -152,6 +152,8 @@ function doctorReport(
     stdin: boolean;
     pty: boolean;
     networkModes: Array<"none" | "full">;
+    directExecutableResolution?: boolean;
+    enclosingContainerRoot?: boolean;
   } = {
     foreground: true,
     background: false,
@@ -177,6 +179,16 @@ function doctorReport(
       stdin: processCapabilities.stdin,
       pty: processCapabilities.pty,
       networkModes: processCapabilities.networkModes,
+      ...(processCapabilities.directExecutableResolution === undefined ? {} : {
+        directExecutableResolution: processCapabilities.directExecutableResolution
+      }),
+      ...(processCapabilities.enclosingContainerRoot === true ? {
+        enclosingContainerRoot: {
+          available: true,
+          rootKind: "container_cow" as const,
+          attestationDigest: `sha256:${"a".repeat(64)}`
+        }
+      } : {}),
       shells,
       runtimeCommands
     }
@@ -299,6 +311,114 @@ describe("configured runtime execution capabilities", () => {
     }));
   });
 
+  it("fails startup unless enclosing-container writes have host reads and native broker attestation", async () => {
+    const root = await workspace();
+    const stateRoot = await mkdtemp(path.join(os.tmpdir(), "sigma-runtime-enclosing-state-"));
+    fixtures.push(stateRoot);
+    const config = configured(root);
+    config.writeScope = "enclosing-container";
+    config.readScope = "host";
+
+    await expect(createConfiguredRuntime(config, {
+      stateRootDir: stateRoot,
+      executionBroker: fixtureBroker(doctorReport([])),
+      gatewayFactory: () => new CapturingGateway()
+    }, { connectMcp: false })).rejects.toMatchObject({
+      code: "enclosing_container_unavailable"
+    });
+
+    config.readScope = "workspace";
+    await expect(createConfiguredRuntime(config, {
+      stateRootDir: stateRoot,
+      executionBroker: fixtureBroker(doctorReport([], [], {
+        foreground: true,
+        background: false,
+        stdin: true,
+        pty: false,
+        networkModes: ["none"],
+        enclosingContainerRoot: true
+      })),
+      gatewayFactory: () => new CapturingGateway()
+    }, { connectMcp: false })).rejects.toMatchObject({
+      code: "enclosing_container_read_scope_required"
+    });
+
+    config.readScope = "host";
+    const runtime = await createConfiguredRuntime(config, {
+      stateRootDir: stateRoot,
+      executionBroker: fixtureBroker(doctorReport([], [], {
+        foreground: true,
+        background: false,
+        stdin: true,
+        pty: false,
+        networkModes: ["none"],
+        enclosingContainerRoot: true
+      })),
+      gatewayFactory: () => new CapturingGateway()
+    }, { connectMcp: false });
+    await runtime.close();
+  });
+
+  it("exposes one attested environment mutation action only in change mode", async () => {
+    const root = await workspace();
+    const stateRoot = await mkdtemp(path.join(os.tmpdir(), "sigma-runtime-environment-shell-state-"));
+    fixtures.push(stateRoot);
+    const runtimeConfig = configured(root);
+    runtimeConfig.writeScope = "enclosing-container";
+    runtimeConfig.readScope = "host";
+    const gateway = new CapturingGateway();
+    const configuredRuntime = await createConfiguredRuntime(runtimeConfig, {
+      stateRootDir: stateRoot,
+      executionBroker: fixtureBroker(doctorReport([{
+        kind: "bash",
+        executable: "/bin/bash",
+        verified: true,
+        supportsChildProcesses: true
+      }], [], {
+        foreground: true,
+        background: false,
+        stdin: true,
+        pty: false,
+        networkModes: ["none"],
+        enclosingContainerRoot: true
+      })),
+      gatewayFactory: () => gateway
+    }, { connectMcp: false });
+    try {
+      const session = await configuredRuntime.runtime.createSession({
+        workspacePath: root,
+        mode: "change"
+      });
+      await configuredRuntime.runtime.command({
+        type: "submit",
+        sessionId: session.sessionId,
+        text: "Inspect the available general environment capabilities.",
+        mode: "change"
+      });
+      await configuredRuntime.runtime.waitForOutcome(session.sessionId);
+
+      const request = gateway.requests[0] as ModelRequest;
+      const environmentShell = request.tools?.find((tool) =>
+        tool.name === "environment_shell");
+      expect(environmentShell).toBeDefined();
+      const schema = JSON.stringify(environmentShell?.inputSchema);
+      expect(schema).not.toContain("writeRoots");
+      expect(schema).not.toContain("expectedChanges");
+      expect(schema).not.toContain("\"access\"");
+      const runtimeContext = request.messages
+        .filter((message) =>
+          message.role === "system" || message.role === "developer")
+        .map((message) => message.content)
+        .join("\n");
+      expect(runtimeContext).toContain(
+        "use environment_shell for foreground system-level changes"
+      );
+      expect(runtimeContext).toContain("environment_process_spawn for a background service");
+    } finally {
+      await configuredRuntime.close();
+    }
+  });
+
   it("closes an eagerly connected broker when later runtime composition fails", async () => {
     const root = await workspace();
     const stateRoot = await mkdtemp(path.join(os.tmpdir(), "sigma-runtime-capabilities-state-"));
@@ -388,7 +508,8 @@ describe("configured runtime execution capabilities", () => {
       runtimeCommands: ["node", "node-runtime"],
       expectedRuntimeCommands: ["node", "node-runtime"],
       processCapabilities: {
-        foreground: true, background: false, stdin: true, pty: false, networkModes: ["none"]
+        foreground: true, background: false, stdin: true, pty: false, networkModes: ["none"],
+        directExecutableResolution: true
       },
       configuredNetworkMode: "none" as const,
       expectedNetworkModes: ["none"] as Array<"none" | "full">
@@ -545,8 +666,13 @@ describe("configured runtime execution capabilities", () => {
       const executionSchema = JSON.stringify(
         exec?.inputSchema
       );
+      const directResolution = "directExecutableResolution" in processCapabilities
+        && processCapabilities.directExecutableResolution === true;
       if (!foregroundAvailable) {
         expect(executionSchema).toBeUndefined();
+      } else if (directResolution) {
+        expect(executionSchema).toContain("resolved, pinned, and authorized");
+        expect(executionSchema).not.toContain("Unlisted bare commands are unavailable");
       } else if (expectedRuntimeCommands.length > 0) {
         for (const command of expectedRuntimeCommands) expect(executionSchema).toContain(command);
         expect(executionSchema).toContain("Unlisted bare commands are unavailable");
@@ -566,10 +692,15 @@ describe("configured runtime execution capabilities", () => {
         .map((message) => message.content)
         .join("\n");
       expect(runtimePrompt).toContain(
-        `platform=linux; arch=fixture-arch; executionCapabilities=broker-verified; defaultShell=${expectedDefault}; verifiedShells=${expectedShells.join(",") || "none"}; verifiedRuntimeCommands=${expectedRuntimeCommands.join(",") || "none"}; pathSeparator=/`
+        `platform=linux; arch=fixture-arch; executionCapabilities=broker-verified; defaultShell=${expectedDefault}; verifiedShells=${expectedShells.join(",") || "none"}; verifiedRuntimeCommands=${expectedRuntimeCommands.join(",") || "none"}; directExecutableResolution=${directResolution}; pathSeparator=/`
       );
-      expect(runtimePrompt).toContain("Execution capabilities are closed-world");
-      expect(runtimePrompt).toContain("Do not probe or retry unlisted host commands");
+      if (directResolution) {
+        expect(runtimePrompt).toContain("resolves, pins, and authorizes executable requests");
+        expect(runtimePrompt).toContain("Do not repeatedly retry");
+      } else {
+        expect(runtimePrompt).toContain("Execution capabilities are closed-world");
+        expect(runtimePrompt).toContain("Do not probe or retry unlisted host commands");
+      }
       expect(runtimePrompt).not.toContain(process.execPath);
     } finally {
       await configuredRuntime.close();

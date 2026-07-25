@@ -26,6 +26,7 @@ interface ImportedOutputArtifacts {
     stream: "stdout" | "stderr";
     complete: boolean;
     redactionLossy: boolean;
+    mediaType: ProcessOutputArtifact["mediaType"];
   }>;
   diagnostics: string[];
 }
@@ -76,7 +77,8 @@ async function preserveProjectedStream(
     });
     imported.byStream[stream] = artifactId;
     imported.metadata.push({
-      artifactId, name, stream, complete: true, redactionLossy: false
+      artifactId, name, stream, complete: true, redactionLossy: false,
+      mediaType: "text/plain; charset=utf-8"
     });
     imported.diagnostics.push(`full_output_artifact:${stream}:${artifactId}`);
   }
@@ -124,7 +126,7 @@ async function importOutputArtifacts(
       artifactId,
       name: artifact.name,
       digest,
-      mediaType: "text/plain; charset=utf-8",
+      mediaType: artifact.mediaType,
       sizeBytes: artifact.content.byteLength
     });
     imported.byStream[artifact.stream] = artifactId;
@@ -133,7 +135,8 @@ async function importOutputArtifacts(
       name: artifact.name,
       stream: artifact.stream,
       complete: artifact.complete,
-      redactionLossy: artifact.redactionLossy
+      redactionLossy: artifact.redactionLossy,
+      mediaType: artifact.mediaType
     });
     imported.diagnostics.push(`full_output_artifact:${artifact.stream}:${artifactId}`);
     if (!artifact.complete) imported.diagnostics.push(`output_artifact_incomplete:${artifact.stream}`);
@@ -149,6 +152,13 @@ async function acknowledge(imported: ImportedOutputArtifacts, broker: ExecutionB
   } catch {
     imported.diagnostics.push("output_artifact_release_failed");
   }
+}
+
+function decodingDiagnostics(
+  result: Pick<ExecutionResult, "outputDecodingErrors">
+): string[] {
+  return (result.outputDecodingErrors ?? []).map((item) =>
+    `${item.code}:${item.stream}`);
 }
 
 function commandEvidence(
@@ -227,6 +237,7 @@ export async function commandReceipt(
       ...(result.failure ? [result.failure.code] : []),
       ...dependencyDiagnostics(result),
       ...(result.outputTruncated ? ["output_truncated"] : []), ...imported.diagnostics,
+      ...decodingDiagnostics(result),
       ...(result.timedOut || result.idleTimedOut ? ["process_timed_out"] : [])
     ],
     evidence: [evidence], startedAt, completedAt
@@ -276,7 +287,7 @@ export async function processReceipt(
     status: imported.metadata.some((artifact) => !artifact.complete || artifact.redactionLossy)
       ? "warning" : "informational",
     createdAt: completedAt, producer: { authority: "tool", id: request.callId },
-    summary: "Broker output overflow was preserved as redacted durable artifacts.",
+    summary: "Bounded or non-text broker output was preserved as redacted durable artifacts.",
     data: { source: "sigma-exec", diagnostic: { type: "process_output_artifacts", artifacts: imported.metadata } }
   }];
   const outcome = processOutcome(operation, value);
@@ -289,6 +300,7 @@ export async function processReceipt(
       ...(value.failure ? [value.failure.code] : []),
       ...outcome.diagnostics,
       ...(value.outputTruncated ? ["output_truncated"] : []),
+      ...decodingDiagnostics(value),
       ...imported.diagnostics
     ],
     evidence, startedAt, completedAt

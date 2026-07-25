@@ -22,6 +22,28 @@ export function approximateTokens(value: string): number {
   return Math.max(1, Math.ceil((bytes - cjkCount * 2) / 4) + cjkCount);
 }
 
+/** Deterministically fit text to an approximate-token ceiling without
+ * splitting a Unicode code point. */
+export function fitApproximateTokens(
+  value: string,
+  maximumTokens: number,
+  marker = "\n[content omitted to stay within the runtime context limit]"
+): string {
+  const limit = Math.max(1, Math.floor(maximumTokens));
+  if (approximateTokens(value) <= limit) return value;
+  const suffix = approximateTokens(marker) < limit ? marker : "";
+  const points = [...value];
+  let low = 0;
+  let high = points.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    const candidate = `${points.slice(0, middle).join("")}${suffix}`;
+    if (approximateTokens(candidate) <= limit) low = middle;
+    else high = middle - 1;
+  }
+  return `${points.slice(0, low).join("")}${suffix}`;
+}
+
 export function lexicalScore(query: string, document: string): number {
   const queryTokens = lexicalTokens(query);
   if (queryTokens.length === 0) return 0;

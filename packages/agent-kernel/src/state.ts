@@ -2,10 +2,17 @@ import {
   KERNEL_STATE_VERSION,
   createBudgetLedger,
   createEmptyPlan,
+  emptyLongHorizonStateV2,
+  emptyReasoningTrajectoryStateV1,
   isBudgetLedgerState,
   isCheckpointRef,
   isContextArchiveV1,
+  isRuntimePromptStateV2,
+  isLongHorizonStateV2,
+  isReasoningTrajectoryStateV1,
+  isToolResultPruneStateV1,
   isEvidenceRecord,
+  parseAgentEventPayload,
   isMutationFrontier,
   isPlanGraph,
   isUsageRecord,
@@ -17,10 +24,16 @@ import {
   type FrozenCustomizationRef,
   type ModelFinishReason,
   type ModelMessage,
+  type AssuranceResourcePolicyV1,
+  type LongHorizonStateV2,
+  type ReasoningTrajectoryStateV1,
   type MutationFrontier,
   type PlanGraph,
   type RunMode,
+  type RuntimePromptStateV2,
+  type ToolResultPruneStateV1,
   type RunOutcome,
+  type ReviewerToolReceiptV1,
   type ToolRequest,
   type ToolReceipt,
   type UsageRecord
@@ -49,6 +62,12 @@ export interface PendingTool {
   started: boolean;
 }
 
+export interface LengthRecoveryStateV1 {
+  schemaVersion: 1;
+  mode: "none" | "action_required" | "bounded_answer" | "continue_after_tools";
+  attempts: number;
+}
+
 export interface KernelState {
   schemaVersion: typeof KERNEL_STATE_VERSION;
   sessionId: string;
@@ -69,10 +88,13 @@ export interface KernelState {
   consecutiveLengthFinishes: number;
   consecutiveLengthNoAction: number;
   lastModelHadToolCalls: boolean;
+  lengthRecovery: LengthRecoveryStateV1;
   messages: ModelMessage[];
   pendingTools: PendingTool[];
   toolCallIds: string[];
   receipts: ToolReceipt[];
+  /** Tool calls executed in disposable independent verification sessions. */
+  reviewReceipts: ReviewerToolReceiptV1[];
   /** Session-scoped mutation evidence retained across follow-up runs so
    * validation and review status remains bound to the actual frontier. */
   mutationEvidence: EvidenceRecord[];
@@ -90,6 +112,14 @@ export interface KernelState {
   childIds: string[];
   /** Durable semantic projection of an omitted stable history prefix. */
   contextArchive?: ContextArchiveV1;
+  /** Last runtime state sections made durable in the prompt history. */
+  promptState: RuntimePromptStateV2;
+  /** Durable model-context projection boundary; the underlying event history is unchanged. */
+  toolResultPrune?: ToolResultPruneStateV1;
+  /** Provider reasoning-protocol projection boundary; durable blocks remain unchanged. */
+  reasoningTrajectory: ReasoningTrajectoryStateV1;
+  /** Task-state-driven long-running work and protected assurance capacity. */
+  longHorizon: LongHorizonStateV2;
   proposedOutcome?: RunOutcome;
   outcome?: RunOutcome;
 }
@@ -100,6 +130,7 @@ export interface CreateKernelStateOptions {
   mode: RunMode;
   startedAt: string;
   deadlineAt: string;
+  assurancePolicy?: AssuranceResourcePolicyV1;
 }
 
 export function createKernelState(options: CreateKernelStateOptions): KernelState {
@@ -116,10 +147,12 @@ export function createKernelState(options: CreateKernelStateOptions): KernelStat
     consecutiveLengthFinishes: 0,
     consecutiveLengthNoAction: 0,
     lastModelHadToolCalls: false,
+    lengthRecovery: { schemaVersion: 1, mode: "none", attempts: 0 },
     messages: [],
     pendingTools: [],
     toolCallIds: [],
     receipts: [],
+    reviewReceipts: [],
     mutationEvidence: [],
     mutationFrontier: emptyMutationFrontier(),
     evidence: [],
@@ -128,7 +161,14 @@ export function createKernelState(options: CreateKernelStateOptions): KernelStat
     budget: createBudgetLedger(),
     frozenSkills: [],
     activeProcessIds: [],
-    childIds: []
+    childIds: [],
+    promptState: {
+      schemaVersion: 2,
+      sectionDigests: {},
+      budgetBand: 100
+    },
+    longHorizon: emptyLongHorizonStateV2(options.assurancePolicy),
+    reasoningTrajectory: emptyReasoningTrajectoryStateV1()
   };
 }
 
@@ -157,12 +197,23 @@ function validKernelCollections(state: Record<string, unknown>): boolean {
     && Array.isArray(state.pendingTools)
     && Array.isArray(state.toolCallIds)
     && Array.isArray(state.receipts)
+    && Array.isArray(state.reviewReceipts)
+    && state.reviewReceipts.every(validReviewerReceipt)
     && Array.isArray(state.mutationEvidence) && state.mutationEvidence.every(isEvidenceRecord)
     && Array.isArray(state.evidence) && state.evidence.every(isEvidenceRecord)
     && Array.isArray(state.usage) && state.usage.every(isUsageRecord)
     && Array.isArray(state.activeProcessIds)
     && state.activeProcessIds.every((item) => typeof item === "string" && item.length > 0)
     && Array.isArray(state.childIds);
+}
+
+function validReviewerReceipt(value: unknown): boolean {
+  try {
+    parseAgentEventPayload("review.tool_completed", value);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function validModelCompletionState(state: Record<string, unknown>): boolean {
@@ -174,7 +225,29 @@ function validModelCompletionState(state: Record<string, unknown>): boolean {
     && Number(state.consecutiveLengthFinishes) >= 0
     && Number.isSafeInteger(state.consecutiveLengthNoAction)
     && Number(state.consecutiveLengthNoAction) >= 0
-    && typeof state.lastModelHadToolCalls === "boolean";
+    && typeof state.lastModelHadToolCalls === "boolean"
+    && validLengthRecoveryState(state.lengthRecovery);
+}
+
+function validLengthRecoveryState(value: unknown): value is LengthRecoveryStateV1 {
+  const recovery = record(value);
+  return Boolean(recovery
+    && recovery.schemaVersion === 1
+    && ["none", "action_required", "bounded_answer", "continue_after_tools"]
+      .includes(String(recovery.mode))
+    && Number.isSafeInteger(recovery.attempts)
+    && Number(recovery.attempts) >= 0);
+}
+
+function validKernelProjectionState(state: Record<string, unknown>): boolean {
+  return (state.contextArchive === undefined || isContextArchiveV1(state.contextArchive))
+    && isRuntimePromptStateV2(state.promptState)
+    && isLongHorizonStateV2(state.longHorizon)
+    && isReasoningTrajectoryStateV1(state.reasoningTrajectory)
+    && (state.toolResultPrune === undefined || isToolResultPruneStateV1(state.toolResultPrune))
+    && (state.activeModelSemanticDelta === undefined
+      || typeof state.activeModelSemanticDelta === "boolean")
+    && validModelCompletionState(state);
 }
 
 function validKernelDomainState(state: Record<string, unknown>): boolean {
@@ -183,10 +256,7 @@ function validKernelDomainState(state: Record<string, unknown>): boolean {
     && isBudgetLedgerState(state.budget)
     && (state.checkpointHead === undefined || isCheckpointRef(state.checkpointHead))
     && validFrozenState(state)
-    && (state.contextArchive === undefined || isContextArchiveV1(state.contextArchive))
-    && (state.activeModelSemanticDelta === undefined
-      || typeof state.activeModelSemanticDelta === "boolean")
-    && validModelCompletionState(state);
+    && validKernelProjectionState(state);
 }
 
 export function isKernelState(value: unknown): value is KernelState {
@@ -235,7 +305,7 @@ function isFrozenCustomizationRef(value: unknown): value is FrozenCustomizationR
 }
 
 export function assertKernelState(value: unknown): asserts value is KernelState {
-  if (!isKernelState(value)) throw new Error("Invalid KernelState V7.");
+  if (!isKernelState(value)) throw new Error("Invalid KernelState V10.");
 }
 
 export function isTerminal(state: KernelState): boolean {

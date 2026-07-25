@@ -13,6 +13,7 @@ export interface RuntimeControlServiceOptions {
   skills?: SkillCatalog;
   createArtifact(sessionId: string, content: string | Uint8Array): Promise<string>;
   readArtifact(sessionId: string, artifactId: string): Promise<string>;
+  readArtifactBytes?(sessionId: string, artifactId: string): Promise<Uint8Array>;
   skillMaterializer?: {
     plannedAccess(sessionId: string, manifest: SkillExecutionManifest, relativePath: string): LoadedSkillResourceAccess;
     materialize(sessionId: string, manifest: SkillExecutionManifest, relativePath: string): Promise<LoadedSkillResourceAccess>;

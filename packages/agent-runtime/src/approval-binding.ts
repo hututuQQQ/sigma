@@ -57,10 +57,14 @@ function validPlanScalars(
     && checkpoint.kind === "restore"
     && typeof checkpoint.checkpointId === "string"
     && checkpoint.checkpointId.length > 0);
-  return (plan.network === "none" || plan.network === "full")
+  const validMutationAuthority = plan.mutationAuthority === undefined
+    || plan.mutationAuthority === "broker_repository_transaction_v2"
+    || plan.mutationAuthority === "disposable_enclosing_container_v1";
+  return (plan.network === "none" || plan.network === "loopback" || plan.network === "full")
     && ["none", "pipe", "pty", "background"].includes(String(plan.processMode))
     && ["read_only", "replay_safe", "non_replayable"].includes(String(plan.idempotence))
-    && validCheckpoint;
+    && validCheckpoint
+    && validMutationAuthority;
 }
 
 export function parseToolCallPlan(value: unknown): ToolCallPlan | null {
@@ -82,6 +86,9 @@ export function parseToolCallPlan(value: unknown): ToolCallPlan | null {
     checkpointScope,
     ...(checkpoint ? {
       checkpointAction: { kind: "restore", checkpointId: checkpoint.checkpointId as string }
+    } : {}),
+    ...(plan.mutationAuthority ? {
+      mutationAuthority: plan.mutationAuthority as ToolCallPlan["mutationAuthority"]
     } : {}),
     idempotence: plan.idempotence as ToolCallPlan["idempotence"]
   };
@@ -193,6 +200,7 @@ function canonicalApprovalAuthority(
       checkpointAction: plan.checkpointAction
         ? { kind: plan.checkpointAction.kind, checkpointId: plan.checkpointAction.checkpointId }
         : null,
+      mutationAuthority: plan.mutationAuthority ?? null,
       idempotence: plan.idempotence
     }
   };

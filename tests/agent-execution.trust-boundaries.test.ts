@@ -118,6 +118,54 @@ describe("trusted toolchain boundaries", () => {
     )).toThrow(BrokerExecutableUnavailableError);
   });
 
+  it("permits overlapping runtime roots only under explicit enclosing-container authority and protects them", async () => {
+    const root = await temporaryRoot("sigma-enclosing-policy-");
+    const workspace = path.join(root, "workspace");
+    const runtimeRoot = path.join(root, "runtime");
+    const executable = path.join(
+      runtimeRoot,
+      process.platform === "win32" ? "runtime-tool.exe" : "runtime-tool"
+    );
+    await mkdir(workspace);
+    await mkdir(runtimeRoot);
+    await writeFile(executable, "runtime\n");
+    if (process.platform !== "win32") await chmod(executable, 0o755);
+    const toolchains = normalizeTrustedToolchains([{
+      id: "runtime",
+      runtime: "generic",
+      executable,
+      aliases: ["runtime"],
+      executionRoots: [runtimeRoot],
+      runtimeRoots: [runtimeRoot]
+    }]);
+    const broad = request("runtime", workspace, [runtimeRoot]);
+    broad.policy.readRoots = [root];
+    broad.policy.writeRoots = [root];
+    broad.policy.protectedPaths = [workspace];
+
+    expect(() => requestParams(
+      broad,
+      clientOptions("unsafe"),
+      toolchains,
+      []
+    )).toThrow(/overlap writeRoots/u);
+
+    broad.policy.enclosingContainerRoot = true;
+    expect(requestParams(
+      broad,
+      clientOptions("unsafe"),
+      toolchains,
+      []
+    )).toMatchObject({
+      policy: {
+        enclosingContainerRoot: true,
+        readRoots: expect.arrayContaining([root, runtimeRoot]),
+        writeRoots: [root],
+        protectedPaths: expect.arrayContaining([workspace, runtimeRoot])
+      }
+    });
+  });
+
   it("does not let a broad descendant root establish a sibling as the primary executable", async () => {
     const root = await temporaryRoot("sigma-toolchain-primary-");
     const entryPoint = path.join(root, process.platform === "win32" ? "compiler.exe" : "compiler");

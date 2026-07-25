@@ -3,9 +3,12 @@ import { readFile, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import type { ModelRole } from "agent-model";
 import { parse as parseToml } from "smol-toml";
+import { canonicalStringify, deepFreeze } from "./profile-canonical.js";
+import { assertProfileNarrowing } from "./profile-narrowing.js";
 
 export type ProfilePermissionMode = "deny" | "ask" | "auto";
 export type ProfileReviewMode = "off" | "advisory" | "required";
+export type ProfileStrategistMode = "off" | "on_demand" | "adaptive";
 export type ProfileSource = "home" | "workspace";
 
 export interface ProfileBudget {
@@ -24,6 +27,25 @@ export interface ProfileMutationPolicy {
   reviewMode: ProfileReviewMode;
 }
 
+/**
+ * Resource bounds for independent assurance work. Reviewer and strategist
+ * values are ceilings. Repair values are capacity reserved from pre-review
+ * solving; once repair starts, the ordinary hard ledger remains authoritative.
+ * None of these values classify task semantics.
+ */
+export interface ProfileAssurancePolicy {
+  budgetPercent: number;
+  reviewRounds: number;
+  repairRounds: number;
+  reviewerMaxTurns: number;
+  reviewerMaxToolCalls: number;
+  repairMaxTurns: number;
+  repairMaxToolCalls: number;
+  strategistMode: ProfileStrategistMode;
+  duplicateThreshold: number;
+  strategyRemainingPercent: number;
+}
+
 export interface ResolvedAgentProfile {
   id: string;
   description?: string;
@@ -35,6 +57,7 @@ export interface ResolvedAgentProfile {
   permissionMode: ProfilePermissionMode;
   budget: ProfileBudget;
   mutationPolicy: ProfileMutationPolicy;
+  assurancePolicy: ProfileAssurancePolicy;
   allowedChildProfiles: readonly string[];
 }
 
@@ -65,12 +88,25 @@ export const DEFAULT_PROFILE_BUDGET: Readonly<ProfileBudget> = {
   maxDepth: 4
 };
 
+export const DEFAULT_PROFILE_ASSURANCE: Readonly<ProfileAssurancePolicy> = {
+  budgetPercent: 20,
+  reviewRounds: 2,
+  repairRounds: 1,
+  reviewerMaxTurns: 4,
+  reviewerMaxToolCalls: 12,
+  repairMaxTurns: 3,
+  repairMaxToolCalls: 8,
+  strategistMode: "adaptive",
+  duplicateThreshold: 3,
+  strategyRemainingPercent: 25
+};
+
 const MODEL_ROLES: readonly ModelRole[] = [
   "orchestrator", "planner", "reviewer", "child_analyze", "child_write", "summarizer"
 ];
 const ROOT_KEYS = new Set([
   "id", "description", "routes", "tool_allow", "tool_deny", "skills", "hooks", "permission_mode",
-  "budget", "mutation", "allowed_child_profiles"
+  "budget", "mutation", "assurance", "allowed_child_profiles"
 ]);
 const BUDGET_KEYS = new Set([
   "max_input_tokens", "max_output_tokens", "max_cost_micro_usd", "max_model_turns",
@@ -78,6 +114,11 @@ const BUDGET_KEYS = new Set([
 ]);
 const MUTATION_KEYS = new Set([
   "require_plan_before_mutation", "checkpoint_before_mutation", "review_mode"
+]);
+const ASSURANCE_KEYS = new Set([
+  "budget_percent", "review_rounds", "repair_rounds", "reviewer_max_turns",
+  "reviewer_max_tool_calls", "repair_max_turns", "repair_max_tool_calls",
+  "strategist_mode", "duplicate_threshold", "strategy_remaining_percent"
 ]);
 
 export function parseAgentProfileToml(source: string, filePath = "<profile>"): ResolvedAgentProfile {
@@ -91,6 +132,7 @@ export function parseAgentProfileToml(source: string, filePath = "<profile>"): R
   const routes = parseRoutes(root.routes, `${filePath}.routes`);
   const budget = parseBudget(root.budget, `${filePath}.budget`);
   const mutation = parseMutationPolicy(root.mutation, `${filePath}.mutation`);
+  const assurance = parseAssurancePolicy(root.assurance, `${filePath}.assurance`);
   return {
     id,
     ...(root.description === undefined ? {} : { description: stringValue(root.description, `${filePath}.description`) }),
@@ -102,6 +144,7 @@ export function parseAgentProfileToml(source: string, filePath = "<profile>"): R
     permissionMode: enumValue(root.permission_mode ?? "ask", ["deny", "ask", "auto"], `${filePath}.permission_mode`),
     budget,
     mutationPolicy: mutation,
+    assurancePolicy: assurance,
     allowedChildProfiles: root.allowed_child_profiles === undefined
       ? [] : uniqueStrings(root.allowed_child_profiles, `${filePath}.allowed_child_profiles`)
   };
@@ -134,16 +177,26 @@ export function narrowAgentProfile(
   parent: ResolvedAgentProfile,
   requested: ResolvedAgentProfile
 ): ResolvedAgentProfile {
-  assertPermissionNarrower(parent, requested);
-  assertBudgetNarrower(parent.budget, requested.budget);
-  assertRoutesNarrower(parent.roleRoutes, requested.roleRoutes);
-  assertSubset(requested.skills, parent.skills, "skills");
-  assertSubset(requested.allowedChildProfiles, parent.allowedChildProfiles, "allowed child profiles");
-  assertSuperset(requested.hooks, parent.hooks, "hooks");
-  assertMutationNarrower(parent.mutationPolicy, requested.mutationPolicy);
-  const toolAllow = narrowerToolAllow(parent.toolAllow, requested.toolAllow);
+  // Profiles frozen before customization V4 do not carry an assurance block.
+  // A missing child block inherits the parent limits; it must not silently
+  // expand to the current defaults when the parent was explicitly tighter.
+  const parentAssurance: ProfileAssurancePolicy = {
+    ...DEFAULT_PROFILE_ASSURANCE,
+    ...(parent.assurancePolicy ?? {})
+  };
+  const requestedAssurance: ProfileAssurancePolicy = {
+    ...parentAssurance,
+    ...(requested.assurancePolicy ?? {})
+  };
+  const toolAllow = assertProfileNarrowing(
+    parent,
+    requested,
+    parentAssurance,
+    requestedAssurance
+  );
   return {
     ...requested,
+    assurancePolicy: { ...requestedAssurance },
     roleRoutes: { ...parent.roleRoutes, ...requested.roleRoutes },
     toolAllow,
     toolDeny: [...new Set([...parent.toolDeny, ...requested.toolDeny])]
@@ -201,6 +254,55 @@ function defaultMutationPolicy(): ProfileMutationPolicy {
     requirePlanBeforeMutation: false,
     checkpointBeforeMutation: true,
     reviewMode: "advisory"
+  };
+}
+
+function parseAssurancePolicy(value: unknown, label: string): ProfileAssurancePolicy {
+  if (value === undefined) return { ...DEFAULT_PROFILE_ASSURANCE };
+  const policy = objectValue(value, label);
+  rejectUnknown(policy, ASSURANCE_KEYS, label);
+  return {
+    budgetPercent: boundedInteger(
+      policy.budget_percent, DEFAULT_PROFILE_ASSURANCE.budgetPercent, 1, 100,
+      `${label}.budget_percent`
+    ),
+    reviewRounds: boundedInteger(
+      policy.review_rounds, DEFAULT_PROFILE_ASSURANCE.reviewRounds, 1, 8,
+      `${label}.review_rounds`
+    ),
+    repairRounds: boundedInteger(
+      policy.repair_rounds, DEFAULT_PROFILE_ASSURANCE.repairRounds, 0, 4,
+      `${label}.repair_rounds`
+    ),
+    reviewerMaxTurns: boundedInteger(
+      policy.reviewer_max_turns, DEFAULT_PROFILE_ASSURANCE.reviewerMaxTurns, 1, 32,
+      `${label}.reviewer_max_turns`
+    ),
+    reviewerMaxToolCalls: boundedInteger(
+      policy.reviewer_max_tool_calls, DEFAULT_PROFILE_ASSURANCE.reviewerMaxToolCalls, 0, 128,
+      `${label}.reviewer_max_tool_calls`
+    ),
+    repairMaxTurns: boundedInteger(
+      policy.repair_max_turns, DEFAULT_PROFILE_ASSURANCE.repairMaxTurns, 1, 32,
+      `${label}.repair_max_turns`
+    ),
+    repairMaxToolCalls: boundedInteger(
+      policy.repair_max_tool_calls, DEFAULT_PROFILE_ASSURANCE.repairMaxToolCalls, 0, 128,
+      `${label}.repair_max_tool_calls`
+    ),
+    strategistMode: enumValue(
+      policy.strategist_mode ?? DEFAULT_PROFILE_ASSURANCE.strategistMode,
+      ["off", "on_demand", "adaptive"],
+      `${label}.strategist_mode`
+    ),
+    duplicateThreshold: boundedInteger(
+      policy.duplicate_threshold, DEFAULT_PROFILE_ASSURANCE.duplicateThreshold, 2, 16,
+      `${label}.duplicate_threshold`
+    ),
+    strategyRemainingPercent: boundedInteger(
+      policy.strategy_remaining_percent, DEFAULT_PROFILE_ASSURANCE.strategyRemainingPercent, 1, 100,
+      `${label}.strategy_remaining_percent`
+    )
   };
 }
 
@@ -265,6 +367,20 @@ function positiveInteger(value: unknown, fallback: number, label: string, zeroAl
   return Number(result);
 }
 
+function boundedInteger(
+  value: unknown,
+  fallback: number,
+  minimum: number,
+  maximum: number,
+  label: string
+): number {
+  const result = value === undefined ? fallback : value;
+  if (!Number.isSafeInteger(result) || Number(result) < minimum || Number(result) > maximum) {
+    throw new Error(`${label} must be an integer from ${minimum} to ${maximum}.`);
+  }
+  return Number(result);
+}
+
 function booleanValue(value: unknown, fallback: boolean, label: string): boolean {
   if (value === undefined) return fallback;
   if (typeof value !== "boolean") throw new Error(`${label} must be a boolean.`);
@@ -273,75 +389,4 @@ function booleanValue(value: unknown, fallback: boolean, label: string): boolean
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function assertPermissionNarrower(parent: ResolvedAgentProfile, requested: ResolvedAgentProfile): void {
-  const rank: Record<ProfilePermissionMode, number> = { deny: 0, ask: 1, auto: 2 };
-  if (rank[requested.permissionMode] > rank[parent.permissionMode]) throw new Error("Child profile cannot widen permission mode.");
-}
-
-function assertBudgetNarrower(parent: ProfileBudget, child: ProfileBudget): void {
-  for (const key of Object.keys(parent) as Array<keyof ProfileBudget>) {
-    if (child[key] > parent[key]) throw new Error(`Child profile cannot increase budget '${key}'.`);
-  }
-}
-
-function assertRoutesNarrower(
-  parent: Partial<Record<ModelRole, string>>,
-  child: Partial<Record<ModelRole, string>>
-): void {
-  for (const [role, route] of Object.entries(child)) {
-    const parentRoute = parent[role as ModelRole];
-    if (parentRoute !== undefined && route !== parentRoute) throw new Error(`Child profile cannot replace route '${role}'.`);
-  }
-}
-
-function assertSubset(child: readonly string[], parent: readonly string[], label: string): void {
-  const parentValues = new Set(parent);
-  const extra = child.find((value) => !parentValues.has(value));
-  if (extra) throw new Error(`Child profile cannot add ${label} entry '${extra}'.`);
-}
-
-function assertSuperset(child: readonly string[], parent: readonly string[], label: string): void {
-  const childValues = new Set(child);
-  const removed = parent.find((value) => !childValues.has(value));
-  if (removed) throw new Error(`Child profile cannot remove ${label} entry '${removed}'.`);
-}
-
-function assertMutationNarrower(parent: ProfileMutationPolicy, child: ProfileMutationPolicy): void {
-  if (parent.requirePlanBeforeMutation && !child.requirePlanBeforeMutation) {
-    throw new Error("Child profile cannot disable mutation policy 'requirePlanBeforeMutation'.");
-  }
-  if (parent.checkpointBeforeMutation && !child.checkpointBeforeMutation) {
-    throw new Error("Child profile cannot disable mutation policy 'checkpointBeforeMutation'.");
-  }
-  const rank: Record<ProfileReviewMode, number> = { off: 0, advisory: 1, required: 2 };
-  if (rank[child.reviewMode] < rank[parent.reviewMode]) {
-    throw new Error("Child profile cannot weaken mutation policy 'reviewMode'.");
-  }
-}
-
-function narrowerToolAllow(parent: readonly string[] | null, child: readonly string[] | null): readonly string[] | null {
-  if (child === null) return parent;
-  if (parent !== null) assertSubset(child, parent, "tool allow");
-  return child;
-}
-
-function canonicalStringify(value: unknown): string {
-  const visit = (item: unknown): unknown => {
-    if (Array.isArray(item)) return item.map(visit);
-    if (!item || typeof item !== "object") return item;
-    return Object.fromEntries(Object.entries(item as Record<string, unknown>)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, child]) => [key, visit(child)]));
-  };
-  return JSON.stringify(visit(value));
-}
-
-function deepFreeze<T>(value: T): Readonly<T> {
-  if (value && typeof value === "object") {
-    for (const child of Object.values(value)) deepFreeze(child);
-    Object.freeze(value);
-  }
-  return value;
 }

@@ -229,6 +229,99 @@ describe("execution tool capability closure", () => {
     });
   });
 
+  it("offers a low-friction disposable-environment process without weakening ordinary spawn scope", async () => {
+    const root = await workspace();
+    const fixture = brokerFixture();
+    const tools = registerBuiltinTools(new EffectToolRegistry(), {
+      broker: fixture.broker,
+      foreground: true,
+      background: true,
+      readScope: "host",
+      writeScope: "enclosing-container",
+      enclosingContainerRoot: true,
+      enclosingContainerAttestationDigest: "attested-container",
+      handoff: true,
+      processHandoff: "allow",
+      networkMode: "none",
+      networkModes: ["none"],
+      runtimeCommands: ["runtime"],
+      protectedPaths: [path.join(root, ".runtime")]
+    });
+    const environment = tools.descriptor("environment_process_spawn");
+    expect(environment).toMatchObject({
+      brokerMutationAuthority: "disposable_enclosing_container_v1",
+      inputSchema: {
+        properties: {
+          lifecycle: { enum: ["session", "deliverable"] }
+        }
+      }
+    });
+    expect(environment?.inputSchema).not.toMatchObject({
+      properties: {
+        access: expect.anything(),
+        writeRoots: expect.anything(),
+        expectedChanges: expect.anything()
+      }
+    });
+
+    const call = request("environment_process_spawn", {
+      executable: "runtime",
+      lifecycle: "deliverable"
+    });
+    const plan = await tools.prepare(call, preparation(root));
+    expect(plan).toMatchObject({
+      mutationAuthority: "disposable_enclosing_container_v1",
+      processMode: "background",
+      checkpointScope: [path.parse(path.resolve(root)).root]
+    });
+    await expect(tools.execute(call, {
+      ...execution(root),
+      callPlan: plan,
+      approval: {
+        callId: call.callId,
+        authority: "runtime",
+        networkApproved: false,
+        externalReadApproved: true,
+        processHandoffApproved: false,
+        openWorldApproved: true
+      }
+    })).resolves.toMatchObject({ ok: true });
+    expect(fixture.spawn).toHaveBeenLastCalledWith(expect.objectContaining({
+      lifecycle: "deliverable",
+      policy: expect.objectContaining({
+        enclosingContainerRoot: true,
+        writeRoots: [path.parse(path.resolve(root)).root],
+        protectedPaths: expect.arrayContaining([
+          path.resolve(root),
+          path.resolve(root, ".runtime")
+        ])
+      })
+    }), expect.anything());
+
+    const ordinary = request("process_spawn", {
+      executable: "runtime",
+      lifecycle: "deliverable",
+      access: "write",
+      writeRoots: [path.parse(path.resolve(root)).root],
+      expectedChanges: [path.parse(path.resolve(root)).root]
+    });
+    await expect(tools.prepare(ordinary, preparation(root)))
+      .rejects.toMatchObject({ code: "policy_denied" });
+
+    const unattested = registerBuiltinTools(new EffectToolRegistry(), {
+      broker: fixture.broker,
+      foreground: true,
+      background: true,
+      readScope: "host",
+      writeScope: "enclosing-container",
+      enclosingContainerRoot: true,
+      networkMode: "none",
+      networkModes: ["none"],
+      runtimeCommands: ["runtime"]
+    });
+    expect(unattested.descriptor("environment_process_spawn")).toBeUndefined();
+  });
+
   it("keeps the shell schema aligned with verified capabilities and rejects unsupported arguments", async () => {
     const root = await workspace();
     const fixture = brokerFixture();

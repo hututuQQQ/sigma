@@ -1460,6 +1460,11 @@ function summarizeTraceEvents(events) {
     reasoning_tokens: 0,
     cache_tokens: 0,
     cache_read_tokens: 0,
+    provider_reported_input_tokens: 0,
+    provider_reported_cache_read_tokens: 0,
+    warm_provider_input_tokens: 0,
+    warm_provider_cache_read_tokens: 0,
+    provider_reported_model_records: 0,
     length_finish_count: 0,
     converge_turns: 0,
     cost_usd: null,
@@ -1495,6 +1500,17 @@ function summarizeTraceEvents(events) {
       const usageCost = Number(usage.costUsd ?? usage.cost_usd
         ?? (Number.isFinite(Number(usage.costMicroUsd)) ? Number(usage.costMicroUsd) / 1_000_000 : NaN));
       if (Number.isFinite(usageCost)) summary.cost_usd = (summary.cost_usd ?? 0) + usageCost;
+      if (usage.providerReported === true && usage.role === "orchestrator") {
+        const input = Number(usage.inputTokens ?? usage.input_tokens ?? 0);
+        const cacheRead = Number(usage.cacheReadTokens ?? usage.cache_read_tokens ?? 0);
+        summary.provider_reported_model_records += 1;
+        summary.provider_reported_input_tokens += input;
+        summary.provider_reported_cache_read_tokens += cacheRead;
+        if (summary.provider_reported_model_records > 1) {
+          summary.warm_provider_input_tokens += input;
+          summary.warm_provider_cache_read_tokens += cacheRead;
+        }
+      }
     }
     if (event?.type === "model_end"
       && (metadata.finishReason ?? metadata.finish_reason) === "length") {
@@ -2069,6 +2085,13 @@ function mergeHarborTrialResult(task, trialResult) {
       task.cache_read_tokens || traceSummary.cache_read_tokens || agentResult.n_cache_read_tokens
       || 0
     ),
+    provider_reported_input_tokens: Number(traceSummary.provider_reported_input_tokens ?? 0),
+    provider_reported_cache_read_tokens: Number(
+      traceSummary.provider_reported_cache_read_tokens ?? 0
+    ),
+    warm_provider_input_tokens: Number(traceSummary.warm_provider_input_tokens ?? 0),
+    warm_provider_cache_read_tokens: Number(traceSummary.warm_provider_cache_read_tokens ?? 0),
+    provider_reported_model_records: Number(traceSummary.provider_reported_model_records ?? 0),
     output_tokens: Number(agentResult.n_output_tokens ?? (task.output_tokens || traceSummary.output_tokens || 0)),
     reasoning_tokens: Number(
       task.reasoning_tokens || traceSummary.reasoning_tokens || agentResult.n_reasoning_tokens || 0
@@ -2476,6 +2499,8 @@ export function formatMarkdownReport(report) {
     `- Input tokens: ${report.usage?.input_tokens ?? 0}`,
     `- Cache tokens: ${report.usage?.cache_tokens ?? 0}`,
     `- Cache read ratio: ${report.cache_read_ratio ?? "unknown"}`,
+    `- Provider-reported cache read ratio: ${report.provider_cache_read_ratio ?? "unknown"}`,
+    `- Warm provider cache read ratio: ${report.warm_provider_cache_read_ratio ?? "unknown"}`,
     `- Output tokens: ${report.usage?.output_tokens ?? 0}`,
     `- Reasoning tokens: ${report.reasoning_tokens ?? report.usage?.reasoning_tokens ?? 0}`,
     `- Reasoning/output ratio: ${report.reasoning_output_ratio ?? "unknown"}`,
@@ -2722,10 +2747,37 @@ export async function generateBenchReport(runDir) {
     input_tokens: total.input_tokens + Number(task.input_tokens ?? 0),
     cache_tokens: total.cache_tokens + Number(task.cache_tokens ?? 0),
     cache_read_tokens: total.cache_read_tokens + Number(task.cache_read_tokens ?? 0),
+    provider_reported_input_tokens: total.provider_reported_input_tokens
+      + Number(task.provider_reported_input_tokens ?? 0),
+    provider_reported_cache_read_tokens: total.provider_reported_cache_read_tokens
+      + Number(task.provider_reported_cache_read_tokens ?? 0),
+    warm_provider_input_tokens: total.warm_provider_input_tokens
+      + Number(task.warm_provider_input_tokens ?? 0),
+    warm_provider_cache_read_tokens: total.warm_provider_cache_read_tokens
+      + Number(task.warm_provider_cache_read_tokens ?? 0),
+    provider_reported_model_records: total.provider_reported_model_records
+      + Number(task.provider_reported_model_records ?? 0),
     output_tokens: total.output_tokens + Number(task.output_tokens ?? 0),
     reasoning_tokens: total.reasoning_tokens + Number(task.reasoning_tokens ?? 0)
-  }), { input_tokens: 0, cache_tokens: 0, cache_read_tokens: 0, output_tokens: 0, reasoning_tokens: 0 });
+  }), {
+    input_tokens: 0,
+    cache_tokens: 0,
+    cache_read_tokens: 0,
+    provider_reported_input_tokens: 0,
+    provider_reported_cache_read_tokens: 0,
+    warm_provider_input_tokens: 0,
+    warm_provider_cache_read_tokens: 0,
+    provider_reported_model_records: 0,
+    output_tokens: 0,
+    reasoning_tokens: 0
+  });
   const cacheReadRatio = usage.input_tokens > 0 ? usage.cache_read_tokens / usage.input_tokens : null;
+  const providerCacheReadRatio = usage.provider_reported_input_tokens > 0
+    ? usage.provider_reported_cache_read_tokens / usage.provider_reported_input_tokens
+    : null;
+  const warmProviderCacheReadRatio = usage.warm_provider_input_tokens > 0
+    ? usage.warm_provider_cache_read_tokens / usage.warm_provider_input_tokens
+    : null;
   const reasoningOutputRatio = usage.output_tokens > 0 ? usage.reasoning_tokens / usage.output_tokens : null;
   const lengthFinishCount = tasks.reduce(
     (total, task) => total + Number(task.length_finish_count ?? 0), 0
@@ -2772,6 +2824,8 @@ export async function generateBenchReport(runDir) {
     usage,
     reasoning_tokens: usage.reasoning_tokens,
     cache_read_ratio: cacheReadRatio,
+    provider_cache_read_ratio: providerCacheReadRatio,
+    warm_provider_cache_read_ratio: warmProviderCacheReadRatio,
     reasoning_output_ratio: reasoningOutputRatio,
     length_finish_count: lengthFinishCount,
     converge_turns: convergeTurns,

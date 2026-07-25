@@ -1,7 +1,8 @@
-import type {
-  AgentEventType,
-  JsonValue,
-  ModelMessage
+import {
+  isRuntimePromptStateV2,
+  type AgentEventType,
+  type JsonValue,
+  type ModelMessage
 } from "agent-protocol";
 import type { KernelEventReducer } from "./durable-reducers.js";
 import {
@@ -21,7 +22,8 @@ export const resetModelCompletion = {
   lastModelFinishReason: undefined,
   consecutiveLengthFinishes: 0,
   consecutiveLengthNoAction: 0,
-  lastModelHadToolCalls: false
+  lastModelHadToolCalls: false,
+  lengthRecovery: { schemaVersion: 1, mode: "none", attempts: 0 }
 } as const;
 
 const modelStarted: KernelEventReducer = (state, _event, payload) => {
@@ -43,7 +45,19 @@ const promptMaterialized: KernelEventReducer = (state, _event, payload) => {
     .map((item) => modelMessage(item))
     .filter((item): item is ModelMessage => item !== null);
   if (messages.length !== payload.messages.length) return state;
-  return { ...state, messages: [...state.messages, ...messages] };
+  const promptState = isRuntimePromptStateV2(payload.promptState)
+    ? payload.promptState
+    : state.promptState;
+  const lengthRecovery = state.lengthRecovery.mode === "action_required"
+    && payload.toolChoice === "none"
+    ? { ...state.lengthRecovery, mode: "bounded_answer" as const }
+    : state.lengthRecovery;
+  return {
+    ...state,
+    messages: [...state.messages, ...messages],
+    promptState,
+    lengthRecovery
+  };
 };
 
 export function lengthContinuationMessage(withTools: boolean): ModelMessage {
@@ -57,13 +71,28 @@ export function lengthContinuationMessage(withTools: boolean): ModelMessage {
 
 function stoppedOutcome(
   state: KernelState,
+  priorRecovery: KernelState["lengthRecovery"],
   payload: Record<string, JsonValue>,
   messages: ModelMessage[],
   message: ModelMessage | null
 ): KernelState {
   const finishReason = text(payload.finishReason);
   const answer = message?.content.trim() ?? "";
-  if (finishReason === "length" && state.consecutiveLengthNoAction < 3) {
+  if (priorRecovery.mode === "action_required") {
+    return proposedOutcomeState({ ...state, messages }, {
+      kind: "recoverable_failure",
+      code: "model_action_recovery_failed",
+      message: "The provider did not produce a tool action during the one strict action-recovery turn."
+    });
+  }
+  if (priorRecovery.mode === "bounded_answer" && finishReason !== "stop") {
+    return proposedOutcomeState({ ...state, messages }, {
+      kind: "recoverable_failure",
+      code: "model_action_recovery_failed",
+      message: "The provider exhausted the one bounded answer-recovery turn."
+    });
+  }
+  if (finishReason === "length") {
     return {
       ...state,
       phase: "ready_model",
@@ -75,9 +104,9 @@ function stoppedOutcome(
   if (finishReason !== "stop") {
     return proposedOutcomeState({ ...state, messages }, {
       kind: "recoverable_failure",
-      code: finishReason === "length" ? "model_output_truncated" : "model_protocol_error",
+      code: finishReason === "length" ? "model_action_recovery_failed" : "model_protocol_error",
       message: finishReason === "length"
-        ? "The model exhausted its output allowance before reaching a natural stop."
+        ? "The model exhausted the one bounded action-recovery turn without taking a tool action or reaching a natural stop."
         : `The model returned no tool calls with finish reason '${finishReason || "unknown"}'.`
     });
   }
@@ -95,6 +124,37 @@ function stoppedOutcome(
   });
 }
 
+function nextLengthRecovery(
+  state: KernelState,
+  length: boolean,
+  hasToolCalls: boolean
+): KernelState["lengthRecovery"] {
+  if (!length) return resetModelCompletion.lengthRecovery;
+  const mode = hasToolCalls ? "continue_after_tools" : "action_required";
+  return {
+    schemaVersion: 1,
+    mode,
+    attempts: state.lengthRecovery.mode === mode
+      ? state.lengthRecovery.attempts + 1
+      : 1
+  };
+}
+
+function recognizedFinishReason(value: string): KernelState["lastModelFinishReason"] {
+  return ["stop", "length", "tool_calls", "content_filter", "protocol_error"].includes(value)
+    ? value as KernelState["lastModelFinishReason"]
+    : undefined;
+}
+
+function duplicateToolCallId(
+  identifiers: readonly string[],
+  previousIdentifiers: readonly string[]
+): string | undefined {
+  const seen = new Set(previousIdentifiers);
+  return identifiers.find((id, index) =>
+    identifiers.indexOf(id) !== index || seen.has(id));
+}
+
 const modelCompleted: KernelEventReducer = (state, _event, payload) => {
   if (state.phase !== "model_in_flight" || !isCurrentModelTurn(state, payload)) return state;
   const message = modelMessage(payload.message);
@@ -103,26 +163,24 @@ const modelCompleted: KernelEventReducer = (state, _event, payload) => {
   const turn = state.activeModelTurn!;
   const finishReason = text(payload.finishReason);
   const length = finishReason === "length";
+  const hasToolCalls = calls.length > 0;
   const completedState: KernelState = {
     ...state,
     activeModelTurn: undefined,
     activeModelSemanticDelta: undefined,
-    lastModelFinishReason: finishReason === "stop" || finishReason === "length"
-      || finishReason === "tool_calls" || finishReason === "content_filter"
-      || finishReason === "protocol_error"
-      ? finishReason
-      : undefined,
+    lastModelFinishReason: recognizedFinishReason(finishReason),
     consecutiveLengthFinishes: length ? state.consecutiveLengthFinishes + 1 : 0,
-    consecutiveLengthNoAction: length && calls.length === 0
+    consecutiveLengthNoAction: length && !hasToolCalls
       ? state.consecutiveLengthNoAction + 1
       : 0,
-    lastModelHadToolCalls: calls.length > 0
+    lastModelHadToolCalls: hasToolCalls,
+    lengthRecovery: nextLengthRecovery(state, length, hasToolCalls)
   };
-  if (calls.length === 0) return stoppedOutcome(completedState, payload, messages, message);
+  if (!hasToolCalls) {
+    return stoppedOutcome(completedState, state.lengthRecovery, payload, messages, message);
+  }
   const identifiers = calls.map((call) => call.id);
-  const seen = new Set(state.toolCallIds);
-  const duplicate = identifiers.find((id, index) =>
-    identifiers.indexOf(id) !== index || seen.has(id));
+  const duplicate = duplicateToolCallId(identifiers, state.toolCallIds);
   if (duplicate) {
     return proposedOutcomeState({ ...completedState, messages }, {
       kind: "recoverable_failure",
