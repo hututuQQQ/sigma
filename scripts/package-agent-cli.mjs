@@ -1543,12 +1543,15 @@ function assertDockerCommand(result, label) {
   ].filter(Boolean).join("\n"));
 }
 
-function normalizedLinuxArchiveCommand(bundleName) {
+function normalizedLinuxArchiveCommand(
+  bundleName,
+  source = `/artifacts/${bundleName}`
+) {
   return [
     "set -eu",
     "rm -rf /tmp/sigma-bundle",
     "mkdir -p /tmp/sigma-bundle",
-    `cp -a /artifacts/${bundleName} /tmp/sigma-bundle/${bundleName}`,
+    `cp -a ${source} /tmp/sigma-bundle/${bundleName}`,
     `find /tmp/sigma-bundle/${bundleName} -type d -exec chmod 0755 {} +`,
     `find /tmp/sigma-bundle/${bundleName} -type f -exec chmod 0644 {} +`,
     `for file in agent node sigma-exec bwrap; do test ! -e /tmp/sigma-bundle/${bundleName}/bin/$file || chmod 0755 /tmp/sigma-bundle/${bundleName}/bin/$file; done`,
@@ -1556,14 +1559,7 @@ function normalizedLinuxArchiveCommand(bundleName) {
   ].join(" && ");
 }
 
-function createNormalizedLinuxArchive(outputPath, artifactsDir, bundleName, rootDir) {
-  const create = spawnSync("docker", [
-    "create", "--platform", "linux/amd64",
-    "--mount", dockerMount(artifactsDir, "/artifacts", true),
-    linuxSysrootImage, "sh", "-c", normalizedLinuxArchiveCommand(bundleName)
-  ], { cwd: rootDir, encoding: "utf8" });
-  assertDockerCommand(create, "failed to create Linux archive container");
-  const containerId = create.stdout.trim();
+function finishNormalizedLinuxArchive(containerId, outputPath, rootDir) {
   try {
     const start = spawnSync("docker", ["start", "--attach", containerId], {
       cwd: rootDir, encoding: "utf8"
@@ -1576,6 +1572,41 @@ function createNormalizedLinuxArchive(outputPath, artifactsDir, bundleName, root
   } finally {
     spawnSync("docker", ["rm", "--force", containerId], { cwd: rootDir, encoding: "utf8" });
   }
+}
+
+function createNormalizedLinuxArchiveByCopy(outputPath, artifactsDir, bundleName, rootDir) {
+  const create = spawnSync("docker", [
+    "create", "--platform", "linux/amd64",
+    linuxSysrootImage, "sh", "-c",
+    normalizedLinuxArchiveCommand(bundleName, "/tmp/sigma-bundle-source")
+  ], { cwd: rootDir, encoding: "utf8" });
+  assertDockerCommand(create, "failed to create copy-based Linux archive container");
+  const containerId = create.stdout.trim();
+  try {
+    const copy = spawnSync("docker", [
+      "cp",
+      path.join(artifactsDir, bundleName),
+      `${containerId}:/tmp/sigma-bundle-source`
+    ], { cwd: rootDir, encoding: "utf8" });
+    assertDockerCommand(copy, "failed to copy the Linux bundle into its archive container");
+  } catch (error) {
+    spawnSync("docker", ["rm", "--force", containerId], { cwd: rootDir, encoding: "utf8" });
+    throw error;
+  }
+  finishNormalizedLinuxArchive(containerId, outputPath, rootDir);
+}
+
+function createNormalizedLinuxArchive(outputPath, artifactsDir, bundleName, rootDir) {
+  const mounted = spawnSync("docker", [
+    "create", "--platform", "linux/amd64",
+    "--mount", dockerMount(artifactsDir, "/artifacts", true),
+    linuxSysrootImage, "sh", "-c", normalizedLinuxArchiveCommand(bundleName)
+  ], { cwd: rootDir, encoding: "utf8" });
+  if (mounted.error || mounted.status !== 0) {
+    createNormalizedLinuxArchiveByCopy(outputPath, artifactsDir, bundleName, rootDir);
+    return;
+  }
+  finishNormalizedLinuxArchive(mounted.stdout.trim(), outputPath, rootDir);
 }
 
 function createBundleArchive(outputPath, artifactsDir, bundleName, targetPlatform, rootDir) {
