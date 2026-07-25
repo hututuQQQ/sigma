@@ -2,10 +2,9 @@ import { randomUUID } from "node:crypto";
 import {
   KERNEL_STATE_VERSION,
   SNAPSHOT_SCHEMA_VERSION,
-  STORE_LAYOUT_VERSION,
   createBudgetLedger,
   type AgentEventEnvelope,
-  type AssuranceResourcePolicyV1,
+  type AssuranceResourcePolicy,
   type BudgetLimits,
   type ContextItem,
   type JsonValue,
@@ -28,9 +27,7 @@ import {
   createdSessionMetadata,
   type RestoredSessionMetadata
 } from "./restore-session-metadata.js";
-import { migrateLegacySnapshot } from "./restore-v5-migration.js";
 import {
-  approvalEffectsForPlan,
   createApprovalBinding,
   parseToolCallPlan,
   parseToolEffects,
@@ -60,7 +57,7 @@ function freshState(
   mode: RunMode,
   runDeadlineMs: number,
   budgetLimits?: BudgetLimits,
-  assurancePolicy?: AssuranceResourcePolicyV1
+  assurancePolicy?: AssuranceResourcePolicy
 ): KernelState {
   const state = createKernelState({
     sessionId,
@@ -112,7 +109,6 @@ interface RestoreAccumulator {
   lastSeq: number;
   followUps: Map<string, string>;
   contextItems: Map<string, ContextItem>;
-  executionPlans: Map<string, ToolCallPlan>;
   pendingApprovals: Map<string, RecoveredApprovalMetadata>;
 }
 
@@ -133,54 +129,34 @@ function recoveredBinding(
   argumentsValue: JsonValue,
   plan: ToolCallPlan,
   effects: ToolEffect[]
-): ApprovalBinding | undefined {
-  try {
-    return createApprovalBinding(event.sessionId, event.runId, {
-      id: callId,
-      name: toolName,
-      arguments: argumentsValue
-    }, plan, effects);
-  } catch {
-    return undefined;
-  }
-}
-
-function recoveredBindingFromPayload(
-  event: AgentEventEnvelope,
-  payload: Record<string, unknown>,
-  callId: string,
-  plan: ToolCallPlan | undefined,
-  effects: ToolEffect[]
-): ApprovalBinding | undefined {
-  if (!plan || typeof payload.toolName !== "string"
-    || !Object.prototype.hasOwnProperty.call(payload, "arguments")) return undefined;
-  return recoveredBinding(
-    event, callId, payload.toolName, payload.arguments as JsonValue, plan, effects
-  );
+): ApprovalBinding {
+  return createApprovalBinding(event.sessionId, event.runId, {
+    id: callId,
+    name: toolName,
+    arguments: argumentsValue
+  }, plan, effects);
 }
 
 function trackApprovalAuthority(accumulator: RestoreAccumulator, event: AgentEventEnvelope): void {
   if (event.authority !== "runtime") return;
   const payload = payloadRecord(event);
   if (!payload) return;
-  if (event.type === "execution.planned") {
-    if (typeof payload.toolCallId !== "string") return;
-    const plan = parseToolCallPlan(payload.plan);
-    if (plan) accumulator.executionPlans.set(approvalKey(event.runId, payload.toolCallId), plan);
-    return;
-  }
   if (event.type !== "tool.approval_requested" || payload.delegated === true) return;
-  const callId = typeof payload.callId === "string"
-    ? payload.callId
-    : typeof payload.requestId === "string" ? payload.requestId : undefined;
-  if (!callId) return;
+  const callId = typeof payload.callId === "string" ? payload.callId : undefined;
+  const plan = parseToolCallPlan(payload.plan);
+  const effects = parseToolEffects(payload.effects);
+  if (!callId || !plan || !effects || typeof payload.toolName !== "string"
+    || !Object.prototype.hasOwnProperty.call(payload, "arguments")) {
+    throw Object.assign(new Error(
+      `Session '${event.sessionId}' contains an incomplete schema 1 approval event at seq ${event.seq}.`
+    ), { code: "unsupported_schema_version" });
+  }
   const key = approvalKey(event.runId, callId);
-  const plan = parseToolCallPlan(payload.plan) ?? accumulator.executionPlans.get(key);
-  const effects = parseToolEffects(payload.effects) ?? (plan ? approvalEffectsForPlan(plan) : []);
-  const binding = recoveredBindingFromPayload(event, payload, callId, plan, effects);
   accumulator.pendingApprovals.set(key, {
     effects,
-    ...(binding ? { binding } : {})
+    binding: recoveredBinding(
+      event, callId, payload.toolName, payload.arguments as JsonValue, plan, effects
+    )
   });
 }
 
@@ -240,16 +216,23 @@ function validatedSnapshotState(
 function snapshotState(snapshot: Awaited<ReturnType<RunStore["latestSnapshot"]>>, sessionId: string): KernelState | undefined {
   if (!snapshot?.state || typeof snapshot.state !== "object" || Array.isArray(snapshot.state)) return undefined;
   const raw = snapshot.state as unknown as Record<string, unknown>;
-  if (["actionConvergenceState", "convergenceStageHighWater", "semanticFactLedgerV2",
-    "taskControlStateV2", "taskControlStateV3", "taskControlStateV4"].some((key) => key in raw)) {
-    throw Object.assign(new Error("Experimental PR #55 session schemas are not supported."), {
-      code: "unsupported_experimental_session_schema"
-    });
+  if (raw.schemaVersion !== KERNEL_STATE_VERSION) {
+    throw Object.assign(
+      new Error(
+        `unsupported_schema_version: kernel state expected ${KERNEL_STATE_VERSION}, received ${String(raw.schemaVersion)}; existing data was not modified`
+      ),
+      {
+        code: "unsupported_schema_version",
+        expected: KERNEL_STATE_VERSION,
+        actual: raw.schemaVersion
+      }
+    );
   }
-  if (raw.schemaVersion === KERNEL_STATE_VERSION) {
-    return validatedSnapshotState(raw as unknown as KernelState, sessionId);
+  const validated = validatedSnapshotState(raw as unknown as KernelState, sessionId);
+  if (!validated) {
+    throw new Error(`Current kernel snapshot is invalid for session '${sessionId}'.`);
   }
-  return migrateLegacySnapshot(raw, sessionId);
+  return validated;
 }
 
 function initializeFromCreated(
@@ -306,7 +289,6 @@ function emptyAccumulator(state?: KernelState): RestoreAccumulator {
     lastSeq: 0,
     followUps: new Map(),
     contextItems: new Map(),
-    executionPlans: new Map(),
     pendingApprovals: new Map()
   };
 }
@@ -317,7 +299,7 @@ export interface SnapshotRebuildInput {
   events(): AsyncIterable<AgentEventEnvelope>;
 }
 
-/** Replays the durable event log through the kernel to rebuild a current V10 snapshot. */
+/** Replays the durable event log through the kernel to rebuild a current snapshot. */
 export async function rebuildSnapshotFromEvents(
   input: SnapshotRebuildInput,
   runDeadlineMs = 30 * 60 * 1_000
@@ -330,7 +312,6 @@ export async function rebuildSnapshotFromEvents(
   assertKernelInvariants(accumulator.state);
   return {
     schemaVersion: SNAPSHOT_SCHEMA_VERSION,
-    storeLayoutVersion: STORE_LAYOUT_VERSION,
     sessionId: input.sessionId,
     seq: input.lastSeq,
     createdAt: new Date().toISOString(),
@@ -340,35 +321,27 @@ export async function rebuildSnapshotFromEvents(
 
 export async function restoreStoredSession(store: RunStore, sessionId: string, runDeadlineMs: number): Promise<RestoredSessionData> {
   const snapshot = await store.latestSnapshot(sessionId);
-  const migratedLegacySnapshot = Number(snapshot?.schemaVersion) < SNAPSHOT_SCHEMA_VERSION
-    || Number((snapshot?.state as { schemaVersion?: unknown } | undefined)?.schemaVersion)
-      < KERNEL_STATE_VERSION;
   const restoredSnapshot = snapshotState(snapshot, sessionId);
   const accumulator = emptyAccumulator(restoredSnapshot);
   for await (const event of store.events(sessionId)) {
     replayEvent(accumulator, event, restoredSnapshot ? snapshot?.seq ?? 0 : 0, runDeadlineMs);
   }
   if (!accumulator.metadata || !accumulator.state) throw new Error(`Session '${sessionId}' was not found.`);
-  if (migratedLegacySnapshot) {
-    await store.writeSnapshot({
-      schemaVersion: SNAPSHOT_SCHEMA_VERSION,
-      storeLayoutVersion: STORE_LAYOUT_VERSION,
-      sessionId,
-      seq: accumulator.lastSeq,
-      createdAt: new Date().toISOString(),
-      state: jsonValue({ ...accumulator.state, lastSeq: accumulator.lastSeq })
-    });
-  }
   const pendingApprovals = accumulator.state.pendingTools
     .filter((item) => item.approval === "pending")
     .map((item) => {
       const recovered = accumulator.pendingApprovals.get(
         approvalKey(accumulator.state!.runId, item.request.callId)
       );
+      if (!recovered) {
+        throw Object.assign(new Error(
+          `Session '${sessionId}' is missing schema 1 approval authority for call '${item.request.callId}'.`
+        ), { code: "unsupported_schema_version" });
+      }
       return {
         callId: item.request.callId,
-        effects: recovered?.effects ?? [],
-        ...(recovered?.binding ? { binding: recovered.binding } : {})
+        effects: recovered.effects,
+        binding: recovered.binding
       };
     });
   return {

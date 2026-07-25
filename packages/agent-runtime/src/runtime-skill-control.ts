@@ -26,7 +26,7 @@ export class RuntimeSkillControl {
   async loadSkill(session: RuntimeSession, qualifiedName: string): Promise<{ content: string; evidence: EvidenceRecord }> {
     assertSkillAllowed(session, qualifiedName);
     const previouslyLoaded = session.durable.state.frozenSkills.find((item) => item.qualifiedName === qualifiedName);
-    const skill = await this.resolveSessionSkill(session, qualifiedName, previouslyLoaded);
+    const skill = this.resolveSessionSkill(session, qualifiedName);
     const artifactId = previouslyLoaded?.artifactId
       ?? await this.options.createArtifact(session.identity.sessionId, skill.instructions);
     const manifest = previouslyLoaded ? undefined : await this.freezeManifest(session.identity.sessionId, skill);
@@ -105,25 +105,17 @@ export class RuntimeSkillControl {
     return snapshot.manifest;
   }
 
-  private async resolveSessionSkill(
+  private resolveSessionSkill(
     session: RuntimeSession,
-    qualifiedName: string,
-    previouslyLoaded: RuntimeSession["durable"]["state"]["frozenSkills"][number] | undefined
-  ): Promise<{ qualifiedName: string; instructions: string; digest: string; source: "home" | "workspace" }> {
-    const frozen = session.durable.frozenCustomization?.skills.find((item) => item.qualifiedName === qualifiedName);
-    if (frozen) return { ...frozen };
-    if (session.durable.frozenCustomization) return fail(`Unknown frozen skill '${qualifiedName}'.`, "skill_unknown");
-    if (previouslyLoaded) {
-      return {
-        qualifiedName,
-        instructions: await this.options.readArtifact(session.identity.sessionId, previouslyLoaded.artifactId),
-        digest: previouslyLoaded.digest,
-        source: previouslyLoaded.source === "home" ? "home" : "workspace"
-      };
+    qualifiedName: string
+  ): { qualifiedName: string; instructions: string; digest: string; source: "home" | "workspace" } {
+    const customization = session.durable.frozenCustomization;
+    if (!customization) {
+      return fail("Session customization is unavailable.", "unsupported_schema_version");
     }
-    if (!this.options.skills) throw new Error("No frozen or current skill catalog is configured for this session.");
-    const loaded = await this.options.skills.load(qualifiedName);
-    return { ...loaded, source: loaded.qualifiedName.startsWith("home:") ? "home" : "workspace" };
+    const frozen = customization.skills.find((item) => item.qualifiedName === qualifiedName);
+    if (frozen) return { ...frozen };
+    return fail(`Unknown frozen skill '${qualifiedName}'.`, "skill_unknown");
   }
 }
 
@@ -135,8 +127,11 @@ function loadedSkillResourceIdentity(
   authority: { qualifiedName: string; digest: string; source: "home" | "workspace" | "builtin" };
 } {
   const customization = session.durable.frozenCustomization;
-  const frozen = customization?.skills.find((item) => item.qualifiedName === qualifiedName);
-  if (customization && !frozen) {
+  if (!customization) {
+    return fail("Session customization is unavailable.", "unsupported_schema_version");
+  }
+  const frozen = customization.skills.find((item) => item.qualifiedName === qualifiedName);
+  if (!frozen) {
     return fail(`Skill '${qualifiedName}' is not frozen in this session.`, "skill_unknown");
   }
   const loaded = session.durable.state.frozenSkills.find((item) => item.qualifiedName === qualifiedName);
@@ -144,10 +139,7 @@ function loadedSkillResourceIdentity(
     `Skill '${qualifiedName}' must be loaded with load_skill before executing resources.`,
     "skill_not_loaded"
   );
-  // Legacy sessions have no customization bundle. Their runtime-authored
-  // skill.loaded event and content-addressed execution manifest form the
-  // immutable compatibility authority after load_skill returns.
-  return { loaded, authority: frozen ?? loaded };
+  return { loaded, authority: frozen };
 }
 
 function assertSkillAllowed(session: RuntimeSession, qualifiedName: string): void {

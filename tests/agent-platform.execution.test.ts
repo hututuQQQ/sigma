@@ -50,7 +50,7 @@ describe("agent-platform execution boundary", () => {
     await expect(runProcess(request)).rejects.toBeInstanceOf(ProcessExecutionUnavailableError);
   });
 
-  it("maps legacy process requests to a required broker policy", async () => {
+  it("maps process requests to a required broker policy", async () => {
     let captured: ExecutionRequest | undefined;
     const execution: ProcessExecutionPort = {
       execute: async (request) => {

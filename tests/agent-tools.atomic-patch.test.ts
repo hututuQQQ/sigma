@@ -287,7 +287,7 @@ describe("applyUnifiedPatch", () => {
     await expectNoWorkspaceTransactionState(root);
   });
 
-  it("does not treat workspace-controlled legacy journals as recovery authority", async () => {
+  it("does not treat workspace-controlled untrusted journals as recovery authority", async () => {
     const root = await workspace();
     const victim = path.join(root, "victim.txt");
     const contents = "keep me\n";

@@ -2,11 +2,10 @@ import { z } from "zod";
 import type { AnyTypedAgentEvent, ExternalEvaluationReport, ProtocolValidationIssue } from "./events.js";
 import { jsonValueSchema } from "./domain-schemas.js";
 import type { JsonValue } from "./json.js";
-import { SNAPSHOT_SCHEMA_VERSION, STORE_LAYOUT_VERSION } from "./versions.js";
+import { SNAPSHOT_SCHEMA_VERSION } from "./versions.js";
 
 export interface SnapshotEnvelope<TState extends JsonValue = JsonValue> {
   schemaVersion: typeof SNAPSHOT_SCHEMA_VERSION;
-  storeLayoutVersion: typeof STORE_LAYOUT_VERSION;
   sessionId: string;
   seq: number;
   createdAt: string;
@@ -31,7 +30,6 @@ export interface EvaluationSink {
 
 const snapshotEnvelopeSchema = z.object({
   schemaVersion: z.literal(SNAPSHOT_SCHEMA_VERSION),
-  storeLayoutVersion: z.literal(STORE_LAYOUT_VERSION),
   sessionId: z.string().min(1),
   seq: z.number().int().nonnegative(),
   createdAt: z.string().refine((value) => Number.isFinite(Date.parse(value)), "Invalid date-time"),
@@ -39,12 +37,24 @@ const snapshotEnvelopeSchema = z.object({
 }).strict();
 
 export class SnapshotValidationError extends Error {
-  readonly code = "invalid_snapshot_envelope";
+  readonly code: "invalid_snapshot_envelope" | "unsupported_schema_version";
+  readonly path?: string;
+  readonly expected?: number;
+  readonly actual?: unknown;
 
-  constructor(readonly issues: readonly ProtocolValidationIssue[]) {
+  constructor(
+    readonly issues: readonly ProtocolValidationIssue[],
+    version?: { path: string; expected: number; actual: unknown }
+  ) {
     const details = issues.map((issue) => `${issue.path.join(".") || "<root>"}: ${issue.message}`).join("; ");
-    super(`Invalid SnapshotEnvelope V${SNAPSHOT_SCHEMA_VERSION}: ${details}`);
+    super(`Invalid SnapshotEnvelope schema ${SNAPSHOT_SCHEMA_VERSION}: ${details}`);
     this.name = "SnapshotValidationError";
+    this.code = version ? "unsupported_schema_version" : "invalid_snapshot_envelope";
+    if (version) {
+      this.path = version.path;
+      this.expected = version.expected;
+      this.actual = version.actual;
+    }
   }
 }
 
@@ -53,6 +63,16 @@ export function isSnapshotEnvelope(value: unknown): value is SnapshotEnvelope {
 }
 
 export function assertSnapshotEnvelope(value: unknown): asserts value is SnapshotEnvelope {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const actual = (value as Record<string, unknown>).schemaVersion;
+    if (actual !== SNAPSHOT_SCHEMA_VERSION) {
+      throw new SnapshotValidationError([{
+        path: ["schemaVersion"],
+        code: "unsupported_schema_version",
+        message: `Snapshot schema expected ${SNAPSHOT_SCHEMA_VERSION}, received ${String(actual)}`
+      }], { path: "schemaVersion", expected: SNAPSHOT_SCHEMA_VERSION, actual });
+    }
+  }
   const result = snapshotEnvelopeSchema.safeParse(value);
   if (result.success) return;
   throw new SnapshotValidationError(result.error.issues.map((issue) => ({

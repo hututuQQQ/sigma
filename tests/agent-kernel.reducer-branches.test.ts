@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   EVENT_SCHEMA_VERSION,
-  emptyLongHorizonStateV2,
+  emptyLongHorizonState,
   type AgentEventEnvelope,
   type AgentEventType,
   type JsonValue
@@ -93,6 +93,7 @@ function toolReceiptPayload(state: KernelState, callId: string, ok = true): Json
     actualEffects: ["filesystem.read"],
     artifacts: [],
     diagnostics: [],
+    evidence: [],
     startedAt: NOW,
     completedAt: NOW
   };
@@ -118,7 +119,7 @@ describe("agent-kernel reducer branch contracts", () => {
     });
     expect(state.messages.at(-1)?.role).toBe("user");
     const promptState = {
-      schemaVersion: 2 as const,
+      schemaVersion: 1 as const,
       sectionDigests: { plan: "a".repeat(64) },
       budgetBand: 100 as const
     };
@@ -233,6 +234,7 @@ describe("agent-kernel reducer branch contracts", () => {
     });
     batch = apply(batch, "tool.completed", toolReceiptPayload(batch, "first"));
     expect(batch).toMatchObject({ phase: "tool_pending", pendingTools: [expect.anything()] });
+    expect(batch.pendingTools).toHaveLength(1);
     expect(apply(batch, "tool.completed", { callId: "bad" })).toEqual(
       expect.objectContaining({ receipts: batch.receipts })
     );
@@ -242,14 +244,14 @@ describe("agent-kernel reducer branch contracts", () => {
     let state = ready();
     expect(apply(state, "run.suspended", { message: "invalid" }).phase).toBe("ready_model");
     state = apply(state, "run.suspended", {
-      requestId: "legacy",
+      requestId: "runtime-request",
       message: "approve",
       remainingDeadlineMs: 10
     });
     expect(state).toMatchObject({
       phase: "needs_input",
       deadlineRemainingMs: 10,
-      outcome: { kind: "needs_input", requestId: "legacy" }
+      outcome: { kind: "needs_input", requestId: "runtime-request" }
     });
     let proposed = complete(start(ready()), {
       message: { role: "assistant", content: "done" },
@@ -309,7 +311,7 @@ describe("agent-kernel reducer branch contracts", () => {
     });
   });
 
-  it("persists only monotonic V8 pruning and correctly authorized review evidence", () => {
+  it("persists only monotonic pruning and correctly authorized review evidence", () => {
     const pruning = {
       schemaVersion: 1 as const,
       coveredBlocks: 3,
@@ -329,7 +331,7 @@ describe("agent-kernel reducer branch contracts", () => {
     }, "tool");
     expect(state.toolResultPrune?.coveredBlocks).toBe(3);
 
-    const longHorizon = { ...emptyLongHorizonStateV2(), goalEpoch: 1 };
+    const longHorizon = { ...emptyLongHorizonState(), goalEpoch: 1 };
     state = apply(state, "long_horizon.updated", { state: {} });
     expect(state.longHorizon.goalEpoch).toBe(0);
     state = apply(state, "long_horizon.updated", { state: longHorizon }, "tool");

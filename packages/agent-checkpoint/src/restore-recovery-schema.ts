@@ -12,20 +12,20 @@ export interface RecoveryOperation {
   index: number;
   backupMoved: boolean;
   installed: boolean;
-  backupIntent?: boolean;
-  installIntent?: boolean;
+  backupIntent: boolean;
+  installIntent: boolean;
   currentImage?: RestoreImageIdentity;
   installedImage?: RestoreImageIdentity;
-  hadCurrent?: boolean;
-  hasDesired?: boolean;
+  hadCurrent: boolean;
+  hasDesired: boolean;
 }
 
 export interface RecoveryJournal {
-  schemaVersion: 1 | 2 | 3 | 4;
+  schemaVersion: 1;
   phase: string;
   operations: RecoveryOperation[];
-  directoryModes?: RestoreDirectoryMode[];
-  finalization?: RestoreFinalization;
+  directoryModes: RestoreDirectoryMode[];
+  finalization: RestoreFinalization;
 }
 
 function safePath(value: string): boolean {
@@ -43,10 +43,6 @@ function restoreImage(value: unknown): value is RestoreImageIdentity {
     && typeof image.digest === "string" && /^[a-f0-9]{64}$/u.test(image.digest);
 }
 
-function optionalBoolean(value: unknown): boolean {
-  return value === undefined || typeof value === "boolean";
-}
-
 function basicRecoveryOperation(operation: Partial<RecoveryOperation>): boolean {
   return [
     Number.isSafeInteger(operation.index),
@@ -54,8 +50,8 @@ function basicRecoveryOperation(operation: Partial<RecoveryOperation>): boolean 
     typeof operation.path === "string" && safePath(operation.path),
     typeof operation.backupMoved === "boolean",
     typeof operation.installed === "boolean",
-    optionalBoolean(operation.backupIntent),
-    optionalBoolean(operation.installIntent)
+    typeof operation.backupIntent === "boolean",
+    typeof operation.installIntent === "boolean"
   ].every(Boolean);
 }
 
@@ -76,12 +72,11 @@ function recoveryImagesValid(operation: Partial<RecoveryOperation>): boolean {
   ].every(Boolean);
 }
 
-function recoveryOperation(value: unknown, schemaVersion: number): value is RecoveryOperation {
+function recoveryOperation(value: unknown): value is RecoveryOperation {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const operation = value as Partial<RecoveryOperation>;
   const basic = basicRecoveryOperation(operation);
-  if (!basic || schemaVersion < 3) return basic;
-  return recoveryImagesValid(operation);
+  return basic && recoveryImagesValid(operation);
 }
 
 function recoveryFinalization(value: unknown): value is RestoreFinalization {
@@ -117,7 +112,7 @@ function recoveryDirectoryMode(value: unknown): value is RestoreDirectoryMode {
 }
 
 function recoverySchemaVersion(value: unknown): value is RecoveryJournal["schemaVersion"] {
-  return value === 1 || value === 2 || value === 3 || value === 4;
+  return value === 1;
 }
 
 function recoveryPhase(value: unknown): value is string {
@@ -130,7 +125,6 @@ function operationsHaveUniqueIndices(operations: readonly RecoveryOperation[]): 
 }
 
 function validDirectoryModes(candidate: Partial<RecoveryJournal>): boolean {
-  if ((candidate.schemaVersion ?? 0) < 3) return true;
   return Array.isArray(candidate.directoryModes)
     && candidate.directoryModes.every(recoveryDirectoryMode);
 }
@@ -140,17 +134,31 @@ function journal(value: unknown, transactionPath: string): RecoveryJournal {
     throw new CheckpointRecoveryError("Checkpoint recovery journal is invalid.", transactionPath);
   }
   const candidate = value as Partial<RecoveryJournal>;
-  if (!recoverySchemaVersion(candidate.schemaVersion)
-    || !recoveryPhase(candidate.phase) || !Array.isArray(candidate.operations)) {
-    throw new CheckpointRecoveryError("Checkpoint recovery journal has an unsupported schema.", transactionPath);
+  if (!recoverySchemaVersion(candidate.schemaVersion)) {
+    const journalPath = path.join(transactionPath, "journal.json");
+    throw Object.assign(
+      new CheckpointRecoveryError(
+        `unsupported_schema_version: checkpoint journal at ${journalPath} expected 1, received ${String(candidate.schemaVersion)}; existing data was not modified`,
+        transactionPath
+      ),
+      {
+        code: "unsupported_schema_version" as const,
+        path: journalPath,
+        expected: 1,
+        actual: candidate.schemaVersion
+      }
+    );
   }
-  if (!candidate.operations.every((operation) => recoveryOperation(operation, candidate.schemaVersion!))) {
+  if (!recoveryPhase(candidate.phase) || !Array.isArray(candidate.operations)) {
+    throw new CheckpointRecoveryError("Checkpoint recovery journal is invalid.", transactionPath);
+  }
+  if (!candidate.operations.every(recoveryOperation)) {
     throw new CheckpointRecoveryError("Checkpoint recovery journal contains an invalid operation.", transactionPath);
   }
   if (!operationsHaveUniqueIndices(candidate.operations as RecoveryOperation[])) {
     throw new CheckpointRecoveryError("Checkpoint recovery journal contains duplicate operation indices.", transactionPath);
   }
-  if (candidate.schemaVersion >= 2 && !recoveryFinalization(candidate.finalization)) {
+  if (!recoveryFinalization(candidate.finalization)) {
     throw new CheckpointRecoveryError("Checkpoint recovery journal finalization is invalid.", transactionPath);
   }
   if (!validDirectoryModes(candidate)) {

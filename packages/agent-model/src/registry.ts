@@ -3,7 +3,7 @@ import { OpenAIModelGateway } from "./openai-gateway.js";
 import type { OpenAIWireProfile } from "./openai-wire.js";
 import { builtinModelSpec, type ModelSpec } from "./catalog.js";
 import { classifyModelFailure } from "./failure-policy.js";
-import type { ProviderSpiV1 } from "./provider-spi.js";
+import type { ProviderSpi } from "./provider-spi.js";
 
 export type SupportedProvider = "deepseek" | "glm";
 
@@ -101,7 +101,7 @@ const defaultCapabilities: ModelCapabilities = {
 };
 
 function sharedAdapter(id: SupportedProvider): Pick<
-  ProviderSpiV1,
+  ProviderSpi,
   "id" | "capabilities" | "stream" | "cancel" | "normalizeUsage" | "classifyError"
 > {
   return {
@@ -114,7 +114,7 @@ function sharedAdapter(id: SupportedProvider): Pick<
   };
 }
 
-const providerAdapters: Readonly<Record<SupportedProvider, ProviderSpiV1>> = {
+const providerAdapters: Readonly<Record<SupportedProvider, ProviderSpi>> = {
   deepseek: {
     ...sharedAdapter("deepseek"),
     defaultModel: (env) => env.DEEPSEEK_MODEL ?? "deepseek-v4-pro",
@@ -127,6 +127,6 @@ const providerAdapters: Readonly<Record<SupportedProvider, ProviderSpiV1>> = {
   }
 };
 
-export function providerAdapter(provider: SupportedProvider): ProviderSpiV1 {
+export function providerAdapter(provider: SupportedProvider): ProviderSpi {
   return providerAdapters[provider];
 }

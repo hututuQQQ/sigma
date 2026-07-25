@@ -1,13 +1,13 @@
 import {
   createBudgetLedger,
   isBudgetLedgerState,
-  isBudgetMutationV1,
+  isBudgetMutation,
   type AgentEventEnvelope,
   type AgentEventType,
   type BudgetAmounts,
   type BudgetLedgerState,
   type BudgetLimits,
-  type BudgetMutationV1
+  type BudgetMutation
 } from "agent-protocol";
 import type { KernelEventReducer } from "./durable-reducers.js";
 
@@ -31,19 +31,6 @@ function sameBudgetAmounts(left: BudgetAmounts, right: BudgetAmounts): boolean {
 
 function sameBudgetLimits(left: BudgetLimits, right: BudgetLimits): boolean {
   return LIMIT_DIMENSIONS.every((dimension) => left[dimension] === right[dimension]);
-}
-
-function sameReservation(
-  left: BudgetLedgerState["reservations"][number],
-  right: BudgetLedgerState["reservations"][number]
-): boolean {
-  return left.reservationId === right.reservationId
-    && left.ownerId === right.ownerId
-    && left.status === right.status
-    && sameBudgetAmounts(left.requested, right.requested)
-    && sameBudgetAmounts(left.consumed, right.consumed)
-    && left.createdAt === right.createdAt
-    && left.settledAt === right.settledAt;
 }
 
 function adjustedBudgetAmounts(
@@ -99,7 +86,7 @@ function pristineLedger(ledger: BudgetLedgerState): boolean {
 
 function applyReserve(
   ledger: BudgetLedgerState,
-  mutation: Extract<BudgetMutationV1, { kind: "reserve" }>
+  mutation: Extract<BudgetMutation, { kind: "reserve" }>
 ): BudgetLedgerState | undefined {
   const reservation = mutation.reservation;
   if (reservation.status !== "reserved" || reservation.settledAt !== undefined
@@ -117,7 +104,7 @@ function applyReserve(
 
 function applySettle(
   ledger: BudgetLedgerState,
-  mutation: Extract<BudgetMutationV1, { kind: "settle" }>
+  mutation: Extract<BudgetMutation, { kind: "settle" }>
 ): BudgetLedgerState | undefined {
   const reservation = ledger.reservations.find((item) => item.reservationId === mutation.reservationId);
   if (!reservation || reservation.status !== "reserved"
@@ -141,7 +128,7 @@ function applySettle(
 
 function applyBind(
   ledger: BudgetLedgerState,
-  mutation: Extract<BudgetMutationV1, { kind: "bind" }>
+  mutation: Extract<BudgetMutation, { kind: "bind" }>
 ): BudgetLedgerState | undefined {
   const reservation = ledger.reservations.find((item) => item.reservationId === mutation.reservationId);
   if (!reservation || reservation.status !== "reserved") return undefined;
@@ -155,7 +142,7 @@ function applyBind(
 
 function applyLimit(
   ledger: BudgetLedgerState,
-  mutation: Extract<BudgetMutationV1, { kind: "limit" }>
+  mutation: Extract<BudgetMutation, { kind: "limit" }>
 ): BudgetLedgerState | undefined {
   if (!LIMIT_DIMENSIONS.some((dimension) => mutation.increase[dimension] > 0)
     || LIMIT_DIMENSIONS.some((dimension) =>
@@ -163,9 +150,9 @@ function applyLimit(
   return { ...ledger, limits: mutation.limits };
 }
 
-export function applyBudgetMutationV1(
+export function applyBudgetMutation(
   ledger: BudgetLedgerState,
-  mutation: BudgetMutationV1
+  mutation: BudgetMutation
 ): BudgetLedgerState | undefined {
   switch (mutation.kind) {
     case "reserve": return applyReserve(ledger, mutation);
@@ -194,127 +181,7 @@ function initialLedger(value: unknown): BudgetLedgerState | undefined {
   return isBudgetLedgerState(candidate) ? candidate : undefined;
 }
 
-function unchangedReservations(
-  before: BudgetLedgerState,
-  after: BudgetLedgerState,
-  changedIndex: number,
-  changed: (beforeItem: BudgetLedgerState["reservations"][number], afterItem: BudgetLedgerState["reservations"][number]) => boolean
-): boolean {
-  return before.reservations.length === after.reservations.length
-    && before.reservations.every((item, index) => index === changedIndex
-      ? changed(item, after.reservations[index]!)
-      : sameReservation(item, after.reservations[index]!));
-}
-
-function legacyReserveTransition(
-  ledger: BudgetLedgerState,
-  candidate: BudgetLedgerState,
-  reservationId: unknown
-): boolean {
-  if (typeof reservationId !== "string" || candidate.reservations.length !== ledger.reservations.length + 1
-    || !ledger.reservations.every((item, index) => sameReservation(item, candidate.reservations[index]!))) return false;
-  const reservation = candidate.reservations.at(-1)!;
-  const reserved = adjustedBudgetAmounts(ledger.reserved, reservation.requested, "add");
-  const limitsCompatible = sameBudgetLimits(ledger.limits, candidate.limits) || pristineLedger(ledger);
-  return reservation.reservationId === reservationId && reservation.status === "reserved"
-    && Boolean(reserved) && limitsCompatible
-    && sameBudgetAmounts(candidate.reserved, reserved!)
-    && sameBudgetAmounts(candidate.consumed, ledger.consumed);
-}
-
-function legacySettleTransition(
-  ledger: BudgetLedgerState,
-  candidate: BudgetLedgerState,
-  reservationId: unknown,
-  status: "committed" | "released"
-): boolean {
-  if (typeof reservationId !== "string" || !sameBudgetLimits(ledger.limits, candidate.limits)) return false;
-  const index = ledger.reservations.findIndex((item) => item.reservationId === reservationId);
-  if (index < 0 || ledger.reservations[index]!.status !== "reserved") return false;
-  const before = ledger.reservations[index]!;
-  const after = candidate.reservations[index];
-  if (!after || !settledReservationMatches(before, after, status)) return false;
-  const reserved = adjustedBudgetAmounts(ledger.reserved, before.requested, "subtract");
-  const consumed = status === "committed"
-    ? adjustedBudgetAmounts(ledger.consumed, after.consumed, "add") : ledger.consumed;
-  return unchangedReservations(ledger, candidate, index, (_prior, next) => sameReservation(after, next))
-    && Boolean(reserved && consumed)
-    && sameBudgetAmounts(candidate.reserved, reserved!)
-    && sameBudgetAmounts(candidate.consumed, consumed!);
-}
-
-function settledReservationMatches(
-  before: BudgetLedgerState["reservations"][number],
-  after: BudgetLedgerState["reservations"][number],
-  status: "committed" | "released"
-): boolean {
-  if (after.status !== status || after.reservationId !== before.reservationId || after.ownerId !== before.ownerId) {
-    return false;
-  }
-  if (!sameBudgetAmounts(after.requested, before.requested)
-    || after.createdAt !== before.createdAt || after.settledAt === undefined) return false;
-  return status !== "released"
-    || BUDGET_DIMENSIONS.every((dimension) => after.consumed[dimension] === 0);
-}
-
-function legacyBindTransition(
-  ledger: BudgetLedgerState,
-  candidate: BudgetLedgerState,
-  reservationId: unknown,
-  ownerId: unknown
-): boolean {
-  if (typeof reservationId !== "string" || typeof ownerId !== "string"
-    || !sameBudgetLimits(ledger.limits, candidate.limits)
-    || !sameBudgetAmounts(ledger.reserved, candidate.reserved)
-    || !sameBudgetAmounts(ledger.consumed, candidate.consumed)) return false;
-  const index = ledger.reservations.findIndex((item) => item.reservationId === reservationId);
-  if (index < 0 || ledger.reservations[index]!.status !== "reserved") return false;
-  return unchangedReservations(ledger, candidate, index, (before, after) =>
-    after.ownerId === ownerId && sameReservation({ ...before, ownerId }, after));
-}
-
-function legacyLimitTransition(
-  ledger: BudgetLedgerState,
-  candidate: BudgetLedgerState,
-  payload: Record<string, unknown>
-): boolean {
-  const previous = initialLedger(payload.previousLimits)?.limits;
-  const increase = payload.increase && typeof payload.increase === "object" && !Array.isArray(payload.increase)
-    ? payload.increase as Record<string, unknown> : undefined;
-  if (!previous || !increase || !sameBudgetLimits(previous, ledger.limits)
-    || !sameBudgetAmounts(ledger.reserved, candidate.reserved)
-    || !sameBudgetAmounts(ledger.consumed, candidate.consumed)
-    || ledger.reservations.length !== candidate.reservations.length
-    || !ledger.reservations.every((item, index) => sameReservation(item, candidate.reservations[index]!))) return false;
-  let positive = false;
-  return LIMIT_DIMENSIONS.every((dimension) => {
-    const amount = increase[dimension] ?? 0;
-    if (!Number.isSafeInteger(amount) || Number(amount) < 0) return false;
-    if (Number(amount) > 0) positive = true;
-    return ledger.limits[dimension] + Number(amount) === candidate.limits[dimension];
-  }) && positive;
-}
-
-function validLegacyTransition(
-  ledger: BudgetLedgerState,
-  event: AgentEventEnvelope,
-  payload: Record<string, unknown>,
-  candidate: BudgetLedgerState
-): boolean {
-  if (!isBudgetLedgerSemanticallyValid(candidate)) return false;
-  switch (event.type) {
-    case "budget.reserved": return legacyReserveTransition(ledger, candidate, payload.reservationId);
-    case "budget.committed": return legacySettleTransition(ledger, candidate, payload.reservationId, "committed");
-    case "budget.released": return legacySettleTransition(ledger, candidate, payload.reservationId, "released");
-    case "budget.reservation_bound": return legacyBindTransition(
-      ledger, candidate, payload.reservationId, payload.ownerId
-    );
-    case "budget.limit_increased": return legacyLimitTransition(ledger, candidate, payload);
-    default: return false;
-  }
-}
-
-function mutationMatchesEvent(event: AgentEventEnvelope, mutation: BudgetMutationV1): boolean {
+function mutationMatchesEvent(event: AgentEventEnvelope, mutation: BudgetMutation): boolean {
   const expectedKind = MUTATION_KIND_BY_EVENT[event.type as keyof typeof MUTATION_KIND_BY_EVENT];
   if (!expectedKind || mutation.kind !== expectedKind) return false;
   if (event.type === "budget.committed") return mutation.kind === "settle" && mutation.status === "committed";
@@ -335,16 +202,10 @@ function replayBudgetMutationEvent(
   if (!ledger || !isBudgetLedgerSemanticallyValid(ledger)) {
     throw new InvalidBudgetTransitionError(event.type, "the prior ledger is missing or semantically invalid");
   }
-  if (isBudgetLedgerState(payload.ledger)) {
-    if (!validLegacyTransition(ledger, event, payload, payload.ledger)) {
-      throw new InvalidBudgetTransitionError(event.type, "legacy full-ledger state does not match the declared transition");
-    }
-    return payload.ledger;
-  }
-  if (!isBudgetMutationV1(payload.mutation) || !mutationMatchesEvent(event, payload.mutation)) {
+  if (!isBudgetMutation(payload.mutation) || !mutationMatchesEvent(event, payload.mutation)) {
     throw new InvalidBudgetTransitionError(event.type, "compact mutation does not match the event type");
   }
-  const next = applyBudgetMutationV1(ledger, payload.mutation);
+  const next = applyBudgetMutation(ledger, payload.mutation);
   if (!next || !isBudgetLedgerSemanticallyValid(next)) {
     throw new InvalidBudgetTransitionError(event.type, "compact mutation totals or reservation state are invalid");
   }
@@ -352,11 +213,8 @@ function replayBudgetMutationEvent(
 }
 
 /**
- * Replays one durable budget authority event. The optional input lets recovery
- * establish the zero-usage ledger from a legacy session.created event before
- * applying either legacy full-ledger records or compact BudgetMutationV1
- * records. Kernel reduction and out-of-process child recovery share this path
- * so their accounting cannot drift.
+ * Replays one durable budget authority event. Kernel reduction and
+ * out-of-process child recovery share this path so their accounting cannot drift.
  */
 export function replayBudgetLedgerEvent(
   ledger: BudgetLedgerState | undefined,
@@ -371,13 +229,13 @@ export function replayBudgetLedgerEvent(
       if (!isBudgetLedgerSemanticallyValid(ledger) || !pristineLedger(ledger)) {
         throw new InvalidBudgetTransitionError(event.type, "session creation cannot reset an established ledger");
       }
-      const declared = payload.budgetLimits === undefined ? undefined : initialLedger(payload.budgetLimits);
-      if (payload.budgetLimits !== undefined && (!declared || !sameBudgetLimits(declared.limits, ledger.limits))) {
+      const declared = initialLedger(payload.budgetLimits);
+      if (!declared || !sameBudgetLimits(declared.limits, ledger.limits)) {
         throw new InvalidBudgetTransitionError(event.type, "declared limits do not match the initialized ledger");
       }
       return ledger;
     }
-    const initial = payload.budgetLimits === undefined ? createBudgetLedger() : initialLedger(payload.budgetLimits);
+    const initial = initialLedger(payload.budgetLimits);
     if (!initial) throw new InvalidBudgetTransitionError(event.type, "initial budget limits are invalid");
     return initial;
   }

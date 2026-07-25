@@ -73,7 +73,7 @@ export async function finalizeChildCompletion(
     childId,
     planNodeIds,
     outcome,
-    evidence: { evidenceId: evidence.evidenceId, kind: evidence.kind }
+    evidence: { evidenceId: evidence.evidenceId, kind: evidence.kind, claim: "acceptance_met" }
   });
 }
 

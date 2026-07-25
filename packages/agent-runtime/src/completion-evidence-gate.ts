@@ -21,7 +21,7 @@ import { substantiveReview } from "./review-coordinator-support.js";
 export { completionCandidate } from "./completion-gate-common.js";
 export { completionFailure } from "./completion-terminal-gate.js";
 export type {
-  CompletionCandidateV1,
+  CompletionCandidate,
   CompletionGateDecision
 } from "./completion-gate-common.js";
 
@@ -265,7 +265,7 @@ function unavailableReviewDecision(
       action: "fail",
       authority: "provider_protocol",
       code: "verification_unavailable",
-      message: "Independent completion review claimed approval without valid durable V3 evidence provenance. The result is incomplete and is not reported as verified."
+      message: "Independent completion review claimed approval without valid durable evidence provenance. The result is incomplete and is not reported as verified."
     };
   }
   return undefined;

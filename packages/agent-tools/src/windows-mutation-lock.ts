@@ -17,7 +17,7 @@ export async function lockWindowsMutationRoots(
   plan: ToolCallPlan
 ): Promise<WindowsDirectoryLock | undefined> {
   if (process.platform !== "win32"
-    || plan.mutationAuthority === "disposable_enclosing_container_v1"
+    || plan.mutationAuthority === "disposable_enclosing_container"
     || !plan.exactEffects.includes("filesystem.write")) return undefined;
   const workspace = path.resolve(context.workspacePath);
   const directories = await windowsMutationDirectories(workspace, plan);

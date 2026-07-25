@@ -11,21 +11,20 @@ async function exists(target: string): Promise<boolean> {
   });
 }
 
-export class SessionStorageVersionUnsupportedError extends Error {
+export class SessionStorageUnsupportedError extends Error {
   readonly code = "session_not_found";
 
   constructor(readonly sessionId: string) {
-    super(`V5 session '${sessionId}' does not exist in the current store.`);
-    this.name = "SessionStorageVersionUnsupportedError";
+    super(`Session '${sessionId}' does not exist in the current store.`);
+    this.name = "SessionStorageUnsupportedError";
   }
 }
 
-/** V5 deliberately inspects only stores/v5. Older stores are neither probed
- * nor normalized into current envelopes; they remain the responsibility of
- * their original binary. */
+/** Reads only the current stores/v1 layout. Unsupported layouts are rejected
+ * by the store before any session data is changed. */
 export async function assertSessionStorageSupported(rootDir: string, sessionId: string): Promise<void> {
   if (!await exists(path.join(sessionDirectory(rootDir, sessionId), "meta.json"))) {
-    throw new SessionStorageVersionUnsupportedError(sessionId);
+    throw new SessionStorageUnsupportedError(sessionId);
   }
 }
 

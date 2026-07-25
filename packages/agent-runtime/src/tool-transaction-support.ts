@@ -21,7 +21,7 @@ interface NoChangePreparedTool {
 }
 
 export function delegatesWorkspaceMutation(plan: ToolCallPlan): boolean {
-  return plan.mutationAuthority === "disposable_enclosing_container_v1"
+  return plan.mutationAuthority === "disposable_enclosing_container"
     || (plan.exactEffects.includes("agent.spawn") && plan.processMode === "background");
 }
 
@@ -123,8 +123,8 @@ export async function createMutationCheckpoint(
   plan: ToolCallPlan
 ): Promise<CheckpointRef | undefined> {
   if (plan.checkpointAction
-    || plan.mutationAuthority === "broker_repository_transaction_v2"
-    || plan.mutationAuthority === "disposable_enclosing_container_v1") {
+    || plan.mutationAuthority === "broker_repository_transaction"
+    || plan.mutationAuthority === "disposable_enclosing_container") {
     return undefined;
   }
   if (!mutatingPlan(plan) || delegatesWorkspaceMutation(plan)) return undefined;

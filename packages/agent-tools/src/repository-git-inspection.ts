@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type {
   JsonValue,
-  RepositoryRecoverySelectionEvidenceV1,
+  RepositoryRecoverySelectionEvidence,
   ToolExecutionContext,
   ToolReceipt,
   ToolRequest
@@ -13,12 +13,12 @@ import {
   type RepositoryWorktreeTopology
 } from "./repository-git-execution.js";
 import {
-  collectRepositoryInspectionV2,
+  collectRepositoryInspection,
   repositoryInspectionDigest
 } from "./repository-git-inspection-probes.js";
 import type {
-  RepositoryInspectionV2,
-  RepositoryRecoveryCandidateV2
+  RepositoryInspection,
+  RepositoryRecoveryCandidate
 } from "./repository-git-inspection-types.js";
 import { RepositoryRecoverySelectionStore } from "./repository-recovery-selection.js";
 import {
@@ -32,7 +32,7 @@ export * from "./repository-git-inspection-types.js";
 
 function inspectionRepositoryStateDigest(
   topology: RepositoryWorktreeTopology,
-  inspection: RepositoryInspectionV2
+  inspection: RepositoryInspection
 ): string {
   return repositoryInspectionDigest({
     root: topology.worktreeRoot,
@@ -49,10 +49,10 @@ function selectionEvidence(
   request: ToolRequest,
   context: ToolExecutionContext,
   topology: RepositoryWorktreeTopology,
-  inspection: RepositoryInspectionV2,
-  candidate: RepositoryRecoveryCandidateV2,
+  inspection: RepositoryInspection,
+  candidate: RepositoryRecoveryCandidate,
   selectionKind: "unique" | "model_selectable"
-): RepositoryRecoverySelectionEvidenceV1 | undefined {
+): RepositoryRecoverySelectionEvidence | undefined {
   const goalEpoch = context.goalEpoch;
   if (goalEpoch === undefined) return undefined;
   return {
@@ -88,9 +88,9 @@ function applySelection(
   request: ToolRequest,
   context: ToolExecutionContext,
   topology: RepositoryWorktreeTopology,
-  inspection: RepositoryInspectionV2,
+  inspection: RepositoryInspection,
   store?: RepositoryRecoverySelectionStore
-): RepositoryRecoverySelectionEvidenceV1[] {
+): RepositoryRecoverySelectionEvidence[] {
   if (!inspection.complete) {
     inspection.selectionStatus = { status: "unavailable", reason: "inspection_incomplete" };
     return [];
@@ -138,8 +138,8 @@ function repositoryInspectionReceipt(
   request: ToolRequest,
   context: ToolExecutionContext,
   startedAt: string,
-  value: RepositoryInspectionV2,
-  selections: readonly RepositoryRecoverySelectionEvidenceV1[]
+  value: RepositoryInspection,
+  selections: readonly RepositoryRecoverySelectionEvidence[]
 ): ToolReceipt {
   const output = JSON.stringify(value);
   const readEvidence = structuredReadEvidence(
@@ -176,7 +176,7 @@ async function executeRepositoryInspection(
   }
   try {
     const topology = await repositoryInspectionTopologyCandidate(context);
-    const value = await collectRepositoryInspectionV2(execution, topology, context.signal);
+    const value = await collectRepositoryInspection(execution, topology, context.signal);
     const selections = applySelection(request, context, topology, value, store);
     return repositoryInspectionReceipt(request, context, startedAt, value, selections);
   } catch (error) {

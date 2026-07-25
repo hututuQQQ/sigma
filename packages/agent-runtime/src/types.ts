@@ -22,11 +22,11 @@ import type {
   SkillCatalog
 } from "agent-extensions";
 import type { ProcessExecutionPort, RuntimeEnvironment } from "agent-platform";
-import type { ManagedSessionBindingV1, ProcessHandle } from "agent-execution";
+import type { ManagedSessionBinding, ProcessHandle } from "agent-execution";
 import type { ReviewerPort } from "./reviewer.js";
 import type { AsyncQueue } from "./async-queue.js";
 import type { ApprovalBinding } from "./approval-binding.js";
-import type { SubjectAttestationContextV1 } from "./subject-attestation.js";
+import type { SubjectAttestationContext } from "./subject-attestation.js";
 
 export interface RuntimeAgentProfile {
   profile: FrozenAgentProfile;
@@ -69,7 +69,7 @@ export interface RuntimeOptions {
   runtimeEnvironment?: RuntimeEnvironment;
   /** Runtime-authority provenance supplied by a trusted launcher. Never derive
    * this from the workspace being operated on. */
-  subjectAttestation?: SubjectAttestationContextV1;
+  subjectAttestation?: SubjectAttestationContext;
   joinChildren?(parentSessionId: string, signal: AbortSignal): Promise<ChildJoinSummary>;
   cancelChildren?(parentSessionId: string, reason: string): Promise<void> | void;
   hasActiveChildren?(parentSessionId: string): Promise<boolean> | boolean;
@@ -84,6 +84,7 @@ export interface ApprovalWaiter {
   effects: readonly ToolEffect[];
   /** Exact durable authority shown to the user for this request. */
   binding?: ApprovalBinding;
+  /** Marks an approval reconstructed from the current durable event log. */
   recovered?: boolean;
   resolving?: boolean;
   external?: {
@@ -156,7 +157,7 @@ export interface RuntimeSessionExecutionState {
   /** Runtime-local broker handles; never restored across process restart. */
   processHandles: Map<string, ProcessHandle>;
   /** Runtime-only capability; never serialized into model-visible history. */
-  managedSessionBinding?: ManagedSessionBindingV1;
+  managedSessionBinding?: ManagedSessionBinding;
 }
 
 export interface RuntimeSessionInteractionState {

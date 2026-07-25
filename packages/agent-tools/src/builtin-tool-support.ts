@@ -37,16 +37,24 @@ export function receipt(
   startedAt: string,
   input: Partial<Omit<ToolReceipt, "callId" | "startedAt" | "completedAt">>
 ): ToolReceipt {
+  const ok = input.ok ?? true;
+  const output = input.output ?? "";
+  const diagnostics = input.diagnostics ?? [];
   return {
     callId: request.callId,
-    ok: input.ok ?? true,
-    output: input.output ?? "",
+    ok,
+    output,
     ...(input.result === undefined ? {} : { result: input.result }),
+    outcome: input.outcome ?? {
+      status: ok ? "succeeded" : "failed",
+      output,
+      diagnosticCodes: diagnostics
+    },
     observedEffects: input.observedEffects ?? [],
     actualEffects: input.actualEffects ?? input.observedEffects ?? [],
     workspaceDelta: input.workspaceDelta,
     artifacts: input.artifacts ?? [],
-    diagnostics: input.diagnostics ?? [],
+    diagnostics,
     evidence: input.evidence ?? [],
     startedAt,
     completedAt: new Date().toISOString()

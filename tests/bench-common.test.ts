@@ -5,7 +5,7 @@ import { EventEmitter } from "node:events";
 import { describe, expect, it } from "vitest";
 import {
   assertUniqueHarborTaskExecutionIdentities,
-  buildResolvedTaskAttestationV2,
+  buildResolvedTaskAttestation,
   buildHarborArgs,
   buildHarborJobConfig,
   buildHarborTimeoutProbeConfig,
@@ -160,40 +160,39 @@ describe("Terminal-Bench command construction", () => {
     const tasksFile = path.join(directory, "tasks.json");
     await writeFile(tasksFile, `${JSON.stringify([{
       name: "registry/task-one",
-      source: "legacy-catalog"
+      provenance_source: "catalog"
     }])}\n`, "utf8");
 
     const [task] = readTaskSelectionFile(tasksFile);
-    expect(task).toMatchObject({ name: "registry/task-one", provenance_source: "legacy-catalog" });
+    expect(task).toMatchObject({ name: "registry/task-one", provenance_source: "catalog" });
     expect(projectHarborTaskConfig({ ...task, untrusted: "ignored" })).toEqual({ name: "registry/task-one" });
     expect(buildHarborJobConfig({ mode: "batch", tasks: [task] }, "jobs").tasks).toEqual([
       { name: "registry/task-one" }
     ]);
     expect(taskSelectionIdentitySha256(task)).not.toBe(harborTaskExecutionIdentitySha256(task));
 
-    const attestation = buildResolvedTaskAttestationV2({
+    const attestation = buildResolvedTaskAttestation({
       jobConfigSha256: "a".repeat(64),
       taskSelectionSha256: "b".repeat(64),
       selectedTasks: [task],
       resolvedTasks: [{ name: "registry/task-one" }]
     });
     expect(attestation).toMatchObject({
-      schema_version: 2,
+      schema_version: 1,
       job_config_sha256: "a".repeat(64),
       task_selection_sha256: "b".repeat(64),
-      tasks: [{ selection_identity: { provenance_source: "legacy-catalog" } }]
+      tasks: [{ selection_identity: { provenance_source: "catalog" } }]
     });
   });
 
-  it("rejects conflicting provenance aliases and duplicate execution identities", async () => {
+  it("rejects unsupported task fields and duplicate execution identities", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "sigma-task-provenance-conflict-"));
     const tasksFile = path.join(directory, "tasks.json");
     await writeFile(tasksFile, `${JSON.stringify([{
       name: "registry/task-one",
-      source: "catalog-a",
-      provenance_source: "catalog-b"
+      source: "catalog-a"
     }])}\n`, "utf8");
-    expect(() => readTaskSelectionFile(tasksFile)).toThrow(/source and provenance_source conflict/u);
+    expect(() => readTaskSelectionFile(tasksFile)).toThrow(/unsupported fields: source/u);
     expect(() => assertUniqueHarborTaskExecutionIdentities([
       { name: "registry/task-one", provenance_source: "a" },
       { name: "registry/task-one", provenance_source: "b" }

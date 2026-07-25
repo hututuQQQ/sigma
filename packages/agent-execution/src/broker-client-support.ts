@@ -283,10 +283,11 @@ export function projectedOutputStream(
   }
   const prefix = redactor.redactText(chunk.data);
   const artifact = outputArtifacts.find((item) => item.stream === stream);
-  const notice = artifact
-    ? `[NON_TEXT_${stream.toUpperCase()} preserved in '${artifact.name}'; bytes=${String(artifact.sizeBytes)}; sha256=${artifact.brokerSha256}]`
-    : `[NON_TEXT_${stream.toUpperCase()} could not be projected as UTF-8; exact bytes were unavailable from this broker]`;
-  return [prefix, notice].filter(Boolean).join("\n");
+  if (!artifact) {
+    throw new BrokerProtocolError(`Process ${stream} decoding errors require a matching byte-safe output artifact.`);
+  }
+  return [prefix, `[NON_TEXT_${stream.toUpperCase()} preserved in '${artifact.name}'; bytes=${String(artifact.sizeBytes)}; sha256=${artifact.brokerSha256}]`]
+    .filter(Boolean).join("\n");
 }
 
 export function createProcessRedaction(

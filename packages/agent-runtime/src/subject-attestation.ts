@@ -1,12 +1,12 @@
 import { createHash } from "node:crypto";
-import { SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1, type JsonValue } from "agent-protocol";
+import { SUBJECT_ATTESTATION_EVIDENCE_SOURCE, type JsonValue } from "agent-protocol";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 import type { RuntimeSession } from "./types.js";
 
-export const SUBJECT_ATTESTATION_SOURCE_V1 = SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1;
-export const SUBJECT_ATTESTOR_ID_V1 = "subject-attestor";
+export const SUBJECT_ATTESTATION_SOURCE = SUBJECT_ATTESTATION_EVIDENCE_SOURCE;
+export const SUBJECT_ATTESTOR_ID = "subject-attestor";
 
-export interface SubjectProductAttestationV1 {
+export interface SubjectProductAttestation {
   schemaVersion: 1;
   productDigest: string;
   buildArtifactDigest: string;
@@ -14,12 +14,12 @@ export interface SubjectProductAttestationV1 {
   platform: "win32" | "linux";
 }
 
-export interface SubjectAttestationContextV1 extends SubjectProductAttestationV1 {
+export interface SubjectAttestationContext extends SubjectProductAttestation {
   configurationDigest: string;
   surface: string;
 }
 
-export interface SubjectAttestationV1 extends SubjectAttestationContextV1 {
+export interface SubjectAttestation extends SubjectAttestationContext {
   provider: string;
   model: string;
 }
@@ -78,13 +78,13 @@ function canonical(value: JsonValue): string {
     .map(([key, item]) => `${JSON.stringify(key)}:${canonical(item)}`).join(",")}}`;
 }
 
-export function digestSubjectConfigurationV1(configuration: JsonValue): string {
+export function digestSubjectConfiguration(configuration: JsonValue): string {
   return createHash("sha256")
     .update(canonical({ schemaVersion: 1, configuration }), "utf8")
     .digest("hex");
 }
 
-export function assertSubjectProductAttestationV1(input: unknown): SubjectProductAttestationV1 {
+export function assertSubjectProductAttestation(input: unknown): SubjectProductAttestation {
   const value = record(input, "Subject product attestation");
   exactKeys(value, [
     "schemaVersion", "productDigest", "buildArtifactDigest", "environmentDigest", "platform"
@@ -99,13 +99,13 @@ export function assertSubjectProductAttestationV1(input: unknown): SubjectProduc
   };
 }
 
-export function assertSubjectAttestationContextV1(input: unknown): SubjectAttestationContextV1 {
+export function assertSubjectAttestationContext(input: unknown): SubjectAttestationContext {
   const value = record(input, "Subject attestation context");
   exactKeys(value, [
     "schemaVersion", "productDigest", "buildArtifactDigest", "environmentDigest", "platform",
     "configurationDigest", "surface"
   ], "Subject attestation context");
-  const product = assertSubjectProductAttestationV1({
+  const product = assertSubjectProductAttestation({
     schemaVersion: value.schemaVersion,
     productDigest: value.productDigest,
     buildArtifactDigest: value.buildArtifactDigest,
@@ -119,28 +119,28 @@ export function assertSubjectAttestationContextV1(input: unknown): SubjectAttest
   };
 }
 
-export function createSubjectAttestationContextV1(
+export function createSubjectAttestationContext(
   product: unknown,
   configuration: JsonValue,
   surface: string,
   observedPlatform: NodeJS.Platform
-): SubjectAttestationContextV1 {
-  const trusted = assertSubjectProductAttestationV1(product);
+): SubjectAttestationContext {
+  const trusted = assertSubjectProductAttestation(product);
   if (trusted.platform !== observedPlatform) {
     throw new Error("Subject product attestation platform does not match the runtime platform.");
   }
   return {
     ...trusted,
-    configurationDigest: digestSubjectConfigurationV1(configuration),
+    configurationDigest: digestSubjectConfiguration(configuration),
     surface: code(surface, "Subject attestation surface")
   };
 }
 
 export function subjectAttestationForSession(
-  context: SubjectAttestationContextV1,
+  context: SubjectAttestationContext,
   session: RuntimeSession
-): SubjectAttestationV1 {
-  const trusted = assertSubjectAttestationContextV1(context);
+): SubjectAttestation {
+  const trusted = assertSubjectAttestationContext(context);
   return {
     ...trusted,
     provider: code(session.services.gateway.provider, "Subject attestation provider"),
@@ -148,9 +148,9 @@ export function subjectAttestationForSession(
   };
 }
 
-export async function emitSubjectAttestationV1(
+export async function emitSubjectAttestation(
   session: RuntimeSession,
-  context: SubjectAttestationContextV1 | undefined,
+  context: SubjectAttestationContext | undefined,
   emit: RuntimeEventEmitter
 ): Promise<void> {
   if (!context || session.identity.parentSessionId) return;
@@ -162,8 +162,8 @@ export async function emitSubjectAttestationV1(
     kind: "diagnostic",
     status: "informational",
     createdAt: new Date().toISOString(),
-    producer: { authority: "runtime", id: SUBJECT_ATTESTOR_ID_V1 },
+    producer: { authority: "runtime", id: SUBJECT_ATTESTOR_ID },
     summary: "Subject build identity was frozen before execution.",
-    data: { source: SUBJECT_ATTESTATION_SOURCE_V1, diagnostic: { ...diagnostic } }
+    data: { source: SUBJECT_ATTESTATION_SOURCE, diagnostic: { ...diagnostic } }
   });
 }

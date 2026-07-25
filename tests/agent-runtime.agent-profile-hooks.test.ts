@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import type { BrokerDoctorReport, ExecutionBroker } from "../packages/agent-execution/src/index.js";
 import {
+  DEFAULT_PROFILE_ASSURANCE,
   DEFAULT_PROFILE_BUDGET,
   freezeAgentProfile,
   type HookDefinition,
@@ -96,6 +97,7 @@ function profile(id: string, hookIds: string[] = []): ReturnType<typeof freezeAg
       checkpointBeforeMutation: true,
       reviewMode: "advisory"
     },
+    assurancePolicy: { ...DEFAULT_PROFILE_ASSURANCE },
     allowedChildProfiles: []
   };
   return freezeAgentProfile(value);
@@ -357,7 +359,18 @@ describe("production agent-profile hook runner", () => {
       occurredAt: new Date().toISOString(),
       type: "budget.reserved",
       authority: "runtime",
-      payload: { reservationId, ledger }
+      payload: {
+        reservationId,
+        mutation: {
+          schemaVersion: 1,
+          kind: "reserve",
+          reservation: ledger.reservations[0]!,
+          totals: {
+            consumed: ledger.consumed,
+            reserved: ledger.reserved
+          }
+        }
+      }
     }, last.seq);
 
     const second = createRuntime(options);

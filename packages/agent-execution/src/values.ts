@@ -3,9 +3,9 @@ import { protocolRecord } from "./protocol.js";
 import { booleanValue, stringValue } from "./broker-value-primitives.js";
 import {
   BROKER_PROTOCOL_VERSION,
-  type RepositoryMetadataLeaseV1,
-  type ScratchLeaseV1,
-  type ProcessLaunchFailureV1,
+  type RepositoryMetadataLease,
+  type ScratchLease,
+  type ProcessLaunchFailure,
   type ProcessState
 } from "./types.js";
 
@@ -39,7 +39,7 @@ export interface ProcessValue {
   stdout: OutputChunkValue;
   stderr: OutputChunkValue;
   outputArtifacts: OutputArtifactValue[];
-  failure?: ProcessLaunchFailureV1;
+  failure?: ProcessLaunchFailure;
 }
 
 export interface ExecutionValue extends ProcessValue {
@@ -66,7 +66,7 @@ function nullableExitCode(value: unknown): number | null {
   return value as number;
 }
 
-function processLaunchFailure(input: unknown): ProcessLaunchFailureV1 | undefined {
+function processLaunchFailure(input: unknown): ProcessLaunchFailure | undefined {
   if (input === undefined) return undefined;
   const value = protocolRecord(input, "Process failure");
   if (value.phase !== "sandbox_launch") {
@@ -149,7 +149,7 @@ function processState(input: unknown): Exclude<ProcessState, "lost"> {
   throw new BrokerProtocolError(`Invalid process state '${String(input)}'.`);
 }
 
-export function parseScratchLease(input: unknown): ScratchLeaseV1 {
+export function parseScratchLease(input: unknown): ScratchLease {
   const value = protocolRecord(input, "Broker scratch lease");
   if (value.protocolVersion !== 1 || value.lifetime !== "runtime_session"
     || value.isolation !== "private" || value.persistentAcrossCalls !== true) {
@@ -201,7 +201,7 @@ export function parseSpawnedProcess(input: unknown): { id: string; systemProcess
   return { id, ...(processId === undefined ? {} : { systemProcessId: processId as number }) };
 }
 
-export function parseRepositoryMetadataLease(input: unknown): RepositoryMetadataLeaseV1 {
+export function parseRepositoryMetadataLease(input: unknown): RepositoryMetadataLease {
   const value = protocolRecord(input, "Repository metadata lease");
   if (value.protocolVersion !== 1 || value.network !== "none" || value.uses !== 1) {
     throw new BrokerProtocolError("Repository metadata lease has unsupported semantics.");
@@ -250,13 +250,22 @@ export function parseProcessValue(input: unknown): ProcessValue {
   if (state === "running" && failure) {
     throw new BrokerProtocolError("Running processes cannot publish a launch failure.");
   }
+  const stdout = outputChunk(value.stdout, "Process stdout");
+  const stderr = outputChunk(value.stderr, "Process stderr");
+  for (const [stream, chunk] of [["stdout", stdout], ["stderr", stderr]] as const) {
+    if (chunk.decodingError && !artifacts.some((artifact) => artifact.stream === stream)) {
+      throw new BrokerProtocolError(
+        `Process ${stream} decoding errors require a matching byte-safe output artifact.`
+      );
+    }
+  }
   return {
     state,
     exitCode: nullableExitCode(value.exitCode),
     signal: nullableString(value.signal, "Process signal"),
     durationMs: integerValue(value.durationMs, "Process durationMs"),
-    stdout: outputChunk(value.stdout, "Process stdout"),
-    stderr: outputChunk(value.stderr, "Process stderr"),
+    stdout,
+    stderr,
     outputArtifacts: artifacts,
     ...(failure ? { failure } : {})
   };

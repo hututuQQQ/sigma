@@ -101,7 +101,7 @@ export interface ModelRoute {
 }
 
 const approximateTokenizer: TokenizerMetadata = {
-  id: "sigma/cjk-byte-v1",
+  id: "sigma/cjk-byte",
   accuracy: "approximate",
   assetDigest: "d80956868f0d3660b3963e24f16475e592c67cebfe71dc2836cd8403e461f760"
 };

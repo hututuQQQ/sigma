@@ -156,7 +156,7 @@ function review(
     producer: { authority: "runtime", id: "reviewer" },
     summary: verdict,
     data: {
-      schemaVersion: 3,
+      schemaVersion: 1,
       reviewerId: "reviewer",
       ...(actualCheck ? { reviewRequestId: `review-request:${id}` } : {}),
       verdict,
@@ -183,7 +183,7 @@ function review(
   };
 }
 
-describe("V6 Standard and Strict completion policy", () => {
+describe("Standard and Strict completion policy", () => {
   it("gives Standard one validation reminder and then completes honestly", () => {
     const session = candidateSession("off");
     const first = completionGateDecision(session);
@@ -235,7 +235,7 @@ describe("V6 Standard and Strict completion policy", () => {
     });
   });
 
-  it("requires V9 reviewer approval for every Standard mutation completion", () => {
+  it("requires reviewer approval for every Standard mutation completion", () => {
     const missing = candidateSession("advisory");
     expect(completionGateDecision(missing)).toMatchObject({
       action: "fail",

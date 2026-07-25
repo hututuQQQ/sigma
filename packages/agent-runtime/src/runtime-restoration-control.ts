@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { ProcessExecutionPort } from "agent-platform";
-import type { WorkspaceRestorationEvidenceV1 } from "agent-protocol";
+import type { WorkspaceRestorationEvidence } from "agent-protocol";
 import type { RuntimeCheckpointControl } from "./runtime-checkpoint-control.js";
 import type { RuntimeControlServiceOptions } from "./runtime-control-contracts.js";
 import type { RuntimeSession } from "./types.js";
@@ -47,7 +47,7 @@ export class RuntimeRestorationControl {
   async restoreRunChanges(
     session: RuntimeSession,
     callId: string
-  ): Promise<WorkspaceRestorationEvidenceV1["data"]> {
+  ): Promise<WorkspaceRestorationEvidence["data"]> {
     await this.assertQuiescence(session, callId, false);
     const repositoryStateDigest = await this.restoreRepositoryBaselines(session);
     const inspection = await this.checkpoints.restoreRunChanges(session);
@@ -57,7 +57,7 @@ export class RuntimeRestorationControl {
   async confirmRunRestored(
     session: RuntimeSession,
     callId: string
-  ): Promise<WorkspaceRestorationEvidenceV1["data"]> {
+  ): Promise<WorkspaceRestorationEvidence["data"]> {
     await this.assertQuiescence(session, callId, true);
     const inspection = await this.checkpoints.inspectRunRestoration(session);
     if (!inspection.restored) {
@@ -84,9 +84,9 @@ export class RuntimeRestorationControl {
     inspection: import("agent-checkpoint").RunRestorationInspection,
     explicitRestore: boolean,
     repositoryStateDigest?: string
-  ): Promise<WorkspaceRestorationEvidenceV1["data"]> {
+  ): Promise<WorkspaceRestorationEvidence["data"]> {
     const frontier = session.durable.state.mutationFrontier;
-    const data: WorkspaceRestorationEvidenceV1["data"] = {
+    const data: WorkspaceRestorationEvidence["data"] = {
       schemaVersion: 1,
       goalEpoch: session.durable.state.messages.filter((message) => message.role === "user").length,
       frontierRevision: frontier.revision,
@@ -106,14 +106,14 @@ export class RuntimeRestorationControl {
         ? { status: "restored", stateDigest: repositoryStateDigest }
         : { status: "unchanged" }
     };
-    const evidence: WorkspaceRestorationEvidenceV1 = {
+    const evidence: WorkspaceRestorationEvidence = {
       evidenceId: randomUUID(),
       sessionId: session.identity.sessionId,
       runId: session.durable.runId,
       kind: "restoration",
       status: inspection.restored ? "passed" : "failed",
       createdAt: new Date().toISOString(),
-      producer: { authority: "runtime", id: "workspace-restoration-v1" },
+      producer: { authority: "runtime", id: "workspace-restoration" },
       summary: inspection.restored
         ? "The current goal epoch is quiescent and the workspace matches its run baseline."
         : "The workspace does not match its run baseline.",

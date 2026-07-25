@@ -18,3 +18,8 @@ provider, model, endpoint host, latency, and a bounded error summary without
 API keys. On timeout or cancellation, local `timeout.json`, `summary.json`,
 `trace.jsonl`, and bounded `stdout.partial.log`/`stderr.partial.log` files are
 written before the original Harbor timeout/cancellation is propagated.
+
+Adapter-owned structured summaries and traces use schema 1 and current,
+unversioned artifact names. The formal task boundary accepts
+`provenance_source` only; removed field aliases are not reconstructed for the
+solver.

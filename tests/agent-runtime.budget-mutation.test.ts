@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  applyBudgetMutationV1,
+  applyBudgetMutation,
   createKernelState,
   isBudgetLedgerSemanticallyValid,
   rehydrate,
@@ -86,60 +86,6 @@ describe("compact budget mutation persistence", () => {
     expect(target.durable.state.budget.reserved.inputTokens).toBe(0);
   });
 
-  it("replays legacy full-ledger and compact mutation events in one session", () => {
-    const initial = createKernelState({
-      sessionId: "budget-session",
-      runId: "budget-run",
-      mode: "change",
-      startedAt: new Date(0).toISOString(),
-      deadlineAt: new Date(60_000).toISOString()
-    });
-    const first = reservation("first", 10, new Date(1_000).toISOString());
-    const legacyReserved: BudgetLedgerState = {
-      ...initial.budget,
-      reserved: amounts(10),
-      reservations: [first]
-    };
-    const second = reservation("second", 20, new Date(2_000).toISOString());
-    const finalLedger: BudgetLedgerState = {
-      ...legacyReserved,
-      consumed: amounts(10),
-      reserved: amounts(),
-      reservations: [
-        { ...first, status: "committed", consumed: amounts(10), settledAt: new Date(3_000).toISOString() },
-        { ...second, status: "released", settledAt: new Date(4_000).toISOString() }
-      ]
-    };
-    const events = [
-      envelope(1, "budget.reserved", { reservationId: "first", ledger: legacyReserved }),
-      envelope(2, "budget.reserved", {
-        reservationId: "second",
-        mutation: {
-          schemaVersion: 1,
-          kind: "reserve",
-          reservation: second,
-          totals: { consumed: amounts(), reserved: amounts(30) }
-        }
-      }),
-      envelope(3, "budget.committed", {
-        reservationId: "first",
-        mutation: {
-          schemaVersion: 1,
-          kind: "settle",
-          reservationId: "first",
-          status: "committed",
-          consumed: amounts(10),
-          settledAt: new Date(3_000).toISOString(),
-          totals: { consumed: amounts(10), reserved: amounts(20) }
-        }
-      }),
-      envelope(4, "budget.released", { reservationId: "second", ledger: finalLedger })
-    ];
-
-    expect(events.every(isAgentEventEnvelope)).toBe(true);
-    expect(rehydrate(initial, events).budget).toEqual(finalLedger);
-  });
-
   it("fails closed on compact mutations whose post totals or limit delta do not match", () => {
     const initial = createKernelState({
       sessionId: "budget-session",
@@ -179,34 +125,6 @@ describe("compact budget mutation persistence", () => {
     const wrongAuthority = { ...corruptLimit, eventId: "runtime-limit", authority: "runtime" as const };
     expect(isAgentEventEnvelope(wrongAuthority)).toBe(false);
     expect(() => rehydrate(initial, [wrongAuthority])).toThrow(/authority must be 'user'/iu);
-  });
-
-  it("rejects non-runtime accounting authority and forged legacy ledger replacement", () => {
-    const initial = createKernelState({
-      sessionId: "budget-session",
-      runId: "budget-run",
-      mode: "change",
-      startedAt: new Date(0).toISOString(),
-      deadlineAt: new Date(60_000).toISOString()
-    });
-    const active = reservation("active", 10, new Date(1_000).toISOString());
-    const reservedLedger: BudgetLedgerState = {
-      ...initial.budget,
-      reserved: amounts(10),
-      reservations: [active]
-    };
-    const reserve = envelope(1, "budget.reserved", {
-      reservationId: active.reservationId,
-      ledger: reservedLedger
-    });
-    const forged = envelope(2, "budget.released", {
-      reservationId: "missing",
-      ledger: createBudgetLedger(reservedLedger.limits)
-    });
-    const toolAuthored = { ...forged, eventId: "tool-budget", authority: "tool" as const };
-
-    expect(isAgentEventEnvelope(toolAuthored)).toBe(false);
-    expect(() => rehydrate(initial, [reserve, forged])).toThrow(/legacy full-ledger state/iu);
   });
 
   it("does not let a repeated session.created event reset an established ledger", () => {
@@ -302,45 +220,45 @@ describe("compact budget mutation persistence", () => {
       reservation: active,
       totals: { reserved: amounts(10), consumed: amounts() }
     };
-    const reserved = applyBudgetMutationV1(initial, reserveMutation)!;
+    const reserved = applyBudgetMutation(initial, reserveMutation)!;
     expect(reserved.reservations).toHaveLength(1);
-    expect(applyBudgetMutationV1(initial, {
+    expect(applyBudgetMutation(initial, {
       ...reserveMutation,
       reservation: { ...active, status: "released", settledAt: new Date(2_000).toISOString() }
     })).toBeUndefined();
-    expect(applyBudgetMutationV1(initial, {
+    expect(applyBudgetMutation(initial, {
       ...reserveMutation,
       reservation: { ...active, consumed: amounts(1) }
     })).toBeUndefined();
-    expect(applyBudgetMutationV1(reserved, reserveMutation)).toBeUndefined();
-    expect(applyBudgetMutationV1(initial, {
+    expect(applyBudgetMutation(reserved, reserveMutation)).toBeUndefined();
+    expect(applyBudgetMutation(initial, {
       ...reserveMutation,
       reservation: { ...active, requested: amounts(21) },
       totals: { reserved: amounts(21), consumed: amounts() }
     })).toBeUndefined();
-    expect(applyBudgetMutationV1(initial, {
+    expect(applyBudgetMutation(initial, {
       ...reserveMutation,
       totals: { reserved: amounts(9), consumed: amounts() }
     })).toBeUndefined();
-    expect(applyBudgetMutationV1(initial, {
+    expect(applyBudgetMutation(initial, {
       ...reserveMutation,
       totals: { reserved: amounts(10), consumed: amounts(1) }
     })).toBeUndefined();
 
-    const bound = applyBudgetMutationV1(reserved, {
+    const bound = applyBudgetMutation(reserved, {
       schemaVersion: 1,
       kind: "bind",
       reservationId: "active",
       ownerId: "bound-owner"
     })!;
     expect(bound.reservations[0]?.ownerId).toBe("bound-owner");
-    expect(applyBudgetMutationV1(reserved, {
+    expect(applyBudgetMutation(reserved, {
       schemaVersion: 1,
       kind: "bind",
       reservationId: "missing",
       ownerId: "owner"
     })).toBeUndefined();
-    expect(applyBudgetMutationV1({
+    expect(applyBudgetMutation({
       ...reserved,
       reservations: [{ ...active, status: "committed", settledAt: new Date(2_000).toISOString() }]
     }, {
@@ -350,7 +268,7 @@ describe("compact budget mutation persistence", () => {
       ownerId: "owner"
     })).toBeUndefined();
 
-    expect(applyBudgetMutationV1(reserved, {
+    expect(applyBudgetMutation(reserved, {
       schemaVersion: 1,
       kind: "settle",
       reservationId: "missing",
@@ -359,7 +277,7 @@ describe("compact budget mutation persistence", () => {
       settledAt: new Date(2_000).toISOString(),
       totals: { reserved: amounts(), consumed: amounts() }
     })).toBeUndefined();
-    expect(applyBudgetMutationV1(reserved, {
+    expect(applyBudgetMutation(reserved, {
       schemaVersion: 1,
       kind: "settle",
       reservationId: "active",
@@ -368,7 +286,7 @@ describe("compact budget mutation persistence", () => {
       settledAt: new Date(2_000).toISOString(),
       totals: { reserved: amounts(), consumed: amounts() }
     })).toBeUndefined();
-    expect(applyBudgetMutationV1(reserved, {
+    expect(applyBudgetMutation(reserved, {
       schemaVersion: 1,
       kind: "settle",
       reservationId: "active",
@@ -377,7 +295,7 @@ describe("compact budget mutation persistence", () => {
       settledAt: new Date(2_000).toISOString(),
       totals: { reserved: amounts(1), consumed: amounts(4) }
     })).toBeUndefined();
-    const committed = applyBudgetMutationV1(reserved, {
+    const committed = applyBudgetMutation(reserved, {
       schemaVersion: 1,
       kind: "settle",
       reservationId: "active",
@@ -397,19 +315,19 @@ describe("compact budget mutation persistence", () => {
       children: 0,
       maxDepth: 0
     };
-    expect(applyBudgetMutationV1(initial, {
+    expect(applyBudgetMutation(initial, {
       schemaVersion: 1,
       kind: "limit",
       increase: { ...increase, inputTokens: 0 },
       limits: initial.limits
     })).toBeUndefined();
-    expect(applyBudgetMutationV1(initial, {
+    expect(applyBudgetMutation(initial, {
       schemaVersion: 1,
       kind: "limit",
       increase,
       limits: { ...initial.limits, inputTokens: initial.limits.inputTokens + 2 }
     })).toBeUndefined();
-    expect(applyBudgetMutationV1(initial, {
+    expect(applyBudgetMutation(initial, {
       schemaVersion: 1,
       kind: "limit",
       increase,
@@ -417,58 +335,10 @@ describe("compact budget mutation persistence", () => {
     })?.limits.inputTokens).toBe(21);
   });
 
-  it("replays bind, commit, and limit legacy ledgers without accepting forged shapes", () => {
-    const initial = createBudgetLedger({ ...createBudgetLedger().limits, inputTokens: 20 });
-    const active = reservation("active", 10, new Date(1_000).toISOString());
-    const reserved: BudgetLedgerState = { ...initial, reserved: amounts(10), reservations: [active] };
-    const boundReservation = { ...active, ownerId: "bound-owner" };
-    const bound: BudgetLedgerState = { ...reserved, reservations: [boundReservation] };
-    const committedReservation = {
-      ...boundReservation,
-      status: "committed" as const,
-      consumed: amounts(4),
-      settledAt: new Date(2_000).toISOString()
-    };
-    const committed: BudgetLedgerState = {
-      ...bound,
-      reserved: amounts(),
-      consumed: amounts(4),
-      reservations: [committedReservation]
-    };
-    const increased: BudgetLedgerState = {
-      ...committed,
-      limits: { ...committed.limits, inputTokens: committed.limits.inputTokens + 2 }
-    };
-    const events = [
-      envelope(1, "budget.reserved", { reservationId: "active", ledger: reserved }),
-      envelope(2, "budget.reservation_bound", {
-        reservationId: "active", ownerId: "bound-owner", ledger: bound
-      }),
-      envelope(3, "budget.committed", { reservationId: "active", ledger: committed }),
-      envelope(4, "budget.limit_increased", {
-        previousLimits: committed.limits,
-        increase: { inputTokens: 2 },
-        ledger: increased
-      }, "user")
-    ];
-    let ledger: BudgetLedgerState | undefined = initial;
-    for (const event of events) ledger = replayBudgetLedgerEvent(ledger, event);
-    expect(ledger).toEqual(increased);
-
-    expect(() => replayBudgetLedgerEvent(reserved, envelope(5, "budget.reservation_bound", {
-      reservationId: "active", ownerId: 1, ledger: bound
-    }))).toThrow(/legacy full-ledger state/iu);
-    expect(() => replayBudgetLedgerEvent(committed, envelope(6, "budget.limit_increased", {
-      previousLimits: committed.limits,
-      increase: { inputTokens: -1 },
-      ledger: increased
-    }, "user"))).toThrow(/legacy full-ledger state/iu);
-  });
-
   it("initializes session ledgers once and validates declared limits and authority", () => {
     const created = envelope(1, "session.created", {
       workspacePath: ".", mode: "change", title: "budget", writeScope: [], strictWriteScope: false,
-      modelRole: "orchestrator"
+      modelRole: "orchestrator", budgetLimits: createBudgetLedger().limits
     });
     const initial = replayBudgetLedgerEvent(undefined, created)!;
     expect(isBudgetLedgerSemanticallyValid(initial)).toBe(true);

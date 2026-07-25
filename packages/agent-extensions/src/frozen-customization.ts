@@ -58,10 +58,9 @@ export interface FrozenSessionProfile {
 }
 
 export interface FrozenSessionCustomization {
-  schemaVersion: 1 | 2 | 3 | 4;
+  schemaVersion: 1;
   skills: readonly FrozenSessionSkill[];
   hooks: readonly FrozenSessionHook[];
-  /** Agent Profile hook targets. Empty only for legacy schema-1 artifacts. */
   profiles: readonly FrozenSessionProfile[];
   canonicalJson: string;
   digest: string;
@@ -76,36 +75,12 @@ interface FreezeCustomizationInput {
   hookArtifacts?: readonly RuntimeHookArtifact[];
 }
 
-interface StoredCustomizationV1 {
+interface StoredCustomization {
   schemaVersion: 1;
   skills: FrozenSessionSkill[];
   hooks: FrozenSessionHook[];
-}
-
-interface StoredCustomizationV2 {
-  schemaVersion: 2;
-  skills: FrozenSessionSkill[];
-  hooks: FrozenSessionHook[];
   profiles: FrozenSessionProfile[];
 }
-
-interface StoredCustomizationV3 {
-  schemaVersion: 3;
-  skills: FrozenSessionSkill[];
-  hooks: FrozenSessionHook[];
-  profiles: FrozenSessionProfile[];
-}
-interface StoredCustomizationV4 {
-  schemaVersion: 4;
-  skills: FrozenSessionSkill[];
-  hooks: FrozenSessionHook[];
-  profiles: FrozenSessionProfile[];
-}
-type StoredCustomization =
-  | StoredCustomizationV1
-  | StoredCustomizationV2
-  | StoredCustomizationV3
-  | StoredCustomizationV4;
 
 const MAX_FROZEN_CUSTOMIZATION_BYTES = 64 * 1_048_576;
 const DIGEST = /^[a-f0-9]{64}$/u;
@@ -190,7 +165,7 @@ export async function freezeSessionCustomization(
       };
     });
   const stored: StoredCustomization = {
-    schemaVersion: 4,
+    schemaVersion: 1,
     skills: skills.sort((left, right) => left.qualifiedName.localeCompare(right.qualifiedName)),
     hooks: hooks.sort((left, right) => left.id.localeCompare(right.id)),
     profiles: freezeReferencedProfiles(input, hooks)
@@ -226,16 +201,13 @@ export function restoreSessionCustomization(
 
 function materialize(stored: StoredCustomization): FrozenSessionCustomization {
   const canonicalJson = canonicalize(stored);
-  const profiles: FrozenSessionProfile[] = stored.schemaVersion === 1
-    ? []
-    : stored.profiles;
   return Object.freeze({
-    schemaVersion: stored.schemaVersion,
+    schemaVersion: 1,
     skills: Object.freeze(stored.skills.map((item) => Object.freeze(structuredClone(item)))),
     hooks: Object.freeze(stored.hooks.map((item) => Object.freeze({
       ...structuredClone(item), definition: Object.freeze(structuredClone(item.definition))
     }))),
-    profiles: Object.freeze(profiles.map((item) =>
+    profiles: Object.freeze(stored.profiles.map((item) =>
       Object.freeze(structuredClone(item)))),
     canonicalJson,
     digest: sha256(canonicalJson)
@@ -244,20 +216,18 @@ function materialize(stored: StoredCustomization): FrozenSessionCustomization {
 
 function storedCustomization(value: unknown): StoredCustomization {
   const root = object(value, "customization");
-  const schemaVersion = customizationSchema(root.schemaVersion);
-  if (!Array.isArray(root.skills) || !Array.isArray(root.hooks)) {
+  if (root.schemaVersion !== 1) {
+    throw new Error(
+      `unsupported_schema_version: customization at <artifact> expected 1, received ${String(root.schemaVersion)}; existing data was not modified`
+    );
+  }
+  if (!Array.isArray(root.skills) || !Array.isArray(root.hooks) || !Array.isArray(root.profiles)) {
     throw new Error("Frozen session customization has an invalid schema.");
   }
-  exactKeys(root, new Set(hasProfiles(schemaVersion)
-    ? ["schemaVersion", "skills", "hooks", "profiles"]
-    : ["schemaVersion", "skills", "hooks"]), "customization");
-  if (hasProfiles(schemaVersion) && !Array.isArray(root.profiles)) {
-    throw new Error("Frozen session customization has invalid profiles.");
-  }
+  exactKeys(root, new Set(["schemaVersion", "skills", "hooks", "profiles"]), "customization");
   const skills = root.skills.map(skillValue);
-  const hooks = root.hooks.map((item) => hookValue(item, schemaVersion));
-  const profiles = hasProfiles(schemaVersion)
-    ? (root.profiles as unknown[]).map(profileValue) : [];
+  const hooks = root.hooks.map(hookValue);
+  const profiles = root.profiles.map(profileValue);
   unique(skills.map((item) => item.qualifiedName), "skill");
   unique(hooks.map((item) => item.id), "hook");
   unique(profiles.map((item) => item.id), "profile");
@@ -266,20 +236,7 @@ function storedCustomization(value: unknown): StoredCustomization {
     throw new Error("Frozen session customization entries are not canonical ordered.");
   }
   validateHookDefinitions(hooks.map((item) => item.definition));
-  if (schemaVersion === 4) return { schemaVersion: 4, skills, hooks, profiles };
-  if (schemaVersion === 3) return { schemaVersion: 3, skills, hooks, profiles };
-  return schemaVersion === 2 ? { schemaVersion: 2, skills, hooks, profiles }
-    : { schemaVersion: 1, skills, hooks };
-}
-
-function customizationSchema(value: unknown): 1 | 2 | 3 | 4 {
-  if (value !== 1 && value !== 2 && value !== 3 && value !== 4) {
-    throw new Error("Frozen session customization has an invalid schema.");
-  }
-  return value;
-}
-function hasProfiles(schemaVersion: 1 | 2 | 3 | 4): schemaVersion is 2 | 3 | 4 {
-  return schemaVersion !== 1;
+  return { schemaVersion: 1, skills, hooks, profiles };
 }
 function profileValue(value: unknown): FrozenSessionProfile {
   const item = object(value, "profile");
@@ -313,7 +270,7 @@ function skillValue(value: unknown): FrozenSessionSkill {
   };
 }
 
-function hookValue(value: unknown, schemaVersion: 1 | 2 | 3 | 4): FrozenSessionHook {
+function hookValue(value: unknown): FrozenSessionHook {
   const item = object(value, "hook");
   exactKeys(item, new Set(["id", "source", "digest", "definition", "trust"]), "hook");
   const hookId = id(item.id, "hook.id");
@@ -324,7 +281,7 @@ function hookValue(value: unknown, schemaVersion: 1 | 2 | 3 | 4): FrozenSessionH
   const definition = hookDefinition(item.definition);
   if (definition.id !== hookId) throw new Error("Frozen session hook id does not match its definition.");
   const trust = item.trust === undefined ? undefined : frozenWorkspaceHookTrustValue(item.trust);
-  if (schemaVersion >= 3 && source === "workspace" && definition.kind === "command" && !trust) {
+  if (source === "workspace" && definition.kind === "command" && !trust) {
     throw new Error(`Frozen workspace command hook '${hookId}' requires durable trust.`);
   }
   return { id: hookId, source, digest: digest(item.digest, "hook.digest"), definition, ...(trust ? { trust } : {}) };

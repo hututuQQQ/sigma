@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-export const REPO_SCALE_GENERATOR_V1 = "repo-scale-v1";
+export const REPO_SCALE_GENERATOR = "repo-scale";
 
 const GROUPS = Object.freeze([
   Object.freeze({ directory: "src/typescript", extension: "ts", count: 140, label: "typescript" }),
@@ -14,7 +14,7 @@ const GROUPS = Object.freeze([
   Object.freeze({ directory: "generated", extension: "ts", count: 30, label: "generated" })
 ]);
 
-export const REPO_SCALE_PROFILE_V1 = Object.freeze({
+export const REPO_SCALE_PROFILE = Object.freeze({
   generatedFiles: 500,
   physicalLines: 90_000,
   includedFiles: 440,
@@ -47,25 +47,25 @@ function deterministicFile(group, index, lineCount, seed) {
   return `${lines.join(newline)}${newline}`;
 }
 
-export function assertRepoScaleGeneratorV1(spec, label = "fixture.generator") {
+export function assertRepoScaleGenerator(spec, label = "fixture.generator") {
   if (!spec || typeof spec !== "object" || Array.isArray(spec)) throw new TypeError(`${label} must be an object`);
   const allowed = new Set(["kind", "seed", "fileCount", "lineCount"]);
   for (const key of Object.keys(spec)) {
     if (!allowed.has(key)) throw new TypeError(`${label} contains unknown field ${JSON.stringify(key)}`);
   }
-  if (spec.kind !== REPO_SCALE_GENERATOR_V1) throw new TypeError(`${label}.kind must equal ${REPO_SCALE_GENERATOR_V1}`);
+  if (spec.kind !== REPO_SCALE_GENERATOR) throw new TypeError(`${label}.kind must equal ${REPO_SCALE_GENERATOR}`);
   if (!Number.isSafeInteger(spec.seed) || spec.seed < 0) throw new TypeError(`${label}.seed must be a non-negative integer`);
-  if (spec.fileCount !== REPO_SCALE_PROFILE_V1.generatedFiles) {
-    throw new TypeError(`${label}.fileCount must equal ${REPO_SCALE_PROFILE_V1.generatedFiles}`);
+  if (spec.fileCount !== REPO_SCALE_PROFILE.generatedFiles) {
+    throw new TypeError(`${label}.fileCount must equal ${REPO_SCALE_PROFILE.generatedFiles}`);
   }
-  if (spec.lineCount !== REPO_SCALE_PROFILE_V1.physicalLines) {
-    throw new TypeError(`${label}.lineCount must equal ${REPO_SCALE_PROFILE_V1.physicalLines}`);
+  if (spec.lineCount !== REPO_SCALE_PROFILE.physicalLines) {
+    throw new TypeError(`${label}.lineCount must equal ${REPO_SCALE_PROFILE.physicalLines}`);
   }
   return spec;
 }
 
-export async function generateRepoScaleFixtureV1(workspace, rawSpec) {
-  const spec = assertRepoScaleGeneratorV1(rawSpec);
+export async function generateRepoScaleFixture(workspace, rawSpec) {
+  const spec = assertRepoScaleGenerator(rawSpec);
   const lineCount = spec.lineCount / spec.fileCount;
   if (!Number.isInteger(lineCount)) throw new Error("repo-scale line count must divide evenly across generated files");
   let generated = 0;
@@ -79,5 +79,5 @@ export async function generateRepoScaleFixtureV1(workspace, rawSpec) {
     }
   }
   if (generated !== spec.fileCount) throw new Error(`repo-scale generator produced ${generated} files; expected ${spec.fileCount}`);
-  return { ...REPO_SCALE_PROFILE_V1, seed: spec.seed };
+  return { ...REPO_SCALE_PROFILE, seed: spec.seed };
 }

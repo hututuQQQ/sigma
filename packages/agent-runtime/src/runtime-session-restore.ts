@@ -48,7 +48,7 @@ export async function hydrateRuntimeSession(
     subscribers: new Set(),
     approvals: new Map(pendingApprovals.map((approval) => [approval.callId, {
       effects: approval.effects,
-      ...(approval.binding ? { binding: approval.binding } : {}),
+      binding: approval.binding,
       recovered: true,
       resolve: () => undefined
     }])),

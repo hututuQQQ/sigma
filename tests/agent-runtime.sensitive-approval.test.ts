@@ -25,7 +25,10 @@ import {
   fakeToolTurn,
   SmokeFakeGateway
 } from "../scripts/smoke-fake-model.mjs";
-import { completeAgentEventPayload } from "./testkit/agent-event-fixtures.js";
+import {
+  completeAgentEventPayload,
+  persistEmptyCustomization
+} from "./testkit/agent-event-fixtures.js";
 
 const fixtures: string[] = [];
 // The fake broker accepts these explicit test entry points; production obtains
@@ -107,12 +110,12 @@ const recoveredWritePlan: ToolCallPlan = {
 
 async function appendRecoveredWriteApproval(
   store: SegmentedJsonlStore,
+  storeRootDir: string,
   workspacePath: string,
   options: {
     pendingContent: string;
     presentedContent: string;
     presentedToolName?: string;
-    durablePlan: boolean;
   }
 ): Promise<number> {
   const call = fakeToolCall("recovered-write", "write", {
@@ -123,6 +126,9 @@ async function appendRecoveredWriteApproval(
     stored.push(fixtureEvent(stored.length + 1, type, payload));
   };
   append("session.created", { workspacePath, mode: "change" });
+  append("customization.frozen", await persistEmptyCustomization(
+    storeRootDir, "sensitive-session"
+  ));
   append("plan.updated", { previousRevision: 0, plan: {
     revision: 1, goal: "write result", activeNodeId: "root", nodes: [{
       id: "root", title: "write result", dependencies: [], status: "in_progress",
@@ -131,29 +137,27 @@ async function appendRecoveredWriteApproval(
   } });
   append("run.started", { mode: "change" });
   append("user.message", { text: "write result" });
-  append("model.started", { turnId: 1, effectRevision: 4 });
+  append("model.started", { turnId: 1, effectRevision: 5 });
   append("model.completed", {
-    turnId: 1, effectRevision: 4,
+    turnId: 1, effectRevision: 5,
     message: { role: "assistant", content: "", toolCalls: [call] },
     finishReason: "tool_calls", toolCalls: [call]
   });
   append("tool.requested", {
-    turnId: 1, effectRevision: 4, callId: call.id, name: call.name, arguments: call.arguments
+    turnId: 1, effectRevision: 5, callId: call.id, name: call.name, arguments: call.arguments
   });
-  if (options.durablePlan) {
-    append("execution.planned", {
-      executionId: call.id, toolCallId: call.id, plan: recoveredWritePlan
-    });
-  }
+  append("execution.planned", {
+    executionId: call.id, toolCallId: call.id, plan: recoveredWritePlan
+  });
   append("tool.approval_requested", {
-    turnId: 1, effectRevision: 4, requestId: call.id, callId: call.id,
+    turnId: 1, effectRevision: 5, requestId: call.id, callId: call.id,
     toolName: options.presentedToolName ?? call.name,
     arguments: { path: "result.txt", content: options.presentedContent },
     effects: ["filesystem.write"],
-    ...(options.durablePlan ? { plan: recoveredWritePlan } : {})
+    plan: recoveredWritePlan
   });
   append("run.suspended", {
-    turnId: 1, effectRevision: 4, requestId: call.id, callId: call.id,
+    turnId: 1, effectRevision: 5, requestId: call.id, callId: call.id,
     message: "approval required", remainingDeadlineMs: 60_000
   });
   for (const event of stored) await store.append(event, event.seq - 1);
@@ -376,8 +380,8 @@ describe("sensitive per-call approvals", () => {
     fixtures.push(root);
     const storeRootDir = path.join(root, "state");
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
-    const lastSeq = await appendRecoveredWriteApproval(store, root, {
-      pendingContent, presentedContent, presentedToolName, durablePlan: true
+    const lastSeq = await appendRecoveredWriteApproval(store, storeRootDir, root, {
+      pendingContent, presentedContent, presentedToolName
     });
     const runtime = createRuntime({
       gateway: new SmokeFakeGateway([]),
@@ -411,50 +415,6 @@ describe("sensitive per-call approvals", () => {
       });
       await expect(completed).resolves.toMatchObject({ type: "tool.completed" });
       await expect(readFile(path.join(root, "result.txt"), "utf8")).resolves.toBe(pendingContent);
-    } finally {
-      await cancelAndRelease(runtime, "sensitive-session", "test complete");
-    }
-  });
-
-  it("does not activate a recovered unbound always_allow grant before a fresh prompt", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-legacy-always-"));
-    fixtures.push(root);
-    const storeRootDir = path.join(root, "state");
-    const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
-    const lastSeq = await appendRecoveredWriteApproval(store, root, {
-      pendingContent: "legacy", presentedContent: "legacy", durablePlan: false
-    });
-    const runtime = createRuntime({
-      gateway: new SmokeFakeGateway([]),
-      tools: registerBuiltinTools(new EffectToolRegistry()),
-      store,
-      storeRootDir,
-      permissionMode: "ask",
-      runDeadlineMs: 60_000
-    });
-    await runtime.command({ type: "resume", sessionId: "sensitive-session" });
-    try {
-      const freshRequest = nextEventAfter(
-        runtime, "sensitive-session", lastSeq, ["tool.approval_requested", "tool.failed"]
-      );
-      await runtime.command({
-        type: "approve",
-        sessionId: "sensitive-session",
-        requestId: "recovered-write",
-        decision: "always_allow"
-      });
-      await expect(freshRequest).resolves.toMatchObject({
-        type: "tool.approval_requested",
-        payload: {
-          requestId: "recovered-write",
-          effects: ["filesystem.read", "filesystem.write"],
-          plan: {
-            ...recoveredWritePlan,
-            exactEffects: ["filesystem.read", "filesystem.write"]
-          }
-        }
-      });
-      await expect(readFile(path.join(root, "result.txt"), "utf8")).rejects.toThrow();
     } finally {
       await cancelAndRelease(runtime, "sensitive-session", "test complete");
     }
@@ -519,40 +479,44 @@ describe("sensitive per-call approvals", () => {
     const call = fakeToolCall("sensitive-resume", "exec", {
       executable: "resume-fixture", args: [], network: "full"
     });
+    const customization = await persistEmptyCustomization(
+      storeRootDir, "sensitive-session"
+    );
     const stored: AgentEventEnvelope[] = [
       fixtureEvent(1, "session.created", { workspacePath: root, mode: "analyze" }),
-      fixtureEvent(2, "plan.updated", { previousRevision: 0, plan: {
+      fixtureEvent(2, "customization.frozen", customization),
+      fixtureEvent(3, "plan.updated", { previousRevision: 0, plan: {
         revision: 1, goal: "resume network", activeNodeId: "root", nodes: [{
           id: "root", title: "resume", dependencies: [], status: "in_progress",
           owner: { kind: "root" }, acceptanceCriteria: ["done"], evidence: []
         }]
       } }),
-      fixtureEvent(3, "run.started", { mode: "analyze" }),
-      fixtureEvent(4, "user.message", { text: "resume" }),
-      fixtureEvent(5, "model.started", { turnId: 1, effectRevision: 4 }),
-      fixtureEvent(6, "model.completed", {
-        turnId: 1, effectRevision: 4,
+      fixtureEvent(4, "run.started", { mode: "analyze" }),
+      fixtureEvent(5, "user.message", { text: "resume" }),
+      fixtureEvent(6, "model.started", { turnId: 1, effectRevision: 5 }),
+      fixtureEvent(7, "model.completed", {
+        turnId: 1, effectRevision: 5,
         message: { role: "assistant", content: "", toolCalls: [call] },
         finishReason: "tool_calls", toolCalls: [call]
       }),
-      fixtureEvent(7, "tool.requested", {
-        turnId: 1, effectRevision: 4, callId: call.id, name: call.name, arguments: call.arguments
+      fixtureEvent(8, "tool.requested", {
+        turnId: 1, effectRevision: 5, callId: call.id, name: call.name, arguments: call.arguments
       }),
-      fixtureEvent(8, "execution.planned", {
+      fixtureEvent(9, "execution.planned", {
         executionId: call.id, toolCallId: call.id, plan: {
           exactEffects: ["process.spawn.readonly", "network"], readPaths: ["."], writePaths: [],
           network: "full", processMode: "pipe", checkpointScope: [], idempotence: "non_replayable"
         }
       }),
-      fixtureEvent(9, "tool.approval_requested", {
-        turnId: 1, effectRevision: 4, requestId: call.id, callId: call.id, toolName: call.name,
+      fixtureEvent(10, "tool.approval_requested", {
+        turnId: 1, effectRevision: 5, requestId: call.id, callId: call.id, toolName: call.name,
         effects: ["process.spawn.readonly", "network"]
       }),
-      fixtureEvent(10, "run.suspended", {
-        turnId: 1, effectRevision: 4, requestId: call.id, callId: call.id, message: "approval required"
+      fixtureEvent(11, "run.suspended", {
+        turnId: 1, effectRevision: 5, requestId: call.id, callId: call.id, message: "approval required"
       }),
-      { ...fixtureEvent(11, "tool.approval_resolved", {
-        turnId: 1, effectRevision: 4, requestId: call.id, callId: call.id, decision: "allow"
+      { ...fixtureEvent(12, "tool.approval_resolved", {
+        turnId: 1, effectRevision: 5, requestId: call.id, callId: call.id, decision: "allow"
       }), authority: "user" }
     ];
     for (const event of stored) await store.append(event, event.seq - 1);
@@ -570,7 +534,7 @@ describe("sensitive per-call approvals", () => {
     await runtime.command({ type: "resume", sessionId: "sensitive-session" });
     const automaticRequest = (async () => {
       for await (const event of runtime.subscribe("sensitive-session")) {
-        if (event.type === "tool.approval_requested" && event.seq > 11) return event;
+        if (event.type === "tool.approval_requested" && event.seq > 12) return event;
       }
       throw new Error("missing automatic approval request");
     })();

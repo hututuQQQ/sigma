@@ -32,7 +32,7 @@ export function ownedTargetName(factory?: () => string): string {
 
 export function ownedProofLabels(): Record<string, string> {
   return {
-    "com.sigma.oci-owned": "v1",
+    "com.sigma.oci-owned": "true",
     "com.sigma.oci-owner": randomBytes(24).toString("hex")
   };
 }

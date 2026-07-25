@@ -3,11 +3,7 @@ import type { ModelPricing, ModelRole, ModelSpec, TokenizerMetadata } from "./ca
 
 export type NormalizedModelUsage = ModelResponseUsage;
 
-export interface NormalizedModelResponse extends ModelResponse {
-  inputTokens: number;
-  outputTokens: number;
-  usage: NormalizedModelUsage;
-}
+export type NormalizedModelResponse = ModelResponse;
 
 export type UnnormalizedModelResponse = Omit<ModelResponse, "usage"> & {
   usage?: NormalizedModelUsage;
@@ -121,15 +117,12 @@ export function normalizeModelResponse(options: {
     : normalizeUsage({
         request: options.request,
         response: options.response,
-        raw: options.rawUsage ?? {
-          inputTokens: options.response.inputTokens,
-          outputTokens: options.response.outputTokens
-        },
+        raw: options.rawUsage,
         pricing: options.spec.pricing,
         latencyMs: options.latencyMs,
         retryAttempt: options.retryAttempt
       });
-  return { ...options.response, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, usage };
+  return { ...options.response, usage };
 }
 
 export function toUsageRecord(usage: NormalizedModelUsage, identity: UsageRecordIdentity): UsageRecord {

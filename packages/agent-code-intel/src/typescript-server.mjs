@@ -1,6 +1,7 @@
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import ts from "typescript";
+import { SIGMA_PROJECT_FACTS } from "agent-execution";
 
 const documents = new Map();
 let rootPath = process.cwd();
@@ -322,7 +323,10 @@ function capabilities(params) {
       renameProvider: true,
       textDocumentSync: { openClose: true, change: 1 }
     },
-    serverInfo: { name: "sigma-typescript-language-server", version: "3.0.0" }
+    serverInfo: {
+      name: "sigma-typescript-language-server",
+      version: SIGMA_PROJECT_FACTS.productVersion
+    }
   };
 }
 

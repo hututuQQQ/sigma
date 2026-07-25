@@ -126,7 +126,6 @@ function normalizedUsage(
   return existing ?? normalizeUsage({
     request,
     response,
-    raw: { inputTokens: response.inputTokens, outputTokens: response.outputTokens },
     pricing: prepared.spec?.pricing,
     latencyMs,
     retryAttempt: 0
@@ -176,7 +175,7 @@ function usageIdentity(
     routeId: defined(routed.routeId, fallback.routeId),
     providerId: defined(routed.providerId, gateway.provider),
     modelSpecId: defined(routed.modelSpecId, gateway.model),
-    tokenizerId: defined(routed.tokenizerId, specTokenizer?.id ?? "legacy/approximate"),
+    tokenizerId: defined(routed.tokenizerId, specTokenizer?.id ?? "sigma/approximate"),
     tokenizerAccuracy: defined(routed.tokenizerAccuracy, specTokenizer?.accuracy ?? "approximate")
   };
   return tokenizerAssetDigest ? { ...identity, tokenizerAssetDigest } : identity;

@@ -14,8 +14,8 @@
 </p>
 
 <p align="center">
-  <img alt="状态：稳定版" src="https://img.shields.io/badge/status-v4.0.0-2ea44f">
-  <img alt="发布目标：Linux 稳定版与 Windows 预览版" src="https://img.shields.io/badge/release%20targets-Linux%20stable%20%2B%20Windows%20preview-0078d4">
+  <img alt="状态：0.1.0 开发预览版" src="https://img.shields.io/badge/status-0.1.0%20development%20preview-f59e0b">
+  <img alt="发布目标：Linux 与 Windows 预览版" src="https://img.shields.io/badge/release%20targets-Linux%20preview%20%2B%20Windows%20unsigned%20preview-0078d4">
   <img alt="正式评估：预注册" src="https://img.shields.io/badge/formal%20evaluation-preregistered-4cc9c0">
 </p>
 
@@ -25,12 +25,15 @@
 
 Sigma Code 把一次编码任务变成一条可持久化、可验证、可重放的类型化事件流。它可以理解仓库、执行范围明确的修改、在沙箱内运行命令、验证结果、请求独立审查，并在进程中断后恢复原来的会话。CLI 与 TUI 不各自维护一套 Agent：产品只有一个事件溯源内核、一种会话格式和一条执行链。
 
-`v4.0.0` 是 Sigma Code 的首个稳定版。Linux x64 是正式稳定的二进制目标；在取得可信 Authenticode 签名之前，Windows x64 会随同发布，但明确标记为未签名预览版。提交问题或参与贡献前，请先查看[变更记录](CHANGELOG.md)、[安全策略](SECURITY.md)和[贡献指南](CONTRIBUTING.md)。
+`0.1.0` 是开发预览版，也是唯一受支持的产品基线。Linux x64 与 Windows x64
+产物都属于预览候选；在取得可信 Authenticode 签名之前，Windows 还必须明确标记为
+未签名。提交问题或参与贡献前，请先查看[安全策略](SECURITY.md)和
+[贡献指南](CONTRIBUTING.md)。
 
 > [!IMPORTANT]
 > **当前产品边界**
 >
-> - **Linux x64 是正式稳定的二进制发布；Windows x64 是未签名预览版。** 两种归档都必须通过原生沙箱、打包产品、校验和、SBOM 与签名来源证明门禁，但 Windows 可执行文件目前没有可信 Authenticode 签名，可能触发 Windows 安全警告。
+> - **Sigma Code 0.1.0 在两个 Tier 1 目标上都是开发预览版。** Linux x64 与 Windows x64 候选都必须通过原生沙箱、打包产品、校验和、SBOM 与签名来源证明门禁；Windows 可执行文件目前没有可信 Authenticode 签名，可能触发 Windows 安全警告。
 > - **正式评估由预注册清单约束，而不是写死 Provider。** SHA 绑定的运行清单会在执行前冻结 Provider、模型、源码、归档、任务选择、网络、超时、并发、尝试次数和重试次数。
 > - 只有 SHA 绑定的运行清单中的控制条件可比时，Provider 对比才有效；harness 不会根据模型名称推断可比性。
 > - Sigma 把 **OpenCode 视为直接竞争对手和追赶目标，而不是已经达到的水平**。就当前整体实际表现与成熟度而言，Sigma 和 OpenCode 仍有真实差距。
@@ -45,9 +48,10 @@ Sigma Code 把一次编码任务变成一条可持久化、可验证、可重放
 | 沙箱失效即拒绝 | 即使授权了宿主机只读输入或网络，进程仍运行在必需的原生沙箱中；沙箱不健康时，Sigma 会拒绝执行。 |
 | 一条产品执行链 | CLI 自动化和 TUI 共用同一个 `RuntimeClient`、内核、事件仓库、工具、恢复逻辑和结果协议。 |
 
-## Linux 快速开始
+## Linux 快速开始（开发预览版）
 
-从 [GitHub Releases](https://github.com/hututuQQQ/sigma/releases) 下载最新的 Linux x64 归档，核对 SHA-256 侧文件与签名来源证明后解压：
+从经过验证的项目 Release 获取 `0.1.0` Linux x64 预览归档，或从源码构建；
+核对 SHA-256 侧文件与签名来源证明后再解压：
 
 ```sh
 SIGMA="$HOME/.local/share/sigma-code"
@@ -84,7 +88,10 @@ $env:DEEPSEEK_API_KEY = "your-api-key"
 
 上面的 API Key 只对当前 PowerShell 进程生效。不要把密钥写进 `.agent/config.toml` 或提交到版本库。
 
-两个平台归档都会发布 SHA-256 校验和、CycloneDX SBOM、签名的来源证明和公开验证密钥。只有 Linux x64 属于稳定二进制发布；Windows x64 仍是未签名预览版。信任边界见 [SECURITY.md](SECURITY.md)，维护者发布流程见 [RELEASING.md](RELEASING.md)。
+发布的预览归档都会带有 SHA-256 校验和、CycloneDX SBOM、签名的来源证明和
+公开验证密钥。`0.1.0` 的两个目标都不是稳定发布；Windows x64 还属于未签名预览。
+信任边界见 [SECURITY.md](SECURITY.md)，维护者发布流程见
+[RELEASING.md](RELEASING.md)。
 
 执行一次性的修改任务：
 
@@ -179,7 +186,12 @@ flowchart TB
 
 `agent-execution` 是生产代码中唯一允许启动任意进程的 Package。它通过分帧协议与正式包中的 Rust `sigma-exec` Broker 通信。在 Windows 上，每条沙箱命令都使用独立的 AppContainer 身份和范围化文件 ACL，并通过 kill-on-close Job Object 限制整个进程树；网络能力按调用授予，交互进程使用 ConPTY。Linux 使用原生 Namespace 沙箱和进程树清理 Watchdog。
 
-配置 Schema v5 默认使用 `permission_mode=workspace-auto`、`sandbox=required`、`read_scope=workspace` 和 `network=none`。工作区内离线读取与声明范围内写入自动执行；外部读取、完整网络和仓库元数据写入仍单独授权。沙箱失败绝不回退宿主执行；`container` 模式在真实 OCI 后端不可用时返回 `container_unavailable`。
+配置 Schema 1 默认使用 `permission_mode=workspace-auto`、
+`sandbox=required`、`read_scope=workspace`、`network=full` 和
+`process_handoff=allow`。工作区内读取与声明范围内写入自动执行；外部读取、完整网络
+和仓库元数据写入仍单独授权。显式设置 `network=none` 或 `network=loopback` 会收窄
+能力。沙箱失败绝不回退宿主执行；`container` 模式在真实 OCI 后端不可用时返回
+`container_unavailable`。
 
 绝对外部输入通过不跟随链接的稳定遍历读取，并生成包含路径、摘要和大小的 `input_access` 证据；进程只挂载已声明的稳定读取根。目标中读取失败的输入会持续阻止完成，直到同一路径稳定读取成功，本轮生成的替代 Fixture 不能清除义务。
 
@@ -192,7 +204,7 @@ Linux 仅在安全转交可用时公布 `processHandoff`。`deliverable` 进程�
 运行状态保存在 Agent 无法写入的工作区之外，目录按工作区哈希隔离：
 
 ```text
-<user-state>/sigma/workspaces/<workspace-sha256>/stores/v5/sessions/<session-id>/
+<user-state>/sigma/workspaces/<workspace-sha256>/stores/v1/sessions/<session-id>/
   meta.json
   events/000001.jsonl
   snapshots/000000000250.json
@@ -205,7 +217,27 @@ Linux 仅在安全转交可用时公布 `processHandoff`。`deliverable` 进程�
 
 Provider 返回 `stop` 只会产生 `model_stopped`。Completion Coordinator 独立推导当前变更所需的 assurance 与 review；只有 `model_stopped`、`assurance_satisfied` 和 `review_satisfied` 同时成立才会写入 `run.completed`。失败、过期、弱化或不完整的语义验证会进入修复或 typed blocker，模型没有可以绕过完成门的工具。
 
-所有净变更都需要当前状态上的语义验证。已密封的 no-op 检查点不会推进 frontier；会写文件的验证在检查点密封后重新绑定最终 frontier。标准 Profile 的独立审查为建议模式，严格 Profile 要求通过。所有非 Detached 子 Agent 会在父任务结束前 Join；仍未集成的 Writer Worktree 也会让父任务保持未完成状态。
+所有净变更都需要当前状态上的语义验证。已密封的 no-op 检查点不会推进 frontier；
+会写文件的验证在检查点密封后重新绑定最终 frontier。标准 Profile 要求当前 frontier
+的审查通过，或由用户显式使用一次性 waiver；严格 Profile 不接受 waiver，并要求审查者
+亲自执行检查后通过。所有非 Detached 子 Agent 会在父任务结束前 Join；仍未集成的
+Writer Worktree 也会让父任务保持未完成状态。
+
+### 当前序列化与工具契约
+
+- Sigma 自有序列化边界只接受严格的 `schemaVersion: 1`（TOML 使用
+  `schema_version = 1`）。未知 Schema、其他 Store Layout 和旧 Checkpoint Journal
+  分别以 `unsupported_schema_version` 或 `unsupported_store_layout` 拒绝；原文件
+  不会被迁移、覆盖或删除。
+- 主动审查是只读的，并在一次性 Overlay 中执行检查。它可以查看已认证的当前 frontier
+  与持久进程生命周期证据，但不能写入父工作区。
+- 普通求解预算耗尽时，已经启动的 session 进程可在总 Deadline 内完成结算。
+  Deliverable 进程在独立健康检查和 `process_handoff` 成功之前仍归 session 管理。
+- `write` 与 `edit` 返回结果字节数和 SHA-256；`write_chunk` 以预映像长度与摘要做原子
+  追加。未指定 Shell 时由 Broker 确定性选择。非 UTF-8 进程输出必须保存在字节安全
+  Artifact 中；只有解码错误而没有 Artifact 会被视为 Broker 协议错误。
+- `inspect_image` 与 `inspect_document` 是面向纯文本模型的有界、离线、只读兜底；
+  OCR 或提取元数据只是检查信息，不是完成证据。
 
 ## 常用命令
 
@@ -241,7 +273,7 @@ Provider 返回 `stop` 只会产生 `model_stopped`。Completion Coordinator 独
 优先级为 **CLI 参数 → 环境变量 → 工作区 `.agent/config.toml` → Home `~/.sigma/config.toml` → 默认值**。未知参数和未知 TOML Key 会立即报错。由仓库提供的 MCP Server 和可执行 Hook 必须获得与内容摘要绑定的显式信任。
 
 ```toml
-schema_version = 5
+schema_version = 1
 
 [model]
 provider = "deepseek"
@@ -253,7 +285,7 @@ mode = "workspace-auto"
 [security]
 sandbox = "required"
 read_scope = "workspace"
-network = "none"
+network = "full"
 process_handoff = "allow"
 
 [runtime]
@@ -277,7 +309,7 @@ fps = 30
 如需逐次申请更宽的外部能力：
 
 ```toml
-schema_version = 5
+schema_version = 1
 
 [security]
 sandbox = "required"
@@ -286,13 +318,17 @@ network = "full"
 process_handoff = "deny"
 ```
 
-旧配置可用 `agent config migrate --workspace . --check` 检查，再用 `agent config migrate --workspace . --write` 原子升级。V5 会话只写入 `stores/v5`，不会读取或回退到 V4 会话存储。
+`agent init` 会直接写入当前 Schema。Sigma 不提供配置迁移命令，也不会读取其他持久
+Store Layout。需要保留的不兼容状态应由用户自行备份或移动；拒绝过程始终只读。
 
 DeepSeek 使用 `DEEPSEEK_API_KEY`。实验性的 GLM/Z.ai 路径也可以读取 `GLM_API_KEY`、`ZAI_API_KEY` 或 `BIGMODEL_API_KEY`。只有 Provider 被明确冻结进本次预注册清单时，它才属于该次正式结果的一部分。
 
 ## 评估与 Benchmark 边界
 
-Sigma 的正式体验评估器会在全新、不透明的工作区中运行已打包产品，再把持久事件流归约为正确性、安全性、体验与可靠性结果。Terminal-Bench 正式运行必须提供 `SigmaFormalRunPreregistrationV1`；代码不再提供正式 dataset、模型、配额、重试或分数阈值默认值。
+Sigma 的正式体验评估器会在全新、不透明的工作区中运行已打包产品，再把持久事件流
+归约为正确性、安全性、体验与可靠性结果。Terminal-Bench 正式运行必须提供
+`SigmaFormalRunPreregistration`；代码不提供正式 dataset、模型、配额、重试或分数
+阈值默认值。
 
 评估器可以选择任务、启动正式包，并在运行结束后收集 Artifact；它不能把场景身份、Verifier 输出、分数、Reward、隐藏检查或运行后失败传给求解会话，也不能利用 Verifier 反馈重试求解。协议类型和生产源码扫描会共同约束这条公平性边界。
 
@@ -326,7 +362,7 @@ pnpm lint
 pnpm test:coverage
 ```
 
-构建并验证当前正式目标：
+构建并验证当前 Windows 预览候选：
 
 ```powershell
 pnpm package:agent-cli:windows

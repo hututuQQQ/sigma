@@ -13,7 +13,7 @@ import {
   formalPreregistrationConsumptionIdentity,
   loadFormalPreregistration,
   sha256,
-  sigmaFormalRunPreregistrationV1,
+  sigmaFormalRunPreregistration,
   validateFormalPreregistration,
   writeFormalPreregistration
 } from "../scripts/bench-terminal-bench-formal-preregistration.mjs";
@@ -76,7 +76,7 @@ function draft(overrides: Record<string, unknown> = {}) {
 }
 
 function manifest(overrides: Record<string, unknown> = {}) {
-  return sigmaFormalRunPreregistrationV1(draft(overrides));
+  return sigmaFormalRunPreregistration(draft(overrides));
 }
 
 function report(taskCount: number, passed: number, blocker = false) {
@@ -139,7 +139,7 @@ describe("formal benchmark preregistration", () => {
   it("derives every digest without supplying policy defaults", () => {
     const value = manifest();
     expect(value).toMatchObject({
-      kind: "SigmaFormalRunPreregistrationV1",
+      kind: "SigmaFormalRunPreregistration",
       model: { provider: "provider-fixture", name: "model-fixture" },
       solver_controls: { max_turns: 73, command_timeout_sec: 41, cleanup_grace_sec: 17 },
       execution: { concurrency: 2, attempts_per_task: 1, retries: 0 }
@@ -152,10 +152,10 @@ describe("formal benchmark preregistration", () => {
 
     const missingModel = draft();
     delete (missingModel as Record<string, unknown>).model;
-    expect(() => sigmaFormalRunPreregistrationV1(missingModel)).toThrow(/field set/u);
+    expect(() => sigmaFormalRunPreregistration(missingModel)).toThrow(/field set/u);
     const missingConcurrency = draft();
     delete (missingConcurrency.execution as Record<string, unknown>).concurrency;
-    expect(() => sigmaFormalRunPreregistrationV1(missingConcurrency)).toThrow(/field set/u);
+    expect(() => sigmaFormalRunPreregistration(missingConcurrency)).toThrow(/field set/u);
   });
 
   it("rejects score thresholds, mutable task sources, and stale digests", () => {
@@ -166,7 +166,7 @@ describe("formal benchmark preregistration", () => {
     const mutable = draft();
     (mutable.task_selection as { tasks: Array<Record<string, unknown>> }).tasks[0]
       .git_commit_id = "d".repeat(40);
-    expect(() => sigmaFormalRunPreregistrationV1(mutable)).toThrow(/pinned/u);
+    expect(() => sigmaFormalRunPreregistration(mutable)).toThrow(/pinned/u);
 
     const tampered = structuredClone(value) as Record<string, unknown>;
     (tampered.model as { name: string }).name = "different-model";
@@ -174,7 +174,7 @@ describe("formal benchmark preregistration", () => {
 
     const contradictoryTopology = draft();
     (contradictoryTopology.execution as Record<string, unknown>).harbor_topology = "managed_three_role";
-    expect(() => sigmaFormalRunPreregistrationV1(contradictoryTopology))
+    expect(() => sigmaFormalRunPreregistration(contradictoryTopology))
       .toThrow(/requires managed_environment_mode=required/u);
   });
 

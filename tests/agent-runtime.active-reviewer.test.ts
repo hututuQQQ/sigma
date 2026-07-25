@@ -305,7 +305,7 @@ function reviewerInput(environmentMutation = false) {
   };
 }
 
-describe("V10 active read-only reviewer tools", () => {
+describe("active read-only reviewer tools", () => {
   it("publishes one stable in-workspace scratch location for cross-call artifacts", () => {
     const messages = reviewMessages({
       ...reviewerInput(),

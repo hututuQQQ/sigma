@@ -6,11 +6,11 @@ import { fileURLToPath } from "node:url";
 import { canonicalJson } from "./common.mjs";
 import { archiveEvaluationEvidence } from "./evaluation-vault.mjs";
 import {
-  assertV5EventStream, listV5Sessions, readV5Session, resolveWorkspaceStateRoot
+  assertEventStream, listSessions, readSession, resolveWorkspaceStateRoot
 } from "./event-store.mjs";
 import { reduceAgentEvents } from "./metrics.mjs";
 import { createOptimizerClusterCards, createOptimizerObservations } from "./optimizer-observation.mjs";
-import { assertOptimizerObservationV1, sha256 } from "./optimizer-schema.mjs";
+import { assertOptimizerObservation, sha256 } from "./optimizer-schema.mjs";
 import {
   readRegisteredOptimizationExperiments, resolveOptimizationRepositoryStateRoot
 } from "./optimization-experiment.mjs";
@@ -60,8 +60,8 @@ const DEFAULT_DIGEST = sha256("unavailable");
 // A launcher that can bind source and built artifacts may record this as
 // runtime-authority diagnostic evidence before the first model turn. The
 // optimizer never substitutes the collector's current checkout for it.
-export const OPTIMIZER_SUBJECT_ATTESTATION_SOURCE_V1 = "sigma.subject_attestation.v1";
-export const OPTIMIZER_SUBJECT_ATTESTOR_ID_V1 = "subject-attestor";
+export const OPTIMIZER_SUBJECT_ATTESTATION_SOURCE = "sigma.subject_attestation";
+export const OPTIMIZER_SUBJECT_ATTESTOR_ID = "subject-attestor";
 const GENERIC_EVALUATOR_KEY = /^(?:benchmark|scenario(?:id|name)?|task(?:id|name)|dataset(?:id|name)?|fixture(?:id|name)?|verifier|reward|score|expected(?:output|result)|rawprompt)$/iu;
 const GENERIC_EVALUATOR_CONTENT = /(?:\bbenchmark\b|\b(?:scenario|task|dataset|fixture|verifier|reward|score)[_-]?(?:id|name|result|output)?\b|\bexpected[_ -]?(?:output|result)\b|\b(?:raw|original)[_ -]?prompt\b)/iu;
 
@@ -99,11 +99,11 @@ function modelField(value, label) {
 function parseSubjectAttestationEvent(event) {
   const payload = object(event.payload);
   const data = object(payload.data);
-  if (data.source !== OPTIMIZER_SUBJECT_ATTESTATION_SOURCE_V1) return null;
+  if (data.source !== OPTIMIZER_SUBJECT_ATTESTATION_SOURCE) return null;
   if (event.type !== "evidence.recorded" || event.authority !== "runtime"
     || payload.kind !== "diagnostic" || !["passed", "informational"].includes(payload.status)
     || object(payload.producer).authority !== "runtime"
-    || object(payload.producer).id !== OPTIMIZER_SUBJECT_ATTESTOR_ID_V1) {
+    || object(payload.producer).id !== OPTIMIZER_SUBJECT_ATTESTOR_ID) {
     throw new Error("Subject attestation evidence has an untrusted durable authority.");
   }
   const diagnostic = object(data.diagnostic);
@@ -129,7 +129,7 @@ function parseSubjectAttestationEvent(event) {
 
 function durableSubjectAttestation(events) {
   const matching = events.filter((event) => object(object(event.payload).data).source
-    === OPTIMIZER_SUBJECT_ATTESTATION_SOURCE_V1);
+    === OPTIMIZER_SUBJECT_ATTESTATION_SOURCE);
   if (matching.length === 0) return { status: "unavailable", reason: "durable_subject_attestation_missing" };
   const parsed = [];
   try {
@@ -262,7 +262,7 @@ function rejectGenericEvaluatorKeys(value, location = "stream") {
   }
 }
 
-export function assertGenericConformanceEventStreamV1(input) {
+export function assertGenericConformanceEventStream(input) {
   const value = object(input);
   exactKeys(value, ["schemaVersion", "kind", "records"], "Generic conformance event stream");
   if (value.schemaVersion !== 1 || value.kind !== "sigma.generic-conformance-event-stream") {
@@ -280,7 +280,7 @@ export function assertGenericConformanceEventStreamV1(input) {
     }
     return record.event;
   });
-  assertV5EventStream(events);
+  assertEventStream(events);
   rejectGenericEvaluatorKeys(events);
   return { value, events };
 }
@@ -293,7 +293,7 @@ async function readStoredObservations(directory) {
   const observations = [];
   for (const name of names.filter((item) => item.endsWith(".json"))) {
     const parsed = JSON.parse(await readFile(path.join(directory, name), "utf8"));
-    observations.push(assertOptimizerObservationV1(parsed));
+    observations.push(assertOptimizerObservation(parsed));
   }
   return observations;
 }
@@ -339,13 +339,13 @@ async function archiveConformanceStream(stream, workspace, vaultRoot) {
 }
 
 async function readConformanceStream(filePath) {
-  return assertGenericConformanceEventStreamV1(JSON.parse(await readFile(filePath, "utf8")));
+  return assertGenericConformanceEventStream(JSON.parse(await readFile(filePath, "utf8")));
 }
 
 async function selectedSessionIds(stateRoot, options) {
   if (options.includeRealSessions === false) return [];
   if (options.sessionIds.length > 0) return [...new Set(options.sessionIds)];
-  const available = await listV5Sessions(stateRoot);
+  const available = await listSessions(stateRoot);
   return available.slice(0, options.latest).map((item) => item.sessionId);
 }
 
@@ -419,7 +419,7 @@ export async function collectOptimizerObservations(options, dependencies = {}) {
   const created = [];
   const archives = [];
   for (const sessionId of sessionIds) {
-    const stored = await readV5Session(stateRoot, sessionId);
+    const stored = await readSession(stateRoot, sessionId);
     archives.push(await archiveSession(stored, workspace, vaultRoot));
     const metrics = reduceAgentEvents(stored.events, { sessionId });
     created.push(...createOptimizerObservations(metrics, {
@@ -466,10 +466,10 @@ function help() {
   return [
     "Usage: node scripts/eval/optimizer-observe.mjs [options]",
     "  --workspace <path>   Sigma workspace (default: .)",
-    "  --state-root <path>  Explicit V5 state root",
+    "  --state-root <path>  Explicit current state root",
     "  --latest <n>         Inspect latest N real sessions (default: 10)",
     "  --session <id>       Select an exact real session; repeatable",
-    "  --conformance-events <path>  Add a checksummed generic V5 event stream; repeatable",
+    "  --conformance-events <path>  Add a checksummed generic event stream; repeatable",
     "  --generic-only       Skip real-session state when ingesting generic conformance events",
     "  --provider/--model/--surface  Assert (never supply) durable subject identity",
     "  --output <path>      Sanitized directory inside shared repository state",

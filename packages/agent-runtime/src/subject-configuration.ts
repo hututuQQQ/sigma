@@ -1,7 +1,7 @@
 import type { JsonValue } from "agent-protocol";
 import type { RuntimeCompositionConfig } from "./configured-runtime.js";
 
-export function subjectConfigurationV1(config: RuntimeCompositionConfig): JsonValue {
+export function subjectConfiguration(config: RuntimeCompositionConfig): JsonValue {
   const {
     workspace: _workspace,
     workspaceMcpTrust,

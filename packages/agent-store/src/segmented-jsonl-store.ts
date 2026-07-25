@@ -19,20 +19,22 @@ import type {
 } from "agent-protocol";
 import { atomicJson, type AtomicReplace } from "./durable-file.js";
 import { inspectDurableEventTail } from "./durable-tail.js";
-import { segmentName, sessionDirectory, sessionsDirectory, snapshotName } from "./paths.js";
 import {
-  isLegacySnapshotEnvelopeV5,
-  isLegacySnapshotEnvelopeV6,
-  isLegacySnapshotEnvelopeV7,
-  isLegacySnapshotEnvelopeV8,
-  isLegacySnapshotEnvelopeV9,
-  isSessionMetaV5,
+  assertCurrentStoreLayout,
+  segmentName,
+  sessionDirectory,
+  sessionsDirectory,
+  snapshotName
+} from "./paths.js";
+import {
+  isSessionMeta,
   snapshotChecksum,
-  type SessionMetaV5,
+  type SessionMeta,
   type StoredSnapshot
 } from "./segmented-store-formats.js";
-export { isSessionMetaV5 } from "./segmented-store-formats.js";
-export type { SessionMetaV5 } from "./segmented-store-formats.js";
+import { unsupportedSchemaVersion } from "./schema-error.js";
+export { isSessionMeta } from "./segmented-store-formats.js";
+export type { SessionMeta } from "./segmented-store-formats.js";
 
 const DEFAULT_SEGMENT_BYTES = 8 * 1024 * 1024;
 const DEFAULT_SEGMENT_EVENTS = 10_000;
@@ -61,10 +63,14 @@ function storedLine(event: AnyTypedAgentEvent): string {
   return `${JSON.stringify({ checksum: checksum(event), event } satisfies StoredRecord)}\n`;
 }
 
-function parseRecord(line: string): AnyTypedAgentEvent {
+function parseRecord(line: string, sourcePath = "<event record>"): AnyTypedAgentEvent {
   const parsed = JSON.parse(line) as StoredRecord;
   if (!parsed || typeof parsed !== "object" || !parsed.event || typeof parsed.checksum !== "string") {
     throw new Error("Invalid event record envelope.");
+  }
+  const actual = (parsed.event as { schemaVersion?: unknown }).schemaVersion;
+  if (actual !== EVENT_SCHEMA_VERSION) {
+    throw unsupportedSchemaVersion("event", sourcePath, EVENT_SCHEMA_VERSION, actual);
   }
   assertAgentEventEnvelope(parsed.event);
   if (checksum(parsed.event) !== parsed.checksum) throw new Error(`Event checksum mismatch at seq ${parsed.event.seq}.`);
@@ -93,6 +99,7 @@ export class SegmentedJsonlStore implements RunStore {
   private readonly segmentEvents: number;
   private readonly replaceFile: AtomicReplace | undefined;
   private readonly queues = new Map<string, Promise<void>>();
+  private layoutValidation: Promise<void> | undefined;
 
   constructor(options: SegmentedJsonlStoreOptions) {
     this.rootDir = path.resolve(options.rootDir);
@@ -102,6 +109,7 @@ export class SegmentedJsonlStore implements RunStore {
   }
 
   async append(event: AnyTypedAgentEvent, expectedSeq: number): Promise<StoreAppendResult> {
+    await this.ensureCurrentLayout();
     assertAgentEventEnvelope(event);
     const previous = this.queues.get(event.sessionId) ?? Promise.resolve();
     const current = previous.then(() => this.appendLocked(event, expectedSeq));
@@ -115,7 +123,7 @@ export class SegmentedJsonlStore implements RunStore {
     const release = await acquireSessionLock(directory);
     try {
     let meta = await this.readMeta(event.sessionId, event.occurredAt);
-    const tail = await inspectDurableEventTail(directory, parseRecord);
+    const tail = await inspectDurableEventTail(directory, (line) => parseRecord(line, directory));
     if (meta.lastSeq !== expectedSeq || tail.incomplete || tail.lastSeq !== meta.lastSeq || tail.segment !== meta.segment) {
       meta = await this.reconcileMeta(event.sessionId, event.occurredAt);
     }
@@ -143,13 +151,11 @@ export class SegmentedJsonlStore implements RunStore {
     }
     await atomicJson(path.join(directory, "meta.json"), {
       ...meta,
-      eventSchemaVersion: EVENT_SCHEMA_VERSION,
-      snapshotSchemaVersion: SNAPSHOT_SCHEMA_VERSION,
       updatedAt: event.occurredAt,
       lastSeq: event.seq,
       segment,
       segmentEvents: segmentEvents + 1
-    } satisfies SessionMetaV5, this.replaceFile);
+    } satisfies SessionMeta, this.replaceFile);
     return { rotated };
     } finally {
       await release();
@@ -157,6 +163,7 @@ export class SegmentedJsonlStore implements RunStore {
   }
 
   async *events(sessionId: string, afterSeq = 0, recoverTail = false): AsyncIterable<AnyTypedAgentEvent> {
+    await this.ensureCurrentLayout();
     const eventsDir = path.join(sessionDirectory(this.rootDir, sessionId), "events");
     const files = (await readdir(eventsDir).catch(() => []))
       .filter((name) => /^\d{6}\.jsonl$/.test(name))
@@ -193,7 +200,7 @@ export class SegmentedJsonlStore implements RunStore {
         continue;
       }
       try {
-        const event = parseRecord(rawLine.trim());
+        const event = parseRecord(rawLine.trim(), filePath);
         if (event.seq !== cursor.lastValidSeq + 1) {
           throw new Error(`Event sequence discontinuity: expected ${cursor.lastValidSeq + 1}, actual ${event.seq}.`);
         }
@@ -228,7 +235,7 @@ export class SegmentedJsonlStore implements RunStore {
     }
   }
 
-  private async reconcileMeta(sessionId: string, now: string): Promise<SessionMetaV5> {
+  private async reconcileMeta(sessionId: string, now: string): Promise<SessionMeta> {
     let lastSeq = 0;
     for await (const event of this.events(sessionId, 0, true)) lastSeq = event.seq;
     const eventsDir = path.join(sessionDirectory(this.rootDir, sessionId), "events");
@@ -238,7 +245,7 @@ export class SegmentedJsonlStore implements RunStore {
       ? (await readFile(path.join(eventsDir, files.at(-1)!), "utf8")).split("\n").filter((line) => line.trim()).length
       : 0;
     const meta = await this.readMeta(sessionId, now);
-    const reconciled = { ...meta, updatedAt: now, lastSeq, segment, segmentEvents } satisfies SessionMetaV5;
+    const reconciled = { ...meta, updatedAt: now, lastSeq, segment, segmentEvents } satisfies SessionMeta;
     await atomicJson(path.join(sessionDirectory(this.rootDir, sessionId), "meta.json"), reconciled, this.replaceFile);
     return reconciled;
   }
@@ -267,10 +274,11 @@ export class SegmentedJsonlStore implements RunStore {
       lastSeq: lastValidSeq,
       segment,
       segmentEvents: validEvents
-    } satisfies SessionMetaV5, this.replaceFile);
+    } satisfies SessionMeta, this.replaceFile);
   }
 
   async writeSnapshot(snapshot: SnapshotEnvelope): Promise<void> {
+    await this.ensureCurrentLayout();
     assertSnapshotEnvelope(snapshot);
     const directory = path.join(sessionDirectory(this.rootDir, snapshot.sessionId), "snapshots");
     await atomicJson(path.join(directory, snapshotName(snapshot.seq)), {
@@ -280,42 +288,58 @@ export class SegmentedJsonlStore implements RunStore {
   }
 
   async latestSnapshot(sessionId: string): Promise<SnapshotEnvelope | null> {
+    await this.ensureCurrentLayout();
     const directory = path.join(sessionDirectory(this.rootDir, sessionId), "snapshots");
     const files = (await readdir(directory).catch(() => []))
       .filter((name) => /^\d{12}\.json$/.test(name))
       .sort()
       .reverse();
     for (const file of files) {
+      let stored: StoredSnapshot;
       try {
-        const stored = JSON.parse(await readFile(path.join(directory, file), "utf8")) as StoredSnapshot;
-        if (stored.snapshot?.schemaVersion === SNAPSHOT_SCHEMA_VERSION) {
-          assertSnapshotEnvelope(stored.snapshot);
-        } else if (!isLegacySnapshotEnvelopeV5(stored.snapshot)
-          && !isLegacySnapshotEnvelopeV6(stored.snapshot)
-          && !isLegacySnapshotEnvelopeV7(stored.snapshot)
-          && !isLegacySnapshotEnvelopeV8(stored.snapshot)
-          && !isLegacySnapshotEnvelopeV9(stored.snapshot)) {
-          continue;
-        }
-        if (stored.snapshot.sessionId === sessionId && snapshotChecksum(stored.snapshot) === stored.checksum) {
-          return stored.snapshot as SnapshotEnvelope;
-        }
+        stored = JSON.parse(await readFile(path.join(directory, file), "utf8")) as StoredSnapshot;
       } catch {
         // A previous complete snapshot remains a valid recovery point.
+        continue;
+      }
+      const actual = (stored.snapshot as { schemaVersion?: unknown } | undefined)?.schemaVersion;
+      if (actual !== SNAPSHOT_SCHEMA_VERSION) {
+        throw unsupportedSchemaVersion(
+          "snapshot", path.join(directory, file), SNAPSHOT_SCHEMA_VERSION, actual
+        );
+      }
+      try {
+        assertSnapshotEnvelope(stored.snapshot);
+        if (stored.snapshot.sessionId === sessionId && snapshotChecksum(stored.snapshot) === stored.checksum) {
+          return stored.snapshot;
+        }
+      } catch {
+        // A malformed or incomplete current snapshot does not invalidate an
+        // earlier complete recovery point.
       }
     }
     return null;
   }
 
   async listSessions(): Promise<Array<{ sessionId: string; updatedAt: string; lastSeq: number }>> {
+    await this.ensureCurrentLayout();
     const root = sessionsDirectory(this.rootDir);
     const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
     const sessions = await Promise.all(entries.filter((item) => item.isDirectory()).map(async (item) => {
       try {
         const meta = JSON.parse(await readFile(path.join(root, item.name, "meta.json"), "utf8")) as unknown;
-        if (!isSessionMetaV5(meta, item.name)) return null;
+        if (!isSessionMeta(meta, item.name)) {
+          const actual = (meta as { schemaVersion?: unknown } | undefined)?.schemaVersion;
+          if (actual !== STORE_LAYOUT_VERSION) {
+            throw unsupportedSchemaVersion(
+              "session metadata", path.join(root, item.name, "meta.json"), STORE_LAYOUT_VERSION, actual
+            );
+          }
+          return null;
+        }
         return { sessionId: meta.sessionId, updatedAt: meta.updatedAt, lastSeq: meta.lastSeq };
-      } catch {
+      } catch (error) {
+        if ((error as { code?: unknown }).code === "unsupported_schema_version") throw error;
         return null;
       }
     }));
@@ -323,18 +347,23 @@ export class SegmentedJsonlStore implements RunStore {
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
   }
 
-  private async readMeta(sessionId: string, now: string): Promise<SessionMetaV5> {
+  private async readMeta(sessionId: string, now: string): Promise<SessionMeta> {
     const metaPath = path.join(sessionDirectory(this.rootDir, sessionId), "meta.json");
     try {
       const parsed = JSON.parse(await readFile(metaPath, "utf8")) as unknown;
-      if (!isSessionMetaV5(parsed, sessionId)) throw new Error("invalid V5 metadata shape");
+      if (!isSessionMeta(parsed, sessionId)) {
+        const actual = (parsed as { schemaVersion?: unknown } | undefined)?.schemaVersion;
+        if (actual !== STORE_LAYOUT_VERSION) {
+          throw unsupportedSchemaVersion("session metadata", metaPath, STORE_LAYOUT_VERSION, actual);
+        }
+        throw new Error("invalid session metadata shape");
+      }
       return parsed;
     } catch (error) {
+      if ((error as { code?: unknown }).code === "unsupported_schema_version") throw error;
       if ((error as { code?: unknown }).code === "ENOENT") {
         return {
           schemaVersion: STORE_LAYOUT_VERSION,
-          eventSchemaVersion: EVENT_SCHEMA_VERSION,
-          snapshotSchemaVersion: SNAPSHOT_SCHEMA_VERSION,
           sessionId,
           createdAt: now,
           updatedAt: now,
@@ -345,6 +374,11 @@ export class SegmentedJsonlStore implements RunStore {
       }
       throw new Error(`Session metadata is corrupt for '${sessionId}'.`, { cause: error });
     }
+  }
+
+  private async ensureCurrentLayout(): Promise<void> {
+    this.layoutValidation ??= assertCurrentStoreLayout(this.rootDir);
+    await this.layoutValidation;
   }
 }
 

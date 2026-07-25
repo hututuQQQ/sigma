@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { assertSigmaManifest, sigmaManifest } from "./lib/sigma-manifest.mjs";
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const generatedTypeScriptPaths = ["agent-config", "agent-execution"].map((name) =>
+const generatedTypeScriptPaths = ["agent-config", "agent-execution", "agent-mcp"].map((name) =>
   path.join(rootDir, "packages", name, "src", "generated-project-facts.ts"));
 
 function typescriptSource(manifest) {

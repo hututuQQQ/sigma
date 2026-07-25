@@ -1,5 +1,5 @@
 import {
-  isRuntimePromptStateV2,
+  isRuntimePromptState,
   type AgentEventType,
   type JsonValue,
   type ModelMessage
@@ -45,7 +45,7 @@ const promptMaterialized: KernelEventReducer = (state, _event, payload) => {
     .map((item) => modelMessage(item))
     .filter((item): item is ModelMessage => item !== null);
   if (messages.length !== payload.messages.length) return state;
-  const promptState = isRuntimePromptStateV2(payload.promptState)
+  const promptState = isRuntimePromptState(payload.promptState)
     ? payload.promptState
     : state.promptState;
   const lengthRecovery = state.lengthRecovery.mode === "action_required"

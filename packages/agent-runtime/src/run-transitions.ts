@@ -60,8 +60,10 @@ export function recoveryDenialPayload(
       diagnosticCodes: ["recovery_retry_denied"]
     },
     observedEffects: [],
+    actualEffects: [],
     artifacts: [],
     diagnostics: ["recovery_retry_denied"],
+    evidence: [],
     startedAt: now,
     completedAt: now,
     ...modelTurn
@@ -84,8 +86,10 @@ export function recoveryResultLostPayload(
       diagnosticCodes: ["recovery_result_lost_no_replay"]
     },
     observedEffects: [],
+    actualEffects: [],
     artifacts: [],
     diagnostics: ["recovery_result_lost_no_replay"],
+    evidence: [],
     startedAt: now,
     completedAt: now,
     ...modelTurn

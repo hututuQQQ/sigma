@@ -2,15 +2,15 @@ import {
   KERNEL_STATE_VERSION,
   createBudgetLedger,
   createEmptyPlan,
-  emptyLongHorizonStateV2,
-  emptyReasoningTrajectoryStateV1,
+  emptyLongHorizonState,
+  emptyReasoningTrajectoryState,
   isBudgetLedgerState,
   isCheckpointRef,
-  isContextArchiveV1,
-  isRuntimePromptStateV2,
-  isLongHorizonStateV2,
-  isReasoningTrajectoryStateV1,
-  isToolResultPruneStateV1,
+  isContextArchive,
+  isRuntimePromptState,
+  isLongHorizonState,
+  isReasoningTrajectoryState,
+  isToolResultPruneState,
   isEvidenceRecord,
   parseAgentEventPayload,
   isMutationFrontier,
@@ -18,22 +18,22 @@ import {
   isUsageRecord,
   type BudgetLedgerState,
   type CheckpointRef,
-  type ContextArchiveV1,
+  type ContextArchive,
   type EvidenceRecord,
   type FrozenArtifactRef,
   type FrozenCustomizationRef,
   type ModelFinishReason,
   type ModelMessage,
-  type AssuranceResourcePolicyV1,
-  type LongHorizonStateV2,
-  type ReasoningTrajectoryStateV1,
+  type AssuranceResourcePolicy,
+  type LongHorizonState,
+  type ReasoningTrajectoryState,
   type MutationFrontier,
   type PlanGraph,
   type RunMode,
-  type RuntimePromptStateV2,
-  type ToolResultPruneStateV1,
+  type RuntimePromptState,
+  type ToolResultPruneState,
   type RunOutcome,
-  type ReviewerToolReceiptV1,
+  type ReviewerToolReceipt,
   type ToolRequest,
   type ToolReceipt,
   type UsageRecord
@@ -62,7 +62,7 @@ export interface PendingTool {
   started: boolean;
 }
 
-export interface LengthRecoveryStateV1 {
+export interface LengthRecoveryState {
   schemaVersion: 1;
   mode: "none" | "action_required" | "bounded_answer" | "continue_after_tools";
   attempts: number;
@@ -88,13 +88,13 @@ export interface KernelState {
   consecutiveLengthFinishes: number;
   consecutiveLengthNoAction: number;
   lastModelHadToolCalls: boolean;
-  lengthRecovery: LengthRecoveryStateV1;
+  lengthRecovery: LengthRecoveryState;
   messages: ModelMessage[];
   pendingTools: PendingTool[];
   toolCallIds: string[];
   receipts: ToolReceipt[];
   /** Tool calls executed in disposable independent verification sessions. */
-  reviewReceipts: ReviewerToolReceiptV1[];
+  reviewReceipts: ReviewerToolReceipt[];
   /** Session-scoped mutation evidence retained across follow-up runs so
    * validation and review status remains bound to the actual frontier. */
   mutationEvidence: EvidenceRecord[];
@@ -111,15 +111,15 @@ export interface KernelState {
   activeProcessIds: string[];
   childIds: string[];
   /** Durable semantic projection of an omitted stable history prefix. */
-  contextArchive?: ContextArchiveV1;
+  contextArchive?: ContextArchive;
   /** Last runtime state sections made durable in the prompt history. */
-  promptState: RuntimePromptStateV2;
+  promptState: RuntimePromptState;
   /** Durable model-context projection boundary; the underlying event history is unchanged. */
-  toolResultPrune?: ToolResultPruneStateV1;
+  toolResultPrune?: ToolResultPruneState;
   /** Provider reasoning-protocol projection boundary; durable blocks remain unchanged. */
-  reasoningTrajectory: ReasoningTrajectoryStateV1;
+  reasoningTrajectory: ReasoningTrajectoryState;
   /** Task-state-driven long-running work and protected assurance capacity. */
-  longHorizon: LongHorizonStateV2;
+  longHorizon: LongHorizonState;
   proposedOutcome?: RunOutcome;
   outcome?: RunOutcome;
 }
@@ -130,7 +130,7 @@ export interface CreateKernelStateOptions {
   mode: RunMode;
   startedAt: string;
   deadlineAt: string;
-  assurancePolicy?: AssuranceResourcePolicyV1;
+  assurancePolicy?: AssuranceResourcePolicy;
 }
 
 export function createKernelState(options: CreateKernelStateOptions): KernelState {
@@ -163,12 +163,12 @@ export function createKernelState(options: CreateKernelStateOptions): KernelStat
     activeProcessIds: [],
     childIds: [],
     promptState: {
-      schemaVersion: 2,
+      schemaVersion: 1,
       sectionDigests: {},
       budgetBand: 100
     },
-    longHorizon: emptyLongHorizonStateV2(options.assurancePolicy),
-    reasoningTrajectory: emptyReasoningTrajectoryStateV1()
+    longHorizon: emptyLongHorizonState(options.assurancePolicy),
+    reasoningTrajectory: emptyReasoningTrajectoryState()
   };
 }
 
@@ -229,7 +229,7 @@ function validModelCompletionState(state: Record<string, unknown>): boolean {
     && validLengthRecoveryState(state.lengthRecovery);
 }
 
-function validLengthRecoveryState(value: unknown): value is LengthRecoveryStateV1 {
+function validLengthRecoveryState(value: unknown): value is LengthRecoveryState {
   const recovery = record(value);
   return Boolean(recovery
     && recovery.schemaVersion === 1
@@ -240,11 +240,11 @@ function validLengthRecoveryState(value: unknown): value is LengthRecoveryStateV
 }
 
 function validKernelProjectionState(state: Record<string, unknown>): boolean {
-  return (state.contextArchive === undefined || isContextArchiveV1(state.contextArchive))
-    && isRuntimePromptStateV2(state.promptState)
-    && isLongHorizonStateV2(state.longHorizon)
-    && isReasoningTrajectoryStateV1(state.reasoningTrajectory)
-    && (state.toolResultPrune === undefined || isToolResultPruneStateV1(state.toolResultPrune))
+  return (state.contextArchive === undefined || isContextArchive(state.contextArchive))
+    && isRuntimePromptState(state.promptState)
+    && isLongHorizonState(state.longHorizon)
+    && isReasoningTrajectoryState(state.reasoningTrajectory)
+    && (state.toolResultPrune === undefined || isToolResultPruneState(state.toolResultPrune))
     && (state.activeModelSemanticDelta === undefined
       || typeof state.activeModelSemanticDelta === "boolean")
     && validModelCompletionState(state);
@@ -305,7 +305,7 @@ function isFrozenCustomizationRef(value: unknown): value is FrozenCustomizationR
 }
 
 export function assertKernelState(value: unknown): asserts value is KernelState {
-  if (!isKernelState(value)) throw new Error("Invalid KernelState V10.");
+  if (!isKernelState(value)) throw new Error("Invalid kernel state.");
 }
 
 export function isTerminal(state: KernelState): boolean {

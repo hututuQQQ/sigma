@@ -15,8 +15,8 @@ import type {
   ProcessHandle,
   ProcessPollResult,
   ProcessSpawnRequest,
-  ScratchLeaseRequestV1,
-  ScratchLeaseV1,
+  ScratchLeaseRequest,
+  ScratchLease,
   TrustedToolchainManifestEntry
 } from "./types.js";
 import {
@@ -126,9 +126,9 @@ export function withTrustedRuntimeCapabilities(
     } : {}),
     ...(broker.acquireScratchLease && broker.releaseScratchLease ? {
       acquireScratchLease: async (
-        request: ScratchLeaseRequestV1,
+        request: ScratchLeaseRequest,
         options?: BrokerRequestOptions
-      ): Promise<ScratchLeaseV1> => await broker.acquireScratchLease!(request, options),
+      ): Promise<ScratchLease> => await broker.acquireScratchLease!(request, options),
       releaseScratchLease: async (sessionId: string, options?: BrokerRequestOptions): Promise<void> =>
         await broker.releaseScratchLease!(sessionId, options)
     } : {}),

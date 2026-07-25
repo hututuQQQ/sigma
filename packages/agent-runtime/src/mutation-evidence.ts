@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type {
   DiagnosticEvidence,
   EvidenceRecord,
-  RepositoryAcceptanceEvidenceV1,
+  RepositoryAcceptanceEvidence,
   ReviewEvidence,
   ValidationEvidence,
   WorkspaceDeltaEvidence
@@ -118,9 +118,9 @@ function isExecutedValidation(item: ValidationEvidence): boolean {
 
 export function currentRepositoryAcceptance(
   session: RuntimeSession
-): RepositoryAcceptanceEvidenceV1 | undefined {
+): RepositoryAcceptanceEvidence | undefined {
   const frontier = session.durable.state.mutationFrontier;
-  return sessionMutationEvidence(session).filter((item): item is RepositoryAcceptanceEvidenceV1 =>
+  return sessionMutationEvidence(session).filter((item): item is RepositoryAcceptanceEvidence =>
     item.kind === "repository_acceptance"
     && item.status === "passed"
     && item.data.frontierRevision === frontier.revision
@@ -270,7 +270,6 @@ export function currentFrontierReview(
 ): ReviewEvidence | undefined {
   const basisDigest = reviewBasisDigest(session);
   return sessionMutationEvidence(session).filter((item): item is ReviewEvidence => item.kind === "review"
-    && item.data.schemaVersion === 3
     && item.data.frontierRevision === session.durable.state.mutationFrontier.revision
     && item.data.stateDigest === session.durable.state.mutationFrontier.currentStateDigest
     && item.data.reviewBasisDigest === basisDigest).at(-1);
@@ -300,9 +299,8 @@ function actualCheckIsDurable(
       evidence.evidenceId === evidenceId)));
 }
 
-function approvedV3Review(review: ReviewEvidence | undefined): review is ReviewEvidence {
+function approvedReview(review: ReviewEvidence | undefined): review is ReviewEvidence {
   return Boolean(review
-    && review.data.schemaVersion === 3
     && review.status === "passed"
     && review.data.verdict === "approved"
     && review.data.failureKind === undefined
@@ -350,7 +348,7 @@ export function authenticCurrentReviewApproval(
   review: ReviewEvidence | undefined,
   requireReviewerCheck = false
 ): boolean {
-  if (!approvedV3Review(review) || !reviewMatchesCurrentBasis(session, review)) return false;
+  if (!approvedReview(review) || !reviewMatchesCurrentBasis(session, review)) return false;
   const known = durableEvidenceIds(session);
   if (!criterionEvidenceIsAuthentic(review, known)
     || !durableReviewEvidenceIsAuthentic(review, known)) return false;
@@ -359,7 +357,7 @@ export function authenticCurrentReviewApproval(
   return !requireReviewerCheck || checks.length > 0;
 }
 
-/** Compatibility projection for reviewer diff material. Only deltas that
+/** Reviewer projection for diff material. Only deltas that
  * contribute a path to the current final frontier are returned. */
 export function unresolvedWorkspaceDeltas(session: RuntimeSession): WorkspaceDeltaEvidence[] {
   const changed = new Set(session.durable.state.mutationFrontier.changedPaths);

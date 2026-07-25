@@ -4,7 +4,7 @@ export const FAILURE_TAXONOMY_VERSION = 1 as const;
 /** A fourth same-family failure means the eligible fail-fast boundary was missed. */
 export const INFRASTRUCTURE_FAILURE_LIMIT = 3 as const;
 
-export type InfrastructureFailureFamilyV1 =
+export type InfrastructureFailureFamily =
   | "workspace_transaction"
   | "checkpoint_recovery"
   | "execution_broker"
@@ -14,14 +14,14 @@ export type InfrastructureFailureFamilyV1 =
   | "execution_output_encoding"
   | "execution_timeout";
 
-export interface InfrastructureFailureClassificationV1 {
+export interface InfrastructureFailureClassification {
   taxonomyVersion: typeof FAILURE_TAXONOMY_VERSION;
-  family: InfrastructureFailureFamilyV1;
+  family: InfrastructureFailureFamily;
   /** Normalized stable codes belonging to the selected family, in input order. */
   codes: string[];
 }
 
-const CODE_FAMILY_V1: Readonly<Record<string, InfrastructureFailureFamilyV1>> = {
+const CODE_FAMILY: Readonly<Record<string, InfrastructureFailureFamily>> = {
   workspace_transaction_root_unavailable: "workspace_transaction",
   workspace_transaction_cleanup_failed: "workspace_transaction",
 
@@ -63,7 +63,7 @@ const CODE_FAMILY_V1: Readonly<Record<string, InfrastructureFailureFamilyV1>> = 
   process_timed_out: "execution_timeout"
 };
 
-export function normalizeInfrastructureFailureCodeV1(value: string): string {
+export function normalizeInfrastructureFailureCode(value: string): string {
   return value.trim().toLowerCase().split(":", 1)[0] ?? "";
 }
 
@@ -74,12 +74,12 @@ export function normalizeInfrastructureFailureCodeV1(value: string): string {
  * own launch dependency is unavailable. Child-command output must use a
  * non-infrastructure diagnostic such as command_dependency_missing.
  */
-export function classifyInfrastructureFailureCodesV1(
+export function classifyInfrastructureFailureCodes(
   values: readonly string[]
-): InfrastructureFailureClassificationV1 | undefined {
-  const classified = [...new Set(values.map(normalizeInfrastructureFailureCodeV1).filter(Boolean))]
+): InfrastructureFailureClassification | undefined {
+  const classified = [...new Set(values.map(normalizeInfrastructureFailureCode).filter(Boolean))]
     .flatMap((code) => {
-      const family = CODE_FAMILY_V1[code];
+      const family = CODE_FAMILY[code];
       return family ? [{ code, family }] : [];
     });
   const family = classified[0]?.family;

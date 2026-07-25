@@ -10,7 +10,7 @@ import { auditDurableChildren } from "./durable-children.js";
 import { brokerRuntimeEnvironment } from "./execution-capabilities.js";
 import type { RuntimeCustomization } from "./customization.js";
 import type { createRoleGateways } from "./model-composition.js";
-import type { SubjectAttestationContextV1 } from "./subject-attestation.js";
+import type { SubjectAttestationContext } from "./subject-attestation.js";
 import type { ChildJoinSummary } from "./types.js";
 import type { createConfiguredTools } from "./configured-runtime-tools.js";
 
@@ -84,7 +84,7 @@ export function createComposedRuntime(input: {
   tools: ReturnType<typeof createConfiguredTools>;
   store: SegmentedJsonlStore;
   supervisor: AgentSupervisor;
-  subjectAttestation: SubjectAttestationContextV1 | undefined;
+  subjectAttestation: SubjectAttestationContext | undefined;
   agentProfileHookRunner?: HookRunnerPort;
 }) {
   const {

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { DecisionAuthorityV1 } from "agent-protocol";
+import type { DecisionAuthority } from "agent-protocol";
 import type { RuntimeSession } from "./types.js";
 
 const ADVISORY_PREFIX = "[sigma-completion-advisory:";
@@ -17,12 +17,12 @@ export function completionFindingText(value: unknown): string {
   }
 }
 
-export interface CompletionCandidateV1 {
+export interface CompletionCandidate {
   answer: string;
   digest: string;
 }
 
-export function completionCandidate(session: RuntimeSession): CompletionCandidateV1 | undefined {
+export function completionCandidate(session: RuntimeSession): CompletionCandidate | undefined {
   const proposed = session.durable.state.proposedOutcome;
   const answer = proposed?.kind === "completed"
     ? proposed.message.trim()
@@ -40,19 +40,19 @@ export type CompletionGateDecision =
       action: "complete";
       validationStatus: "not_needed" | "passed" | "failed" | "unverified";
       statusNote?: string;
-      authority: DecisionAuthorityV1;
+      authority: DecisionAuthority;
     }
   | {
       action: "continue";
       basisDigest: string;
       message: string;
-      authority: DecisionAuthorityV1;
+      authority: DecisionAuthority;
     }
   | {
       action: "fail";
       code: "strict_policy_failure" | "verification_failed" | "verification_unavailable";
       message: string;
-      authority: DecisionAuthorityV1;
+      authority: DecisionAuthority;
     };
 
 export function hasCompletionAdvisory(
@@ -67,7 +67,7 @@ export function hasCompletionAdvisory(
 export function completionAdvisory(
   basisDigest: string,
   body: string,
-  authority: DecisionAuthorityV1 = "user_policy"
+  authority: DecisionAuthority = "user_policy"
 ): Extract<CompletionGateDecision, { action: "continue" }> {
   return {
     action: "continue",

@@ -1,6 +1,7 @@
 import { lstat, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { SIGMA_PROJECT_FACTS } from "agent-execution";
 import { encodeLspMessage, LspFrameDecoder } from "./framing.js";
 import type {
   LspClientOptions,
@@ -64,7 +65,7 @@ export class LspClient {
     this.pump = this.readLoop(signal);
     await this.request("initialize", {
       processId: process.pid,
-      clientInfo: { name: this.clientName, version: "3.0.0" },
+      clientInfo: { name: this.clientName, version: SIGMA_PROJECT_FACTS.productVersion },
       rootUri: pathToFileURL(this.rootPath).href,
       capabilities: {
         textDocument: {

@@ -13,7 +13,7 @@ import {
   summarizeEvalMetrics
 } from "./report.mjs";
 
-export const EVAL_COMPARISON_SCHEMA_VERSION = 2;
+export const EVAL_COMPARISON_SCHEMA_VERSION = 1;
 export const EVAL_COMPATIBILITY_FIELDS = Object.freeze([
   "scenarioDigest",
   "evaluatorDigest",
@@ -22,11 +22,6 @@ export const EVAL_COMPATIBILITY_FIELDS = Object.freeze([
   "platform",
   "surface",
   "environmentDigest"
-]);
-
-const LEGACY_COMPATIBILITY_FIELDS = Object.freeze([
-  "scenarioDigest", "evaluatorDigest", "verifierDigest", "brokerDigest",
-  "model", "platform", "surface", "configDigest"
 ]);
 
 const LOWER_IS_BETTER = new Set([
@@ -51,7 +46,7 @@ function scenarioAttempts(run, scenarioId) {
 
 function metricAttempts(run, scenarioId) {
   const attempts = scenarioAttempts(run, scenarioId);
-  return run.sourceSchemaVersion === 1 ? attempts : attempts.filter((attempt) => attempt.validity === "valid");
+  return attempts.filter((attempt) => attempt.validity === "valid");
 }
 
 function subjectValues(run, scenarioId, field) {
@@ -83,8 +78,7 @@ function infrastructureValidity(run) {
   ]);
   const attemptErrors = run.attempts.reduce((count, attempt) => count + (attempt.dimensions?.reliability?.signals ?? [])
     .filter((signal) => invalidCodes.has(signal?.code)).length, 0);
-  const invalidAttempts = run.sourceSchemaVersion === 1 ? 0
-    : run.attempts.filter((attempt) => attempt.validity !== "valid").length;
+  const invalidAttempts = run.attempts.filter((attempt) => attempt.validity !== "valid").length;
   const expectedSamples = run.scenarios.reduce((total, scenario) => total + Number(scenario.expectedAttempts ?? run.repeat ?? 0), 0);
   const actualSamples = run.attempts.length;
   const sampleMismatch = expectedSamples !== actualSamples;
@@ -94,26 +88,8 @@ function infrastructureValidity(run) {
   };
 }
 
-function compatibilityFields(baseline, candidate) {
-  const scenarioIds = [...new Set([
-    ...baseline.scenarios.map((scenario) => scenario.scenarioId),
-    ...candidate.scenarios.map((scenario) => scenario.scenarioId)
-  ])];
-  const hasEnvironmentDigest = scenarioIds.every((scenarioId) =>
-    subjectValues(baseline, scenarioId, "environmentDigest").length > 0
-    && subjectValues(candidate, scenarioId, "environmentDigest").length > 0);
-  return hasEnvironmentDigest ? EVAL_COMPATIBILITY_FIELDS : LEGACY_COMPATIBILITY_FIELDS;
-}
-
 function runCompatibilityMismatches(baseline, candidate) {
   const mismatches = [];
-  if (baseline.sourceSchemaVersion !== candidate.sourceSchemaVersion) {
-    mismatches.push({
-      scope: "run", field: "schemaVersion", baseline: baseline.sourceSchemaVersion,
-      candidate: candidate.sourceSchemaVersion,
-      reason: "V1 and V2 evaluation reports cannot be statistically compared."
-    });
-  }
   if (baseline.runId === candidate.runId) {
     mismatches.push({
       scope: "run", field: "runId", baseline: baseline.runId, candidate: candidate.runId,
@@ -239,14 +215,13 @@ function pairedAttempts(baseline, candidate) {
   return keys.map((key) => ({ key, baseline: baselineByKey.get(key), candidate: candidateByKey.get(key) }));
 }
 
-function validPair(run, attempt) {
-  return Boolean(attempt) && (run.sourceSchemaVersion === 1 || attempt.validity === "valid");
+function validPair(attempt) {
+  return Boolean(attempt) && attempt.validity === "valid";
 }
 
 function pairedMetricDifferences(baseline, candidate) {
-  if (baseline.sourceSchemaVersion === 1 || candidate.sourceSchemaVersion === 1) return "unavailable";
   const pairs = pairedAttempts(baseline, candidate)
-    .filter((pair) => validPair(baseline, pair.baseline) && validPair(candidate, pair.candidate));
+    .filter((pair) => validPair(pair.baseline) && validPair(pair.candidate));
   return Object.fromEntries(Object.keys(EVAL_METRIC_PATHS).flatMap((name) => {
     const differences = pairs.flatMap((pair) => {
       const baselineValue = evalMetricValue(pair.baseline, name);
@@ -355,8 +330,8 @@ export function evaluateFrozenABGate(baselineInput, candidateInput, primary) {
   const candidate = buildEvalRunReport(candidateInput);
   const comparison = compareEvalRuns(baseline, candidate);
   const pairs = pairedAttempts(baseline, candidate);
-  const invalidPairs = pairs.filter((pair) => !validPair(baseline, pair.baseline)
-    || !validPair(candidate, pair.candidate)).map((pair) => pair.key);
+  const invalidPairs = pairs.filter((pair) => !validPair(pair.baseline)
+    || !validPair(pair.candidate)).map((pair) => pair.key);
   const guardrails = guardrailRegressions(baseline, candidate, pairs);
   const primaryResult = primaryGateResult(pairs, primary);
   const uniqueReasons = [...new Set([
@@ -425,7 +400,7 @@ function compareScenario(baselineRun, candidateRun, scenarioId) {
 function runIdentity(run) {
   return {
     runId: run.runId,
-    sourceSchemaVersion: run.sourceSchemaVersion,
+    schemaVersion: run.schemaVersion,
     suite: run.suite ?? null,
     repeat: run.repeat,
     status: run.status,
@@ -433,15 +408,14 @@ function runIdentity(run) {
     platform: run.subject?.platform ?? null,
     surface: run.subject?.surface ?? null,
     subjectDigest: run.subject?.subjectDigest ?? null,
-    environmentDigest: run.subject?.environmentDigest ?? null,
-    configDigest: run.subject?.configDigest ?? null
+    environmentDigest: run.subject?.environmentDigest ?? null
   };
 }
 
 export function compareEvalRuns(baselineInput, candidateInput) {
   const baseline = buildEvalRunReport(baselineInput);
   const candidate = buildEvalRunReport(candidateInput);
-  const requiredFields = compatibilityFields(baseline, candidate);
+  const requiredFields = EVAL_COMPATIBILITY_FIELDS;
   const mismatches = compatibilityMismatches(baseline, candidate, requiredFields);
   const comparable = mismatches.length === 0;
   const sharedIds = baseline.scenarios.map((scenario) => scenario.scenarioId)
@@ -472,10 +446,8 @@ export function compareEvalRuns(baselineInput, candidateInput) {
     }])),
     metrics: comparable
       ? metricDeltas(
-        summarizeEvalMetrics(baseline.sourceSchemaVersion === 1
-          ? baseline.attempts : baseline.attempts.filter((attempt) => attempt.validity === "valid")),
-        summarizeEvalMetrics(candidate.sourceSchemaVersion === 1
-          ? candidate.attempts : candidate.attempts.filter((attempt) => attempt.validity === "valid"))
+        summarizeEvalMetrics(baseline.attempts.filter((attempt) => attempt.validity === "valid")),
+        summarizeEvalMetrics(candidate.attempts.filter((attempt) => attempt.validity === "valid"))
       )
       : Object.fromEntries(Object.keys(EVAL_METRIC_PATHS).map((name) => [name, {
         baseline: null, candidate: null, delta: null, deltaPercent: null, change: "invalid"

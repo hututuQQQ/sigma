@@ -18,6 +18,7 @@ export function simpleExecutionReceipt(
     callId: request.callId,
     ok: true,
     output: JSON.stringify(value),
+    outcome: { status: "succeeded", output: JSON.stringify(value), diagnosticCodes: [] },
     observedEffects: effects,
     actualEffects: effects,
     artifacts: [],

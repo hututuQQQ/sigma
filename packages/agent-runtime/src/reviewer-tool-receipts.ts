@@ -4,7 +4,7 @@ import type {
   ModelToolCall,
   ToolReceipt
 } from "agent-protocol";
-import type { ReviewerToolCheckV1 } from "./reviewer-contracts.js";
+import type { ReviewerToolCheck } from "./reviewer-contracts.js";
 import type { RuntimeSession } from "./types.js";
 import {
   type ActiveReviewerToolEnvironmentOptions,
@@ -89,7 +89,7 @@ export function reviewerToolFailure(
 export function checkFor(
   call: ModelToolCall,
   receipt: ToolReceipt
-): ReviewerToolCheckV1 {
+): ReviewerToolCheck {
   return {
     toolName: call.name,
     evidenceIds: (receipt.evidence ?? []).map((item) => item.evidenceId),

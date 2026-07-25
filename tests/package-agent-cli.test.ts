@@ -25,7 +25,7 @@ async function writeBuiltPackage(
   rootDir: string,
   packageName: string,
   dependencies: Record<string, string> = {},
-  version = "2.0.0"
+  version = "0.1.0"
 ) {
   const packageDir = path.join(rootDir, "packages", packageName);
   await mkdir(path.join(packageDir, "dist"), { recursive: true });
@@ -71,7 +71,7 @@ async function writeFakeNodeRuntimeTarball(tmpDir: string, arch = "x64") {
   const nodePath = path.join(runtimeDir, "bin", "node");
   await writeFile(nodePath, `#!/usr/bin/env sh
 if [ "$1" = "--version" ]; then echo "${pinnedNodeVersion}"; exit 0; fi
-if [ "$2" = "version" ]; then echo '{"product":"Sigma Code","package":{"name":"agent-cli","version":"2.0.0"},"runtime":{"node":"${pinnedNodeVersion}"}}'; exit 0; fi
+if [ "$2" = "version" ]; then echo '{"product":"Sigma Code","package":{"name":"agent-cli","version":"0.1.0"},"runtime":{"node":"${pinnedNodeVersion}"}}'; exit 0; fi
 exec "${process.execPath}" "$@"
 `, "utf8");
   await chmod(nodePath, 0o755);
@@ -151,8 +151,17 @@ async function writeFakeWindowsNodeRuntimeZip(tmpDir: string, arch = "x64") {
 
 async function writePackageFixture() {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), "sigma-package-agent-cli-"));
+  await writeFile(
+    path.join(rootDir, "package.json"),
+    `${JSON.stringify({ name: "sigma", version: "0.1.0", private: true, license: "MIT" })}\n`,
+    "utf8"
+  );
   await writeFile(path.join(rootDir, "LICENSE"), "MIT License\n", "utf8");
   await writeBuiltPackage(rootDir, "agent-protocol");
+  await writeBuiltPackage(rootDir, "agent-execution");
+  await writeBuiltPackage(rootDir, "agent-code-intel");
+  await writeBuiltPackage(rootDir, "agent-checkpoint");
+  await writeBuiltPackage(rootDir, "agent-extensions");
   await writeBuiltPackage(rootDir, "agent-runtime", { "agent-protocol": "workspace:*" });
   await writeBuiltPackage(rootDir, "agent-tui", { "agent-protocol": "workspace:*" });
   await writeBuiltPackage(rootDir, "agent-cli", { "agent-runtime": "workspace:*", "agent-tui": "workspace:*" });
@@ -213,12 +222,12 @@ async function writeDynamicLinuxExecutable(filePath: string) {
   await writeFile(filePath, bytes);
 }
 
-async function writeV3PackageFixture(
+async function writePackagingWorkspace(
   brokerTarget: "linux" | "win32" = "linux",
   brokerArch: "x64" | "arm64" = "x64"
 ) {
-  const rootDir = await mkdtemp(path.join(os.tmpdir(), "sigma-package-agent-cli-v3-"));
-  const version = "4.0.0";
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "sigma-package-agent-cli-"));
+  const version = "0.1.0";
   await writeFile(
     path.join(rootDir, "package.json"),
     `${JSON.stringify({ name: "sigma", version, private: true, license: "MIT" })}\n`,
@@ -251,11 +260,11 @@ async function writeV3PackageFixture(
     await mkdir(path.dirname(entryPath), { recursive: true });
     await writeFile(entryPath, "export {};\n", "utf8");
   }
-  const tokenizerAsset = path.join(rootDir, "assets", "tokenizers", "sigma-cjk-byte-v1.json");
+  const tokenizerAsset = path.join(rootDir, "assets", "tokenizers", "sigma-cjk-byte.json");
   await mkdir(path.dirname(tokenizerAsset), { recursive: true });
   await writeFile(tokenizerAsset, `${JSON.stringify({
     schemaVersion: 1,
-    id: "sigma/cjk-byte-v1",
+    id: "sigma/cjk-byte",
     accuracy: "approximate",
     safetyMarginPercent: 20
   })}\n`, "utf8");
@@ -269,14 +278,14 @@ describe("package-agent-cli", () => {
     await expect(packageAgentCli({ rootDir: process.cwd(), targetArch: "arm64" })).rejects.toThrow("AGENT_TARGET_ARCH");
   });
 
-  it("rejects an unknown future major instead of falling back to the legacy package schema", async () => {
-    const { rootDir } = await writeV3PackageFixture();
+  it("rejects a workspace product version that differs from the manifest", async () => {
+    const { rootDir } = await writePackagingWorkspace();
     const manifestPath = path.join(rootDir, "package.json");
     const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-    manifest.version = "5.0.0";
+    manifest.version = "0.1.1";
     await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`, "utf8");
 
-    await expect(packageAgentCli({ rootDir })).rejects.toThrow("a new major requires an explicit schema review");
+    await expect(packageAgentCli({ rootDir })).rejects.toThrow("does not match sigma-manifest.json productVersion");
   });
 
   it("rejects unknown or unapproved Windows Node patch inputs", () => {
@@ -579,7 +588,7 @@ describe("package-agent-cli", () => {
         product: "Sigma Code",
         package: {
           name: "agent-cli",
-          version: "2.0.0"
+          version: "0.1.0"
         }
       },
       metadata: {
@@ -599,7 +608,7 @@ describe("package-agent-cli", () => {
   });
 
   it("rejects a renamed sigma-exec binary for a different target", async () => {
-    const { rootDir, broker } = await writeV3PackageFixture("win32");
+    const { rootDir, broker } = await writePackagingWorkspace("win32");
     const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
     const runtimeSha256 = createHash("sha256").update(await readFile(runtimeTarball)).digest("hex");
 
@@ -614,7 +623,7 @@ describe("package-agent-cli", () => {
   });
 
   it("rejects a sigma-exec binary for a different architecture", async () => {
-    const { rootDir, broker } = await writeV3PackageFixture("linux", "arm64");
+    const { rootDir, broker } = await writePackagingWorkspace("linux", "arm64");
     const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
     const runtimeSha256 = createHash("sha256").update(await readFile(runtimeTarball)).digest("hex");
 
@@ -629,7 +638,7 @@ describe("package-agent-cli", () => {
   });
 
   it("rejects a dynamically linked Linux broker", async () => {
-    const { rootDir, broker } = await writeV3PackageFixture("linux");
+    const { rootDir, broker } = await writePackagingWorkspace("linux");
     await writeDynamicLinuxExecutable(broker);
     const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
 
@@ -643,7 +652,7 @@ describe("package-agent-cli", () => {
   });
 
   it("rejects a non-Linux host Node disguised as a Linux package runtime", async () => {
-    const { rootDir, broker } = await writeV3PackageFixture("linux");
+    const { rootDir, broker } = await writePackagingWorkspace("linux");
     const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
 
     await expect(packageAgentCli({
@@ -655,8 +664,8 @@ describe("package-agent-cli", () => {
     })).rejects.toThrow("is not an ELF binary");
   });
 
-  linuxPackagingIt("packages V3 broker/LSP assets with integrity, SBOM, checksum, and provenance", async () => {
-    const { rootDir, broker, version } = await writeV3PackageFixture();
+  linuxPackagingIt("packages broker/LSP assets with integrity, SBOM, checksum, and provenance", async () => {
+    const { rootDir, broker, version } = await writePackagingWorkspace();
     const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
     const runtimeSha256 = createHash("sha256").update(await readFile(runtimeTarball)).digest("hex");
     const artifactsDir = path.join(rootDir, ".artifacts");
@@ -694,7 +703,7 @@ describe("package-agent-cli", () => {
         archiveChecksum: true
       },
       metadata: {
-        schemaVersion: 4,
+        schemaVersion: 1,
         productVersion: version,
         node: { archiveSha256: runtimeSha256 },
         sigmaExec: { source: "env" }
@@ -744,7 +753,7 @@ describe("package-agent-cli", () => {
   });
 
   linuxPackagingIt("rejects every unmanifested file in the portable bundle tree", async () => {
-    const { rootDir, broker } = await writeV3PackageFixture("linux");
+    const { rootDir, broker } = await writePackagingWorkspace("linux");
     const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
     const artifactsDir = path.join(rootDir, ".artifacts");
     const packaged = await packageAgentCli({
@@ -776,7 +785,7 @@ describe("package-agent-cli", () => {
   });
 
   linuxPackagingIt("binds sidecar and provenance verification to the initially inspected archive bytes", async () => {
-    const { rootDir, broker } = await writeV3PackageFixture("linux");
+    const { rootDir, broker } = await writePackagingWorkspace("linux");
     const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
     const artifactsDir = path.join(rootDir, ".artifacts");
     const packaged = await packageAgentCli({
@@ -831,7 +840,7 @@ describe("package-agent-cli", () => {
   });
 
   linuxPackagingIt("verifies release provenance only against an externally trusted Ed25519 key", async () => {
-    const { rootDir, broker } = await writeV3PackageFixture("linux");
+    const { rootDir, broker } = await writePackagingWorkspace("linux");
     const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
     const artifactsDir = path.join(rootDir, ".artifacts");
     const releaseKey = generateKeyPairSync("ed25519");
@@ -893,8 +902,8 @@ describe("package-agent-cli", () => {
     })).rejects.toThrow("DSSE signature is invalid for trusted key");
   });
 
-  approvedWindowsPackageIt("creates and verifies the Windows V3 artifact and patched Node proof chain", async () => {
-    const { rootDir, broker, version } = await writeV3PackageFixture("win32");
+  approvedWindowsPackageIt("creates and verifies the Windows artifact and patched Node proof chain", async () => {
+    const { rootDir, broker, version } = await writePackagingWorkspace("win32");
     const runtimeArchive = await writeFakeWindowsNodeRuntimeZip(rootDir);
     const artifactsDir = path.join(rootDir, ".artifacts");
 
@@ -970,7 +979,7 @@ describe("package-agent-cli", () => {
         archiveChecksum: true
       },
       metadata: {
-        schemaVersion: 4,
+        schemaVersion: 1,
         productVersion: version,
         targetPlatform: "win32",
         targetArch: "x64",
@@ -1050,7 +1059,7 @@ describe("package-agent-cli", () => {
       if (command === "wsl" && args[0] === "-e" && args[3]?.includes("./bin/agent version --json")) {
         return {
           status: 0,
-          stdout: `${JSON.stringify({ product: "Sigma Code", package: { name: "agent-cli", version: "2.0.0" } })}\n`,
+          stdout: `${JSON.stringify({ product: "Sigma Code", package: { name: "agent-cli", version: "0.1.0" } })}\n`,
           stderr: ""
         };
       }
@@ -1073,7 +1082,7 @@ describe("package-agent-cli", () => {
         product: "Sigma Code",
         package: {
           name: "agent-cli",
-          version: "2.0.0"
+          version: "0.1.0"
         }
       }
     });
@@ -1090,7 +1099,7 @@ describe("package-agent-cli", () => {
       if (command === "docker" && args[0] === "run") {
         return {
           status: 0,
-          stdout: `${JSON.stringify({ product: "Sigma Code", package: { name: "agent-cli", version: "2.0.0" } })}\n`,
+          stdout: `${JSON.stringify({ product: "Sigma Code", package: { name: "agent-cli", version: "0.1.0" } })}\n`,
           stderr: ""
         };
       }
@@ -1107,7 +1116,7 @@ describe("package-agent-cli", () => {
       status: "passed",
       transport: "docker",
       dockerVersion: "29.5.3",
-      version: { product: "Sigma Code", package: { name: "agent-cli", version: "2.0.0" } }
+      version: { product: "Sigma Code", package: { name: "agent-cli", version: "0.1.0" } }
     });
     expect(calls.map((call) => call.command)).toEqual(["docker", "docker"]);
     expect(calls[1].args).toContain("linux/amd64");
@@ -1121,7 +1130,7 @@ describe("package-agent-cli", () => {
       if (command === "powershell.exe" && args.join(" ").includes("agent.cmd") && args.join(" ").includes("version --json")) {
         return {
           status: 0,
-          stdout: `${JSON.stringify({ product: "Sigma Code", package: { name: "agent-cli", version: "2.0.0" } })}\n`,
+          stdout: `${JSON.stringify({ product: "Sigma Code", package: { name: "agent-cli", version: "0.1.0" } })}\n`,
           stderr: ""
         };
       }
@@ -1142,7 +1151,7 @@ describe("package-agent-cli", () => {
         product: "Sigma Code",
         package: {
           name: "agent-cli",
-          version: "2.0.0"
+          version: "0.1.0"
         }
       }
     });

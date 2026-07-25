@@ -1,4 +1,4 @@
-# Sigma Code 4.0.0 validation
+# Sigma Code 0.1.0 validation
 
 Run release checks from the repository root with Node `26.4.0`. The exact pin is shared by `.node-version`, the root package, CI, and the portable packager. TUI checks also require `--experimental-ffi`; a lower local Node may run some tests but is not release evidence.
 
@@ -16,6 +16,7 @@ pnpm build
 pnpm lint
 pnpm test:coverage
 pnpm test:harbor
+cargo test --locked --manifest-path native/sigma-exec/Cargo.toml
 ```
 
 `pnpm lint` includes:
@@ -26,7 +27,8 @@ pnpm test:harbor
 - Knip dead-code/export checks;
 - the architecture guard: production package files at most 400 lines and TUI source files at most 250 lines.
 
-The V8 coverage gate includes every `packages/*/src/**/*.{ts,tsx}` file and currently requires:
+The Vitest V8 coverage-provider gate includes every
+`packages/*/src/**/*.{ts,tsx}` file and currently requires:
 
 - global statements, lines, functions, and branches: at least 80%;
 - `agent-kernel` branch coverage: at least 90%;
@@ -45,7 +47,7 @@ pnpm smoke:tui-product
 pnpm verify:containment
 pnpm verify:package:agent-cli:linux
 pnpm perf:repo-100k
-pnpm perf:replay-v4-100k
+pnpm perf:replay-100k
 pnpm package:harbor-runtime
 pnpm product:readiness -- --internal-only
 ```
@@ -57,9 +59,12 @@ What these commands prove:
 - `verify:containment`: lexical and symlink/junction workspace escapes are rejected and a cancelled process tree returns in under one second in that check. This command does not claim process isolation.
 - `verify:package:agent-cli:linux`: the Linux portable archive contains the manifest-derived dependency closure, wrapper, metadata, and pinned runtime and must execute its target wrapper.
 - `verify:package:agent-cli:windows`: the Windows portable archive provides the equivalent native-wrapper proof; `verify:package:agent-cli:windows:structure` is structure-only and is not release evidence.
-- `perf:replay-v4-100k`: validates segmented V4 reads, envelope validation, reducer replay, snapshot rebuild, and tail replay over 100,000 events.
+- `perf:replay-100k`: validates schema 1 segmented reads, envelope validation,
+  reducer replay, snapshot rebuild, and tail replay over 100,000 events.
 - `package:harbor-runtime`: packages the already-built CLI archive with the external Harbor adapter; it does not add Harbor behavior to the solving runtime.
-- `product:readiness`: evaluates generated smoke/package evidence. It distinguishes internal readiness, Windows preview readiness, and stable release readiness.
+- `product:readiness`: evaluates generated smoke/package evidence. For `0.x`,
+  it distinguishes internal readiness from preview readiness on each Tier 1
+  target; it does not claim stable release readiness.
 
 `pnpm verify:product` combines only platform-neutral lint, coverage, fake product/TUI smoke, and internal readiness. Target archive, wrapper, sandbox, provider smoke, replay performance, and release readiness belong to `verify:release:linux` or `verify:release:windows`.
 
@@ -71,7 +76,13 @@ On Windows, with provider credentials configured, run:
 pnpm verify:release:windows
 ```
 
-This requires successful execution of the bundled Windows wrapper, real packaged sandbox and LSP smokes, trusted release provenance, and a live DeepSeek provider smoke in addition to the neutral product checks. It deliberately requires the Authenticode signer policy to remain unsatisfied and emits a preview-ready result. A structure-only Windows archive produced on another OS does not prove that the Windows wrapper executed successfully.
+This requires successful execution of the bundled Windows wrapper, real
+packaged sandbox and LSP smokes, trusted release provenance, and a live DeepSeek
+provider smoke in addition to the neutral product checks. A preview candidate
+must either have an approved Authenticode signer or be explicitly verified as
+unsigned; a signed but unapproved executable is rejected. A structure-only
+Windows archive produced on another OS does not prove that the Windows wrapper
+executed successfully.
 
 Live provider validation is intentionally separate because it costs money, depends on credentials/network/provider state, and is not a deterministic PR gate.
 
@@ -80,7 +91,7 @@ Live provider validation is intentionally separate because it costs money, depen
 The automated suites cover:
 
 - DeepSeek/GLM request serialization, retryable HTTP failures, `Retry-After`, stream aggregation/divergence, partial-stream restart, finish reasons, idle timeout, hard deadline, and cancellation;
-- kernel reducer decisions and the `complete_task` acceptance/evidence protocol;
+- kernel reducer decisions and the completion acceptance/evidence protocol;
 - checksummed segment rotation, concurrent append serialization, corrupt/torn tails, snapshots, artifacts, and stale append locks;
 - multi-run restore, durable deadlines, outcome-pending recovery, active-session ownership, command inboxes, pending approvals, and interrupted idempotent/non-idempotent tools;
 - effect-based permission/mode decisions, per-call contexts, resource locking, process cancellation, tool failures, workspace delta receipts, and nested `AGENTS.md` discovery;
@@ -94,14 +105,22 @@ The automated suites cover:
 - 10,000-event projection with keyed incremental updates under 100 ms, long streaming-message update/render stages under 150 ms, and heap growth under 150 MiB in the unit-test environment;
 - packaged TUI startup and cleanup through a real Linux PTY and Windows ConPTY in CI;
 - a synthetic 100,000-path Git index through the production repository-context provider, bounded to 30 seconds and 300 MiB incremental heap;
-- recursive production-dependency packaging, nested-version preservation, target OpenTUI native selection, pinned Node/FFI wrapper startup, and absence of the removed legacy packages;
+- recursive production-dependency packaging, nested dependency-version
+  preservation, target OpenTUI native selection, pinned Node/FFI wrapper
+  startup, and absence of deprecated package names;
 - the production evaluation/fairness boundary.
 
 ## Boundaries not established by the automated gate
 
 Do not interpret the checks above as claims beyond their scope:
 
-- Sigma defaults to required OS isolation and no process network. Linux uses namespace/Landlock/seccomp and Windows uses AppContainer when the native broker self-test succeeds. Execution fails closed when required isolation is unavailable; unsafe host execution needs both a home-level grant and a per-run request. `agent doctor` reports the actual backend and self-test state.
+- Sigma defaults to required OS isolation and a `full` process-network policy.
+  Each full-network call still passes through the per-call authorization path;
+  `none` and `loopback` explicitly narrow the capability. Linux uses
+  namespace/Landlock/seccomp and Windows uses AppContainer when the native
+  broker self-test succeeds. Execution fails closed when required isolation is
+  unavailable, and there is no unsafe host-execution mode. `agent doctor`
+  reports the actual backend and self-test state.
 - CI exercises packaged `/quit` startup and cleanup through Linux PTY and Windows ConPTY. It does not replace manual IME, rapid-resize, font, and terminal-emulator matrix signoff.
 - A trusted MCP process still runs with the user's OS authority. Repository MCP requires path-and-digest-bound trust and receives a restricted environment, but policy cannot independently prove what a remote server does.
 - A dirty/non-Git writer runs under an exclusive lease in the source workspace, not an isolated worktree. In that mode only path-addressable writes inside its required `writeScope` are allowed; broad process/MCP mutation tools are denied.

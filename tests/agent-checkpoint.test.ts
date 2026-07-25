@@ -533,7 +533,7 @@ describe("CheckpointManager", () => {
     const currentImage = await checkpointFileImage(path.join(transaction, "backup", "0"));
     const installedImage = await checkpointFileImage(path.join(workspace, "existing.txt"));
     await writeFile(path.join(transaction, "journal.json"), JSON.stringify({
-      schemaVersion: 3,
+      schemaVersion: 1,
       phase: "applying",
       finalization: validRecoveryFinalization(workspace),
       directoryModes: [],
@@ -574,7 +574,7 @@ describe("CheckpointManager", () => {
     if (keepBackup) await rename(target, path.join(transaction, "backup", "0"));
     if (!keepTarget && !keepBackup) await rm(target);
     await writeFile(path.join(transaction, "journal.json"), JSON.stringify({
-      schemaVersion: 3,
+      schemaVersion: 1,
       phase: "rolling_back",
       finalization: validRecoveryFinalization(workspace),
       directoryModes: [],
@@ -594,7 +594,7 @@ describe("CheckpointManager", () => {
     await expect(lstat(transaction)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it.skipIf(process.platform === "win32")("restores a pure directory mode change from a v3 recovery journal", async () => {
+  it.skipIf(process.platform === "win32")("restores a pure directory mode change from the current recovery journal", async () => {
     const { root, workspace, manager } = await fixture();
     const directory = path.join(workspace, "mode-only");
     await mkdir(directory);
@@ -607,7 +607,7 @@ describe("CheckpointManager", () => {
     await mkdir(path.join(transaction, "backup"), { recursive: true });
     await mkdir(path.join(transaction, "stage"), { recursive: true });
     await writeFile(path.join(transaction, "journal.json"), JSON.stringify({
-      schemaVersion: 3,
+      schemaVersion: 1,
       phase: "applying",
       finalization: validRecoveryFinalization(workspace),
       directoryModes: [{ path: "mode-only", currentMode, desiredMode }],
@@ -626,14 +626,14 @@ describe("CheckpointManager", () => {
     ["malformed finalization record", "applying", () => ({
       desiredManifestDigest: "0".repeat(64), record: []
     })]
-  ])("rejects a v3 journal with %s", async (_label, phase, finalizationFactory) => {
+  ])("rejects a current journal with %s", async (_label, phase, finalizationFactory) => {
     const { root, workspace, manager } = await fixture();
     const transactions = await checkpointTransactionRoot(root, workspace);
     const transaction = path.join(transactions, `restore-invalid-${String(_label).replaceAll(" ", "-")}`);
     await mkdir(path.join(transaction, "backup"), { recursive: true });
     await mkdir(path.join(transaction, "stage"), { recursive: true });
     await writeFile(path.join(transaction, "journal.json"), JSON.stringify({
-      schemaVersion: 3,
+      schemaVersion: 1,
       phase,
       finalization: finalizationFactory(workspace),
       directoryModes: [],
@@ -648,36 +648,36 @@ describe("CheckpointManager", () => {
     await expect(lstat(transaction)).resolves.toBeDefined();
   });
 
-  it("finalizes a schema v2 verified restore journal before the next checkpoint operation", async () => {
+  it("rejects an unknown journal schema without modifying the journal or workspace", async () => {
     const { root, workspace, manager } = await fixture();
-    const checkpoint = await manager.create({
-      sessionId: "session-verified-finalize", runId: "run-verified-finalize",
-      workspacePath: workspace, scopePaths: ["existing.txt"], baseSeq: 1
-    });
-    await writeFile(path.join(workspace, "existing.txt"), "after", "utf8");
-    const sealed = await manager.seal(checkpoint.sessionId, checkpoint.checkpointId);
-    await writeFile(path.join(workspace, "existing.txt"), "before", "utf8");
-    const restored = { ...sealed, status: "restored" as const, restoredAt: new Date().toISOString() };
     const transactions = await checkpointTransactionRoot(root, workspace);
-    const transaction = path.join(transactions, "restore-verified");
-    await mkdir(transaction, { recursive: true });
-    await writeFile(path.join(transaction, "journal.json"), JSON.stringify({
-      schemaVersion: 2,
-      phase: "verified",
-      finalization: { record: restored, desiredManifestDigest: sealed.preManifestDigest },
+    const transaction = path.join(transactions, "restore-unknown-schema");
+    await mkdir(path.join(transaction, "backup"), { recursive: true });
+    await mkdir(path.join(transaction, "stage"), { recursive: true });
+    const journalPath = path.join(transaction, "journal.json");
+    const original = `${JSON.stringify({
+      schemaVersion: 999,
+      phase: "applying",
+      finalization: validRecoveryFinalization(workspace),
+      directoryModes: [],
       operations: []
-    }), "utf8");
+    })}\n`;
+    await writeFile(journalPath, original, "utf8");
 
-    await manager.create({
-      sessionId: checkpoint.sessionId, runId: "run-after-recovery",
-      workspacePath: workspace, scopePaths: ["existing.txt"], baseSeq: 2
+    await expect(manager.create({
+      sessionId: "session-unknown-schema",
+      runId: "run-unknown-schema",
+      workspacePath: workspace,
+      scopePaths: ["existing.txt"],
+      baseSeq: 0
+    })).rejects.toMatchObject({
+      code: "unsupported_schema_version",
+      path: journalPath,
+      expected: 1,
+      actual: 999
     });
-    await expect(manager.list(checkpoint.sessionId)).resolves.toContainEqual(expect.objectContaining({
-      checkpointId: checkpoint.checkpointId,
-      status: "restored"
-    }));
-    await expect(lstat(transaction)).rejects.toMatchObject({ code: "ENOENT" });
-    await expect(lstat(path.join(workspace, ".agent"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(journalPath, "utf8")).toBe(original);
+    await expect(readFile(path.join(workspace, "existing.txt"), "utf8")).resolves.toBe("before");
   });
 
   it("recovers finalization after a subprocess is killed at the verified boundary", async () => {
@@ -720,7 +720,7 @@ describe("CheckpointManager", () => {
     await expect(lstat(path.join(workspace, ".agent"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("never scans or applies a forged legacy journal from workspace .agent state", async () => {
+  it("never scans or applies a forged journal from workspace-local .agent state", async () => {
     const { workspace, manager } = await fixture();
     const transaction = path.join(workspace, ".agent", "checkpoint-transactions", "restore-forged");
     await mkdir(path.join(transaction, "backup"), { recursive: true });
@@ -729,7 +729,7 @@ describe("CheckpointManager", () => {
     const currentImage = await checkpointFileImage(path.join(transaction, "backup", "0"));
     const installedImage = await checkpointFileImage(path.join(workspace, "existing.txt"));
     await writeFile(path.join(transaction, "journal.json"), JSON.stringify({
-      schemaVersion: 3,
+      schemaVersion: 1,
       phase: "applying",
       finalization: {
         desiredManifestDigest: "0".repeat(64),
@@ -743,7 +743,7 @@ describe("CheckpointManager", () => {
     }), "utf8");
 
     await expect(manager.create({
-      sessionId: "session-legacy-verified", runId: "run-legacy-verified",
+      sessionId: "session-forged-local", runId: "run-forged-local",
       workspacePath: workspace, scopePaths: ["existing.txt"], baseSeq: 0
     })).resolves.toMatchObject({ status: "open" });
     await expect(readFile(path.join(workspace, "existing.txt"), "utf8")).resolves.toBe("before");
@@ -898,7 +898,7 @@ describe("CheckpointManager", () => {
     }
   );
 
-  it("keeps restore state external when the legacy .agent directory is linked", async () => {
+  it("keeps restore state external when the workspace .agent directory is linked", async () => {
     const { root, workspace, manager } = await fixture();
     const outside = path.join(root, "agent-link-outside");
     await mkdir(outside);

@@ -18,14 +18,14 @@ export function roleForMode(mode: RunMode): ModelExecutionRole {
 }
 
 export function resolveHookProfile(
-  options: RuntimeOptions,
+  _options: RuntimeOptions,
   session: RuntimeSession,
   profileId: string
 ): FrozenAgentProfile | undefined {
   if (session.services.profile?.profile.id === profileId) return session.services.profile;
   const frozen = session.durable.frozenCustomization?.profiles.find((item) => item.id === profileId);
   if (frozen) return restoreFrozenAgentProfile(frozen.canonicalJson, frozen.digest);
-  return options.availableProfiles?.find((item) => item.profile.profile.id === profileId)?.profile;
+  return undefined;
 }
 
 export function profileBudgetLimits(profile: FrozenAgentProfile): BudgetLimits {
@@ -60,7 +60,7 @@ export function constrainBudget(
 }
 
 export function resolveChildProfile(
-  options: RuntimeOptions,
+  _options: RuntimeOptions,
   parent: RuntimeSession,
   requestedProfileId: string | null | undefined
 ): SessionProfileSelection {
@@ -82,11 +82,10 @@ export function resolveChildProfile(
       `Agent Profile '${requested}' is not allowed by frozen parent profile '${parent.services.profile.profile.id}'.`
     );
   }
-  return resolveAllowedChildProfile(options, parent, requested);
+  return resolveAllowedChildProfile(parent, requested);
 }
 
 function resolveAllowedChildProfile(
-  options: RuntimeOptions,
   parent: RuntimeSession,
   requested: string
 ): SessionProfileSelection {
@@ -94,7 +93,7 @@ function resolveAllowedChildProfile(
   const candidate: RuntimeAgentProfile | undefined = frozen ? {
     profile: restoreFrozenAgentProfile(frozen.canonicalJson, frozen.digest),
     source: frozen.source
-  } : options.availableProfiles?.find((item) => item.profile.profile.id === requested);
+  } : undefined;
   if (!candidate) throw profileError("child_profile_unknown", `Unknown child Agent Profile '${requested}'.`);
   try {
     return {
@@ -132,16 +131,14 @@ export function assertFrozenProfileResources(
   const hookIds = new Set(customization.hooks.map((item) => item.id));
   const missingHook = profile.profile.hooks.find((id) => !hookIds.has(id));
   if (missingHook) throw profileError("profile_resource_missing", `Frozen Agent Profile hook '${missingHook}' is unavailable.`);
-  if (customization.schemaVersion >= 2) {
-    const profileIds = new Set(customization.profiles.map((item) => item.id));
-    const missingTarget = customization.hooks.find((item) =>
-      item.definition.kind === "agent_profile" && !profileIds.has(item.definition.profileId));
-    if (missingTarget?.definition.kind === "agent_profile") {
-      throw profileError(
-        "profile_resource_missing",
-        `Frozen agent-profile hook '${missingTarget.id}' target '${missingTarget.definition.profileId}' is unavailable.`
-      );
-    }
+  const profileIds = new Set(customization.profiles.map((item) => item.id));
+  const missingTarget = customization.hooks.find((item) =>
+    item.definition.kind === "agent_profile" && !profileIds.has(item.definition.profileId));
+  if (missingTarget?.definition.kind === "agent_profile") {
+    throw profileError(
+      "profile_resource_missing",
+      `Frozen agent-profile hook '${missingTarget.id}' target '${missingTarget.definition.profileId}' is unavailable.`
+    );
   }
   const skillIds = new Set<string>(customization.skills.map((item) => item.qualifiedName));
   const missingSkill = profile.profile.skills.find((id) => !skillIds.has(id));

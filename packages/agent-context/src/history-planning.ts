@@ -1,5 +1,5 @@
 import type {
-  ContextArchiveV1,
+  ContextArchive,
   ContextItem,
   ModelMessage
 } from "agent-protocol";
@@ -31,9 +31,9 @@ const SUMMARY_DELTA_TOKEN_RESERVE = 2_048;
 
 export function historyAfterArchive(
   history: readonly ModelMessage[],
-  archive: ContextArchiveV1 | undefined
+  archive: ContextArchive | undefined
 ): {
-  archive?: ContextArchiveV1;
+  archive?: ContextArchive;
   history: ModelMessage[];
   coveredBlocks: HistoryBlock[];
   /** Authority-bearing blocks replayed raw even though the archive covers

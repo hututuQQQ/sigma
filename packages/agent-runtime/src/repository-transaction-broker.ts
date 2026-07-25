@@ -1,6 +1,6 @@
 import type {
-  RepositoryOperationV2,
-  RepositoryTransactionResultV2
+  RepositoryOperation,
+  RepositoryTransactionResult
 } from "agent-execution";
 import type { ProcessExecutionPort } from "agent-platform";
 import type { ToolDescriptor } from "agent-protocol";
@@ -68,7 +68,7 @@ export function requireRepositoryTransactionBroker(
   }
 }
 
-export function brokerOperations(operations: readonly GitOperation[]): RepositoryOperationV2[] {
+export function brokerOperations(operations: readonly GitOperation[]): RepositoryOperation[] {
   return operations.map((operation) => ({
     operationClass: operation.op,
     args: gitOperationArgs(operation)
@@ -87,7 +87,7 @@ export function transactionEffects(
   ];
 }
 
-export function requireTransactionHandle(result: RepositoryTransactionResultV2): string {
+export function requireTransactionHandle(result: RepositoryTransactionResult): string {
   if (!result.transactionHandle) {
     throw Object.assign(new Error(
       "Broker repository result omitted its durable transaction handle."
@@ -96,11 +96,11 @@ export function requireTransactionHandle(result: RepositoryTransactionResultV2):
   return result.transactionHandle;
 }
 
-export function requireCompletedAssertions(result: RepositoryTransactionResultV2) {
-  if (result.status !== "completed_pending_seal" || result.protocolVersion !== 3
+export function requireCompletedAssertions(result: RepositoryTransactionResult) {
+  if (result.status !== "completed_pending_seal" || result.protocolVersion !== 1
     || !result.semanticAssertions || result.semanticAssertions.conflictCount !== 0) {
     throw Object.assign(new Error(
-      "Broker repository transaction did not provide conflict-free V3 semantic assertions."
+      "Broker repository transaction did not provide conflict-free semantic assertions."
     ), { code: "repository_postcondition_failed" });
   }
   return result.semanticAssertions;

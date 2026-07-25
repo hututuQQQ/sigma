@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "id": "sigma/cjk-byte-v1",
+  "id": "sigma/cjk-byte",
   "accuracy": "approximate",
   "algorithm": "utf8-byte-and-script-weighted-estimate",
   "safetyMarginPercent": 20,

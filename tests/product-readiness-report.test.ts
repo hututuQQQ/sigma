@@ -16,7 +16,7 @@ async function fixture(targetWrapper: Record<string, unknown>, providerSmoke?: R
   const rootDir = await mkdir(path.join(os.tmpdir(), `sigma-readiness-${Date.now()}-${Math.random().toString(16).slice(2)}`), { recursive: true });
   const artifactsDir = path.join(rootDir, ".artifacts");
   await writeJson(path.join(rootDir, "package.json"), {
-    version: "2.0.0",
+    version: "0.1.0",
     scripts: {
       "verify:product": "pnpm lint && pnpm test && pnpm smoke:product && pnpm smoke:tui-product && pnpm verify:package:agent-cli:windows:structure && pnpm product:readiness"
     }
@@ -50,15 +50,38 @@ async function fixture(targetWrapper: Record<string, unknown>, providerSmoke?: R
       readme: true,
       wrapper: true,
       metadata: true,
+      bundledNode: true,
+      noSystemNodeFallback: true,
+      sigmaExec: true,
+      languageServerAssets: true,
+      tokenizerAssets: true,
+      integrity: true,
+      sbom: true,
+      provenance: true,
+      provenanceSignature: true,
+      archiveChecksum: true,
+      windowsSignerPolicy: true,
       hostCli: true,
       targetWrapper: targetWrapper.ok === true
     },
     metadata: {
-      schemaVersion: 2,
-      productVersion: "2.0.0",
+      schemaVersion: 1,
+      productVersion: "0.1.0",
+      releaseChannel: "preview",
       sigmaExec: { sha256: "a".repeat(64) },
       node: { sha256: "c".repeat(64) },
       signing: { authenticodeVerified: targetPlatform === "win32" }
+    },
+    signing: {
+      authenticodeVerified: targetPlatform === "win32",
+      policyVerified: true
+    },
+    integrity: {
+      manifestDigest: "d".repeat(64),
+      manifest: { entries: [
+        { path: "node_modules/agent-code-intel/dist/typescript-server.mjs", sha256: "e".repeat(64) },
+        { path: "node_modules/pyright/langserver.index.js", sha256: "f".repeat(64) }
+      ] }
     },
     targetWrapper
   });
@@ -82,16 +105,23 @@ async function fixture(targetWrapper: Record<string, unknown>, providerSmoke?: R
     bundledNodeSha256: "c".repeat(64),
     sandbox: { required: true, network: "none", writeRoots: [], selfTestPassed: true },
     checks: {
+      languageServerDiscovery: true,
       typescript: { ready: true }, pyright: { ready: true },
       mcp: {
         ready: true, processStarted: true, initializeWriteDenied: true,
         idleWriteDenied: true, spawnCalls: 0
       }
-    }
+    },
+    productVersion: "0.1.0",
+    assets: {
+      typescriptLanguageServerSha256: "e".repeat(64),
+      pyrightSha256: "f".repeat(64)
+    },
+    integrityManifestSha256: "d".repeat(64)
   });
-  await writeJson(path.join(artifactsDir, "replay-v5-100k.json"), {
+  await writeJson(path.join(artifactsDir, "replay-100k.json"), {
     schemaVersion: 1,
-    kind: "v5Replay100k",
+    kind: "replay100k",
     ok: true,
     events: 100_000,
     elapsedMs: 5_000,
@@ -113,13 +143,13 @@ async function fixture(targetWrapper: Record<string, unknown>, providerSmoke?: R
   return { rootDir, artifactsDir };
 }
 
-async function promoteV3Evidence(
+async function promoteCurrentEvidence(
   rootDir: string,
   artifactsDir: string,
   {
     provenanceTrusted,
     windowsSignerPolicy,
-    version = "4.0.0"
+    version = "0.1.0"
   }: { provenanceTrusted: boolean; windowsSignerPolicy: boolean; version?: string }
 ) {
   const packageJsonPath = path.join(rootDir, "package.json");
@@ -141,9 +171,9 @@ async function promoteV3Evidence(
     archiveChecksum: true,
     windowsSignerPolicy
   });
-  verification.metadata.schemaVersion = Number(version.split(".")[0]);
+  verification.metadata.schemaVersion = 1;
   verification.metadata.productVersion = version;
-  verification.metadata.releaseChannel = windowsSignerPolicy ? "stable" : "preview";
+  verification.metadata.releaseChannel = version.startsWith("0.") ? "preview" : "stable";
   verification.metadata.signing = { authenticodeVerified: windowsSignerPolicy };
   verification.signing = {
     authenticodeVerified: windowsSignerPolicy,
@@ -197,7 +227,7 @@ describe("product readiness report", () => {
     expect(report.releaseChecks.some((item) => item.name === "lspSandboxSmoke:ready" && item.ok)).toBe(true);
   });
 
-  it("marks release-ready when the target wrapper passed", async () => {
+  it("marks a complete 0.x Windows artifact preview-ready", async () => {
     const { rootDir, artifactsDir } = await fixture({
       ok: true,
       status: "passed",
@@ -219,9 +249,10 @@ describe("product readiness report", () => {
     const report = await buildProductReadinessReport({ rootDir, artifactsDir });
 
     expect(report).toMatchObject({
-      status: "release-ready",
+      status: "preview-ready",
       internalReady: true,
-      releaseReady: true,
+      releaseReady: false,
+      previewReady: true,
       evidence: {
         packageVerify: {
           targetPlatform: "win32"
@@ -230,7 +261,7 @@ describe("product readiness report", () => {
     });
   });
 
-  it("marks Linux x64 as an independent Tier 1 release target", async () => {
+  it("marks Linux x64 as an independent Tier 1 preview target", async () => {
     const { rootDir, artifactsDir } = await fixture({
       ok: true,
       status: "passed",
@@ -250,9 +281,10 @@ describe("product readiness report", () => {
     const report = await buildProductReadinessReport({ rootDir, artifactsDir });
 
     expect(report).toMatchObject({
-      status: "release-ready",
+      status: "preview-ready",
       internalReady: true,
-      releaseReady: true
+      releaseReady: false,
+      previewReady: true
     });
     expect(report.releaseChecks).toContainEqual({
       name: "package:tier1Target",
@@ -277,7 +309,7 @@ describe("product readiness report", () => {
         inspect: true
       }
     });
-    const evidencePath = path.join(artifactsDir, "replay-v5-100k.json");
+    const evidencePath = path.join(artifactsDir, "replay-100k.json");
     const evidence = JSON.parse(await readFile(evidencePath, "utf8"));
     evidence.snapshotRebuilt = false;
     await writeJson(evidencePath, evidence);
@@ -292,7 +324,7 @@ describe("product readiness report", () => {
     });
   });
 
-  it("keeps structurally valid but externally untrusted V3 artifacts preview-only", async () => {
+  it("keeps structurally valid but externally untrusted artifacts internal-only", async () => {
     const { rootDir, artifactsDir } = await fixture({
       ok: true,
       status: "passed",
@@ -302,7 +334,7 @@ describe("product readiness report", () => {
       status: "passed",
       checks: { doctorApi: true, runCompleted: true, fileContent: true, inspect: true }
     });
-    await promoteV3Evidence(rootDir, artifactsDir, {
+    await promoteCurrentEvidence(rootDir, artifactsDir, {
       provenanceTrusted: false,
       windowsSignerPolicy: false
     });
@@ -327,7 +359,7 @@ describe("product readiness report", () => {
       status: "passed",
       checks: { doctorApi: true, runCompleted: true, fileContent: true, inspect: true }
     });
-    await promoteV3Evidence(rootDir, artifactsDir, {
+    await promoteCurrentEvidence(rootDir, artifactsDir, {
       provenanceTrusted: true,
       windowsSignerPolicy: false
     });
@@ -351,7 +383,7 @@ describe("product readiness report", () => {
       status: "passed",
       checks: { doctorApi: true, runCompleted: true, fileContent: true, inspect: true }
     });
-    await promoteV3Evidence(rootDir, artifactsDir, {
+    await promoteCurrentEvidence(rootDir, artifactsDir, {
       provenanceTrusted: true,
       windowsSignerPolicy: false
     });
@@ -365,13 +397,13 @@ describe("product readiness report", () => {
       status: "internal-ready", releaseReady: false, previewReady: false
     });
     expect(report.releaseChecks).toContainEqual({
-      name: "package:releaseChannel",
+      name: "package:windowsSignerPolicy",
       ok: false,
-      detail: "expected=stable, package=preview"
+      detail: "unsigned or unapproved preview only"
     });
   });
 
-  it("requires both external provenance trust and approved Windows signer policy for V3 release", async () => {
+  it("keeps a trusted signed 0.x Windows artifact on the preview channel", async () => {
     const { rootDir, artifactsDir } = await fixture({
       ok: true,
       status: "passed",
@@ -381,14 +413,14 @@ describe("product readiness report", () => {
       status: "passed",
       checks: { doctorApi: true, runCompleted: true, fileContent: true, inspect: true }
     });
-    await promoteV3Evidence(rootDir, artifactsDir, {
+    await promoteCurrentEvidence(rootDir, artifactsDir, {
       provenanceTrusted: true,
       windowsSignerPolicy: true
     });
 
     const report = await buildProductReadinessReport({ rootDir, artifactsDir });
     expect(report).toMatchObject({
-      status: "release-ready", internalReady: true, releaseReady: true, previewReady: false
+      status: "preview-ready", internalReady: true, releaseReady: false, previewReady: true
     });
     expect(report.releaseChecks).toEqual(expect.arrayContaining([
       expect.objectContaining({ name: "package:provenanceSignature", ok: true }),
@@ -396,7 +428,7 @@ describe("product readiness report", () => {
     ]));
   });
 
-  it("fails closed for an unknown future major without disabling portable trust gates", async () => {
+  it("fails closed when the workspace product version differs from the manifest", async () => {
     const { rootDir, artifactsDir } = await fixture({
       ok: true,
       status: "passed",
@@ -406,16 +438,16 @@ describe("product readiness report", () => {
       status: "passed",
       checks: { doctorApi: true, runCompleted: true, fileContent: true, inspect: true }
     });
-    await promoteV3Evidence(rootDir, artifactsDir, {
+    await promoteCurrentEvidence(rootDir, artifactsDir, {
       provenanceTrusted: true,
       windowsSignerPolicy: true,
-      version: "5.0.0"
+      version: "0.1.1"
     });
 
     const report = await buildProductReadinessReport({ rootDir, artifactsDir });
     expect(report).toMatchObject({ status: "not-ready", internalReady: false, releaseReady: false });
     expect(report.checks).toEqual(expect.arrayContaining([
-      expect.objectContaining({ name: "productVersion:supportedMajor", ok: false }),
+      expect.objectContaining({ name: "productVersion:manifest", ok: false }),
       expect.objectContaining({ name: "package:schemaVersion", ok: true }),
       expect.objectContaining({ name: "package:integrity", ok: true })
     ]));
@@ -443,15 +475,10 @@ describe("product readiness report", () => {
     });
   });
 
-  it("binds V3 sandbox smoke evidence to the broker digest in the verified package", async () => {
+  it("binds sandbox smoke evidence to the broker digest in the verified package", async () => {
     const { rootDir, artifactsDir } = await fixture({ ok: true, status: "passed", transport: "native" });
-    const rootPackagePath = path.join(rootDir, "package.json");
-    const rootPackage = JSON.parse(await readFile(rootPackagePath, "utf8"));
-    rootPackage.version = "4.0.0";
-    await writeJson(rootPackagePath, rootPackage);
     const packagePath = path.join(artifactsDir, "agent-cli-package-verify.json");
     const packaged = JSON.parse(await readFile(packagePath, "utf8"));
-    packaged.metadata.schemaVersion = 3;
     packaged.metadata.sigmaExec = { sha256: "b".repeat(64) };
     await writeJson(packagePath, packaged);
 
@@ -466,14 +493,8 @@ describe("product readiness report", () => {
 
   it("binds bundled LSP evidence to the package target, broker, Node, and sandbox policy", async () => {
     const { rootDir, artifactsDir } = await fixture({ ok: true, status: "passed", transport: "native" });
-    const rootPackagePath = path.join(rootDir, "package.json");
-    const rootPackage = JSON.parse(await readFile(rootPackagePath, "utf8"));
-    rootPackage.version = "4.0.0";
-    await writeJson(rootPackagePath, rootPackage);
     const packagePath = path.join(artifactsDir, "agent-cli-package-verify.json");
     const packageReport = JSON.parse(await readFile(packagePath, "utf8"));
-    packageReport.metadata.schemaVersion = 2;
-    packageReport.metadata.productVersion = "4.0.0";
     packageReport.integrity = { manifestDigest: "b".repeat(64), manifest: { entries: [
       { path: "node_modules/agent-code-intel/dist/typescript-server.mjs", sha256: "e".repeat(64) },
       { path: "node_modules/pyright/langserver.index.js", sha256: "f".repeat(64) }
@@ -481,7 +502,7 @@ describe("product readiness report", () => {
     await writeJson(packagePath, packageReport);
     const evidencePath = path.join(artifactsDir, "lsp-sandbox-smoke-win32-x64.json");
     const evidence = JSON.parse(await readFile(evidencePath, "utf8"));
-    evidence.productVersion = "4.0.0";
+    evidence.productVersion = "0.1.0";
     evidence.assets = {
       typescriptLanguageServerSha256: "0".repeat(64),
       pyrightSha256: "f".repeat(64)
@@ -504,7 +525,7 @@ describe("product readiness report", () => {
     expect(report.releaseChecks.some((item) => item.name === "lspSandboxSmoke:pyrightDigest" && item.ok)).toBe(true);
     expect(report.releaseChecks.some((item) => item.name === "lspSandboxSmoke:productVersion" && item.ok)).toBe(true);
     expect(report.releaseChecks.some((item) => item.name === "lspSandboxSmoke:integrityManifestDigest" && item.ok)).toBe(true);
-    expect(report.checks.some((item) => item.name === "package:schemaVersion" && !item.ok)).toBe(true);
+    expect(report.checks.some((item) => item.name === "package:schemaVersion" && item.ok)).toBe(true);
     expect(report.releaseReady).toBe(false);
   });
 

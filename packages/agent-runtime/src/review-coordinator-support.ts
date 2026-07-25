@@ -51,7 +51,7 @@ export function failedReview(
     producer: { authority: "runtime", id: reviewerId },
     summary: message,
     data: {
-      schemaVersion: 3,
+      schemaVersion: 1,
       reviewerId,
       verdict: "blocked",
       findings: [message],
@@ -179,8 +179,7 @@ function reviewAttemptAllowed(
 }
 
 export function substantiveReview(review: ReviewEvidence): boolean {
-  return review.data.schemaVersion === 3
-    && review.data.failureKind === undefined
+  return review.data.failureKind === undefined
     && review.data.failureCode !== "review_scope_too_large"
     && review.data.failureCode !== "review_protocol_invalid"
     && review.data.failureCode !== "review_unavailable";

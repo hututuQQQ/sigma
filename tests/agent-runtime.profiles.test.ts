@@ -2,12 +2,16 @@ import os from "node:os";
 import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
-import { DEFAULT_PROFILE_BUDGET, freezeAgentProfile, type ResolvedAgentProfile } from "../packages/agent-extensions/src/index.js";
+import {
+  DEFAULT_PROFILE_ASSURANCE,
+  DEFAULT_PROFILE_BUDGET,
+  freezeAgentProfile,
+  type ResolvedAgentProfile
+} from "../packages/agent-extensions/src/index.js";
 import { createKernelState } from "../packages/agent-kernel/src/index.js";
 import {
   EVENT_SCHEMA_VERSION,
   SNAPSHOT_SCHEMA_VERSION,
-  STORE_LAYOUT_VERSION,
   type BudgetLimits,
   type ModelGateway,
   type ModelRequest,
@@ -48,6 +52,7 @@ function profile(id: string, overrides: Partial<ResolvedAgentProfile> = {}): Res
     mutationPolicy: {
       requirePlanBeforeMutation: true, checkpointBeforeMutation: true, reviewMode: "advisory"
     },
+    assurancePolicy: { ...DEFAULT_PROFILE_ASSURANCE },
     allowedChildProfiles: [],
     ...overrides
   };
@@ -211,7 +216,6 @@ describe("runtime Agent Profile binding", () => {
       state.outcome = { kind: "completed", message: "done", evidence: [] };
       await store.writeSnapshot({
         schemaVersion: SNAPSHOT_SCHEMA_VERSION,
-        storeLayoutVersion: STORE_LAYOUT_VERSION,
         sessionId,
         seq: 1,
         createdAt: startedAt,

@@ -1,6 +1,6 @@
 import { lstat } from "node:fs/promises";
 import path from "node:path";
-import type { ExecutionPolicy, ScratchLeaseV1 } from "agent-execution";
+import type { ExecutionPolicy, ScratchLease } from "agent-execution";
 import type {
   JsonValue,
   LoadedSkillResourceAccess,
@@ -266,7 +266,7 @@ export function executionPolicy(
   writeRoots: string[] = [],
   skillResource?: LoadedSkillResourceAccess,
   disposableValidation = false,
-  scratchLease?: ScratchLeaseV1
+  scratchLease?: ScratchLease
 ): ExecutionPolicy {
   const networkMode = plan.network;
   const workspaceRoot = path.resolve(context.workspacePath);
@@ -279,7 +279,7 @@ export function executionPolicy(
     throw readScopeError(`Approved external process read path lacks a fresh grant: ${item}.`);
   });
   const enclosingContainer =
-    plan.mutationAuthority === "disposable_enclosing_container_v1";
+    plan.mutationAuthority === "disposable_enclosing_container";
   const runtimeProtectedPaths = enclosingContainer
     ? (options.protectedPaths ?? []).map((item) => path.resolve(item))
     : [];
@@ -314,7 +314,7 @@ export async function resolvedWriteRoots(
   plan: ToolCallPlan
 ): Promise<string[]> {
   if (context.runMode !== "change") return [];
-  if (plan.mutationAuthority === "disposable_enclosing_container_v1") {
+  if (plan.mutationAuthority === "disposable_enclosing_container") {
     if (plan.checkpointScope.some((item) => !path.isAbsolute(item))) {
       throw Object.assign(new Error(
         "Enclosing-container write roots must remain canonical absolute paths."

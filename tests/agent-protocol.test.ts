@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
-  AGENT_EVENT_TYPES, SNAPSHOT_SCHEMA_VERSION, STORE_LAYOUT_VERSION, AgentEventValidationError,
+  AGENT_EVENT_TYPES, SNAPSHOT_SCHEMA_VERSION, AgentEventValidationError,
   assertAgentEventEnvelope, assertEvidenceRecord, assertMcpPersistentEffectsAllowed,
   assertMcpWriteRootsEmpty, assertSnapshotEnvelope, createBudgetLedger, createEmptyPlan,
   evidenceSupportsClaim, isAgentEventEnvelope, isBudgetLedgerState, isCheckpointRef,
   isCompletionEligibleEvidence, isCompletionReferenceableEvidence,
   isEvidenceRecord, isJsonValue,
   isPlanGraph, isSnapshotEnvelope, isSolverVisibleAuthority, isUsageRecord, McpCapabilityPolicyError,
-  SnapshotValidationError, SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1, type AgentEventType,
+  SnapshotValidationError, SUBJECT_ATTESTATION_EVIDENCE_SOURCE, type AgentEventType,
   type ValidationEvidence
 } from "../packages/agent-protocol/src/index.js";
 import {
@@ -15,7 +15,7 @@ import {
   usageFixture, validAgentEventFixture
 } from "./testkit/agent-event-fixtures.js";
 
-describe("AgentEventEnvelope V6 runtime boundary", () => {
+describe("AgentEventEnvelope runtime boundary", () => {
   it("accepts a producer fixture for every declared durable event", () => {
     expect(Object.keys(fixtures).sort()).toEqual([...AGENT_EVENT_TYPES].sort());
     for (const type of AGENT_EVENT_TYPES) expect(isAgentEventEnvelope(validAgentEventFixture(type)), type).toBe(true);
@@ -117,12 +117,12 @@ describe("AgentEventEnvelope V6 runtime boundary", () => {
     })).toBe(false);
   });
 
-  it("rejects wrong versions and authority/scope violations", () => {
-    expect(isAgentEventEnvelope({ ...validAgentEventFixture(), schemaVersion: 3 })).toBe(false);
-    expect(isAgentEventEnvelope({ ...validAgentEventFixture(), schemaVersion: 5 })).toBe(true);
+  it("accepts schema 1 and rejects unknown schemas and authority/scope violations", () => {
+    expect(isAgentEventEnvelope({ ...validAgentEventFixture(), schemaVersion: 1 })).toBe(true);
+    expect(isAgentEventEnvelope({ ...validAgentEventFixture(), schemaVersion: 999 })).toBe(false);
     expect(isAgentEventEnvelope({
       ...validAgentEventFixture("model.prompt_materialized"),
-      schemaVersion: 5
+      schemaVersion: 999
     })).toBe(false);
     expect(isAgentEventEnvelope({ ...validAgentEventFixture(), authority: "external_verifier" })).toBe(false);
     expect(isAgentEventEnvelope({
@@ -134,13 +134,13 @@ describe("AgentEventEnvelope V6 runtime boundary", () => {
     expect(isSolverVisibleAuthority("external_verifier")).toBe(false);
   });
 
-  it("validates strict V7 snapshots independently", () => {
+  it("validates strict current snapshots independently", () => {
     const snapshot = {
-      schemaVersion: SNAPSHOT_SCHEMA_VERSION, storeLayoutVersion: STORE_LAYOUT_VERSION,
+      schemaVersion: SNAPSHOT_SCHEMA_VERSION,
       sessionId: "session", seq: 1, createdAt: fixtureOccurredAt, state: { value: 1 }
     };
     expect(isSnapshotEnvelope(snapshot)).toBe(true);
-    expect(isSnapshotEnvelope({ ...snapshot, schemaVersion: 3 })).toBe(false);
+    expect(isSnapshotEnvelope({ ...snapshot, schemaVersion: 999 })).toBe(false);
     expect(isSnapshotEnvelope({ ...snapshot, extra: true })).toBe(false);
     expect(() => assertSnapshotEnvelope({ ...snapshot, createdAt: "invalid" })).toThrow(SnapshotValidationError);
   });
@@ -160,7 +160,7 @@ describe("AgentEventEnvelope V6 runtime boundary", () => {
     }
     const validation = {
       ...command, kind: "validation", data: {
-        validator: "tests", command: "pnpm test", exitCode: 0, artifactIds: [],
+        schemaVersion: 1, validator: "tests", command: "pnpm test", exitCode: 0, artifactIds: [],
         frontierRevision: 1, stateDigest: "a".repeat(64), coveredPaths: []
       }
     };
@@ -176,11 +176,11 @@ describe("AgentEventEnvelope V6 runtime boundary", () => {
     expect(evidenceSupportsClaim(diagnostic, "validation_executed")).toBe(false);
     expect(isCompletionEligibleEvidence({
       ...diagnostic,
-      data: { ...diagnostic.data, source: SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1 }
+      data: { ...diagnostic.data, source: SUBJECT_ATTESTATION_EVIDENCE_SOURCE }
     }, "session", "run")).toBe(false);
     expect(evidenceSupportsClaim({
       ...diagnostic,
-      data: { ...diagnostic.data, source: SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1 }
+      data: { ...diagnostic.data, source: SUBJECT_ATTESTATION_EVIDENCE_SOURCE }
     })).toBe(false);
     expect(isCompletionEligibleEvidence({ ...diagnostic, status: "failed" }, "session", "run")).toBe(false);
     expect(isCompletionEligibleEvidence(diagnostic, "session", "other-run")).toBe(false);
@@ -197,6 +197,7 @@ describe("AgentEventEnvelope V6 runtime boundary", () => {
       producer: { authority: "tool", id: "validate" },
       summary: "tests exited 1",
       data: {
+        schemaVersion: 1,
         validator: "command",
         command: "pnpm test",
         exitCode: 1,

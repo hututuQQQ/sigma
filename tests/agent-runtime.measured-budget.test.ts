@@ -23,6 +23,23 @@ import type {
   ReviewerPort
 } from "../packages/agent-runtime/src/reviewer.js";
 
+function measuredUsage(
+  inputTokens: number,
+  outputTokens: number
+): ModelResponse["usage"] {
+  return {
+    inputTokens,
+    outputTokens,
+    reasoningTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    providerReported: true,
+    costMicroUsd: 0,
+    latencyMs: 1,
+    retryAttempt: 0
+  };
+}
+
 class UnderestimatedGateway implements ModelGateway {
   readonly provider = "fake";
   readonly model = "measured-usage";
@@ -57,8 +74,7 @@ class UnderestimatedGateway implements ModelGateway {
           }]
         },
         finishReason: "tool_calls",
-        inputTokens: 130,
-        outputTokens: 5
+        usage: measuredUsage(130, 5)
       }
     };
   }
@@ -118,8 +134,7 @@ function requestInputResponse(): ModelResponse {
       }]
     },
     finishReason: "tool_calls",
-    inputTokens: 100,
-    outputTokens: 10
+    usage: measuredUsage(100, 10)
   };
 }
 
@@ -148,8 +163,7 @@ describe("provider-measured model budget settlement", () => {
         toolCalls: [{ id: "read-once", name: "read", arguments: { path: "seed.txt" } }]
       },
       finishReason: "tool_calls",
-      inputTokens: 100,
-      outputTokens: 10
+      usage: measuredUsage(100, 10)
     }, requestInputResponse()]);
     const store = new SegmentedJsonlStore({ rootDir: state });
     const runtime = createRuntime({
@@ -192,8 +206,7 @@ describe("provider-measured model budget settlement", () => {
         reasoningContent: "private truncated reasoning"
       },
       finishReason: "length",
-      inputTokens: 100,
-      outputTokens: 4_096
+      usage: measuredUsage(100, 4_096)
     })));
     const runtime = createRuntime({
       gateway,
@@ -227,13 +240,11 @@ describe("provider-measured model budget settlement", () => {
     const gateway = new InspectableGateway([{
       message: { role: "assistant", content: "partial" },
       finishReason: "length",
-      inputTokens: 100,
-      outputTokens: 8_192
+      usage: measuredUsage(100, 8_192)
     }, {
       message: { role: "assistant", content: "Small complete answer." },
       finishReason: "stop",
-      inputTokens: 100,
-      outputTokens: 20
+      usage: measuredUsage(100, 20)
     }], { strictToolChoice: false });
     const runtime = createRuntime({
       gateway,
@@ -269,8 +280,7 @@ describe("provider-measured model budget settlement", () => {
         toolCalls: [{ id: "length-read", name: "read", arguments: { path: "seed.txt" } }]
       },
       finishReason: "length",
-      inputTokens: 100,
-      outputTokens: 4_096
+      usage: measuredUsage(100, 4_096)
     }, requestInputResponse()]);
     const store = new SegmentedJsonlStore({ rootDir: state });
     const runtime = createRuntime({
@@ -420,8 +430,7 @@ describe("provider-measured model budget settlement", () => {
         }]
       },
       finishReason: "tool_calls",
-      inputTokens: 130,
-      outputTokens: 5
+      usage: measuredUsage(130, 5)
     }]);
     let reviewerCalls = 0;
     const reviewer: ReviewerPort = {
@@ -443,7 +452,7 @@ describe("provider-measured model budget settlement", () => {
           producer: { authority: "runtime", id: "budget-boundary-reviewer" },
           summary: "The independent reviewer approved the current frontier.",
           data: {
-            schemaVersion: 3,
+            schemaVersion: 1,
             reviewerId: "budget-boundary-reviewer",
             verdict: "approved",
             findings: [],
@@ -519,8 +528,7 @@ describe("provider-measured model budget settlement", () => {
         }]
       },
       finishReason: "tool_calls",
-      inputTokens: 130,
-      outputTokens: 5
+      usage: measuredUsage(130, 5)
     }, {
       message: {
         role: "assistant",
@@ -532,8 +540,7 @@ describe("provider-measured model budget settlement", () => {
         }]
       },
       finishReason: "tool_calls",
-      inputTokens: 100,
-      outputTokens: 5
+      usage: measuredUsage(100, 5)
     }]);
     let reviewerCalls = 0;
     const reviewer: ReviewerPort = {
@@ -558,7 +565,7 @@ describe("provider-measured model budget settlement", () => {
             ? "The repaired evidence was approved."
             : "Inspect the written result before approval.",
           data: {
-            schemaVersion: 3,
+            schemaVersion: 1,
             reviewerId: "repair-budget-reviewer",
             verdict: approved ? "approved" : "changes_requested",
             findings: approved ? [] : [{

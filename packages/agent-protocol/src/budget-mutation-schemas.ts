@@ -12,14 +12,14 @@ const mutationTotalsSchema = z.object({
   reserved: budgetAmountsSchema
 }).strict();
 
-export const budgetReserveMutationV1Schema = z.object({
+export const budgetReserveMutationSchema = z.object({
   schemaVersion: z.literal(1),
   kind: z.literal("reserve"),
   reservation: budgetReservationSchema,
   totals: mutationTotalsSchema
 }).strict();
 
-export const budgetSettleMutationV1Schema = z.object({
+export const budgetSettleMutationSchema = z.object({
   schemaVersion: z.literal(1),
   kind: z.literal("settle"),
   reservationId: nonEmptyStringSchema,
@@ -29,14 +29,14 @@ export const budgetSettleMutationV1Schema = z.object({
   totals: mutationTotalsSchema
 }).strict();
 
-export const budgetBindMutationV1Schema = z.object({
+export const budgetBindMutationSchema = z.object({
   schemaVersion: z.literal(1),
   kind: z.literal("bind"),
   reservationId: nonEmptyStringSchema,
   ownerId: nonEmptyStringSchema
 }).strict();
 
-export const budgetLimitMutationV1Schema = z.object({
+export const budgetLimitMutationSchema = z.object({
   schemaVersion: z.literal(1),
   kind: z.literal("limit"),
   increase: budgetLimitsSchema,
@@ -44,9 +44,9 @@ export const budgetLimitMutationV1Schema = z.object({
 }).strict();
 
 /** Fixed-size event-log mutations; complete ledgers live in snapshots. */
-export const budgetMutationV1Schema = z.discriminatedUnion("kind", [
-  budgetReserveMutationV1Schema,
-  budgetSettleMutationV1Schema,
-  budgetBindMutationV1Schema,
-  budgetLimitMutationV1Schema
+export const budgetMutationSchema = z.discriminatedUnion("kind", [
+  budgetReserveMutationSchema,
+  budgetSettleMutationSchema,
+  budgetBindMutationSchema,
+  budgetLimitMutationSchema
 ]);

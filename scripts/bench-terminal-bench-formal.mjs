@@ -176,7 +176,7 @@ async function completedBatchRecords(outputDir, manifest, preregistrationSha256)
     }
     if (started) {
       assertBatchMarker(
-        started, "SigmaFormalBatchStartedV1", batch, manifest, preregistrationSha256
+        started, "SigmaFormalBatchStarted", batch, manifest, preregistrationSha256
       );
     }
     if (started && !completed) {
@@ -185,7 +185,7 @@ async function completedBatchRecords(outputDir, manifest, preregistrationSha256)
     }
     if (completed) {
       assertBatchMarker(
-        completed, "SigmaFormalBatchCompletedV1", batch, manifest, preregistrationSha256
+        completed, "SigmaFormalBatchCompleted", batch, manifest, preregistrationSha256
       );
       if (completed.started_at !== started.started_at) {
         throw new Error(`Formal batch ${batch.id} completion receipt does not bind its started marker.`);
@@ -265,8 +265,8 @@ export function aggregateFormalReports(manifest, batchRecords) {
   const status = allBatchesRecorded ? executionComplete ? "complete" : "incomplete" : "running";
   const usage = aggregateNumericObjects(reports, "usage");
   return {
-    schemaVersion: 2,
-    kind: "SigmaFormalRunReportV2",
+    schemaVersion: 1,
+    kind: "SigmaFormalRunReport",
     formal_run_id: manifest.formal_run_id,
     consumption_identity_sha256: manifest.consumption_identity_sha256,
     status,
@@ -316,8 +316,8 @@ async function writeFormalReport(outputDir, manifest, records, preregistrationSh
   await writeJson(path.join(outputDir, "report.json"), report);
   await writeFile(path.join(outputDir, "report.md"), formalMarkdown(report), "utf8");
   await writeJson(path.join(outputDir, "state.json"), {
-    schemaVersion: 2,
-    kind: "SigmaFormalRunStateV2",
+    schemaVersion: 1,
+    kind: "SigmaFormalRunState",
     formal_run_id: manifest.formal_run_id,
     consumption_identity_sha256: manifest.consumption_identity_sha256,
     preregistration_sha256: preregistrationSha256,
@@ -412,7 +412,7 @@ export async function runFormalBenchmark(argv = process.argv.slice(2), deps = {}
     if (started) throw new Error(`Formal batch ${nextBatch.id} dispatch boundary was entered more than once.`);
     started = {
       schemaVersion: 1,
-      kind: "SigmaFormalBatchStartedV1",
+      kind: "SigmaFormalBatchStarted",
       formal_run_id: manifest.formal_run_id,
       consumption_identity_sha256: manifest.consumption_identity_sha256,
       preregistration_sha256: bundle.sha256,
@@ -433,7 +433,7 @@ export async function runFormalBenchmark(argv = process.argv.slice(2), deps = {}
   }
   const completed = {
     schemaVersion: 1,
-    kind: "SigmaFormalBatchCompletedV1",
+    kind: "SigmaFormalBatchCompleted",
     formal_run_id: manifest.formal_run_id,
     consumption_identity_sha256: manifest.consumption_identity_sha256,
     preregistration_sha256: bundle.sha256,

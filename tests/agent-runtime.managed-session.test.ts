@@ -11,7 +11,7 @@ import type {
   ModelStreamEvent,
   ModelToolDefinition
 } from "../packages/agent-protocol/src/index.js";
-import type { ManagedSessionBindingV1 } from "../packages/agent-execution/src/index.js";
+import type { ManagedSessionBinding } from "../packages/agent-execution/src/index.js";
 import { runtimeEnvironment, type ProcessExecutionPort } from "../packages/agent-platform/src/index.js";
 import { createRuntime } from "../packages/agent-runtime/src/testing.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
@@ -57,7 +57,7 @@ describe("runtime managed session lifecycle", () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-managed-runtime-"));
     const storeRootDir = path.join(workspace, ".agent");
     let bound = false;
-    const bindManagedSession = vi.fn(async (request): Promise<ManagedSessionBindingV1> => {
+    const bindManagedSession = vi.fn(async (request): Promise<ManagedSessionBinding> => {
       bound = true;
       return {
         ...request,

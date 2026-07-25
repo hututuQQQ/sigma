@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
 import type { ModelRole } from "agent-model";
 import {
-  DEFAULT_PROFILE_ASSURANCE,
   freezeAgentProfile,
   type FrozenAgentProfile,
   type ProfileAssurancePolicy,
@@ -41,25 +40,17 @@ export function restoreFrozenAgentProfile(canonicalJson: string, expectedDigest:
   }
   const profile = profileValue(parsed);
   const restored = freezeAgentProfile(profile);
-  const legacy = !Object.hasOwn(object(parsed, "frozen Agent Profile"), "assurancePolicy");
-  if ((!legacy && restored.canonicalJson !== canonicalJson)
+  if (restored.canonicalJson !== canonicalJson
     || createHash("sha256").update(canonicalJson).digest("hex") !== expectedDigest) {
     throw new Error("Frozen Agent Profile artifact is not in canonical form.");
   }
-  return legacy
-    ? {
-        profile: restored.profile,
-        canonicalJson,
-        digest: expectedDigest
-      }
-    : restored;
+  return restored;
 }
 
 function profileValue(value: unknown): ResolvedAgentProfile {
   const root = object(value, "frozen Agent Profile");
   allowedKeys(root, ROOT_KEYS, "frozen Agent Profile");
-  const required = [...ROOT_KEYS].filter((key) =>
-    key !== "description" && key !== "assurancePolicy");
+  const required = [...ROOT_KEYS].filter((key) => key !== "description");
   const missing = required.find((key) => !(key in root));
   if (missing) throw new Error(`Frozen Agent Profile 'frozen Agent Profile' has missing key '${missing}'.`);
   const routes = object(root.roleRoutes, "roleRoutes");
@@ -75,9 +66,7 @@ function profileValue(value: unknown): ResolvedAgentProfile {
     permissionMode: oneOf(root.permissionMode, ["deny", "ask", "auto"], "permissionMode"),
     budget: budgetValue(root.budget),
     mutationPolicy: mutationValue(root.mutationPolicy),
-    assurancePolicy: root.assurancePolicy === undefined
-      ? { ...DEFAULT_PROFILE_ASSURANCE }
-      : assuranceValue(root.assurancePolicy),
+    assurancePolicy: assuranceValue(root.assurancePolicy),
     allowedChildProfiles: strings(root.allowedChildProfiles, "allowedChildProfiles")
   };
 }

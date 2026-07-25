@@ -2,7 +2,7 @@ import type { EvidenceRecord } from "./domain.js";
 
 export type RunMode = "analyze" | "change";
 
-export type DecisionAuthorityV1 =
+export type DecisionAuthority =
   | "safety_invariant"
   | "resource_boundary"
   | "provider_protocol"
@@ -14,19 +14,18 @@ export type RunOutcome =
     kind: "completed";
     message: string;
     evidence: EvidenceRecord[];
-    /** Optional on the wire only for replay compatibility with V9 and older logs. */
-    decisionAuthority?: DecisionAuthorityV1;
+    decisionAuthority?: DecisionAuthority;
   }
   | {
     kind: "needs_input";
     requestId: string;
     message: string;
-    decisionAuthority?: DecisionAuthorityV1;
+    decisionAuthority?: DecisionAuthority;
   }
   | {
     kind: "cancelled";
     reason: string;
-    decisionAuthority?: DecisionAuthorityV1;
+    decisionAuthority?: DecisionAuthority;
   }
   | {
     kind: "recoverable_failure";
@@ -37,13 +36,13 @@ export type RunOutcome =
     failureKind?: "blocked";
     /** Stable structured code mirrored for external runners. */
     failureCode?: string;
-    decisionAuthority?: DecisionAuthorityV1;
+    decisionAuthority?: DecisionAuthority;
   }
   | {
     kind: "fatal";
     code: string;
     message: string;
-    decisionAuthority?: DecisionAuthorityV1;
+    decisionAuthority?: DecisionAuthority;
   };
 
 export type RunCommand =

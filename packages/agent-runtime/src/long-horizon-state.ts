@@ -1,11 +1,11 @@
 import { createHash } from "node:crypto";
 import {
-  emptyLongHorizonStateV2,
+  emptyLongHorizonState,
   type JsonValue,
-  type AssuranceResourcePolicyV1,
-  type LongHorizonActionOutcomeV1,
+  type AssuranceResourcePolicy,
+  type LongHorizonActionOutcome,
   type ModelToolCall,
-  type LongHorizonStateV2,
+  type LongHorizonState,
   type ModelMessage,
   type ToolReceipt
 } from "agent-protocol";
@@ -18,14 +18,14 @@ interface SettledBatch {
   calls: NonNullable<ModelMessage["toolCalls"]>;
   receipts: ToolReceipt[];
 }
-export interface EvidenceAttentionWindowV1 {
+export interface EvidenceAttentionWindow {
   basisDigest: string;
   tokenCount: number;
   tokenLimit: number;
   batchCount: number;
   saturated: boolean;
   outcomeDigest: string;
-  representativeOutcomes: LongHorizonActionOutcomeV1[];
+  representativeOutcomes: LongHorizonActionOutcome[];
 }
 
 /**
@@ -110,7 +110,7 @@ function summarizedCallArguments(call: ModelToolCall): string {
   return compactSemanticText(JSON.stringify(canonical(summary))).slice(0, 320);
 }
 
-function actionOutcome(batch: SettledBatch, index: number): LongHorizonActionOutcomeV1 {
+function actionOutcome(batch: SettledBatch, index: number): LongHorizonActionOutcome {
   const callShape = batch.calls.map((call) => ({
     name: call.name,
     arguments: call.arguments
@@ -226,7 +226,7 @@ export function longHorizonCommitmentBasisDigest(
 
 export function evidenceAttentionWindow(
   session: RuntimeSession
-): EvidenceAttentionWindowV1 {
+): EvidenceAttentionWindow {
   const batches = settledLongHorizonBatches(session);
   const activePlan = session.durable.state.plan.nodes.some((node) =>
     node.status === "pending" || node.status === "in_progress"
@@ -316,7 +316,7 @@ export function longHorizonProgressBasisDigest(session: RuntimeSession): string 
   });
 }
 
-function policyOf(state: LongHorizonStateV2): AssuranceResourcePolicyV1 {
+function policyOf(state: LongHorizonState): AssuranceResourcePolicy {
   const assurance = state.assurance;
   return {
     budgetPercent: assurance.budgetPercent,
@@ -334,8 +334,8 @@ function policyOf(state: LongHorizonStateV2): AssuranceResourcePolicyV1 {
 
 export function withAccountedAssurance(
   session: RuntimeSession,
-  state: LongHorizonStateV2
-): LongHorizonStateV2 {
+  state: LongHorizonState
+): LongHorizonState {
   const usage = currentAuxiliaryUsage(session);
   return {
     ...state,
@@ -357,21 +357,21 @@ export function withAccountedAssurance(
 }
 
 function sameObjectiveOutcome(
-  left: LongHorizonActionOutcomeV1 | undefined,
-  right: LongHorizonActionOutcomeV1
+  left: LongHorizonActionOutcome | undefined,
+  right: LongHorizonActionOutcome
 ): boolean {
   return Boolean(left
     && left.callDigest === right.callDigest
     && left.resultDigest === right.resultDigest);
 }
 
-export function nextLongHorizonState(session: RuntimeSession): LongHorizonStateV2 {
+export function nextLongHorizonState(session: RuntimeSession): LongHorizonState {
   const current = withAccountedAssurance(session, session.durable.state.longHorizon);
   const batches = settledLongHorizonBatches(session);
   const goalEpoch = session.durable.state.messages.filter((message) =>
     message.role === "user").length;
   if (current.goalEpoch !== goalEpoch || current.settledBatchCount > batches.length) {
-    const reset = emptyLongHorizonStateV2(policyOf(current));
+    const reset = emptyLongHorizonState(policyOf(current));
     return withAccountedAssurance(session, {
       ...reset,
       goalEpoch,

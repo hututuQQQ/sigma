@@ -3,7 +3,7 @@ import { dateTimeSchema, nonEmptyStringSchema } from "./domain-schemas.js";
 import {
   assuranceResourcePolicySchema,
   contextItemSchema,
-  runtimePromptStateV2Schema,
+  runtimePromptStateSchema,
   durableToolReceiptShape,
   modelMessageSchema,
   modelToolCallSchema,
@@ -52,7 +52,36 @@ const approvalRequestedSchema = z.object({
   approvalMode: z.enum(["human", "automatic"]).optional(),
   turnId: z.number().int().positive().optional(),
   effectRevision: z.number().int().nonnegative().optional()
-}).strict();
+}).strict().superRefine((value, context) => {
+  if (value.delegated === true) {
+    if (!value.childId) context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["childId"],
+      message: "Delegated approvals require a child id"
+    });
+    if (value.plan !== undefined || value.approvalMode !== undefined) context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["delegated"],
+      message: "Delegated approvals must not contain a local execution plan or approval mode"
+    });
+    return;
+  }
+  if (value.arguments === undefined) context.addIssue({
+    code: z.ZodIssueCode.custom,
+    path: ["arguments"],
+    message: "Local approvals require exact tool arguments"
+  });
+  if (value.plan === undefined) context.addIssue({
+    code: z.ZodIssueCode.custom,
+    path: ["plan"],
+    message: "Local approvals require the current execution plan"
+  });
+  if (value.approvalMode === undefined) context.addIssue({
+    code: z.ZodIssueCode.custom,
+    path: ["approvalMode"],
+    message: "Local approvals require an approval mode"
+  });
+});
 
 const approvalResolvedSchema = z.object({
   requestId: nonEmptyStringSchema,
@@ -63,7 +92,21 @@ const approvalResolvedSchema = z.object({
   delegated: z.literal(true).optional(),
   turnId: z.number().int().positive().optional(),
   effectRevision: z.number().int().nonnegative().optional()
-}).strict();
+}).strict().superRefine((value, context) => {
+  if (value.delegated === true) {
+    if (!value.childId) context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["childId"],
+      message: "Delegated approval resolutions require a child id"
+    });
+    return;
+  }
+  if (value.turnId === undefined || value.effectRevision === undefined) context.addIssue({
+    code: z.ZodIssueCode.custom,
+    path: ["turnId"],
+    message: "Local approval resolutions require their model turn binding"
+  });
+});
 
 const modelFailureDiagnosticsSchema = z.object({
   provider: nonEmptyStringSchema.optional(),
@@ -163,8 +206,6 @@ const diagnosticSchema = z.discriminatedUnion("kind", [
     stage: z.enum(["normal", "converge", "stop"]),
     budgetStage: z.enum(["normal", "converge", "terminal"]).optional(),
     remainingMs: z.number(),
-    /** Present only in legacy telemetry; V7 does not forecast model latency. */
-    nextModelEstimateMs: z.number().int().nonnegative().optional(),
     outputReserveTokens: z.number().int().positive()
   }).strict(),
   z.object({
@@ -208,7 +249,7 @@ export const coreEventPayloadSchemas = {
     writeScope: z.array(z.string()),
     strictWriteScope: z.boolean(),
     modelRole: sharedSchemas.modelExecutionRoleSchema,
-    budgetLimits: sharedSchemas.budgetLimitsSchema.optional(),
+    budgetLimits: sharedSchemas.budgetLimitsSchema,
     assurancePolicy: assuranceResourcePolicySchema.optional(),
     parentSessionId: nonEmptyStringSchema.optional()
   }).strict(),
@@ -258,9 +299,8 @@ export const coreEventPayloadSchemas = {
     requestDigest: z.string().regex(/^[a-f0-9]{64}$/u),
     prefixMessageCount: z.number().int().nonnegative(),
     cacheMode: z.enum(["prefix_cache", "provider_window"]),
-    /** Optional only while replaying an event-schema V6 session. */
-    promptState: runtimePromptStateV2Schema.optional(),
-    frameMode: z.enum(["full", "delta"]).optional(),
+    promptState: runtimePromptStateSchema,
+    frameMode: z.enum(["full", "delta"]),
     /** Durable record of the recovery policy actually sent to the provider. */
     toolChoice: z.enum(["auto", "required", "none"]).nullable().optional()
   }).strict(),

@@ -88,7 +88,7 @@ fn acquire_value(
     let (git_dir, common_dir) = topology(root);
     let value = store
         .acquire(AcquireRepositoryTransactionLeaseParams {
-            protocol_version: 2,
+            protocol_version: 1,
             session_id: session.into(),
             run_id: run.into(),
             repository_root: root.to_owned(),
@@ -146,10 +146,10 @@ fn begin_conflict(store: &RepositoryTransactions, root: &Path, session: &str, ru
         .begin(
             1,
             BeginRepositoryTransactionParams {
-                protocol_version: 2,
+                protocol_version: 1,
                 lease_id,
                 expected_postconditions: None,
-                operations: vec![RepositoryOperationV2 {
+                operations: vec![RepositoryOperation {
                     operation_class: "merge".into(),
                     args: vec![
                         "merge".into(),
@@ -181,11 +181,11 @@ fn conflict_begin_edit_continue_and_seal_is_broker_journaled() {
         .continue_transaction(
             2,
             ContinueRepositoryTransactionParams {
-                protocol_version: 2,
+                protocol_version: 1,
                 transaction_handle: handle.clone(),
                 session_id: "session-a".into(),
                 run_id: "run-a".into(),
-                operations: vec![RepositoryOperationV2 {
+                operations: vec![RepositoryOperation {
                     operation_class: "add".into(),
                     args: vec!["add".into(), "--".into(), "seed.txt".into()],
                 }],
@@ -195,7 +195,7 @@ fn conflict_begin_edit_continue_and_seal_is_broker_journaled() {
     assert_eq!(result["status"], "completed_pending_seal");
     store
         .seal(BoundRepositoryTransactionParams {
-            protocol_version: 2,
+            protocol_version: 1,
             transaction_handle: handle.clone(),
             session_id: "session-a".into(),
             run_id: "run-a".into(),
@@ -213,7 +213,7 @@ fn conflict_begin_edit_continue_and_seal_is_broker_journaled() {
     );
     let reused = store
         .seal(BoundRepositoryTransactionParams {
-            protocol_version: 2,
+            protocol_version: 1,
             transaction_handle: handle,
             session_id: "session-a".into(),
             run_id: "run-a".into(),
@@ -238,10 +238,10 @@ fn merge_uses_an_isolated_identity_fallback_when_local_identity_is_missing() {
         .begin(
             2,
             BeginRepositoryTransactionParams {
-                protocol_version: 2,
+                protocol_version: 1,
                 lease_id,
                 expected_postconditions: None,
-                operations: vec![RepositoryOperationV2 {
+                operations: vec![RepositoryOperation {
                     operation_class: "merge".into(),
                     args: vec![
                         "merge".into(),
@@ -257,7 +257,7 @@ fn merge_uses_an_isolated_identity_fallback_when_local_identity_is_missing() {
     let handle = result["transactionHandle"].as_str().unwrap().to_owned();
     store
         .seal(BoundRepositoryTransactionParams {
-            protocol_version: 2,
+            protocol_version: 1,
             transaction_handle: handle,
             session_id: "session-identity".into(),
             run_id: "run-identity".into(),
@@ -282,10 +282,10 @@ fn merge_preserves_a_repository_local_identity_over_the_broker_fallback() {
         .begin(
             3,
             BeginRepositoryTransactionParams {
-                protocol_version: 2,
+                protocol_version: 1,
                 lease_id,
                 expected_postconditions: None,
-                operations: vec![RepositoryOperationV2 {
+                operations: vec![RepositoryOperation {
                     operation_class: "merge".into(),
                     args: vec![
                         "merge".into(),
@@ -301,7 +301,7 @@ fn merge_preserves_a_repository_local_identity_over_the_broker_fallback() {
     let handle = result["transactionHandle"].as_str().unwrap().to_owned();
     store
         .seal(BoundRepositoryTransactionParams {
-            protocol_version: 2,
+            protocol_version: 1,
             transaction_handle: handle,
             session_id: "session-local".into(),
             run_id: "run-local".into(),
@@ -327,7 +327,7 @@ fn abort_restores_exact_preimage_and_rejects_forged_or_cross_run_handles() {
     fs::write(root.join("seed.txt"), b"partial resolution\n").unwrap();
     let cross_run = store
         .abort(BoundRepositoryTransactionParams {
-            protocol_version: 2,
+            protocol_version: 1,
             transaction_handle: handle.clone(),
             session_id: "session-b".into(),
             run_id: "other-run".into(),
@@ -336,7 +336,7 @@ fn abort_restores_exact_preimage_and_rejects_forged_or_cross_run_handles() {
     assert_eq!(cross_run.code, "repository_transaction_handle_invalid");
     let forged = store
         .abort(BoundRepositoryTransactionParams {
-            protocol_version: 2,
+            protocol_version: 1,
             transaction_handle: format!("{handle}0"),
             session_id: "session-b".into(),
             run_id: "run-b".into(),
@@ -348,7 +348,7 @@ fn abort_restores_exact_preimage_and_rejects_forged_or_cross_run_handles() {
     fs::remove_file(root.join(".git").join("MERGE_HEAD")).unwrap();
     let result = store
         .abort(BoundRepositoryTransactionParams {
-            protocol_version: 2,
+            protocol_version: 1,
             transaction_handle: handle,
             session_id: "session-b".into(),
             run_id: "run-b".into(),
@@ -379,11 +379,11 @@ fn cancellation_kills_the_active_git_child_and_restores_the_preimage() {
         .continue_transaction(
             900,
             ContinueRepositoryTransactionParams {
-                protocol_version: 2,
+                protocol_version: 1,
                 transaction_handle: handle.clone(),
                 session_id: "session-x".into(),
                 run_id: "run-x".into(),
-                operations: vec![RepositoryOperationV2 {
+                operations: vec![RepositoryOperation {
                     operation_class: "add".into(),
                     args: vec!["add".into(), "--".into(), "seed.txt".into()],
                 }],
@@ -515,10 +515,10 @@ fn runtime_owned_agent_state_fails_closed_before_git_writes() {
         .begin(
             72,
             BeginRepositoryTransactionParams {
-                protocol_version: 2,
+                protocol_version: 1,
                 lease_id,
                 expected_postconditions: None,
-                operations: vec![RepositoryOperationV2 {
+                operations: vec![RepositoryOperation {
                     operation_class: "branch".into(),
                     args: vec!["branch".into(), "must-not-exist".into()],
                 }],
@@ -562,10 +562,10 @@ fn tree_operation_cannot_publish_or_leave_runtime_owned_agent_state() {
         .begin(
             73,
             BeginRepositoryTransactionParams {
-                protocol_version: 2,
+                protocol_version: 1,
                 lease_id,
                 expected_postconditions: None,
-                operations: vec![RepositoryOperationV2 {
+                operations: vec![RepositoryOperation {
                     operation_class: "switch".into(),
                     args: vec!["switch".into(), "--detach".into(), "contains-agent".into()],
                 }],
@@ -593,10 +593,10 @@ fn seal_restores_the_preimage_when_final_runtime_state_checks_fail() {
         .begin(
             75,
             BeginRepositoryTransactionParams {
-                protocol_version: 2,
+                protocol_version: 1,
                 lease_id,
                 expected_postconditions: None,
-                operations: vec![RepositoryOperationV2 {
+                operations: vec![RepositoryOperation {
                     operation_class: "branch".into(),
                     args: vec!["branch".into(), "seal-must-rollback".into()],
                 }],
@@ -610,7 +610,7 @@ fn seal_restores_the_preimage_when_final_runtime_state_checks_fail() {
 
     let error = store
         .seal(BoundRepositoryTransactionParams {
-            protocol_version: 2,
+            protocol_version: 1,
             transaction_handle: handle.clone(),
             session_id: "session-seal-agent".into(),
             run_id: "run-seal-agent".into(),
@@ -661,10 +661,10 @@ fn repository_signing_helpers_are_rejected_before_git_writes() {
             .begin(
                 74 + index as u64,
                 BeginRepositoryTransactionParams {
-                    protocol_version: 2,
+                    protocol_version: 1,
                     lease_id,
                     expected_postconditions: None,
-                    operations: vec![RepositoryOperationV2 {
+                    operations: vec![RepositoryOperation {
                         operation_class: "branch".into(),
                         args: vec!["branch".into(), "must-not-exist".into()],
                     }],
@@ -687,7 +687,7 @@ fn repository_signing_helpers_are_rejected_before_git_writes() {
 #[test]
 fn native_git_grammar_rejects_shell_signing_strategy_and_magic_pathspecs() {
     for operation in [
-        RepositoryOperationV2 {
+        RepositoryOperation {
             operation_class: "rebase".into(),
             args: vec![
                 "rebase".into(),
@@ -696,11 +696,11 @@ fn native_git_grammar_rejects_shell_signing_strategy_and_magic_pathspecs() {
                 "HEAD~1".into(),
             ],
         },
-        RepositoryOperationV2 {
+        RepositoryOperation {
             operation_class: "commit".into(),
             args: vec!["commit".into(), "-S".into(), "-m".into(), "signed".into()],
         },
-        RepositoryOperationV2 {
+        RepositoryOperation {
             operation_class: "merge".into(),
             args: vec![
                 "merge".into(),
@@ -709,7 +709,7 @@ fn native_git_grammar_rejects_shell_signing_strategy_and_magic_pathspecs() {
                 "topic".into(),
             ],
         },
-        RepositoryOperationV2 {
+        RepositoryOperation {
             operation_class: "add".into(),
             args: vec!["add".into(), "--".into(), ":(glob).agent/**".into()],
         },
@@ -765,7 +765,7 @@ fn native_git_grammar_accepts_only_the_structured_builder_shapes() {
     ];
     for (class, args) in operations {
         validate_operations(
-            &[RepositoryOperationV2 {
+            &[RepositoryOperation {
                 operation_class: class.into(),
                 args: args.into_iter().map(str::to_owned).collect(),
             }],
@@ -794,10 +794,10 @@ fn linked_worktree_binds_and_mutates_its_common_directory() {
         .begin(
             3,
             BeginRepositoryTransactionParams {
-                protocol_version: 2,
+                protocol_version: 1,
                 lease_id,
                 expected_postconditions: None,
-                operations: vec![RepositoryOperationV2 {
+                operations: vec![RepositoryOperation {
                     operation_class: "branch".into(),
                     args: vec!["branch".into(), "linked-created".into()],
                 }],
@@ -808,7 +808,7 @@ fn linked_worktree_binds_and_mutates_its_common_directory() {
     let handle = result["transactionHandle"].as_str().unwrap().to_owned();
     store
         .seal(BoundRepositoryTransactionParams {
-            protocol_version: 2,
+            protocol_version: 1,
             transaction_handle: handle,
             session_id: "session-e".into(),
             run_id: "run-e".into(),
@@ -845,7 +845,7 @@ fn corrupted_content_addressed_preimage_fails_closed_without_consuming_the_journ
 
     let error = store
         .abort(BoundRepositoryTransactionParams {
-            protocol_version: 2,
+            protocol_version: 1,
             transaction_handle: handle.clone(),
             session_id: "session-cas".into(),
             run_id: "run-cas".into(),
@@ -876,7 +876,7 @@ fn snapshot_limit_fails_during_lease_acquisition_before_the_first_repository_wri
     let (git_dir, common_dir) = topology(&root);
     let error = store
         .acquire(AcquireRepositoryTransactionLeaseParams {
-            protocol_version: 2,
+            protocol_version: 1,
             session_id: "session-f".into(),
             run_id: "run-f".into(),
             repository_root: root.clone(),
@@ -912,10 +912,10 @@ fn forged_and_reused_write_leases_are_rejected_before_additional_writes() {
         .begin(
             50,
             BeginRepositoryTransactionParams {
-                protocol_version: 2,
+                protocol_version: 1,
                 lease_id: format!("{lease_id}0"),
                 expected_postconditions: None,
-                operations: vec![RepositoryOperationV2 {
+                operations: vec![RepositoryOperation {
                     operation_class: "branch".into(),
                     args: vec!["branch".into(), "forged-must-not-exist".into()],
                 }],
@@ -927,10 +927,10 @@ fn forged_and_reused_write_leases_are_rejected_before_additional_writes() {
         .begin(
             51,
             BeginRepositoryTransactionParams {
-                protocol_version: 2,
+                protocol_version: 1,
                 lease_id: lease_id.clone(),
                 expected_postconditions: None,
-                operations: vec![RepositoryOperationV2 {
+                operations: vec![RepositoryOperation {
                     operation_class: "branch".into(),
                     args: vec!["branch".into(), "lease-created".into()],
                 }],
@@ -940,7 +940,7 @@ fn forged_and_reused_write_leases_are_rejected_before_additional_writes() {
     let handle = result["transactionHandle"].as_str().unwrap().to_owned();
     store
         .seal(BoundRepositoryTransactionParams {
-            protocol_version: 2,
+            protocol_version: 1,
             transaction_handle: handle,
             session_id: "session-g".into(),
             run_id: "run-g".into(),
@@ -950,10 +950,10 @@ fn forged_and_reused_write_leases_are_rejected_before_additional_writes() {
         .begin(
             52,
             BeginRepositoryTransactionParams {
-                protocol_version: 2,
+                protocol_version: 1,
                 lease_id,
                 expected_postconditions: None,
-                operations: vec![RepositoryOperationV2 {
+                operations: vec![RepositoryOperation {
                     operation_class: "branch".into(),
                     args: vec!["branch".into(), "reused-must-not-exist".into()],
                 }],
@@ -977,14 +977,14 @@ fn forged_and_reused_write_leases_are_rejected_before_additional_writes() {
 }
 
 #[test]
-fn v3_selected_head_postconditions_are_returned_and_sealed() {
-    let root = repository("v3-selected-head");
+fn selected_head_postconditions_are_returned_and_sealed() {
+    let root = repository("selected-head");
     fs::write(root.join("seed.txt"), b"second\n").unwrap();
     git_ok(&root, &["add", "seed.txt"]);
     git_ok(&root, &["commit", "-qm", "second"]);
     let target = git_ok(&root, &["rev-parse", "HEAD~1"]);
-    let store = test_store("test-v3-selected-head");
-    let Some(lease_id) = acquire(&store, &root, "session-v3", "run-v3", None) else {
+    let store = test_store("test-selected-head");
+    let Some(lease_id) = acquire(&store, &root, "session-postcondition", "run-postcondition", None) else {
         let _ = remove_any(&root);
         return;
     };
@@ -992,22 +992,22 @@ fn v3_selected_head_postconditions_are_returned_and_sealed() {
         .begin(
             80,
             BeginRepositoryTransactionParams {
-                protocol_version: 3,
+                protocol_version: 1,
                 lease_id,
-                expected_postconditions: Some(RepositoryExpectedPostconditionsV3 {
-                    schema_version: 3,
+                expected_postconditions: Some(RepositoryExpectedPostconditions {
+                    schema_version: 1,
                     selected_head: target.clone(),
                     selected_symbolic_ref: Some("refs/heads/main".into()),
                     required_reachable_objects: vec![target.clone()],
                 }),
-                operations: vec![RepositoryOperationV2 {
+                operations: vec![RepositoryOperation {
                     operation_class: "reset".into(),
                     args: vec!["reset".into(), "--hard".into(), target.clone()],
                 }],
             },
         )
         .unwrap();
-    assert_eq!(result["protocolVersion"], 3);
+    assert_eq!(result["protocolVersion"], 1);
     assert_eq!(
         result["semanticAssertions"]["targetAssertions"]["selectedHead"],
         target
@@ -1016,25 +1016,25 @@ fn v3_selected_head_postconditions_are_returned_and_sealed() {
     let handle = result["transactionHandle"].as_str().unwrap().to_owned();
     store
         .seal(BoundRepositoryTransactionParams {
-            protocol_version: 2,
+            protocol_version: 1,
             transaction_handle: handle,
-            session_id: "session-v3".into(),
-            run_id: "run-v3".into(),
+            session_id: "session-postcondition".into(),
+            run_id: "run-postcondition".into(),
         })
         .unwrap();
     remove_any(&root).unwrap();
 }
 
 #[test]
-fn wrong_v3_selected_head_assertion_aborts_and_restores_preimage() {
-    let root = repository("v3-wrong-head");
+fn wrong_selected_head_assertion_aborts_and_restores_preimage() {
+    let root = repository("wrong-head");
     fs::write(root.join("seed.txt"), b"second\n").unwrap();
     git_ok(&root, &["add", "seed.txt"]);
     git_ok(&root, &["commit", "-qm", "second"]);
     let before = git_ok(&root, &["rev-parse", "HEAD"]);
     let target = git_ok(&root, &["rev-parse", "HEAD~1"]);
-    let store = test_store("test-v3-wrong-head");
-    let Some(lease_id) = acquire(&store, &root, "session-v3b", "run-v3b", None) else {
+    let store = test_store("test-wrong-head");
+    let Some(lease_id) = acquire(&store, &root, "session-postcondition-b", "run-postcondition-b", None) else {
         let _ = remove_any(&root);
         return;
     };
@@ -1042,15 +1042,15 @@ fn wrong_v3_selected_head_assertion_aborts_and_restores_preimage() {
         .begin(
             81,
             BeginRepositoryTransactionParams {
-                protocol_version: 3,
+                protocol_version: 1,
                 lease_id,
-                expected_postconditions: Some(RepositoryExpectedPostconditionsV3 {
-                    schema_version: 3,
+                expected_postconditions: Some(RepositoryExpectedPostconditions {
+                    schema_version: 1,
                     selected_head: before.clone(),
                     selected_symbolic_ref: Some("refs/heads/main".into()),
                     required_reachable_objects: vec![before.clone()],
                 }),
-                operations: vec![RepositoryOperationV2 {
+                operations: vec![RepositoryOperation {
                     operation_class: "reset".into(),
                     args: vec!["reset".into(), "--hard".into(), target],
                 }],
@@ -1094,10 +1094,10 @@ fn sealed_transactions_share_one_run_baseline_and_restore_exact_repository_state
         .begin(
             90,
             BeginRepositoryTransactionParams {
-                protocol_version: 2,
+                protocol_version: 1,
                 lease_id: first_lease["leaseId"].as_str().unwrap().to_owned(),
                 expected_postconditions: None,
-                operations: vec![RepositoryOperationV2 {
+                operations: vec![RepositoryOperation {
                     operation_class: "branch".into(),
                     args: vec!["branch".into(), "created-in-run".into()],
                 }],
@@ -1106,7 +1106,7 @@ fn sealed_transactions_share_one_run_baseline_and_restore_exact_repository_state
         .unwrap();
     store
         .seal(BoundRepositoryTransactionParams {
-            protocol_version: 2,
+            protocol_version: 1,
             transaction_handle: first["transactionHandle"].as_str().unwrap().to_owned(),
             session_id: "session-baseline".into(),
             run_id: "run-baseline".into(),
@@ -1124,15 +1124,15 @@ fn sealed_transactions_share_one_run_baseline_and_restore_exact_repository_state
         .begin(
             91,
             BeginRepositoryTransactionParams {
-                protocol_version: 2,
+                protocol_version: 1,
                 lease_id: second_lease["leaseId"].as_str().unwrap().to_owned(),
                 expected_postconditions: None,
                 operations: vec![
-                    RepositoryOperationV2 {
+                    RepositoryOperation {
                         operation_class: "add".into(),
                         args: vec!["add".into(), "--".into(), "seed.txt".into()],
                     },
-                    RepositoryOperationV2 {
+                    RepositoryOperation {
                         operation_class: "commit".into(),
                         args: vec![
                             "commit".into(),
@@ -1147,7 +1147,7 @@ fn sealed_transactions_share_one_run_baseline_and_restore_exact_repository_state
         .unwrap();
     store
         .seal(BoundRepositoryTransactionParams {
-            protocol_version: 2,
+            protocol_version: 1,
             transaction_handle: second["transactionHandle"].as_str().unwrap().to_owned(),
             session_id: "session-baseline".into(),
             run_id: "run-baseline".into(),
@@ -1302,10 +1302,10 @@ fn dead_broker_run_baseline_rebinds_only_through_a_fresh_matching_lease() {
         .begin(
             92,
             BeginRepositoryTransactionParams {
-                protocol_version: 2,
+                protocol_version: 1,
                 lease_id: first_lease["leaseId"].as_str().unwrap().to_owned(),
                 expected_postconditions: None,
-                operations: vec![RepositoryOperationV2 {
+                operations: vec![RepositoryOperation {
                     operation_class: "branch".into(),
                     args: vec!["branch".into(), "rebind-created".into()],
                 }],
@@ -1314,7 +1314,7 @@ fn dead_broker_run_baseline_rebinds_only_through_a_fresh_matching_lease() {
         .unwrap();
     store
         .seal(BoundRepositoryTransactionParams {
-            protocol_version: 2,
+            protocol_version: 1,
             transaction_handle: transaction["transactionHandle"]
                 .as_str()
                 .unwrap()

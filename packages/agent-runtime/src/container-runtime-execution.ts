@@ -9,7 +9,7 @@ import {
   type ContainerEngine,
   type ContainerTarget,
   type ExecutionBroker,
-  type TrustedContainerLauncherV1
+  type TrustedContainerLauncher
 } from "agent-execution";
 import type { RuntimeCompositionConfig, RuntimeFactoryDeps } from "./configured-runtime.js";
 
@@ -56,7 +56,7 @@ export async function configuredExecutionBroker(
 }
 
 function assertTrustedLauncher(
-  launcher: TrustedContainerLauncherV1,
+  launcher: TrustedContainerLauncher,
   genericBroker: ExecutionBroker | undefined
 ): void {
   if (genericBroker) {
@@ -73,7 +73,7 @@ async function resolveContainerLauncher(
   deps: RuntimeFactoryDeps,
   config: { engine: ContainerEngine; target: ContainerTarget },
   workspace: string
-): Promise<TrustedContainerLauncherV1 | undefined> {
+): Promise<TrustedContainerLauncher | undefined> {
   if (deps.containerLauncher) return deps.containerLauncher;
   try {
     return config.target === "managed"

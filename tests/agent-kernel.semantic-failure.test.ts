@@ -14,6 +14,7 @@ function receipt(overrides: Partial<ToolReceipt> = {}): ToolReceipt {
     actualEffects: ["filesystem.read"],
     artifacts: [],
     diagnostics: [],
+    evidence: [],
     startedAt: NOW,
     completedAt: NOW,
     ...overrides
@@ -58,6 +59,7 @@ describe("model-visible tool receipts", () => {
       output: `head\n${"payload ".repeat(20_000)}\ntail`,
       outcome: { status: "succeeded", output: "ok", diagnosticCodes: [] },
       observedEffects: ["filesystem.read"],
+      actualEffects: ["filesystem.read"],
       artifacts: ["artifact-1"],
       artifactRefs: [{
         artifactId: "artifact-1",
@@ -66,6 +68,7 @@ describe("model-visible tool receipts", () => {
         sizeBytes: 123_456
       }],
       diagnostics: [],
+      evidence: [],
       startedAt: NOW,
       completedAt: NOW
     });
@@ -83,10 +86,12 @@ describe("model-visible tool receipts", () => {
       callId: "empty-effects",
       ok: false,
       output: "denied",
+      outcome: { status: "failed", output: "denied", diagnosticCodes: ["policy_denied"] },
       observedEffects: ["process.spawn.readonly"],
       actualEffects: [],
       artifacts: [],
       diagnostics: ["policy_denied"],
+      evidence: [],
       startedAt: NOW,
       completedAt: NOW
     })).toMatchObject({ actualEffects: [] });

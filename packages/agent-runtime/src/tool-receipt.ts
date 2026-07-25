@@ -7,10 +7,12 @@ export function failed(
   diagnostic: string,
   result?: JsonValue
 ): ToolReceipt {
+  const diagnostics = [diagnostic];
   return {
     callId: call.id, ok: false, output,
     ...(result === undefined ? {} : { result }),
-    observedEffects: [], artifacts: [], diagnostics: [diagnostic],
+    outcome: { status: "failed", output, diagnosticCodes: diagnostics },
+    observedEffects: [], actualEffects: [], artifacts: [], diagnostics, evidence: [],
     startedAt, completedAt: new Date().toISOString()
   };
 }

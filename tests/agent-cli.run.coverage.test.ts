@@ -546,7 +546,7 @@ describe("run command branch coverage", () => {
       "--prompt-file", path.join(os.tmpdir(), "missing-sigma-stream-prompt"),
       "--output-format", "stream-json"
     ], { stdin, stdout, stderr })).resolves.toBe(1);
-    expect(JSON.parse(stdout.text())).toMatchObject({ schemaVersion: 3, kind: "error", type: "error" });
+    expect(JSON.parse(stdout.text())).toMatchObject({ schemaVersion: 1, kind: "error", type: "error" });
     expect(stderr.text()).toBe("");
   });
 });

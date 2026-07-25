@@ -4,7 +4,7 @@ export interface ChildPlanOutcome {
   childId: string;
   planNodeIds: readonly string[];
   outcome: "completed" | "failed" | "cancelled" | "blocked";
-  evidence: { evidenceId: string; kind: "child_outcome" };
+  evidence: { evidenceId: string; kind: "child_outcome"; claim: "acceptance_met" };
 }
 
 function returnedNode(

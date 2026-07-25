@@ -44,14 +44,7 @@ function installCallGrant(
   decision: "allow" | "deny" | "always_allow",
   hasPendingTool: boolean
 ): void {
-  const binding = approval.binding ?? (approval.recovered ? {
-    sessionId: session.identity.sessionId,
-    runId: session.durable.runId,
-    callId: requestId,
-    // Legacy approval events without a durable plan deliberately create a
-    // non-matching sentinel so the resumed runner must present its fresh plan.
-    planEffectsDigest: "unbound"
-  } : undefined);
+  const binding = approval.binding;
   // Every explicit local approval receives a one-shot, plan-bound grant. The
   // execution gate consumes it before starting a sensitive or mutating call.
   if (decision === "deny" || !hasPendingTool || !binding

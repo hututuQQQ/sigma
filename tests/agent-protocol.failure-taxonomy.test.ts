@@ -2,12 +2,12 @@ import { describe, expect, it } from "vitest";
 import {
   FAILURE_TAXONOMY_VERSION,
   INFRASTRUCTURE_FAILURE_LIMIT,
-  classifyInfrastructureFailureCodesV1
+  classifyInfrastructureFailureCodes
 } from "../packages/agent-protocol/src/index.js";
 
 describe("infrastructure failure taxonomy v1", () => {
   it("classifies stable codes shared by the runtime and evaluator", () => {
-    expect(classifyInfrastructureFailureCodesV1([
+    expect(classifyInfrastructureFailureCodes([
       "sandbox_reparse_target_unresolvable",
       "sandbox_unavailable"
     ])).toEqual({
@@ -19,7 +19,7 @@ describe("infrastructure failure taxonomy v1", () => {
   });
 
   it("does not infer infrastructure failure from policy or process status", () => {
-    expect(classifyInfrastructureFailureCodesV1([
+    expect(classifyInfrastructureFailureCodes([
       "policy_denied",
       "exit_code=125",
       "something happened: sandbox_reparse_target_unresolvable"
@@ -27,7 +27,7 @@ describe("infrastructure failure taxonomy v1", () => {
   });
 
   it("classifies adapter-authenticated missing dependencies separately from missing runtimes", () => {
-    expect(classifyInfrastructureFailureCodesV1(["dependency_missing"])).toEqual({
+    expect(classifyInfrastructureFailureCodes(["dependency_missing"])).toEqual({
       taxonomyVersion: FAILURE_TAXONOMY_VERSION,
       family: "execution_dependency",
       codes: ["dependency_missing"]
@@ -35,7 +35,7 @@ describe("infrastructure failure taxonomy v1", () => {
   });
 
   it("selects one family deterministically and normalizes code suffixes", () => {
-    expect(classifyInfrastructureFailureCodesV1([
+    expect(classifyInfrastructureFailureCodes([
       " BROKER_TIMEOUT:poll ",
       "sandbox_unavailable",
       "broker_timeout"

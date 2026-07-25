@@ -34,7 +34,11 @@ describe("durable Plan transition policy", () => {
       revision: 2,
       activeNodeId: undefined,
       nodes: [{ ...previous.nodes[0]!, status: "completed" as const,
-        evidence: [{ evidenceId: "evidence", kind: "validation" as const }] }]
+        evidence: [{
+          evidenceId: "evidence",
+          kind: "validation" as const,
+          claim: "acceptance_met" as const
+        }] }]
     };
     expect(() => assertPlanTransition(previous, completed, new Map([[evidence.evidenceId, evidence]]), false))
       .toThrow(/mismatched evidence/iu);
@@ -77,11 +81,19 @@ describe("durable Plan transition policy", () => {
     previous.nodes[0] = {
       ...previous.nodes[0]!,
       status: "completed",
-      evidence: [{ evidenceId: evidence.evidenceId, kind: evidence.kind }]
+      evidence: [{
+        evidenceId: evidence.evidenceId,
+        kind: evidence.kind,
+        claim: "acceptance_met"
+      }]
     };
     const next = structuredClone(previous);
     next.revision = 2;
-    next.nodes[0]!.evidence = [{ evidenceId: "different-evidence", kind: "diagnostic" }];
+    next.nodes[0]!.evidence = [{
+      evidenceId: "different-evidence",
+      kind: "diagnostic",
+      claim: "acceptance_met"
+    }];
     expect(() => assertPlanTransition(previous, next, new Map(), false))
       .toThrow("cannot be modified without reopening");
   });

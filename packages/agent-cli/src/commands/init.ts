@@ -1,6 +1,6 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { renderConfigToml } from "agent-config";
+import { SIGMA_PROJECT_FACTS, renderConfigToml } from "agent-config";
 import { loadCliConfig, parseArgs } from "../config.js";
 
 interface InitDeps {
@@ -32,7 +32,7 @@ export async function runInitCommand(argv: string[], deps: InitDeps = {}): Promi
       model: config.model,
       workspace: ".",
       permissionMode
-    }, `Sigma Code 3.0 workspace configuration (init profile: ${profile})`), "utf8");
+    }, `Sigma Code ${SIGMA_PROJECT_FACTS.productVersion} workspace configuration (init profile: ${profile})`), "utf8");
     if (flags.json === true) stdout.write(`${JSON.stringify({ ok: true, configPath, profile })}\n`);
     else stdout.write(`initialized ${configPath}\n`);
     return 0;

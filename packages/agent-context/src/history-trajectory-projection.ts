@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import type {
   ModelMessage,
-  ReasoningTrajectoryStateV1,
-  ToolResultPruneStateV1
+  ReasoningTrajectoryState,
+  ToolResultPruneState
 } from "agent-protocol";
 import {
   compactHistoryFallback,
@@ -34,14 +34,14 @@ function reasoningTrajectorySourceDigest(blockDigests: readonly string[]): strin
 }
 
 export interface ReasoningTrajectoryProposal {
-  state: ReasoningTrajectoryStateV1;
+  state: ReasoningTrajectoryState;
   changed: boolean;
   newlyTombstoned: number;
 }
 
 export function proposeReasoningTrajectoryTombstones(
   history: readonly ModelMessage[],
-  previous: ReasoningTrajectoryStateV1,
+  previous: ReasoningTrajectoryState,
   required: boolean
 ): ReasoningTrajectoryProposal {
   if (!required) return { state: previous, changed: false, newlyTombstoned: 0 };
@@ -54,7 +54,7 @@ export function proposeReasoningTrajectoryTombstones(
   const newlyTombstoned = missing.filter((blockDigest) => !existing.has(blockDigest)).length;
   for (const blockDigest of missing) existing.add(blockDigest);
   const blockDigests = [...existing].sort();
-  const state: ReasoningTrajectoryStateV1 = {
+  const state: ReasoningTrajectoryState = {
     schemaVersion: 1,
     blockDigests,
     sourceDigest: reasoningTrajectorySourceDigest(blockDigests)
@@ -88,7 +88,7 @@ function reasoningTrajectoryTombstone(
 
 export function projectReasoningSafeHistory(
   history: readonly ModelMessage[],
-  state: ReasoningTrajectoryStateV1,
+  state: ReasoningTrajectoryState,
   required: boolean
 ): ModelMessage[] {
   if (!required) return [...history];
@@ -108,9 +108,9 @@ function toolResultTokens(block: HistoryBlock): number {
 
 function validPruneState(
   blocks: readonly HistoryBlock[],
-  state: ToolResultPruneStateV1 | undefined,
+  state: ToolResultPruneState | undefined,
   archiveSourceDigest: string | undefined
-): state is ToolResultPruneStateV1 {
+): state is ToolResultPruneState {
   return Boolean(state
     && state.archiveSourceDigest === archiveSourceDigest
     && state.coveredBlocks <= blocks.length
@@ -118,7 +118,7 @@ function validPruneState(
 }
 
 export interface ToolResultPruneProposal {
-  state?: ToolResultPruneStateV1;
+  state?: ToolResultPruneState;
   changed: boolean;
   protectedTokens: number;
   prunedTokens: number;
@@ -126,7 +126,7 @@ export interface ToolResultPruneProposal {
 
 export function proposeToolResultPrune(
   history: readonly ModelMessage[],
-  previous: ToolResultPruneStateV1 | undefined,
+  previous: ToolResultPruneState | undefined,
   archiveSourceDigest?: string
 ): ToolResultPruneProposal {
   const blocks = historyBlocks(history);
@@ -162,7 +162,7 @@ export function proposeToolResultPrune(
     };
   }
   const coveredBlocks = eligibleEnd + 1;
-  const state: ToolResultPruneStateV1 = {
+  const state: ToolResultPruneState = {
     schemaVersion: 1,
     coveredBlocks,
     sourceDigest: stableHistoryDigest(blocks.slice(0, coveredBlocks)),
@@ -173,7 +173,7 @@ export function proposeToolResultPrune(
 
 export function projectToolResultHistory(
   history: readonly ModelMessage[],
-  state: ToolResultPruneStateV1 | undefined,
+  state: ToolResultPruneState | undefined,
   archiveSourceDigest?: string
 ): ModelMessage[] {
   const blocks = historyBlocks(history);

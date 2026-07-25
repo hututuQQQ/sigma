@@ -1,10 +1,10 @@
 import { canonicalJson, digest as sha256 } from "./common.mjs";
 import {
-  assertOptimizationExperimentV1,
-  assertOptimizerClusterCardV1,
-  assertOptimizerObservationV1,
+  assertOptimizationExperiment,
+  assertOptimizerClusterCard,
+  assertOptimizerObservation,
   isActiveExperimentStatus,
-  optimizerClusterCardDigestV1
+  optimizerClusterCardDigest
 } from "./optimizer-schema.mjs";
 
 const DEFAULT_PLATFORM = "unavailable";
@@ -172,7 +172,7 @@ function createObservation(metrics, episode, metadata, observedAt) {
     evidence: evidenceReferences(episode, metrics.terminal ?? {}),
     blocker: isBlocker(metrics, episode)
   };
-  return assertOptimizerObservationV1(observation);
+  return assertOptimizerObservation(observation);
 }
 
 export function createOptimizerObservations(metrics, metadata = {}) {
@@ -258,12 +258,12 @@ function clusterCard(clusterId, observations, experimentState, asOf, days) {
     metrics: aggregateMetrics(orderedEvidence),
     observationRefs: orderedEvidence.map((item) => item.observationId)
   };
-  return assertOptimizerClusterCardV1({ ...unsigned, cardDigest: optimizerClusterCardDigestV1(unsigned) });
+  return assertOptimizerClusterCard({ ...unsigned, cardDigest: optimizerClusterCardDigest(unsigned) });
 }
 
 export function createOptimizerClusterCards(input, experiments = [], options = {}) {
-  const observations = input.map(assertOptimizerObservationV1);
-  const registered = experiments.map(assertOptimizationExperimentV1);
+  const observations = input.map(assertOptimizerObservation);
+  const registered = experiments.map(assertOptimizationExperiment);
   const grouped = new Map();
   for (const observation of observations) {
     const group = grouped.get(observation.clusterId) ?? [];

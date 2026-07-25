@@ -1,5 +1,4 @@
 import {
-  isBudgetLedgerState,
   type AgentEventEnvelope,
   type BudgetAmounts,
   type BudgetLedgerState,
@@ -7,6 +6,7 @@ import {
   type RunOutcome,
   type RunStore
 } from "agent-protocol";
+import { replayBudgetLedgerEvent } from "agent-kernel";
 import { finalizeChildCompletion, handleChildEvent } from "./child-event-handler.js";
 import type { RuntimeControlService } from "./runtime-control.js";
 import type { ChildJoinSummary, RuntimeSession } from "./types.js";
@@ -142,9 +142,7 @@ async function childLedger(store: RunStore, sessionId: string): Promise<ChildLed
     if (event.type === "run.started") result.terminal = undefined;
     const terminal = eventOutcome(event);
     if (terminal) result.terminal = terminal;
-    if (!event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) continue;
-    const ledger = (event.payload as Record<string, unknown>).ledger;
-    if (isBudgetLedgerState(ledger)) result.ledger = ledger;
+    result.ledger = replayBudgetLedgerEvent(result.ledger, event);
   }
   return result;
 }

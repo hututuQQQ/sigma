@@ -1,6 +1,6 @@
 {
   "name": "sigma-agent-mvp",
-  "version": "4.0.0",
+  "version": "0.1.0",
   "private": true,
   "license": "MIT",
   "description": "A safety-focused coding agent that runs in your terminal.",
@@ -72,7 +72,7 @@
     "smoke:harbor": "node scripts/run-bash.mjs scripts/smoke-harbor.sh",
     "verify:containment": "cargo build --locked --manifest-path native/sigma-exec/Cargo.toml && node scripts/verify-containment.mjs",
     "perf:repo-100k": "pnpm build && node scripts/perf-repository-100k.mjs",
-    "perf:replay-v5-100k": "pnpm build && node --expose-gc scripts/perf-v5-replay-100k.mjs",
+    "perf:replay-100k": "pnpm build && node --expose-gc scripts/perf-replay-100k.mjs",
     "bench:tb:smoke": "node scripts/bench-terminal-bench.mjs --mode smoke",
     "bench:tb:k": "node scripts/bench-terminal-bench.mjs --mode k",
     "bench:tb:task": "node scripts/bench-terminal-bench.mjs --mode task",

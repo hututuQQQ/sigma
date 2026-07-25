@@ -11,7 +11,7 @@ import type {
   BrokerDoctorReport, BrokerRequestOptions, BrokerSandboxLeaseStatus, BrokerSandboxRevokeResult,
   ExecutionBroker, ExecutionRequest, ExecutionResult,
   ProcessHandle, ProcessHandoffResult, ProcessPollResult, ProcessSpawnRequest,
-  ScratchLeaseRequestV1, ScratchLeaseV1,
+  ScratchLeaseRequest, ScratchLease,
 } from "./types.js";
 import {
   invokeRepositoryOperation,
@@ -79,7 +79,7 @@ export class LazyExecutionBroker extends RepositoryExecutionBrokerBase implement
       forwardSandboxLeaseRevoke(client, workspacePath, signal), signal)).value;
   }
 
-  async acquireScratchLease(request: ScratchLeaseRequestV1, options?: BrokerRequestOptions): Promise<ScratchLeaseV1> {
+  async acquireScratchLease(request: ScratchLeaseRequest, options?: BrokerRequestOptions): Promise<ScratchLease> {
     const lease = (await this.invokeFresh(
       (client) => forwardScratchLease(client, request, options), options?.signal
     )).value;

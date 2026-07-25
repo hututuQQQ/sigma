@@ -1,6 +1,6 @@
 import type {
-  AssuranceRequirementV1,
-  ValidationClaimKindV1
+  AssuranceRequirement,
+  ValidationClaimKind
 } from "agent-protocol";
 import type { RuntimeSession } from "./types.js";
 
@@ -8,8 +8,8 @@ const HIGH_RISK_PATH = /(?:^|\/)(?:native|security|sandbox|permissions?|auth|com
 const SOURCE_PATH = /\.(?:[cm]?[jt]sx?|py|rs|go|java|kt|swift|c|cc|cpp|h|hpp)$/iu;
 const TEST_PATH = /(?:^|\/)(?:tests?|__tests__)(?:\/|$)|\.(?:test|spec)\.[cm]?[jt]sx?$/iu;
 
-function explicitAcceptanceClaims(goal: string): ValidationClaimKindV1[] {
-  const claims: ValidationClaimKindV1[] = [];
+function explicitAcceptanceClaims(goal: string): ValidationClaimKind[] {
+  const claims: ValidationClaimKind[] = [];
   const lower = goal.toLowerCase();
   if (/\b(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?lint\b|\beslint\b/u.test(lower)) claims.push("lint");
   if (/\b(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?(?:typecheck|check-types)\b|\btsc\b/u.test(lower)) claims.push("typecheck");
@@ -23,11 +23,11 @@ function explicitAcceptanceClaims(goal: string): ValidationClaimKindV1[] {
   return claims;
 }
 
-export function assuranceRequirement(session: RuntimeSession): AssuranceRequirementV1 {
+export function assuranceRequirement(session: RuntimeSession): AssuranceRequirement {
   const changed = session.durable.state.mutationFrontier.changedPaths;
   if (changed.length === 0) return { risk: "read_only", requiredClaims: [], review: "off" };
   const high = changed.some((item) => HIGH_RISK_PATH.test(item));
-  const required = new Set<ValidationClaimKindV1>(explicitAcceptanceClaims(session.durable.state.plan.goal));
+  const required = new Set<ValidationClaimKind>(explicitAcceptanceClaims(session.durable.state.plan.goal));
   if (changed.some((item) => TEST_PATH.test(item))) required.add("unit");
   if (changed.some((item) => /\.[cm]?tsx?$/iu.test(item))) required.add("typecheck");
   if (changed.some((item) => SOURCE_PATH.test(item)) && required.size === 0) required.add("unit");
@@ -41,8 +41,8 @@ export function assuranceRequirement(session: RuntimeSession): AssuranceRequirem
 }
 
 export function validationClaimSatisfies(
-  actual: ValidationClaimKindV1 | undefined,
-  required: ValidationClaimKindV1
+  actual: ValidationClaimKind | undefined,
+  required: ValidationClaimKind
 ): boolean {
   if (!actual || actual === "probe") return false;
   if (actual === required) return true;
@@ -51,7 +51,7 @@ export function validationClaimSatisfies(
 
 export function assurancePathsForClaim(
   paths: readonly string[],
-  claim: ValidationClaimKindV1
+  claim: ValidationClaimKind
 ): string[] {
   if (claim === "typecheck") return paths.filter((item) => /\.[cm]?tsx?$/iu.test(item));
   if (claim === "unit" || claim === "integration") {

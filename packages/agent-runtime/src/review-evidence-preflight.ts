@@ -71,10 +71,10 @@ function opaqueEvidenceFailure(
 }
 
 /**
- * V10 preflight verifies only evidence integrity. Material completeness,
- * language type, command shape, validation coverage, and whether a change is
- * reviewable are semantic questions for the active reviewer. Missing or
- * truncated material therefore cannot consume a substantive review attempt.
+ * Preflight verifies only evidence integrity. Material completeness, language
+ * type, command shape, validation coverage, and whether a change is reviewable
+ * are semantic questions for the active reviewer. Missing or truncated
+ * material therefore cannot consume a substantive review attempt.
  */
 export function reviewInputFailure(input: ReviewerInput): string | undefined {
   for (const delta of input.workspaceDeltas) {

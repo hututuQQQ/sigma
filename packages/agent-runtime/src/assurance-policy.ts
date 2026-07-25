@@ -1,22 +1,22 @@
 import type { KernelState } from "agent-kernel";
 import {
   DEFAULT_ASSURANCE_RESOURCE_POLICY,
-  isAssuranceResourcePolicyV1,
-  type AssuranceResourcePolicyV1
+  isAssuranceResourcePolicy,
+  type AssuranceResourcePolicy
 } from "agent-protocol";
 import type { RuntimeSession } from "./types.js";
 
 export function normalizedAssurancePolicy(
   policy: unknown
-): AssuranceResourcePolicyV1 {
-  return isAssuranceResourcePolicyV1(policy)
+): AssuranceResourcePolicy {
+  return isAssuranceResourcePolicy(policy)
     ? { ...policy }
     : { ...DEFAULT_ASSURANCE_RESOURCE_POLICY };
 }
 
 export function assurancePolicyFromState(
   state: KernelState
-): AssuranceResourcePolicyV1 {
+): AssuranceResourcePolicy {
   const assurance = state.longHorizon.assurance;
   return {
     budgetPercent: assurance.budgetPercent,
@@ -34,9 +34,9 @@ export function assurancePolicyFromState(
 
 export function sessionAssurancePolicy(
   session: RuntimeSession
-): AssuranceResourcePolicyV1 {
+): AssuranceResourcePolicy {
   const profilePolicy = session.services.profile?.profile.assurancePolicy;
-  return isAssuranceResourcePolicyV1(profilePolicy)
+  return isAssuranceResourcePolicy(profilePolicy)
     ? { ...profilePolicy }
     : assurancePolicyFromState(session.durable.state);
 }

@@ -22,7 +22,10 @@ import { EVENT_SCHEMA_VERSION } from "../packages/agent-protocol/src/index.js";
 import { createRuntime, restoreStoredSession } from "../packages/agent-runtime/src/testing.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
-import { completeAgentEventPayload } from "./testkit/agent-event-fixtures.js";
+import {
+  completeAgentEventPayload,
+  persistEmptyCustomization
+} from "./testkit/agent-event-fixtures.js";
 
 const roots: string[] = [];
 const occurredAt = "2026-07-11T00:00:00.000Z";
@@ -103,6 +106,7 @@ function validation(id: string, deltaId: string): ValidationEvidence {
     producer: { authority: "runtime", id: "test-validator" },
     summary: "Validation passed.",
     data: {
+      schemaVersion: 1,
       validator: "test",
       frontierRevision: deltaId === "delta-one" ? 1 : 2,
       stateDigest: (deltaId === "delta-one" ? "a" : "b").repeat(64),
@@ -122,7 +126,7 @@ function review(deltaId: string): ReviewEvidence {
     producer: { authority: "runtime", id: "independent-reviewer" },
     summary: "First checkpoint approved.",
     data: {
-      schemaVersion: 3,
+      schemaVersion: 1,
       reviewerId: "independent-reviewer",
       verdict: "approved",
       findings: [],
@@ -155,9 +159,11 @@ async function pendingFixture(terminal = false): Promise<{
   const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
   const first = delta("delta-one", "checkpoint-one", "src/one.ts");
   const second = delta("delta-two", "checkpoint-two", "src/two.ts");
+  const customization = await persistEmptyCustomization(storeRootDir, "session");
   const events = [
     event(1, "session.created", { workspacePath: root, mode: "change" }),
-    event(2, "plan.updated", {
+    event(2, "customization.frozen", customization),
+    event(3, "plan.updated", {
       previousRevision: 0,
       plan: {
         revision: 1,
@@ -174,20 +180,20 @@ async function pendingFixture(terminal = false): Promise<{
         }]
       }
     }),
-    event(3, "run.started", { mode: "change" }),
-    event(4, "user.message", { text: "Apply two changes." }, "user"),
-    event(5, "evidence.recorded", first),
-    event(6, "evidence.recorded", validation("validation-one", first.evidenceId)),
-    event(7, "review.completed", review(first.evidenceId)),
-    event(8, "evidence.recorded", second),
-    event(9, "evidence.recorded", validation("validation-two", second.evidenceId)),
+    event(4, "run.started", { mode: "change" }),
+    event(5, "user.message", { text: "Apply two changes." }, "user"),
+    event(6, "evidence.recorded", first),
+    event(7, "evidence.recorded", validation("validation-one", first.evidenceId)),
+    event(8, "review.completed", review(first.evidenceId)),
+    event(9, "evidence.recorded", second),
+    event(10, "evidence.recorded", validation("validation-two", second.evidenceId)),
     terminal
-      ? event(10, "run.failed", {
+      ? event(11, "run.failed", {
         kind: "recoverable_failure",
         code: "review_required",
         message: "Awaiting an explicit user follow-up."
       })
-      : event(10, "run.suspended", {
+      : event(11, "run.suspended", {
         requestId: "review-required",
         message: "Independent review requires an explicit user decision."
       })

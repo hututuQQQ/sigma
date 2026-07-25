@@ -170,7 +170,7 @@ export async function executeForegroundCommand(
     );
     const writeRoots = validation ? [] : await resolvedWriteRoots(context, approvedPlan);
     await readLock.verify();
-    const scratchLease = approvedPlan.mutationAuthority === "disposable_enclosing_container_v1"
+    const scratchLease = approvedPlan.mutationAuthority === "disposable_enclosing_container"
       ? undefined
       : await options.broker.acquireScratchLease?.({
           protocolVersion: 1,
@@ -217,7 +217,7 @@ function foregroundTool(kind: "exec" | "shell" | "validate", options: ExecutionT
       ...schema,
       ...(options.writeScope === "enclosing-container"
         && options.enclosingContainerRoot === true
-        ? { brokerMutationAuthority: "disposable_enclosing_container_v1" as const }
+        ? { brokerMutationAuthority: "disposable_enclosing_container" as const }
         : {}),
       prepare(value, context) {
         const input = executionArgs(value);
@@ -282,7 +282,7 @@ async function executeBackgroundProcess(
     );
     await readLock.verify();
     const writeRoots = await resolvedWriteRoots(context, approvedPlan);
-    const scratchLease = approvedPlan.mutationAuthority === "disposable_enclosing_container_v1"
+    const scratchLease = approvedPlan.mutationAuthority === "disposable_enclosing_container"
       ? undefined
       : await options.broker.acquireScratchLease?.({
           protocolVersion: 1,

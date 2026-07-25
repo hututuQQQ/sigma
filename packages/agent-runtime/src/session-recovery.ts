@@ -128,9 +128,9 @@ export async function recoverInterruptedSession(session: RuntimeSession, options
     const descriptor = options.descriptors.find((item) => item.name === pending.request.name);
     if (pending.approval === "pending") {
       if (!session.interaction.approvals.has(pending.request.callId)) {
-        session.interaction.approvals.set(pending.request.callId, {
-          effects: descriptor?.possibleEffects ?? [], recovered: true, resolve: () => undefined
-        });
+        throw Object.assign(new Error(
+          `Session '${session.identity.sessionId}' is missing schema 1 approval authority for call '${pending.request.callId}'.`
+        ), { code: "unsupported_schema_version" });
       }
       continue;
     }

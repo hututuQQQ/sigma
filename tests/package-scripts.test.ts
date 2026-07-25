@@ -49,7 +49,7 @@ describe("package script semantics", () => {
 
   it("keeps target release stages explicit, ordered, and isolated from secrets", async () => {
     expect(stageIds("release-linux")).toEqual([
-      "build", "lint", "coverage", "native-coverage", "v5-replay", "product-smoke", "tui-smoke",
+      "build", "lint", "coverage", "native-coverage", "replay", "product-smoke", "tui-smoke",
       "package", "sandbox", "lsp-sandbox", "provider-smoke", "readiness"
     ]);
     expect(stageIds("release-windows")).toEqual(stageIds("release-linux"));
@@ -57,8 +57,8 @@ describe("package script semantics", () => {
     const windows = releaseStageGraph("release-windows");
     expect(linux.find((stage) => stage.id === "package")?.args).toContain("verify:package:agent-cli:linux");
     expect(windows.find((stage) => stage.id === "package")?.args).toContain("verify:package:agent-cli:windows");
-    expect(linux.find((stage) => stage.id === "readiness")?.args).toContain("--require-release-ready");
-    expect(linux.find((stage) => stage.id === "readiness")?.args).not.toContain("--require-preview-ready");
+    expect(linux.find((stage) => stage.id === "readiness")?.args).toContain("--require-preview-ready");
+    expect(linux.find((stage) => stage.id === "readiness")?.args).not.toContain("--require-release-ready");
     expect(windows.find((stage) => stage.id === "readiness")?.args).toContain("--require-preview-ready");
     expect(windows.find((stage) => stage.id === "readiness")?.args).not.toContain("--require-release-ready");
     expect(linux.find((stage) => stage.id === "provider-smoke")?.environment).toEqual({

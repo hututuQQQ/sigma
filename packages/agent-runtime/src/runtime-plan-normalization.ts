@@ -1,10 +1,9 @@
 import { createHash } from "node:crypto";
 import {
   isPlanGraph,
-  type ModelPlanNormalizationWarningV3,
-  type ModelPlanProjectionV3,
-  type ModelPlanUpdateV2,
-  type ModelPlanUpdateV3,
+  type ModelPlanNormalizationWarning,
+  type ModelPlanProjection,
+  type ModelPlanUpdate,
   type PlanGraph
 } from "agent-protocol";
 
@@ -20,7 +19,7 @@ function normalizedStep(value: string): string {
   return value.trim().replace(/\s+/gu, " ").toLocaleLowerCase("en-US");
 }
 
-export function modelPlanProjection(plan: PlanGraph): ModelPlanProjectionV3 {
+export function modelPlanProjection(plan: PlanGraph): ModelPlanProjection {
   const roots = plan.nodes.filter((node) => node.owner.kind === "root"
     && node.status !== "cancelled");
   return {
@@ -48,12 +47,6 @@ function stableStepId(title: string, used: ReadonlySet<string>): string {
   throw new Error("Unable to allocate a unique plan step identifier.");
 }
 
-export function isLegacyPlanUpdate(
-  input: ModelPlanUpdateV3 | ModelPlanUpdateV2
-): input is ModelPlanUpdateV2 {
-  return Object.hasOwn(input, "nodes");
-}
-
 type PlanNode = PlanGraph["nodes"][number];
 
 interface RootChecklistNormalization {
@@ -69,7 +62,7 @@ function planSchemaError(message: string): Error {
 }
 
 function validateRequestedStep(
-  requested: ModelPlanUpdateV3["plan"][number],
+  requested: ModelPlanUpdate["plan"][number],
   index: number
 ): string {
   const title = trimmed(requested.step);
@@ -81,13 +74,13 @@ function validateRequestedStep(
 }
 
 function resolvedStepIdentity(
-  requested: ModelPlanUpdateV3["plan"][number],
+  requested: ModelPlanUpdate["plan"][number],
   title: string,
   currentById: ReadonlyMap<string, PlanNode>,
   currentByTitle: ReadonlyMap<string, PlanNode>,
   usedIds: Set<string>,
   requestedIds: Set<string>,
-  warnings: ModelPlanNormalizationWarningV3[]
+  warnings: ModelPlanNormalizationWarning[]
 ): { id: string; previous?: PlanNode } {
   const previous = (requested.id ? currentById.get(requested.id) : undefined)
     ?? currentByTitle.get(normalizedStep(title));
@@ -106,9 +99,9 @@ function resolvedStepIdentity(
 }
 
 function normalizedBlockedReason(
-  requested: ModelPlanUpdateV3["plan"][number],
+  requested: ModelPlanUpdate["plan"][number],
   id: string,
-  warnings: ModelPlanNormalizationWarningV3[]
+  warnings: ModelPlanNormalizationWarning[]
 ): string {
   const supplied = trimmed(requested.blockedReason);
   if (requested.status !== "blocked" || supplied) return supplied;
@@ -121,15 +114,15 @@ function normalizedBlockedReason(
 }
 
 function normalizedRequestedRoot(
-  input: ModelPlanUpdateV3,
-  requested: ModelPlanUpdateV3["plan"][number],
+  input: ModelPlanUpdate,
+  requested: ModelPlanUpdate["plan"][number],
   index: number,
   maps: {
     currentById: ReadonlyMap<string, PlanNode>;
     currentByTitle: ReadonlyMap<string, PlanNode>;
   },
   identifiers: { usedIds: Set<string>; requestedIds: Set<string> },
-  warnings: ModelPlanNormalizationWarningV3[]
+  warnings: ModelPlanNormalizationWarning[]
 ): PlanNode {
   const title = validateRequestedStep(requested, index);
   const { id, previous } = resolvedStepIdentity(
@@ -177,8 +170,8 @@ function normalizedRequestedRoot(
 
 function normalizeRootChecklist(
   current: PlanGraph,
-  input: ModelPlanUpdateV3,
-  warnings: ModelPlanNormalizationWarningV3[]
+  input: ModelPlanUpdate,
+  warnings: ModelPlanNormalizationWarning[]
 ): RootChecklistNormalization {
   const currentRoots = current.nodes.filter((node) => node.owner.kind === "root");
   const currentById = new Map(currentRoots.map((node) => [node.id, node] as const));
@@ -196,7 +189,7 @@ function normalizeRootChecklist(
 
 function preserveCompletedRoots(
   normalization: RootChecklistNormalization,
-  warnings: ModelPlanNormalizationWarningV3[]
+  warnings: ModelPlanNormalizationWarning[]
 ): void {
   for (const completed of normalization.currentRoots.filter((node) =>
     node.status === "completed" && !normalization.requestedIds.has(node.id))) {
@@ -229,7 +222,7 @@ function runtimeDependencyRootIds(
 function preserveRuntimeDependencies(
   normalization: RootChecklistNormalization,
   children: readonly PlanNode[],
-  warnings: ModelPlanNormalizationWarningV3[]
+  warnings: ModelPlanNormalizationWarning[]
 ): void {
   const dependencyIds = runtimeDependencyRootIds(children, normalization.currentById);
   for (const dependency of normalization.currentRoots.filter((node) =>
@@ -245,7 +238,7 @@ function preserveRuntimeDependencies(
 }
 
 function acceptanceChangedAfterCompletion(
-  input: ModelPlanUpdateV3,
+  input: ModelPlanUpdate,
   acceptanceCriteria: readonly string[],
   current: PlanGraph
 ): boolean {
@@ -256,9 +249,9 @@ function acceptanceChangedAfterCompletion(
 
 function attachAcceptanceCriteria(
   current: PlanGraph,
-  input: ModelPlanUpdateV3,
+  input: ModelPlanUpdate,
   normalization: RootChecklistNormalization,
-  warnings: ModelPlanNormalizationWarningV3[]
+  warnings: ModelPlanNormalizationWarning[]
 ): void {
   const acceptanceCriteria = input.acceptanceCriteria
     ? uniqueText(input.acceptanceCriteria)
@@ -294,7 +287,7 @@ function attachAcceptanceCriteria(
 function normalizeActiveRoot(
   current: PlanGraph,
   roots: PlanNode[],
-  warnings: ModelPlanNormalizationWarningV3[]
+  warnings: ModelPlanNormalizationWarning[]
 ): PlanNode | undefined {
   const requestedActive = roots.filter((node) => node.status === "in_progress");
   let active = requestedActive.find((node) => node.id === current.activeNodeId)
@@ -331,16 +324,16 @@ function comparablePlan(plan: PlanGraph): string {
 
 export function normalizedWorkPlan(
   current: PlanGraph,
-  input: ModelPlanUpdateV3
+  input: ModelPlanUpdate
 ): {
   proposed: PlanGraph;
-  warnings: ModelPlanNormalizationWarningV3[];
+  warnings: ModelPlanNormalizationWarning[];
   changed: boolean;
 } {
   if (!Array.isArray(input.plan) || input.plan.length > 32) {
     throw planSchemaError("plan must be an array with at most 32 steps.");
   }
-  const warnings: ModelPlanNormalizationWarningV3[] = [];
+  const warnings: ModelPlanNormalizationWarning[] = [];
   const normalization = normalizeRootChecklist(current, input, warnings);
   preserveCompletedRoots(normalization, warnings);
   const children = current.nodes.filter((node) => node.owner.kind === "child");

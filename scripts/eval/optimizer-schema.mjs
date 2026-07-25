@@ -25,7 +25,7 @@ const EVIDENCE_TYPES = new Set(["failure_started", "fail_fast_eligible", "fail_f
 const GENERALITY_EVIDENCE = new Set(["unit_test", "property_test", "generic_reproduction"]);
 const DIRECTIONS = new Set(["increase", "decrease"]);
 const PRIMARY_KINDS = new Set(["binary", "continuous"]);
-export const OPTIMIZATION_PRIMARY_METRICS_V1 = Object.freeze({
+export const OPTIMIZATION_PRIMARY_METRICS = Object.freeze({
   stable_run: Object.freeze({ kind: "binary", direction: "increase" }),
   correctness: Object.freeze({ kind: "binary", direction: "increase" }),
   safety: Object.freeze({ kind: "binary", direction: "increase" }),
@@ -227,7 +227,7 @@ function assertAggregateMetrics(value, label = "clusterCard.metrics") {
   for (const key of keys) finite(value[key], `${label}.${key}`);
 }
 
-export function assertOptimizerObservationV1(input) {
+export function assertOptimizerObservation(input) {
   const value = object(input, "observation");
   rejectForbiddenKeys(value, "observation");
   rejectTaintedStrings(value, "observation");
@@ -259,7 +259,7 @@ export function assertOptimizerObservationV1(input) {
   return value;
 }
 
-export function optimizerClusterCardDigestV1(input) {
+export function optimizerClusterCardDigest(input) {
   const value = object(input, "clusterCard");
   const unsigned = { ...value };
   delete unsigned.cardDigest;
@@ -269,7 +269,7 @@ export function optimizerClusterCardDigestV1(input) {
   return createHash("sha256").update(canonical(unsigned)).digest("hex");
 }
 
-export function assertOptimizerClusterCardV1(input) {
+export function assertOptimizerClusterCard(input) {
   const value = object(input, "clusterCard");
   rejectForbiddenKeys(value, "clusterCard");
   rejectTaintedStrings(value, "clusterCard");
@@ -302,7 +302,7 @@ export function assertOptimizerClusterCardV1(input) {
   if (new Set(value.observationRefs).size !== value.observationRefs.length) {
     throw new Error("clusterCard.observationRefs must be unique.");
   }
-  if (value.cardDigest !== optimizerClusterCardDigestV1(value)) {
+  if (value.cardDigest !== optimizerClusterCardDigest(value)) {
     throw new Error("clusterCard.cardDigest must be the canonical hash of the card.");
   }
   return value;
@@ -356,7 +356,7 @@ function assertPrimaryMetric(value) {
   code(value.name, "experiment.primaryMetric.name");
   enumValue(value.kind, PRIMARY_KINDS, "experiment.primaryMetric.kind");
   enumValue(value.direction, DIRECTIONS, "experiment.primaryMetric.direction");
-  const contract = OPTIMIZATION_PRIMARY_METRICS_V1[value.name];
+  const contract = OPTIMIZATION_PRIMARY_METRICS[value.name];
   if (!contract) throw new Error(`experiment.primaryMetric.name '${value.name}' is not supported by the frozen gate.`);
   if (value.kind !== contract.kind || value.direction !== contract.direction) {
     throw new Error(`experiment.primaryMetric '${value.name}' requires kind=${contract.kind} and direction=${contract.direction}.`);
@@ -428,7 +428,7 @@ function assertAbPolicy(value) {
   if (value.invalidPairAction !== "block") throw new Error("experiment.abPolicy.invalidPairAction must be block.");
 }
 
-export function assertOptimizationExperimentV1(input) {
+export function assertOptimizationExperiment(input) {
   const value = object(input, "experiment");
   rejectForbiddenKeys(value, "experiment");
   rejectTaintedStrings(value, "experiment");
@@ -467,13 +467,13 @@ export function assertOptimizationExperimentV1(input) {
   if (!ACTIVE_EXPERIMENT.has(value.status) && value.closedAt === null) {
     throw new Error("A closed experiment must include closedAt.");
   }
-  if (value.experimentId !== optimizationExperimentIdV1(value)) {
+  if (value.experimentId !== optimizationExperimentId(value)) {
     throw new Error("experiment.experimentId must be the canonical hash of its immutable preregistration.");
   }
   return value;
 }
 
-export function optimizationExperimentIdV1(value) {
+export function optimizationExperimentId(value) {
   const immutable = {
     schemaVersion: value.schemaVersion,
     kind: value.kind,

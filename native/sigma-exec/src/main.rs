@@ -363,7 +363,7 @@ fn main() {
     if let Some(code) = try_run_mcp_readonly_probe() {
         std::process::exit(code);
     }
-    // V5 has no host-execution escape hatch. Unsafe policy requests remain
+    // The current protocol has no host-execution escape hatch. Unsafe policy requests remain
     // fail-closed in the lower layer, and no command-line switch can enable them.
     let state = Arc::new(BrokerState::new(instance_id(), false));
     let writer: SharedWriter = Arc::new(Mutex::new(Box::new(io::stdout())));

@@ -9,8 +9,8 @@ import {
 
 const objectIdSchema = z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u);
 
-export const repositorySemanticAssertionsV3Schema = z.object({
-  schemaVersion: z.literal(3),
+export const repositorySemanticAssertionsSchema = z.object({
+  schemaVersion: z.literal(1),
   head: objectIdSchema.nullable(),
   symbolicRef: nonEmptyStringSchema.nullable(),
   refsDigest: digestSchema,
@@ -24,7 +24,7 @@ export const repositorySemanticAssertionsV3Schema = z.object({
   untrackedDigest: digestSchema,
   untrackedCount: nonNegativeIntegerSchema,
   targetAssertions: z.object({
-    schemaVersion: z.literal(3),
+    schemaVersion: z.literal(1),
     selectedHead: objectIdSchema,
     selectedSymbolicRef: nonEmptyStringSchema.nullable(),
     requiredReachableObjects: z.array(objectIdSchema),
@@ -52,7 +52,7 @@ export const repositoryDeltaEvidenceSchema = z.object({
     worktreeDelta: checkpointDeltaSchema.optional(),
     reviewDiff: z.string().optional(),
     reviewDiffPaths: z.array(nonEmptyStringSchema).optional(),
-    semanticAssertions: repositorySemanticAssertionsV3Schema.optional(),
+    semanticAssertions: repositorySemanticAssertionsSchema.optional(),
     transactionHandle: nonEmptyStringSchema.optional(),
     selectionEvidenceId: nonEmptyStringSchema.optional(),
     candidateId: digestSchema.optional(),
@@ -60,7 +60,7 @@ export const repositoryDeltaEvidenceSchema = z.object({
   }).strict()
 }).strict();
 
-export const repositoryRecoverySelectionEvidenceV1Schema = z.object({
+export const repositoryRecoverySelectionEvidenceSchema = z.object({
   ...evidenceBaseShape,
   kind: z.literal("repository_recovery_selection"),
   status: z.literal("passed"),
@@ -81,7 +81,7 @@ export const repositoryRecoverySelectionEvidenceV1Schema = z.object({
   }).strict()
 }).strict();
 
-export const repositoryRecoveryDecisionEvidenceV1Schema = z.object({
+export const repositoryRecoveryDecisionEvidenceSchema = z.object({
   ...evidenceBaseShape,
   kind: z.literal("repository_recovery_decision"),
   status: z.literal("passed"),
@@ -105,7 +105,7 @@ export const repositoryRecoveryDecisionEvidenceV1Schema = z.object({
   }).strict()
 }).strict();
 
-export const repositoryAcceptanceEvidenceV1Schema = z.object({
+export const repositoryAcceptanceEvidenceSchema = z.object({
   ...evidenceBaseShape,
   kind: z.literal("repository_acceptance"),
   status: z.literal("passed"),
@@ -120,7 +120,7 @@ export const repositoryAcceptanceEvidenceV1Schema = z.object({
     repositoryStateDigest: digestSchema,
     selectionEvidenceId: nonEmptyStringSchema.optional(),
     candidateId: digestSchema.optional(),
-    semanticAssertions: repositorySemanticAssertionsV3Schema
+    semanticAssertions: repositorySemanticAssertionsSchema
   }).strict().superRefine((value, context) => {
     if ((value.selectionEvidenceId === undefined) !== (value.candidateId === undefined)) {
       context.addIssue({

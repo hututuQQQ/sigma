@@ -202,7 +202,7 @@ workspace = root / "workspace"
 state_home = root / "state"
 workspace.mkdir(parents=True)
 if mode == "mismatch":
-    incompatible = state_home / "workspaces" / driver.workspace_digest(workspace) / "stores" / "v${STORE_LAYOUT_VERSION - 1}"
+    incompatible = state_home / "workspaces" / driver.workspace_digest(workspace) / "stores" / "v999"
     incompatible.mkdir(parents=True)
 result = driver.run({
     "command":["unused"], "workspace":str(workspace), "stateHome":str(state_home),

@@ -13,7 +13,7 @@ import type { RuntimeAgentProfile, RuntimeSession } from "./types.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 import { assurancePolicyFromState } from "./assurance-policy.js";
 import { persistFrozenWorkspaceHookAssets } from "./frozen-hook-assets.js";
-import { emitSubjectAttestationV1, type SubjectAttestationContextV1 } from "./subject-attestation.js";
+import { emitSubjectAttestation, type SubjectAttestationContext } from "./subject-attestation.js";
 
 type DispatchHook = (
   session: RuntimeSession,
@@ -32,7 +32,7 @@ export interface RuntimeSessionInitializationOptions {
   putArtifact(sessionId: string, content: string | Uint8Array): Promise<string>;
   emit: RuntimeEventEmitter;
   dispatchHook: DispatchHook;
-  subjectAttestation?: SubjectAttestationContextV1;
+  subjectAttestation?: SubjectAttestationContext;
 }
 
 async function emitResolvedProfile(
@@ -141,7 +141,7 @@ export async function initializeRuntimeSession(
     budgetLimits: session.durable.state.budget.limits,
     assurancePolicy: assurancePolicyFromState(session.durable.state)
   });
-  await emitSubjectAttestationV1(session, options.subjectAttestation, options.emit);
+  await emitSubjectAttestation(session, options.subjectAttestation, options.emit);
   await emitResolvedProfile(session, options);
   await emitFrozenCustomization(session, options);
   await options.dispatchHook(session, "session_start", {

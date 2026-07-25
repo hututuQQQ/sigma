@@ -10,7 +10,7 @@ import type { CreateGatewayOptions, SupportedProvider } from "./registry.js";
 
 /** Provider boundary owned by agent-model. Runtime/session code consumes only
  * ModelGateway and never branches on a provider id. */
-export interface ProviderSpiV1 {
+export interface ProviderSpi {
   readonly id: SupportedProvider;
   defaultModel(env: NodeJS.ProcessEnv): string;
   capabilities(spec?: ModelSpec): ModelCapabilities;

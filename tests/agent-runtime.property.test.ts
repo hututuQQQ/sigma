@@ -65,7 +65,7 @@ function graph(size: number, next: () => number): PlanGraph {
   return { revision: 0, goal: "generated DAG", nodes };
 }
 
-describe("V3 plan and budget invariant properties", () => {
+describe("plan and budget invariant properties", () => {
   it("accepts generated DAGs and rejects a generated back-edge cycle", () => {
     const next = random();
     for (let iteration = 0; iteration < 250; iteration += 1) {

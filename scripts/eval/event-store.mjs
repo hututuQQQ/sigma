@@ -3,11 +3,9 @@ import { readFile, readdir, realpath } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-export const STORE_LAYOUT_VERSION = 5;
-const CURRENT_EVENT_SCHEMA_VERSION = 9;
-const EVENT_SCHEMA_VERSIONS = new Set([5, 6, 7, 8, CURRENT_EVENT_SCHEMA_VERSION]);
-const CURRENT_SNAPSHOT_SCHEMA_VERSION = 10;
-const SNAPSHOT_SCHEMA_VERSIONS = new Set([5, 6, 7, 8, 9, CURRENT_SNAPSHOT_SCHEMA_VERSION]);
+export const STORE_LAYOUT_VERSION = 1;
+const EVENT_SCHEMA_VERSION = 1;
+const SNAPSHOT_SCHEMA_VERSION = 1;
 const EVENT_TYPES = new Set([
   "session.created", "run.started", "run.suspended", "run.completed", "run.cancelled", "run.failed",
   "user.message", "user.steer", "user.follow_up", "model.started", "model.prompt_materialized",
@@ -28,8 +26,8 @@ let officialAssertAgentEventEnvelope = null;
 try {
   const protocol = await import("../../packages/agent-protocol/dist/index.js");
   if (protocol.STORE_LAYOUT_VERSION !== STORE_LAYOUT_VERSION
-    || protocol.EVENT_SCHEMA_VERSION !== CURRENT_EVENT_SCHEMA_VERSION
-    || protocol.SNAPSHOT_SCHEMA_VERSION !== CURRENT_SNAPSHOT_SCHEMA_VERSION) {
+    || protocol.EVENT_SCHEMA_VERSION !== EVENT_SCHEMA_VERSION
+    || protocol.SNAPSHOT_SCHEMA_VERSION !== SNAPSHOT_SCHEMA_VERSION) {
     throw new Error("Built agent-protocol versions do not match the event-store audit reader.");
   }
   officialAssertAgentEventEnvelope = protocol.assertAgentEventEnvelope;
@@ -64,7 +62,7 @@ function validEventIdentity(event) {
 
 function validEventMetadata(event) {
   return [
-    EVENT_SCHEMA_VERSIONS.has(event.schemaVersion),
+    event.schemaVersion === EVENT_SCHEMA_VERSION,
     Number.isSafeInteger(event.seq),
     event.seq >= 1,
     validEventIdentity(event),
@@ -74,38 +72,31 @@ function validEventMetadata(event) {
   ].every(Boolean);
 }
 
-function eventTypeAllowedBySchema(event) {
-  if (event.schemaVersion === 5 && event.type === "model.prompt_materialized") return false;
-  if (event.schemaVersion < 7
-    && event.type === "context.tool_results_pruned") return false;
-  if (event.schemaVersion !== CURRENT_EVENT_SCHEMA_VERSION
-    && event.type === "long_horizon.updated") return false;
-  if (event.schemaVersion !== CURRENT_EVENT_SCHEMA_VERSION
-    && event.type === "context.reasoning_trajectory_tombstoned") return false;
-  return true;
-}
-
-export function assertV5EventEnvelope(event) {
+export function assertEventEnvelope(event) {
   const record = eventRecord(event);
-  if (!record || !validEventMetadata(record)
-    || !eventTypeAllowedBySchema(record) || !jsonValue(record.payload)) {
+  if (record?.schemaVersion !== EVENT_SCHEMA_VERSION) {
+    throw new Error(
+      `unsupported_schema_version: path=event expected=${EVENT_SCHEMA_VERSION} actual=${String(record?.schemaVersion)}`
+    );
+  }
+  if (!validEventMetadata(record) || !jsonValue(record.payload)) {
     throw new Error("Invalid supported AgentEventEnvelope.");
   }
   officialAssertAgentEventEnvelope?.(record);
 }
 
-export function assertV5EventStream(input) {
+export function assertEventStream(input) {
   if (!Array.isArray(input) || input.length < 1) {
-    throw new Error("A V5 event stream must contain at least one event.");
+    throw new Error("An event stream must contain at least one event.");
   }
   let sessionId = null;
   let expectedSeq = 1;
   for (const event of input) {
-    assertV5EventEnvelope(event);
+    assertEventEnvelope(event);
     if (sessionId === null) sessionId = event.sessionId;
-    if (event.sessionId !== sessionId) throw new Error("A V5 event stream cannot mix sessions.");
+    if (event.sessionId !== sessionId) throw new Error("An event stream cannot mix sessions.");
     if (event.seq !== expectedSeq) {
-      throw new Error(`V5 event sequence discontinuity: expected ${expectedSeq}, actual ${event.seq}.`);
+      throw new Error(`Event sequence discontinuity: expected ${expectedSeq}, actual ${event.seq}.`);
     }
     expectedSeq += 1;
   }
@@ -129,12 +120,19 @@ function validDate(value) {
   return typeof value === "string" && Number.isFinite(Date.parse(value));
 }
 
-function validateMeta(value, sessionId) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid V5 session metadata.");
+function validateMeta(value, sessionId, metadataPath) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid session metadata.");
+  if (value.schemaVersion !== STORE_LAYOUT_VERSION) {
+    throw new Error(
+      `unsupported_schema_version: path=${metadataPath} expected=${STORE_LAYOUT_VERSION} actual=${String(value.schemaVersion)}`
+    );
+  }
+  const expectedKeys = [
+    "createdAt", "lastSeq", "schemaVersion", "segment",
+    "segmentEvents", "sessionId", "updatedAt"
+  ];
   const valid = [
-    value.schemaVersion === STORE_LAYOUT_VERSION,
-    EVENT_SCHEMA_VERSIONS.has(value.eventSchemaVersion),
-    SNAPSHOT_SCHEMA_VERSIONS.has(value.snapshotSchemaVersion),
+    JSON.stringify(Object.keys(value).sort()) === JSON.stringify(expectedKeys),
     value.sessionId === sessionId,
     validDate(value.createdAt),
     validDate(value.updatedAt),
@@ -142,7 +140,7 @@ function validateMeta(value, sessionId) {
     Number.isSafeInteger(value.segment) && value.segment >= 1,
     Number.isSafeInteger(value.segmentEvents) && value.segmentEvents >= 0
   ].every(Boolean);
-  if (!valid) throw new Error(`Invalid V5 session metadata for '${sessionId}'.`);
+  if (!valid) throw new Error(`Invalid session metadata for '${sessionId}'.`);
   return value;
 }
 
@@ -155,12 +153,12 @@ function parseRecord(line, sessionId, expectedSeq, location) {
   try {
     stored = JSON.parse(line);
   } catch (error) {
-    throw new Error(`Invalid JSON in V5 event record ${location}.`, { cause: error });
+    throw new Error(`Invalid JSON in event record ${location}.`, { cause: error });
   }
   if (!stored || typeof stored !== "object" || typeof stored.checksum !== "string" || !stored.event) {
-    throw new Error(`Invalid V5 event record envelope ${location}.`);
+    throw new Error(`Invalid event record envelope ${location}.`);
   }
-  assertV5EventEnvelope(stored.event);
+  assertEventEnvelope(stored.event);
   if (stored.event.sessionId !== sessionId) throw new Error(`Foreign session event in ${location}.`);
   if (stored.event.seq !== expectedSeq) {
     throw new Error(`Event sequence discontinuity in ${location}: expected ${expectedSeq}, actual ${stored.event.seq}.`);
@@ -186,7 +184,7 @@ export async function resolveWorkspaceStateRoot(workspace, options = {}) {
   return path.join(stateHome, "workspaces", workspaceDigest);
 }
 
-export async function listV5Sessions(rootDir) {
+export async function listSessions(rootDir) {
   const directory = sessionsDirectory(rootDir);
   const entries = await readdir(directory, { withFileTypes: true }).catch((error) => {
     if (error?.code === "ENOENT") return [];
@@ -196,24 +194,26 @@ export async function listV5Sessions(rootDir) {
   for (const entry of entries) {
     if (!entry.isDirectory() || !SAFE_ID.test(entry.name)) continue;
     try {
-      const raw = await readFile(path.join(directory, entry.name, "meta.json"), "utf8");
-      const meta = validateMeta(JSON.parse(raw), entry.name);
+      const metadataPath = path.join(directory, entry.name, "meta.json");
+      const raw = await readFile(metadataPath, "utf8");
+      const meta = validateMeta(JSON.parse(raw), entry.name, metadataPath);
       sessions.push({ sessionId: meta.sessionId, createdAt: meta.createdAt, updatedAt: meta.updatedAt, lastSeq: meta.lastSeq });
     } catch {
-      // A corrupt or non-V5 directory is not selectable. Explicit reads still fail loudly.
+      // A corrupt directory is not selectable. Explicit reads still fail loudly.
     }
   }
   return sessions.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
 }
 
-export async function readV5Session(rootDir, inputSessionId) {
+export async function readSession(rootDir, inputSessionId) {
   const sessionId = validateSessionId(inputSessionId);
   const directory = path.join(sessionsDirectory(rootDir), sessionId);
   let meta;
   try {
-    meta = validateMeta(JSON.parse(await readFile(path.join(directory, "meta.json"), "utf8")), sessionId);
+    const metadataPath = path.join(directory, "meta.json");
+    meta = validateMeta(JSON.parse(await readFile(metadataPath, "utf8")), sessionId, metadataPath);
   } catch (error) {
-    throw new Error(`Cannot read valid V5 metadata for session '${sessionId}'.`, { cause: error });
+    throw new Error(`Cannot read valid metadata for session '${sessionId}': ${error instanceof Error ? error.message : String(error)}`, { cause: error });
   }
   const eventDirectory = path.join(directory, "events");
   const files = (await readdir(eventDirectory).catch((error) => {
@@ -222,7 +222,7 @@ export async function readV5Session(rootDir, inputSessionId) {
   })).filter((name) => /^\d{6}\.jsonl$/u.test(name)).sort();
   for (let index = 0; index < files.length; index += 1) {
     const segment = Number.parseInt(files[index].slice(0, 6), 10);
-    if (segment !== index + 1) throw new Error(`V5 event segment discontinuity for '${sessionId}' at '${files[index]}'.`);
+    if (segment !== index + 1) throw new Error(`Event segment discontinuity for '${sessionId}' at '${files[index]}'.`);
   }
   const events = [];
   let expectedSeq = 1;
@@ -243,11 +243,11 @@ export async function readV5Session(rootDir, inputSessionId) {
     lastSegmentEvents = segmentEvents;
   }
   if (events.length !== meta.lastSeq) {
-    throw new Error(`V5 metadata/event mismatch for '${sessionId}': meta=${meta.lastSeq}, events=${events.length}.`);
+    throw new Error(`Metadata/event mismatch for '${sessionId}': meta=${meta.lastSeq}, events=${events.length}.`);
   }
   const lastSegment = files.length === 0 ? 1 : Number.parseInt(files.at(-1).slice(0, 6), 10);
   if (meta.segment !== lastSegment || meta.segmentEvents !== lastSegmentEvents) {
-    throw new Error(`V5 segment metadata mismatch for '${sessionId}'.`);
+    throw new Error(`Segment metadata mismatch for '${sessionId}'.`);
   }
   return { meta, events };
 }

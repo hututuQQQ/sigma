@@ -1,13 +1,13 @@
-import type { BrokerRuntimeClosureV1 } from "./types.js";
+import type { BrokerRuntimeClosure } from "./types.js";
 
-export interface ManagedEnvironmentPrepareRequestV1 {
+export interface ManagedEnvironmentPrepareRequest {
   protocolVersion: 1;
   sessionId: string;
   requestedExecutable: string;
   packages: string[];
 }
 
-export interface ManagedEnvironmentPrepareResultV1 {
+export interface ManagedEnvironmentPrepareResult {
   protocolVersion: 1;
   status: "prepared";
   sessionId: string;
@@ -24,11 +24,11 @@ export interface ManagedEnvironmentPrepareResultV1 {
   attemptDigest: string;
   installedEvidenceDigest: string;
   previousRuntimeClosureDigest: string;
-  runtimeClosure: BrokerRuntimeClosureV1;
+  runtimeClosure: BrokerRuntimeClosure;
   receiptDigest: string;
 }
 
-export interface RuntimeDependencyObservationV1 {
+export interface RuntimeDependencyObservation {
   protocolVersion: 1;
   requestedExecutable: string;
   status: "available" | "unavailable";

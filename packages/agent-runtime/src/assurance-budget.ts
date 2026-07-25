@@ -62,7 +62,6 @@ function substantiveReviewRoundsUsed(session: RuntimeSession): number {
   return session.durable.state.evidence.filter((evidence) =>
     evidence.kind === "review"
     && evidence.runId === session.durable.runId
-    && evidence.data.schemaVersion === 3
     && evidence.data.failureKind === undefined
     && !["review_scope_too_large", "review_protocol_invalid", "review_unavailable"]
       .includes(evidence.data.failureCode ?? "")).length;
@@ -212,7 +211,6 @@ export function reviewRepairActive(session: RuntimeSession): boolean {
   const reviews = session.durable.state.evidence.filter((evidence) =>
     evidence.kind === "review"
     && evidence.runId === session.durable.runId
-    && evidence.data.schemaVersion === 3
     && evidence.data.failureKind === undefined
     && !["review_scope_too_large", "review_protocol_invalid", "review_unavailable"]
       .includes(evidence.data.failureCode ?? ""));

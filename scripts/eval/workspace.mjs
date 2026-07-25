@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { cp, lstat, mkdir, readFile, readdir, readlink, rm, symlink, writeFile, appendFile } from "node:fs/promises";
 import path from "node:path";
-import { generateRepoScaleFixtureV1 } from "./fixture-generator.mjs";
+import { generateRepoScaleFixture } from "./fixture-generator.mjs";
 
 function run(command, args, cwd, env = process.env) {
   return new Promise((resolve, reject) => {
@@ -91,7 +91,7 @@ export async function seedWorkspace({ attemptRoot, fixtureDirectory, setupAfterC
   const workspace = path.join(workspaceParent, `workspace-${randomUUID()}`);
   await mkdir(workspaceParent, { recursive: true });
   await cp(fixtureDirectory, workspace, { recursive: true, force: false, errorOnExist: true });
-  if (generator) await generateRepoScaleFixtureV1(workspace, generator);
+  if (generator) await generateRepoScaleFixture(workspace, generator);
   await mustRun("git", ["init", "--quiet"], workspace);
   await mustRun("git", ["config", "user.name", "Workspace User"], workspace);
   await mustRun("git", ["config", "user.email", "workspace-user@example.invalid"], workspace);

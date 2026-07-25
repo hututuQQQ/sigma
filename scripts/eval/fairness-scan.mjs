@@ -140,7 +140,7 @@ async function scanOptimizerSkill(workspace = root) {
     if (knownIds.some((item) => source.includes(item))) violations.push(`${relative(file, workspace)}: contains a known evaluation identity`);
     if (/test-fixtures[/\\]agent-evals/iu.test(source)) violations.push(`${relative(file, workspace)}: points at evaluator fixtures`);
   }
-  const required = ["OptimizerObservationV1", "OptimizationExperimentV1", "verifier", "one general invariant"];
+  const required = ["OptimizerObservation", "OptimizationExperiment", "verifier", "one general invariant"];
   for (const phrase of required) {
     if (!combined.includes(phrase)) violations.push(`optimizer skill: missing boundary instruction '${phrase}'`);
   }

@@ -96,7 +96,7 @@ export function reviewMessages(input: ReviewerInput): ModelMessage[] {
       "Use changes_requested for a reproduced implementation error, an authoritative specification conflict, or a materially unsupported requirement after feasible checks; blocked only when verification cannot proceed; and approved only when every numbered requirement is satisfied.",
       "Keep the verdict compact: at most 8 findings and 6 required validations. The runtime binds authenticated workspace, validation, and reviewer-check evidence to the verdict; do not copy opaque evidence IDs into the submission.",
       "The verification session has a bounded inspection phase. Its final model turn exposes only submit_verification, so gather the highest-value evidence before then and use that final turn for the verdict.",
-      "When submit_verification is available, call it exactly once and alone after inspecting enough evidence. Otherwise return one strict JSON object with keys verdict, findings, criteria, and requiredValidations; criteria should use criterionIndex, status, and an optional summary. Legacy evidence fields remain accepted during migration.",
+      "When submit_verification is available, call it exactly once and alone after inspecting enough evidence. Otherwise return one strict JSON object with keys verdict, findings, criteria, and requiredValidations; criteria must use criterionIndex, evidenceIds, status, coverage, and an optional summary.",
       "The supplied material can include complete goal-referenced workspace read snapshots."
     ].join(" ")
   }, {

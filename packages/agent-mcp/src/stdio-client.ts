@@ -1,5 +1,6 @@
 import type { JsonValue } from "agent-protocol";
 import { resolveMcpClientSettings } from "./config.js";
+import { SIGMA_PROJECT_FACTS } from "./generated-project-facts.js";
 import {
   McpCancelledError,
   McpConnectionError,
@@ -93,7 +94,7 @@ export class McpStdioClient {
       const result = initializeResult(await this.sendRequest("initialize", {
         protocolVersion: this.supportedVersions[0],
         capabilities: {},
-        clientInfo: this.config.clientInfo ?? { name: "sigma", version: "2.0.0" }
+        clientInfo: this.config.clientInfo ?? { name: "sigma", version: SIGMA_PROJECT_FACTS.productVersion }
       }, { signal, cancellable: false }), this.supportedVersions);
       await this.enqueue({ jsonrpc: "2.0", method: "notifications/initialized" });
       this.serverInfoValue = result;

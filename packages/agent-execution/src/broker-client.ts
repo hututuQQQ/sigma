@@ -32,8 +32,8 @@ import {
 } from "./repository-execution-broker-base.js";
 import type { BrokerDoctorReport, BrokerRequestOptions, BrokerSandboxLeaseStatus, BrokerSandboxRevokeResult,
   ExecutionBroker, ExecutionRequest, ExecutionResult, ProcessHandle, ProcessHandoffResult,
-  ManagedEnvironmentPrepareRequestV1, ManagedEnvironmentPrepareResultV1,
-  ProcessPollResult, ProcessSpawnRequest, ScratchLeaseRequestV1, ScratchLeaseV1,
+  ManagedEnvironmentPrepareRequest, ManagedEnvironmentPrepareResult,
+  ProcessPollResult, ProcessSpawnRequest, ScratchLeaseRequest, ScratchLease,
   SigmaExecBrokerClientOptions } from "./types.js";
 import { parseProcessHandoff, parseProcessValue, parseSpawnedProcess } from "./values.js";
 export class SigmaExecBrokerClient extends RepositoryExecutionBrokerBase implements ExecutionBroker {
@@ -186,7 +186,7 @@ export class SigmaExecBrokerClient extends RepositoryExecutionBrokerBase impleme
     this.assertReady();
     return await requestSandboxLeaseRevoke(this.transport, workspacePath, this.options.requestTimeoutMs, signal);
   }
-  async acquireScratchLease(request: ScratchLeaseRequestV1, options: BrokerRequestOptions = {}): Promise<ScratchLeaseV1> {
+  async acquireScratchLease(request: ScratchLeaseRequest, options: BrokerRequestOptions = {}): Promise<ScratchLease> {
     this.assertReady(); return await this.scratchLeases.acquire(request, options);
   }
   async releaseScratchLease(sessionId: string, options: BrokerRequestOptions = {}): Promise<void> {
@@ -202,8 +202,8 @@ export class SigmaExecBrokerClient extends RepositoryExecutionBrokerBase impleme
       this.transport, this.repositoryEnvironment, method, request, options
     );
   }
-  async prepareManagedEnvironment(request: ManagedEnvironmentPrepareRequestV1, options: BrokerRequestOptions = {}):
-  Promise<ManagedEnvironmentPrepareResultV1> {
+  async prepareManagedEnvironment(request: ManagedEnvironmentPrepareRequest, options: BrokerRequestOptions = {}):
+  Promise<ManagedEnvironmentPrepareResult> {
     this.assertReady(); return await requestManagedEnvironmentPreparation(this.transport, this.doctorValue, request, options);
   }
   async execute(request: ExecutionRequest, options: BrokerRequestOptions = {}): Promise<ExecutionResult> {

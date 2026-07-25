@@ -4,6 +4,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { supportedReleaseTargets } from "./package-agent-cli.mjs";
+import { sigmaManifest } from "./lib/sigma-manifest.mjs";
 
 export const defaultRootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -17,13 +18,6 @@ function bool(value) {
 
 function check(name, ok, detail) {
   return { name, ok: Boolean(ok), detail };
-}
-
-function productMajor(version) {
-  const match = String(version ?? "").match(/^([1-9][0-9]*)\./u);
-  if (!match) return null;
-  const major = Number(match[1]);
-  return Number.isSafeInteger(major) ? major : null;
 }
 
 function assertEvidenceFile(filePath, label, checks) {
@@ -62,7 +56,7 @@ function tuiSmokeChecks(tuiSmoke) {
   ];
 }
 
-function packageChecks(packageVerify, expectedV3, expectedSchemaVersion) {
+function packageChecks(packageVerify) {
   const checks = packageVerify?.checks ?? {};
   return [
     check("package:ok", packageVerify?.ok === true, "package verification completed"),
@@ -71,18 +65,18 @@ function packageChecks(packageVerify, expectedV3, expectedSchemaVersion) {
     check("package:metadata", checks.metadata === true, "package metadata verified"),
     check(
       "package:schemaVersion",
-      expectedSchemaVersion !== null && packageVerify?.metadata?.schemaVersion === expectedSchemaVersion,
-      `expected=${String(expectedSchemaVersion ?? "unsupported")}, package=${String(packageVerify?.metadata?.schemaVersion ?? "missing")}`
+      packageVerify?.metadata?.schemaVersion === 1,
+      `expected=1, package=${String(packageVerify?.metadata?.schemaVersion ?? "missing")}`
     ),
-    check("package:bundledNode", !expectedV3 || checks.bundledNode === true, "pinned bundled Node verified"),
-    check("package:noSystemNodeFallback", !expectedV3 || checks.noSystemNodeFallback === true, "wrapper cannot use system Node"),
-    check("package:sigmaExec", !expectedV3 || checks.sigmaExec === true, "target-native sigma-exec verified"),
-    check("package:languageServerAssets", !expectedV3 || checks.languageServerAssets === true, "bundled TypeScript/Python LSP assets verified"),
-    check("package:tokenizerAssets", !expectedV3 || checks.tokenizerAssets === true, "versioned tokenizer-estimator assets verified"),
-    check("package:integrity", !expectedV3 || checks.integrity === true, "portable SHA-256 manifest verified"),
-    check("package:sbom", !expectedV3 || checks.sbom === true, "CycloneDX SBOM verified"),
-    check("package:provenance", !expectedV3 || checks.provenance === true, "archive provenance verified"),
-    check("package:archiveChecksum", !expectedV3 || checks.archiveChecksum === true, "archive SHA-256 sidecar verified"),
+    check("package:bundledNode", checks.bundledNode === true, "pinned bundled Node verified"),
+    check("package:noSystemNodeFallback", checks.noSystemNodeFallback === true, "wrapper cannot use system Node"),
+    check("package:sigmaExec", checks.sigmaExec === true, "target-native sigma-exec verified"),
+    check("package:languageServerAssets", checks.languageServerAssets === true, "bundled TypeScript/Python LSP assets verified"),
+    check("package:tokenizerAssets", checks.tokenizerAssets === true, "tokenizer-estimator assets verified"),
+    check("package:integrity", checks.integrity === true, "portable SHA-256 manifest verified"),
+    check("package:sbom", checks.sbom === true, "CycloneDX SBOM verified"),
+    check("package:provenance", checks.provenance === true, "archive provenance verified"),
+    check("package:archiveChecksum", checks.archiveChecksum === true, "archive SHA-256 sidecar verified"),
     check("package:hostCli", checks.hostCli === true, "host Node CLI smoke passed"),
     check("package:targetWrapperKnown", typeof packageVerify?.targetWrapper?.status === "string", packageVerify?.targetWrapper?.status ?? "missing")
   ];
@@ -103,7 +97,7 @@ function providerSmokeReleaseChecks(providerSmoke, providerSmokePath) {
   ];
 }
 
-function sandboxSmokeReleaseChecks(sandboxSmoke, sandboxSmokePath, targetPlatform, targetArch, packageVerify, expectedV3) {
+function sandboxSmokeReleaseChecks(sandboxSmoke, sandboxSmokePath, targetPlatform, targetArch, packageVerify) {
   const expectedDigest = String(packageVerify?.metadata?.sigmaExec?.sha256 ?? "");
   const actualDigest = String(sandboxSmoke?.brokerSha256 ?? "");
   const targetMatches = sandboxSmoke?.targetPlatform === targetPlatform && sandboxSmoke?.targetArch === targetArch;
@@ -118,13 +112,13 @@ function sandboxSmokeReleaseChecks(sandboxSmoke, sandboxSmokePath, targetPlatfor
     check("sandboxSmoke:backend", backendMatches, sandboxSmoke?.backend ?? "missing"),
     check(
       "sandboxSmoke:brokerDigest",
-      !expectedV3 || (/^[a-f0-9]{64}$/u.test(expectedDigest) && actualDigest === expectedDigest),
-      expectedV3 ? `expected=${expectedDigest || "missing"}, evidence=${actualDigest || "missing"}` : "not required before V3"
+      /^[a-f0-9]{64}$/u.test(expectedDigest) && actualDigest === expectedDigest,
+      `expected=${expectedDigest || "missing"}, evidence=${actualDigest || "missing"}`
     )
   ];
 }
 
-function lspSandboxSmokeReleaseChecks(lspSmoke, lspSmokePath, targetPlatform, targetArch, packageVerify, expectedV3) {
+function lspSandboxSmokeReleaseChecks(lspSmoke, lspSmokePath, targetPlatform, targetArch, packageVerify) {
   const expectedBrokerDigest = String(packageVerify?.metadata?.sigmaExec?.sha256 ?? "");
   const expectedNodeDigest = String(packageVerify?.metadata?.node?.sha256 ?? "");
   const actualBrokerDigest = String(lspSmoke?.brokerSha256 ?? "");
@@ -157,7 +151,7 @@ function lspSandboxSmokeReleaseChecks(lspSmoke, lspSmokePath, targetPlatform, ta
     check("lspSandboxSmoke:target", targetMatches, `requested=${targetPlatform}-${targetArch}, evidence=${lspSmoke?.targetPlatform ?? "missing"}-${lspSmoke?.targetArch ?? "missing"}`),
     check(
       "lspSandboxSmoke:productVersion",
-      !expectedV3 || lspSmoke?.productVersion === packageVerify?.metadata?.productVersion,
+      lspSmoke?.productVersion === packageVerify?.metadata?.productVersion,
       `package=${String(packageVerify?.metadata?.productVersion ?? "missing")}, evidence=${String(lspSmoke?.productVersion ?? "missing")}`
     ),
     check(
@@ -172,12 +166,12 @@ function lspSandboxSmokeReleaseChecks(lspSmoke, lspSmokePath, targetPlatform, ta
     ),
     check(
       "lspSandboxSmoke:typescriptDigest",
-      !expectedV3 || (/^[a-f0-9]{64}$/u.test(expectedTypescriptDigest) && actualTypescriptDigest === expectedTypescriptDigest),
+      /^[a-f0-9]{64}$/u.test(expectedTypescriptDigest) && actualTypescriptDigest === expectedTypescriptDigest,
       `expected=${expectedTypescriptDigest || "missing"}, evidence=${actualTypescriptDigest || "missing"}`
     ),
     check(
       "lspSandboxSmoke:pyrightDigest",
-      !expectedV3 || (/^[a-f0-9]{64}$/u.test(expectedPyrightDigest) && actualPyrightDigest === expectedPyrightDigest),
+      /^[a-f0-9]{64}$/u.test(expectedPyrightDigest) && actualPyrightDigest === expectedPyrightDigest,
       `expected=${expectedPyrightDigest || "missing"}, evidence=${actualPyrightDigest || "missing"}`
     ),
     check(
@@ -188,10 +182,10 @@ function lspSandboxSmokeReleaseChecks(lspSmoke, lspSmokePath, targetPlatform, ta
     ),
     check(
       "lspSandboxSmoke:integrityManifestDigest",
-      !expectedV3 || (/^[a-f0-9]{64}$/u.test(expectedManifestDigest) && actualManifestDigest === expectedManifestDigest),
+      /^[a-f0-9]{64}$/u.test(expectedManifestDigest) && actualManifestDigest === expectedManifestDigest,
       `expected=${expectedManifestDigest || "missing"}, evidence=${actualManifestDigest || "missing"}`
     ),
-    check("lspSandboxSmoke:discovery", !expectedV3 || lspSmoke?.checks?.languageServerDiscovery === true, "packaged default discovery"),
+    check("lspSandboxSmoke:discovery", lspSmoke?.checks?.languageServerDiscovery === true, "packaged default discovery"),
     check("lspSandboxSmoke:typescript", lspSmoke?.checks?.typescript?.ready === true, "symbols/definition/references/hover/rename"),
     check("lspSandboxSmoke:pyright", lspSmoke?.checks?.pyright?.ready === true, "diagnostics"),
     check(
@@ -211,7 +205,7 @@ function replayPerformanceReleaseChecks(performance, performancePath) {
     check("replayPerformance:present", Boolean(performance), performancePath),
     check(
       "replayPerformance:100k",
-      performance?.schemaVersion === 1 && performance?.kind === "v5Replay100k"
+      performance?.schemaVersion === 1 && performance?.kind === "replay100k"
         && performance?.ok === true && performance?.events === 100_000,
       `events=${String(performance?.events ?? "missing")}, ok=${String(performance?.ok ?? false)}`
     ),
@@ -275,7 +269,7 @@ function markdownReport(report) {
     `- package target: ${report.evidence.packageVerify.targetPlatform ?? "unknown"}`,
     `- sandbox smoke: ${report.evidence.sandboxSmoke.path}`,
     `- LSP sandbox smoke: ${report.evidence.lspSandboxSmoke.path}`,
-    `- V5 replay performance: ${report.evidence.replayPerformance.path}`,
+    `- replay performance: ${report.evidence.replayPerformance.path}`,
     `- native protocol coverage: ${report.evidence.nativeProtocolCoverage.path}`,
     "",
     "## Checks",
@@ -310,7 +304,7 @@ export async function buildProductReadinessReport(options = {}) {
     ? targetedPackageVerifyPath
     : path.join(artifactsDir, "agent-cli-package-verify.json");
   const providerSmokePath = path.join(artifactsDir, "smoke-provider", "provider-smoke.json");
-  const replayPerformancePath = path.join(artifactsDir, "replay-v5-100k.json");
+  const replayPerformancePath = path.join(artifactsDir, "replay-100k.json");
   const nativeProtocolCoveragePath = path.join(artifactsDir, "sigma-exec-branch-coverage.json");
   const checks = [];
 
@@ -352,20 +346,10 @@ export async function buildProductReadinessReport(options = {}) {
   checks.push(...productSmokeChecks(productSmoke));
   checks.push(...tuiSmokeChecks(tuiSmoke));
   const expectedProductVersion = String(packageJson.version ?? "");
-  const expectedProductMajor = productMajor(expectedProductVersion);
-  // V3 introduced the portable trust contract. Every later major must retain
-  // those gates, while an unknown major remains unsupported until its package
-  // schema is reviewed explicitly.
-  const expectedV3 = expectedProductMajor !== null && expectedProductMajor >= 3;
-  const supportedProductMajor = expectedProductMajor === 2
-    || expectedProductMajor === 3
-    || expectedProductMajor === 4;
   checks.push(check(
-    "productVersion:supportedMajor",
-    supportedProductMajor,
-    expectedProductMajor === null
-      ? `invalid version=${expectedProductVersion || "missing"}`
-      : `major=${expectedProductMajor}`
+    "productVersion:manifest",
+    expectedProductVersion === sigmaManifest.productVersion,
+    `manifest=${sigmaManifest.productVersion}, package=${expectedProductVersion || "missing"}`
   ));
   if (!internalOnly) {
     checks.push(check(
@@ -373,33 +357,31 @@ export async function buildProductReadinessReport(options = {}) {
       packageVerify?.metadata?.productVersion === expectedProductVersion,
       `workspace=${expectedProductVersion || "missing"}, package=${String(packageVerify?.metadata?.productVersion ?? "missing")}`
     ));
-    checks.push(...packageChecks(packageVerify, expectedV3, expectedProductMajor));
+    checks.push(...packageChecks(packageVerify));
   }
 
   const target = `${targetPlatform}-${targetArch}`;
-  const v3IntegrityReady = !expectedV3 || packageVerify?.checks?.integrity === true;
-  const provenanceTrusted = !expectedV3 || packageVerify?.checks?.provenanceSignature === true;
+  const integrityReady = packageVerify?.checks?.integrity === true;
+  const provenanceTrusted = packageVerify?.checks?.provenanceSignature === true;
   const windowsSigned = targetPlatform !== "win32"
-    || (expectedV3
-      ? packageVerify?.signing?.policyVerified === true
-      : packageVerify?.metadata?.signing?.authenticodeVerified === true);
+    || packageVerify?.signing?.policyVerified === true;
   const windowsUnsigned = targetPlatform === "win32"
-    && (expectedV3
-      ? packageVerify?.signing?.authenticodeVerified === false
-      : packageVerify?.metadata?.signing?.authenticodeVerified === false);
+    && packageVerify?.signing?.authenticodeVerified === false;
   const expectedReleaseChannel = windowsUnsigned
     ? "preview"
-    : expectedProductVersion.includes("-")
+    : expectedProductVersion.startsWith("0.")
+      ? "preview"
+      : expectedProductVersion.includes("-")
       ? expectedProductVersion.split("-")[1].split(".")[0]
       : "stable";
   const releaseChecks = [
     check("package:tier1Target", supportedReleaseTargets.has(target), target),
     check("package:targetWrapper", packageVerify?.targetWrapper?.ok === true, packageVerify?.targetWrapper?.status ?? "missing"),
-    check("package:integrity", v3IntegrityReady, v3IntegrityReady ? "verified" : "missing"),
+    check("package:integrity", integrityReady, integrityReady ? "verified" : "missing"),
     check(
       "package:provenanceSignature",
       provenanceTrusted,
-      expectedV3 ? (provenanceTrusted ? "verified by an externally trusted key" : "unsigned or untrusted preview only") : "not applicable"
+      provenanceTrusted ? "verified by an externally trusted key" : "unsigned or untrusted preview only"
     ),
     check(
       "package:windowsSignerPolicy",
@@ -408,21 +390,24 @@ export async function buildProductReadinessReport(options = {}) {
     ),
     check(
       "package:releaseChannel",
-      !expectedV3 || packageVerify?.metadata?.releaseChannel === expectedReleaseChannel,
+      packageVerify?.metadata?.releaseChannel === expectedReleaseChannel,
       `expected=${expectedReleaseChannel}, package=${String(packageVerify?.metadata?.releaseChannel ?? "missing")}`
     ),
-    ...sandboxSmokeReleaseChecks(sandboxSmoke, sandboxSmokePath, targetPlatform, targetArch, packageVerify, expectedV3),
-    ...lspSandboxSmokeReleaseChecks(lspSandboxSmoke, lspSandboxSmokePath, targetPlatform, targetArch, packageVerify, expectedV3),
+    ...sandboxSmokeReleaseChecks(sandboxSmoke, sandboxSmokePath, targetPlatform, targetArch, packageVerify),
+    ...lspSandboxSmokeReleaseChecks(lspSandboxSmoke, lspSandboxSmokePath, targetPlatform, targetArch, packageVerify),
     ...replayPerformanceReleaseChecks(replayPerformance, replayPerformancePath),
     ...nativeProtocolCoverageReleaseChecks(nativeProtocolCoverage, nativeProtocolCoveragePath),
     ...providerSmokeReleaseChecks(providerSmoke, providerSmokePath)
   ];
   const internalReady = checks.every((item) => item.ok);
-  const releaseReady = internalReady && releaseChecks.every((item) => item.ok);
-  const previewReady = targetPlatform === "win32"
-    && internalReady
-    && windowsUnsigned
-    && releaseChecks.every((item) => item.name === "package:windowsSignerPolicy" ? !item.ok : item.ok);
+  const releaseChecksPassed = releaseChecks.every((item) => item.ok);
+  const releaseReady = !expectedProductVersion.startsWith("0.") && internalReady && releaseChecksPassed;
+  const unsignedWindowsPreview = targetPlatform === "win32" && windowsUnsigned && provenanceTrusted;
+  const previewReady = expectedProductVersion.startsWith("0.") && internalReady
+    && releaseChecks.every((item) =>
+      item.name === "package:windowsSignerPolicy" && unsignedWindowsPreview
+        ? true
+        : item.ok);
   const status = releaseReady
     ? "release-ready"
     : previewReady
@@ -433,12 +418,14 @@ export async function buildProductReadinessReport(options = {}) {
   const packageLabel = `${target} CLI wrapper`;
   const packageReleaseNote = packageVerify?.targetWrapper?.ok !== true
     ? `${packageLabel} is not proven in this environment: ${packageVerify?.targetWrapper?.status ?? "missing"}${packageVerify?.targetWrapper?.reason ? ` (${packageVerify.targetWrapper.reason})` : ""}`
-    : !v3IntegrityReady
+    : !integrityReady
       ? `${packageLabel} ran successfully, but portable integrity evidence is missing.`
       : !provenanceTrusted
-        ? `${packageLabel} and integrity evidence passed; external provenance trust is missing, so the build remains preview-only.`
+        ? `${packageLabel} and integrity evidence passed; external provenance trust is missing, so the build remains internal-only.`
         : !windowsSigned
-          ? `${packageLabel}, integrity, and provenance passed; Windows signer policy is not satisfied, so the build remains preview-only.`
+          ? windowsUnsigned
+            ? `${packageLabel}, integrity, and provenance passed on the unsigned preview channel.`
+            : `${packageLabel}, integrity, and provenance passed, but the Windows signer is not approved.`
           : `${packageLabel} has been executed successfully with release integrity and trust gates.`;
   const releaseNotes = [
     packageReleaseNote,

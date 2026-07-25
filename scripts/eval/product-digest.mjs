@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { canonicalJson, digest } from "./common.mjs";
 
 const execFile = promisify(execFileCallback);
-// Candidate binding covers every root that OptimizationExperimentV1 may
+// Candidate binding covers every root that OptimizationExperiment may
 // authorize, including the ordinary tests that establish generality.
 const PRODUCT_ROOTS = ["packages", "native", "tests"];
 const EVALUATION_CONTROL_PATHS = [

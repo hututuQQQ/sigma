@@ -3,8 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  generateRepoScaleFixtureV1,
-  REPO_SCALE_PROFILE_V1
+  generateRepoScaleFixture,
+  REPO_SCALE_PROFILE
 } from "../scripts/eval/fixture-generator.mjs";
 import { evaluatorLinkTargetRoot, seedWorkspace, snapshotWorkspace } from "../scripts/eval/workspace.mjs";
 
@@ -31,10 +31,10 @@ describe("agent evaluation fixture realism", () => {
   it("deterministically generates 500 multilingual files and 90,000 physical lines", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-repo-scale-"));
     temporary.push(root);
-    const profile = await generateRepoScaleFixtureV1(root, {
-      kind: "repo-scale-v1", seed: 20260714, fileCount: 500, lineCount: 90_000
+    const profile = await generateRepoScaleFixture(root, {
+      kind: "repo-scale", seed: 20260714, fileCount: 500, lineCount: 90_000
     });
-    expect(profile).toMatchObject(REPO_SCALE_PROFILE_V1);
+    expect(profile).toMatchObject(REPO_SCALE_PROFILE);
 
     const files = await filesBelow(root);
     expect(files).toHaveLength(500);

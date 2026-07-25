@@ -5,7 +5,7 @@ export interface CommandDefinition {
   aliases?: string[];
   summary: string;
   mode?: RunMode;
-  handler: "run" | "tui" | "session" | "replay" | "doctor" | "sandbox" | "version" | "init" | "config" | "completion";
+  handler: "run" | "tui" | "session" | "replay" | "doctor" | "sandbox" | "version" | "init" | "completion";
   sessionAction?: "list" | "cancel" | "resume" | "approve";
 }
 
@@ -23,7 +23,6 @@ export const SIGMA_COMMANDS: readonly CommandDefinition[] = [
   { name: "sandbox", summary: "Check or prepare the native execution sandbox", handler: "sandbox" },
   { name: "version", summary: "Print version information", handler: "version" },
   { name: "init", summary: "Create .agent/config.toml", handler: "init" },
-  { name: "config", summary: "Inspect or migrate configuration", handler: "config" },
   { name: "completion", summary: "Generate shell completion", handler: "completion" }
 ];
 

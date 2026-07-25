@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   EVENT_SCHEMA_VERSION,
-  isLongHorizonStateV2,
+  isLongHorizonState,
   type AgentEventEnvelope,
   type ContextAuthority,
   type JsonValue,
@@ -216,7 +216,7 @@ function coordinatorHarness(
   });
 }
 
-describe("V10 objective long-horizon triggers", () => {
+describe("objective long-horizon triggers", () => {
   it("does not turn a finite diverse sequence below the attention boundary into a semantic checkpoint", () => {
     const session = runtimeSessionFixture();
     session.durable.state.messages.push({ role: "user", content: "Investigate." });
@@ -226,7 +226,7 @@ describe("V10 objective long-horizon triggers", () => {
       refresh(session);
     }
     expect(session.durable.state.longHorizon).toMatchObject({
-      schemaVersion: 2,
+      schemaVersion: 1,
       settledBatchCount: 12,
       duplicateStreak: 1,
       strategyRequested: false
@@ -489,11 +489,11 @@ describe("V10 objective long-horizon triggers", () => {
       /deadline|remainingMs|verifier|benchmark/iu
     );
     expect(session.durable.state.longHorizon).toMatchObject({
-      schemaVersion: 2,
+      schemaVersion: 1,
       strategyRequested: false,
       assurance: { strategistCalls: 1 },
       strategy: {
-        schemaVersion: 2,
+        schemaVersion: 1,
         trigger: "duplicate_result",
         decision: "revise_plan",
         nextDiscriminatingAction: "Inspect the nearest independent boundary."
@@ -568,7 +568,7 @@ describe("V10 objective long-horizon triggers", () => {
         }
       }
     });
-    expect(isLongHorizonStateV2(
+    expect(isLongHorizonState(
       (reset?.payload as { state?: unknown } | undefined)?.state
     )).toBe(true);
     expect(session.durable.state.longHorizon).toMatchObject({
@@ -588,32 +588,6 @@ describe("V10 objective long-horizon triggers", () => {
     expect(strategistInput).toContain("\"evidenceAttention\"");
     expect(strategistInput).not.toContain("do-not-project-secret-values");
     expect(strategistInput).not.toMatch(/deadline|remainingMs|verifier|benchmark/iu);
-  });
-
-  it("restores pre-decision V10 strategies but requires paired decision metadata when present", () => {
-    const session = runtimeSessionFixture();
-    const legacyStrategy = {
-      schemaVersion: 2 as const,
-      basisDigest: "a".repeat(64),
-      establishedFacts: ["Fact"],
-      falsifiedApproaches: [],
-      hypothesis: "Hypothesis",
-      nextDiscriminatingAction: "Inspect once.",
-      expectedSignal: "A bounded result.",
-      trigger: "resource_band" as const
-    };
-    expect(isLongHorizonStateV2({
-      ...session.durable.state.longHorizon,
-      strategy: legacyStrategy
-    })).toBe(true);
-    expect(isLongHorizonStateV2({
-      ...session.durable.state.longHorizon,
-      strategy: {
-        ...legacyStrategy,
-        trigger: "evidence_window",
-        decision: "revise_plan"
-      }
-    })).toBe(false);
   });
 
   it("derives the same attention boundary after snapshot-style recovery and ignores deadline changes", () => {

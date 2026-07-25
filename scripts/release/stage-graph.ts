@@ -44,7 +44,7 @@ const releaseQuality = [
   stage("lint", "pnpm", "lint"),
   stage("coverage", "pnpm", "test:coverage"),
   stage("native-coverage", "pnpm", "test:coverage:native-protocol"),
-  stage("v5-replay", "pnpm", "perf:replay-v5-100k"),
+  stage("replay", "pnpm", "perf:replay-100k"),
   stage("product-smoke", "pnpm", "smoke:product"),
   stage("tui-smoke", "pnpm", "smoke:tui-product")
 ] as const;
@@ -62,7 +62,7 @@ const linuxRelease = [
     ".artifacts/agent-cli-linux-x64/bin/node"
   ),
   stage("readiness", "node", "scripts/product-readiness-report.mjs", "--target-platform", "linux",
-    "--target-arch", "x64", "--require-release-ready", "--require-provider-smoke")
+    "--target-arch", "x64", "--require-preview-ready", "--require-provider-smoke")
 ] as const;
 
 const windowsRelease = [

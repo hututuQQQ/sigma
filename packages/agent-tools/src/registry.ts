@@ -46,7 +46,7 @@ export interface ToolNoChangeProbeExecutor {
 export interface PlannedToolExecutionContext extends ToolExecutionContext {
   /** The immutable plan prepared and approved for this exact call. Effect tools
    * must use this plan, rather than reparsing model arguments, as their
-   * execution authority. Undefined only for legacy direct executor callers. */
+   * execution authority. Undefined only for direct read-only executor callers. */
   callPlan?: ToolCallPlan;
 }
 
@@ -109,12 +109,12 @@ function assertPlanEffects(descriptor: ToolDescriptor, plan: ToolCallPlan): void
       `Tool '${descriptor.name}' planned undeclared or duplicated effects: ${[...new Set(outside)].join(", ")}.`
     );
   }
-  if (plan.mutationAuthority === "broker_repository_transaction_v2"
-    && descriptor.brokerMutationAuthority !== "repository_transaction_v2") {
+  if (plan.mutationAuthority === "broker_repository_transaction"
+    && descriptor.brokerMutationAuthority !== "repository_transaction") {
     throw planError(`Tool '${descriptor.name}' cannot delegate mutation rollback to the repository broker.`);
   }
-  if (plan.mutationAuthority === "disposable_enclosing_container_v1"
-    && descriptor.brokerMutationAuthority !== "disposable_enclosing_container_v1") {
+  if (plan.mutationAuthority === "disposable_enclosing_container"
+    && descriptor.brokerMutationAuthority !== "disposable_enclosing_container") {
     throw planError(`Tool '${descriptor.name}' cannot mutate an enclosing disposable container.`);
   }
 }

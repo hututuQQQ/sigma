@@ -19,7 +19,7 @@ import {
   repositoryObjectIsAncestor,
   repositoryRevisionDelta
 } from "./repository-transaction-state.js";
-import type { RepositoryTransactionResultV2 } from "agent-execution";
+import type { RepositoryTransactionResult } from "agent-execution";
 
 function assertionDigest(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value), "utf8").digest("hex");
@@ -89,7 +89,7 @@ async function assertRecoveryState(
   return {
     ...assertions,
     targetAssertions: {
-      schemaVersion: 3,
+      schemaVersion: 1,
       selectedHead: recovery.selectedObject,
       selectedSymbolicRef: recovery.selectedSymbolicRef,
       requiredReachableObjects: [...new Set([
@@ -106,7 +106,7 @@ async function assertRuntimeAndBrokerState(
   context: PlannedToolExecutionContext,
   transaction: PendingRepositoryTransaction,
   after: RepositoryEvidenceState,
-  result: RepositoryTransactionResultV2
+  result: RepositoryTransactionResult
 ): Promise<CompletedAssertions> {
   const assertions = requireCompletedAssertions(result);
   if (after.head !== assertions.head
@@ -127,7 +127,7 @@ async function abortAfterFailure(
 ): Promise<never> {
   try {
     await execution.abortRepositoryTransaction({
-      protocolVersion: 2,
+      protocolVersion: 1,
       transactionHandle: transaction.handle,
       sessionId: transaction.sessionId,
       runId: transaction.runId
@@ -190,7 +190,7 @@ export async function completedRepositoryReceipt(
   request: { callId: string },
   context: PlannedToolExecutionContext,
   transaction: PendingRepositoryTransaction,
-  result: RepositoryTransactionResultV2,
+  result: RepositoryTransactionResult,
   startedAt: string
 ): Promise<ToolReceipt> {
   try {
@@ -207,16 +207,18 @@ export async function completedRepositoryReceipt(
       request, context, transaction, assertions, after, revisionDelta
     );
     await execution.sealRepositoryTransaction({
-      protocolVersion: 2,
+      protocolVersion: 1,
       transactionHandle: transaction.handle,
       sessionId: transaction.sessionId,
       runId: transaction.runId
     }, { signal: context.signal });
     const effects = transactionEffects(transaction.operations, transaction.topology);
+    const output = result.output ?? "";
     return {
       callId: request.callId,
       ok: true,
-      output: result.output ?? "",
+      output,
+      outcome: { status: "succeeded", output, diagnosticCodes: [] },
       result: {
         status: "completed",
         transactionHandle: transaction.handle,
@@ -238,22 +240,28 @@ export async function completedRepositoryReceipt(
 export function pendingRepositoryReceipt(
   callId: string,
   transaction: PendingRepositoryTransaction,
-  result: RepositoryTransactionResultV2,
+  result: RepositoryTransactionResult,
   conflictPaths: string[],
   startedAt: string
 ): ToolReceipt {
   const effects = transactionEffects(transaction.operations, transaction.topology);
+  const output = JSON.stringify({
+    status: "conflicts_pending",
+    transactionHandle: transaction.handle,
+    operation: result.operation ?? null,
+    conflictCount: result.conflictCount ?? 0,
+    conflictPaths,
+    nextActions: ["resolve conflicts", "git_transaction continue", "git_transaction abort"]
+  });
   return {
     callId,
     ok: true,
-    output: JSON.stringify({
-      status: "conflicts_pending",
-      transactionHandle: transaction.handle,
-      operation: result.operation ?? null,
-      conflictCount: result.conflictCount ?? 0,
-      conflictPaths,
-      nextActions: ["resolve conflicts", "git_transaction continue", "git_transaction abort"]
-    }),
+    output,
+    outcome: {
+      status: "succeeded",
+      output,
+      diagnosticCodes: ["conflicts_pending"]
+    },
     result: {
       status: "conflicts_pending",
       transactionHandle: transaction.handle,

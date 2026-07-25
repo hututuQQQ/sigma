@@ -2,7 +2,7 @@ import type {
   ModelMessage,
   ModelToolCall,
   ModelToolDefinition,
-  ReviewerToolReceiptV1,
+  ReviewerToolReceipt,
   ToolCallPlan,
   ToolDescriptor
 } from "agent-protocol";
@@ -36,7 +36,7 @@ import {
 } from "./reviewer-special-tools.js";
 import type {
   ReviewerInput,
-  ReviewerToolCheckV1,
+  ReviewerToolCheck,
   ReviewerToolEnvironment,
   ReviewerToolSessionPort
 } from "./reviewer-contracts.js";
@@ -115,7 +115,7 @@ class ActiveReviewerToolSession implements ReviewerToolSessionPort {
 
   async execute(call: ModelToolCall, signal: AbortSignal): Promise<{
     message: ModelMessage;
-    check: ReviewerToolCheckV1;
+    check: ReviewerToolCheck;
   }> {
     if (this.closed) throw new Error("Verification tool session is already closed.");
     const prior = this.options.session.durable.state.reviewReceipts.find((item) =>
@@ -147,7 +147,7 @@ class ActiveReviewerToolSession implements ReviewerToolSessionPort {
         error
       );
     }
-    const durable: ReviewerToolReceiptV1 = {
+    const durable: ReviewerToolReceipt = {
       schemaVersion: 1,
       reviewRequestId: this.reviewRequestId,
       call,

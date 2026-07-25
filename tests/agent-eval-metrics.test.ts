@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { listV5Sessions, readV5Session, resolveWorkspaceStateRoot } from "../scripts/eval/event-store.mjs";
+import { listSessions, readSession, resolveWorkspaceStateRoot } from "../scripts/eval/event-store.mjs";
 import { reduceAgentEvents, renderSessionMetricsMarkdown } from "../scripts/eval/metrics.mjs";
 import { auditSessions, renderSessionAuditMarkdown, writeSessionAudit } from "../scripts/eval/session-audit.mjs";
 
@@ -16,7 +16,7 @@ function eventFactory(sessionId = "session", runId = "run") {
     tick += advanceMs;
     seq += 1;
     return {
-      schemaVersion: 5,
+      schemaVersion: 1,
       seq,
       eventId: `event-${seq}`,
       sessionId,
@@ -60,13 +60,11 @@ function storedLine(value: unknown) {
 }
 
 async function writeSession(root: string, sessionId: string, updatedAt: string, events: unknown[]) {
-  const directory = path.join(root, "stores", "v5", "sessions", sessionId);
+  const directory = path.join(root, "stores", "v1", "sessions", sessionId);
   await mkdir(path.join(directory, "events"), { recursive: true });
   await writeFile(path.join(directory, "events", "000001.jsonl"), events.map(storedLine).join(""), "utf8");
   await writeFile(path.join(directory, "meta.json"), `${JSON.stringify({
-    schemaVersion: 5,
-    eventSchemaVersion: 5,
-    snapshotSchemaVersion: 5,
+    schemaVersion: 1,
     sessionId,
     createdAt: events[0]?.occurredAt ?? updatedAt,
     updatedAt,
@@ -391,7 +389,7 @@ describe("agent experience event metrics", () => {
     });
   });
 
-  it("reports V9 plan normalization, strategy reset, assurance, validation, and review outcomes", () => {
+  it("reports plan normalization, strategy reset, assurance, validation, and review outcomes", () => {
     const make = eventFactory("long-horizon-session");
     const longHorizon = {
       progressBasisDigest: "a".repeat(64),
@@ -574,8 +572,8 @@ describe("agent experience event metrics", () => {
   });
 });
 
-describe("V5 historical session audit", () => {
-  it("resolves workspace state, validates official records, selects latest or exact sessions, and writes versioned reports", async () => {
+describe("current session audit", () => {
+  it("resolves workspace state, validates records, selects latest or exact sessions, and writes reports", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-eval-workspace-"));
     const stateHome = await mkdtemp(path.join(os.tmpdir(), "sigma-eval-state-"));
     const stateRoot = await resolveWorkspaceStateRoot(workspace, {
@@ -587,7 +585,11 @@ describe("V5 historical session audit", () => {
     const newMake = eventFactory("new-session", "new-run");
     const created = (mode: "analyze" | "change") => ({
       workspacePath: "D:/workspace", mode, title: "audit", writeScope: ["."],
-      strictWriteScope: true, modelRole: "orchestrator"
+      strictWriteScope: true, modelRole: "orchestrator",
+      budgetLimits: {
+        inputTokens: 1_000_000, outputTokens: 100_000, costMicroUsd: 1_000_000,
+        modelTurns: 100, toolCalls: 1_000, children: 10, maxDepth: 4
+      }
     });
     const oldEvents = [
       oldMake("session.created", created("analyze")),
@@ -602,8 +604,8 @@ describe("V5 historical session audit", () => {
     await writeSession(stateRoot, "old-session", "2026-07-12T01:00:00.000Z", oldEvents);
     await writeSession(stateRoot, "new-session", "2026-07-12T02:00:00.000Z", newEvents);
 
-    expect((await listV5Sessions(stateRoot)).map((item) => item.sessionId)).toEqual(["new-session", "old-session"]);
-    await expect(readV5Session(stateRoot, "new-session")).resolves.toMatchObject({ meta: { lastSeq: 3 } });
+    expect((await listSessions(stateRoot)).map((item) => item.sessionId)).toEqual(["new-session", "old-session"]);
+    await expect(readSession(stateRoot, "new-session")).resolves.toMatchObject({ meta: { lastSeq: 3 } });
 
     const latest = await auditSessions({
       workspace,
@@ -633,20 +635,24 @@ describe("V5 historical session audit", () => {
     const make = eventFactory("corrupt-session");
     const events = [make("session.created", {
       workspacePath: "D:/workspace", mode: "change", title: "audit", writeScope: ["."],
-      strictWriteScope: true, modelRole: "orchestrator"
+      strictWriteScope: true, modelRole: "orchestrator",
+      budgetLimits: {
+        inputTokens: 1_000_000, outputTokens: 100_000, costMicroUsd: 1_000_000,
+        modelTurns: 100, toolCalls: 1_000, children: 10, maxDepth: 4
+      }
     })];
     await writeSession(root, "corrupt-session", "2026-07-12T01:00:00.000Z", events);
-    const file = path.join(root, "stores", "v5", "sessions", "corrupt-session", "events", "000001.jsonl");
+    const file = path.join(root, "stores", "v1", "sessions", "corrupt-session", "events", "000001.jsonl");
     const stored = JSON.parse((await readFile(file, "utf8")).trim());
     stored.checksum = "0".repeat(64);
     await writeFile(file, `${JSON.stringify(stored)}\n`, "utf8");
-    await expect(readV5Session(root, "corrupt-session")).rejects.toThrow("checksum mismatch");
+    await expect(readSession(root, "corrupt-session")).rejects.toThrow("checksum mismatch");
 
     await writeFile(file, storedLine(events[0]), "utf8");
-    const metaPath = path.join(root, "stores", "v5", "sessions", "corrupt-session", "meta.json");
+    const metaPath = path.join(root, "stores", "v1", "sessions", "corrupt-session", "meta.json");
     const meta = JSON.parse(await readFile(metaPath, "utf8"));
     meta.lastSeq = 2;
     await writeFile(metaPath, `${JSON.stringify(meta)}\n`, "utf8");
-    await expect(readV5Session(root, "corrupt-session")).rejects.toThrow("metadata/event mismatch");
+    await expect(readSession(root, "corrupt-session")).rejects.toThrow(/metadata\/event mismatch/iu);
   });
 });

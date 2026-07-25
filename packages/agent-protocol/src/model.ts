@@ -38,7 +38,7 @@ export interface ModelCapabilities {
   strictToolChoice?: boolean;
   /**
    * Thinking-mode tool calls must be replayed with the provider-returned
-   * reasoning field. Complete legacy/non-thinking blocks without that field
+   * reasoning field. Complete non-thinking blocks without that field
    * are projected as one non-executable trajectory tombstone.
    */
   requiresToolCallReasoningReplay?: boolean;
@@ -73,12 +73,8 @@ export interface ModelRequest {
 export interface ModelResponse {
   message: ModelMessage;
   finishReason: ModelFinishReason;
-  /** Required V3 accounting data; gateways estimate conservatively when providers omit usage. */
+  /** Accounting data; gateways estimate conservatively when providers omit usage. */
   usage: ModelResponseUsage;
-  /** @deprecated V2 compatibility projection. */
-  inputTokens?: number;
-  /** @deprecated V2 compatibility projection. */
-  outputTokens?: number;
   raw?: JsonValue;
 }
 

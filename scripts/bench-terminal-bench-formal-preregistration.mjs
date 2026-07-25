@@ -306,7 +306,7 @@ function normalizedExecution(value, tasks) {
 /** Builds the immutable manifest from explicit caller-provided controls. It
  * fills only digests; it never supplies a dataset, model, quota, timeout, or
  * acceptance default. */
-export function sigmaFormalRunPreregistrationV1(draft, options = {}) {
+export function sigmaFormalRunPreregistration(draft, options = {}) {
   const input = record(draft, "formal preregistration draft");
   exactKeys(input, [
     "formal_run_id", "source", "archive_sha256", "model", "task_selection",
@@ -372,7 +372,7 @@ export function sigmaFormalRunPreregistrationV1(draft, options = {}) {
   });
   const payload = {
     schemaVersion: 1,
-    kind: "SigmaFormalRunPreregistrationV1",
+    kind: "SigmaFormalRunPreregistration",
     formal_run_id: identifier(input.formal_run_id, "formal_run_id"),
     source,
     source_identity_sha256: formalSourceIdentitySha256(source),
@@ -401,8 +401,8 @@ export function validateFormalPreregistration(input, options = {}) {
     "archive_sha256", "model", "task_selection", "solver_controls", "execution",
     "consumption_identity_sha256"
   ], "formal preregistration");
-  if (manifest.schemaVersion !== 1 || manifest.kind !== "SigmaFormalRunPreregistrationV1") {
-    throw new Error("Formal evaluation requires SigmaFormalRunPreregistrationV1.");
+  if (manifest.schemaVersion !== 1 || manifest.kind !== "SigmaFormalRunPreregistration") {
+    throw new Error("Formal evaluation requires SigmaFormalRunPreregistration.");
   }
   const source = normalizedSource(manifest.source);
   const sourceIdentity = formalSourceIdentitySha256(source);
@@ -414,7 +414,7 @@ export function validateFormalPreregistration(input, options = {}) {
   );
   const normalized = {
     schemaVersion: 1,
-    kind: "SigmaFormalRunPreregistrationV1",
+    kind: "SigmaFormalRunPreregistration",
     formal_run_id: identifier(manifest.formal_run_id, "formal_run_id"),
     source,
     source_identity_sha256: sourceIdentity,
@@ -545,7 +545,7 @@ export async function writeFormalPreregistration(draftPath, outputPath) {
   } catch (error) {
     throw new Error("Formal preregistration draft is not valid JSON.", { cause: error });
   }
-  const manifest = sigmaFormalRunPreregistrationV1(draft, {
+  const manifest = sigmaFormalRunPreregistration(draft, {
     baseDir: path.dirname(resolvedDraft)
   });
   const bytes = `${JSON.stringify(manifest, null, 2)}\n`;

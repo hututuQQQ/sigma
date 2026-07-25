@@ -6,7 +6,7 @@ import {
 
 function report(overrides: Record<string, unknown> = {}) {
   return {
-    sourceSchemaVersion: 2,
+    schemaVersion: 1,
     suite: "quick",
     repeat: 1,
     status: "stable",
@@ -52,7 +52,7 @@ describe("sanitized evaluation status export", () => {
     });
   });
 
-  it("marks weekly samples inconclusive unless every aggregate is V2 repeat-three and valid", () => {
+  it("marks weekly samples inconclusive unless every aggregate is current, repeat-three, and valid", () => {
     expect(buildSanitizedEvaluationStatus([report()], { mode: "weekly" }).interpretation).toBe("inconclusive");
     const complete = report({ suite: "repo-scale", repeat: 3 });
     const experience = report({ suite: "experience", repeat: 3 });

@@ -78,7 +78,7 @@ function failedReview(session: ReturnType<typeof mutatedSession>): ReviewEvidenc
     producer: { authority: "runtime", id: "reviewer" },
     summary: "Repair required.",
     data: {
-      schemaVersion: 3,
+      schemaVersion: 1,
       reviewerId: "reviewer",
       verdict: "changes_requested",
       findings: [{ actionable: true, severity: "error", summary: "Fix the defect." }],
@@ -126,7 +126,7 @@ function consumeModelTurns(
   };
 }
 
-describe("V10 assurance resource reserve", () => {
+describe("assurance resource reserve", () => {
   it("caps auxiliary usage at 20% and protects review plus repair turns from ordinary work", () => {
     const session = mutatedSession();
 

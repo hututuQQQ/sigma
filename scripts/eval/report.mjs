@@ -6,7 +6,7 @@ import {
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const EVAL_REPORT_SCHEMA_VERSION = 2;
+export const EVAL_REPORT_SCHEMA_VERSION = 1;
 const HUMAN_AUDIT_AUDIENCE = "human_only";
 const HUMAN_AUDIT_FEEDBACK_POLICY = "never_supply_to_solving_or_optimization_agents";
 export const EVAL_DIMENSIONS = Object.freeze([
@@ -16,7 +16,6 @@ export const EVAL_DIMENSIONS = Object.freeze([
   "experience",
   "reliability"
 ]);
-const EVAL_DIMENSIONS_V1 = Object.freeze(["correctness", "safety", "experience", "reliability"]);
 
 const PASS_STATUSES = new Set(["pass", "passed", "ok", "success", "successful", "stable"]);
 const COMPLETED_OUTCOMES = new Set(["completed", "complete", "passed", "pass", "success", "successful", "succeeded"]);
@@ -201,8 +200,11 @@ export function sanitizeEvalReportValue(value, seen = new WeakSet()) {
 }
 
 function assertAttempt(attempt, label = "attempt") {
-  if (!isRecord(attempt) || ![1, 2].includes(attempt.schemaVersion) || attempt.kind !== "eval_attempt") {
-    throw new Error(`${label} must be a versioned EvalAttemptReportV1/V2 (schemaVersion=1|2, kind=eval_attempt).`);
+  if (!isRecord(attempt) || attempt.schemaVersion !== EVAL_REPORT_SCHEMA_VERSION
+    || attempt.kind !== "eval_attempt") {
+    throw new Error(
+      `unsupported_schema_version: path=${label} expected=${EVAL_REPORT_SCHEMA_VERSION} actual=${String(attempt?.schemaVersion)}`
+    );
   }
   assertAttemptIdentifiers(attempt, label);
   if (!Number.isSafeInteger(attempt.repetition) || attempt.repetition < 1) {
@@ -211,11 +213,10 @@ function assertAttempt(attempt, label = "attempt") {
   for (const key of ["subject", "outcome", "dimensions", "metrics"]) {
     if (!isRecord(attempt[key])) throw new Error(`${label}.${key} must be an object.`);
   }
-  const dimensions = attempt.schemaVersion === 1 ? EVAL_DIMENSIONS_V1 : EVAL_DIMENSIONS;
-  for (const dimension of dimensions) {
+  for (const dimension of EVAL_DIMENSIONS) {
     if (!isRecord(attempt.dimensions[dimension])) throw new Error(`${label}.dimensions.${dimension} must be an object.`);
   }
-  if (attempt.schemaVersion === 2 && !["valid", "invalid", "not_observed"].includes(attempt.validity)) {
+  if (!["valid", "invalid", "not_observed"].includes(attempt.validity)) {
     throw new Error(`${label}.validity must be valid, invalid, or not_observed.`);
   }
 }
@@ -260,16 +261,9 @@ export function evalDimensionPassed(attempt, dimension) {
 }
 
 export function evalAttemptPassed(attempt) {
-  if (attempt?.schemaVersion === 2 && attempt.validity !== "valid") return false;
-  const dimensions = attempt?.schemaVersion === 1 ? EVAL_DIMENSIONS_V1 : EVAL_DIMENSIONS;
+  if (attempt?.validity !== "valid") return false;
   return (attempt?.outcome?.expected === true || COMPLETED_OUTCOMES.has(statusText(attempt?.outcome?.status)))
-    && dimensions.every((dimension) => evalDimensionPassed(attempt, dimension));
-}
-
-function aggregateStatus(passed, observed, expected) {
-  if (observed > 0 && passed === expected && observed === expected) return "stable";
-  if (passed > 0) return "flaky";
-  return "fail";
+    && EVAL_DIMENSIONS.every((dimension) => evalDimensionPassed(attempt, dimension));
 }
 
 function dimensionObserved(attempt, dimension) {
@@ -277,18 +271,13 @@ function dimensionObserved(attempt, dimension) {
   return !["not_observed", "unavailable", "unknown"].includes(status);
 }
 
-function aggregateDimension(attempts, dimension, expected, sourceVersion) {
-  if (sourceVersion === 1 && dimension === "delivery") {
-    return { status: "unavailable", passed: "unavailable", failed: "unavailable", missing: "unavailable" };
-  }
-  const eligible = sourceVersion === 1 ? attempts
-    : attempts.filter((attempt) => attempt.validity === "valid");
+function aggregateDimension(attempts, dimension, expected) {
+  const eligible = attempts.filter((attempt) => attempt.validity === "valid");
   const observedAttempts = eligible.filter((attempt) => dimensionObserved(attempt, dimension));
   const passed = observedAttempts.filter((attempt) => evalDimensionPassed(attempt, dimension)).length;
   const missing = Math.max(0, expected - observedAttempts.length);
-  const status = sourceVersion === 1 ? aggregateStatus(passed, observedAttempts.length, expected)
-    : observedAttempts.length === 0 || missing > 0 ? "inconclusive"
-      : passed === expected ? "stable" : passed > 0 ? "flaky" : "fail";
+  const status = observedAttempts.length === 0 || missing > 0 ? "inconclusive"
+    : passed === expected ? "stable" : passed > 0 ? "flaky" : "fail";
   return {
     status,
     passed,
@@ -345,33 +334,30 @@ function scenarioDigest(attempts, declared) {
   return typeof fallback === "string" && fallback.length > 0 ? fallback : null;
 }
 
-function v2ScenarioStatus(passed, expected, invalid, notObserved, missing) {
+function scenarioStatus(passed, expected, invalid, notObserved, missing) {
   if (invalid > 0 || notObserved > 0 || missing > 0) return "inconclusive";
   if (passed === expected) return "stable";
   return passed > 0 ? "flaky" : "fail";
 }
 
-function v2Availability(sourceVersion, value) {
-  return sourceVersion === 1 ? "unavailable" : value;
-}
-
-function scenarioValiditySummary(sourceVersion, valid, invalid, notObserved, missing) {
-  return v2Availability(sourceVersion, {
+function scenarioValiditySummary(valid, invalid, notObserved, missing) {
+  return {
     valid: valid.length,
     invalid: invalid.length,
     notObserved: notObserved.length,
     missing
-  });
+  };
 }
 
-function aggregateScenario(scenarioId, attempts, expected, declared, sourceVersion) {
-  const validAttempts = sourceVersion === 1 ? attempts : attempts.filter((attempt) => attempt.validity === "valid");
-  const invalidAttempts = sourceVersion === 1 ? [] : attempts.filter((attempt) => attempt.validity === "invalid");
-  const notObservedAttempts = sourceVersion === 1 ? [] : attempts.filter((attempt) => attempt.validity === "not_observed");
+function aggregateScenario(scenarioId, attempts, expected, declared) {
+  const validAttempts = attempts.filter((attempt) => attempt.validity === "valid");
+  const invalidAttempts = attempts.filter((attempt) => attempt.validity === "invalid");
+  const notObservedAttempts = attempts.filter((attempt) => attempt.validity === "not_observed");
   const passed = validAttempts.filter(evalAttemptPassed).length;
   const missing = Math.max(0, expected - attempts.length);
-  const status = sourceVersion === 1 ? aggregateStatus(passed, attempts.length, expected)
-    : v2ScenarioStatus(passed, expected, invalidAttempts.length, notObservedAttempts.length, missing);
+  const status = scenarioStatus(
+    passed, expected, invalidAttempts.length, notObservedAttempts.length, missing
+  );
   const declaredEvidence = Array.isArray(declared?.evidence)
     ? declared.evidence.filter((value) => typeof value === "string")
     : [];
@@ -382,16 +368,16 @@ function aggregateScenario(scenarioId, attempts, expected, declared, sourceVersi
     expectedAttempts: expected,
     passedAttempts: passed,
     failedAttempts: validAttempts.length - passed,
-    invalidAttempts: v2Availability(sourceVersion, invalidAttempts.length),
-    notObservedAttempts: v2Availability(sourceVersion, notObservedAttempts.length),
+    invalidAttempts: invalidAttempts.length,
+    notObservedAttempts: notObservedAttempts.length,
     missingAttempts: missing,
     status,
-    validity: scenarioValiditySummary(sourceVersion, validAttempts, invalidAttempts, notObservedAttempts, missing),
-    passRate: v2Availability(sourceVersion, wilsonPassRate(passed, validAttempts.length)),
-    costPerSuccessUsd: v2Availability(sourceVersion, costPerSuccess(validAttempts, passed)),
+    validity: scenarioValiditySummary(validAttempts, invalidAttempts, notObservedAttempts, missing),
+    passRate: wilsonPassRate(passed, validAttempts.length),
+    costPerSuccessUsd: costPerSuccess(validAttempts, passed),
     dimensions: Object.fromEntries(EVAL_DIMENSIONS.map((dimension) => [
       dimension,
-      aggregateDimension(attempts, dimension, expected, sourceVersion)
+      aggregateDimension(attempts, dimension, expected)
     ])),
     metrics: summarizeEvalMetrics(validAttempts),
     evidence: [...new Set([...declaredEvidence, ...attempts.flatMap(evidencePaths)])].sort()
@@ -408,23 +394,23 @@ function declaredScenarios(value) {
   return result;
 }
 
-function runStatus(scenarios, infrastructureErrors = [], sourceVersion = 2) {
-  if (infrastructureErrors.length > 0) return sourceVersion === 1 ? "fail" : "inconclusive";
+function runStatus(scenarios, infrastructureErrors = []) {
+  if (infrastructureErrors.length > 0) return "inconclusive";
   if (scenarios.some((scenario) => scenario.status === "inconclusive")) return "inconclusive";
   if (scenarios.length === 0 || scenarios.some((scenario) => scenario.status === "fail")) return "fail";
   return scenarios.every((scenario) => scenario.status === "stable") ? "stable" : "flaky";
 }
 
-function runCounts(attempts, scenarios, sourceVersion) {
+function runCounts(attempts, scenarios) {
   const cancelled = attempts.filter((attempt) => attempt.cancellation
     || statusText(attempt.outcome?.status).includes("cancel")).length;
-  const valid = sourceVersion === 1 ? attempts : attempts.filter((attempt) => attempt.validity === "valid");
+  const valid = attempts.filter((attempt) => attempt.validity === "valid");
   return {
     attempts: {
       total: attempts.length,
-      valid: sourceVersion === 1 ? "unavailable" : valid.length,
-      invalid: sourceVersion === 1 ? "unavailable" : attempts.filter((attempt) => attempt.validity === "invalid").length,
-      notObserved: sourceVersion === 1 ? "unavailable" : attempts.filter((attempt) => attempt.validity === "not_observed").length,
+      valid: valid.length,
+      invalid: attempts.filter((attempt) => attempt.validity === "invalid").length,
+      notObserved: attempts.filter((attempt) => attempt.validity === "not_observed").length,
       passed: valid.filter(evalAttemptPassed).length,
       failed: valid.filter((attempt) => !evalAttemptPassed(attempt)).length,
       cancelled
@@ -454,19 +440,8 @@ function wrapAttempt(attempt) {
   };
 }
 
-function reportAttempt(attempt, sourceVersion) {
-  const sanitized = sanitizeEvalReportValue(attempt);
-  if (sourceVersion !== 1) return sanitized;
-  return {
-    ...sanitized,
-    validity: "unavailable",
-    validityDetail: "unavailable",
-    failureChain: "unavailable",
-    dimensions: {
-      ...sanitized.dimensions,
-      delivery: { status: "unavailable" }
-    }
-  };
+function reportAttempt(attempt) {
+  return sanitizeEvalReportValue(attempt);
 }
 
 function sumObject(target, source) {
@@ -491,8 +466,7 @@ function aggregateCoverage(observed, total) {
   return { observed, total, status: observed === total ? "complete" : "incomplete" };
 }
 
-function aggregateFailureConvergence(attempts, sourceVersion) {
-  if (sourceVersion === 1) return "unavailable";
+function aggregateFailureConvergence(attempts) {
   if (attempts.length === 0) return "unavailable";
   const values = attempts.map((attempt) => attempt?.metrics?.failureConvergence).filter(convergenceRecordComplete);
   const result = Object.fromEntries(FAILURE_CONVERGENCE_FIELDS.filter((key) => key !== "maxAttemptsWithoutRecovery")
@@ -506,8 +480,7 @@ function aggregateFailureConvergence(attempts, sourceVersion) {
   return result;
 }
 
-function aggregateMutationDiscipline(attempts, sourceVersion) {
-  if (sourceVersion === 1) return "unavailable";
+function aggregateMutationDiscipline(attempts) {
   if (attempts.length === 0) return "unavailable";
   const values = attempts.map((attempt) => attempt?.metrics?.mutationDiscipline)
     .filter((value) => completeNumericRecord(value, MUTATION_DISCIPLINE_FIELDS));
@@ -523,13 +496,14 @@ export function buildEvalRunReport(input) {
     assertAttempt(input);
     return buildEvalRunReport(wrapAttempt(input));
   }
-  if (!isRecord(input) || ![1, 2].includes(input.schemaVersion) || input.kind !== "eval_run") {
-    throw new Error("input must be a versioned EvalRunReportV1/V2 or EvalAttemptReportV1/V2.");
+  if (!isRecord(input) || input.schemaVersion !== EVAL_REPORT_SCHEMA_VERSION
+    || input.kind !== "eval_run") {
+    throw new Error(
+      `unsupported_schema_version: path=eval_run expected=${EVAL_REPORT_SCHEMA_VERSION} actual=${String(input?.schemaVersion)}`
+    );
   }
   const sanitizedInput = sanitizeEvalReportValue(input);
-  const sourceVersion = sanitizedInput.sourceSchemaVersion === 1
-    ? 1 : sanitizedInput.schemaVersion;
-  const validated = validateRunAttempts(sanitizedInput, sourceVersion);
+  const validated = validateRunAttempts(sanitizedInput);
   const expected = validated.expected;
   const attempts = [...validated.attempts].sort((left, right) =>
     compareText(left.scenarioId, right.scenarioId)
@@ -542,48 +516,43 @@ export function buildEvalRunReport(input) {
     scenarioId,
     grouped.get(scenarioId) ?? [],
     expected,
-    declared.get(scenarioId),
-    sourceVersion
+    declared.get(scenarioId)
   ));
   const infrastructureErrors = Array.isArray(sanitizedInput.infrastructureErrors)
     ? sanitizedInput.infrastructureErrors : [];
   const infrastructureSafetyFailure = infrastructureErrors.some((error) =>
     String(error?.code ?? "").includes("secret") || String(error?.code ?? "").includes("safety"));
-  const validAttempts = sourceVersion === 1 ? attempts : attempts.filter((attempt) => attempt.validity === "valid");
+  const validAttempts = attempts.filter((attempt) => attempt.validity === "valid");
   const passed = validAttempts.filter(evalAttemptPassed).length;
   const missing = scenarios.reduce((total, scenario) => total + scenario.missingAttempts, 0);
   return {
     ...sanitizedInput,
     schemaVersion: EVAL_REPORT_SCHEMA_VERSION,
-    sourceSchemaVersion: sourceVersion,
     kind: "eval_run",
     repeat: expected,
-    attempts: attempts.map((attempt) => reportAttempt(attempt, sourceVersion)),
+    attempts: attempts.map(reportAttempt),
     scenarios,
-    counts: runCounts(attempts, scenarios, sourceVersion),
-    validity: sourceVersion === 1 ? "unavailable" : {
+    counts: runCounts(attempts, scenarios),
+    validity: {
       valid: validAttempts.length,
       invalid: attempts.filter((attempt) => attempt.validity === "invalid").length,
       notObserved: attempts.filter((attempt) => attempt.validity === "not_observed").length,
       missing
     },
     statistics: {
-      passRate: sourceVersion === 1 ? "unavailable" : wilsonPassRate(passed, validAttempts.length),
-      costPerSuccessUsd: sourceVersion === 1 ? "unavailable" : costPerSuccess(validAttempts, passed)
+      passRate: wilsonPassRate(passed, validAttempts.length),
+      costPerSuccessUsd: costPerSuccess(validAttempts, passed)
     },
-    failureConvergence: aggregateFailureConvergence(validAttempts, sourceVersion),
-    mutationDiscipline: aggregateMutationDiscipline(validAttempts, sourceVersion),
-    status: runStatus(scenarios, infrastructureErrors, sourceVersion),
-    dimensions: runDimensions(scenarios, infrastructureErrors, infrastructureSafetyFailure, sourceVersion)
+    failureConvergence: aggregateFailureConvergence(validAttempts),
+    mutationDiscipline: aggregateMutationDiscipline(validAttempts),
+    status: runStatus(scenarios, infrastructureErrors),
+    dimensions: runDimensions(scenarios, infrastructureErrors, infrastructureSafetyFailure)
   };
 }
 
-function validateRunAttempts(input, sourceVersion) {
+function validateRunAttempts(input) {
   const attempts = Array.isArray(input.attempts) ? input.attempts : [];
   attempts.forEach((attempt, index) => assertAttempt(attempt, `attempts[${index}]`));
-  if (attempts.some((attempt) => attempt.schemaVersion !== sourceVersion)) {
-    throw new Error("every attempt schemaVersion must match the run sourceSchemaVersion.");
-  }
   const expected = Math.max(1, Number.isInteger(input.repeat) ? input.repeat : 1);
   if (typeof input.runId !== "string" || input.runId.length === 0) throw new Error("runId must be a non-empty string.");
   if (!Number.isSafeInteger(input.repeat) || input.repeat < 1) throw new Error("repeat must be a positive integer.");
@@ -600,12 +569,11 @@ function validateRunAttempts(input, sourceVersion) {
   return { attempts, expected };
 }
 
-function runDimensions(scenarios, infrastructureErrors, infrastructureSafetyFailure, sourceVersion) {
+function runDimensions(scenarios, infrastructureErrors, infrastructureSafetyFailure) {
   return Object.fromEntries(EVAL_DIMENSIONS.map((dimension) => {
     const statuses = scenarios.map((scenario) => scenario.dimensions[dimension].status);
-    if (sourceVersion === 1 && dimension === "delivery") return [dimension, "unavailable"];
     if (dimension === "reliability" && infrastructureErrors.length > 0) {
-      return [dimension, sourceVersion === 1 ? "fail" : "inconclusive"];
+      return [dimension, "inconclusive"];
     }
     if (dimension === "safety" && infrastructureSafetyFailure) return [dimension, "fail"];
     if (statuses.includes("inconclusive")) return [dimension, "inconclusive"];
@@ -676,8 +644,7 @@ function reportScenarioRows(run) {
 }
 
 function reportMetricAttempts(run) {
-  return run.sourceSchemaVersion === 1
-    ? run.attempts : run.attempts.filter((attempt) => attempt.validity === "valid");
+  return run.attempts.filter((attempt) => attempt.validity === "valid");
 }
 
 function infrastructureFailureSection(run) {

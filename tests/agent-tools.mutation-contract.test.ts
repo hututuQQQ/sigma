@@ -230,11 +230,11 @@ describe("typed workspace mutation contracts", () => {
       writeRoots: [path.join(workspace, "src")]
     });
 
-    const legacy = request("legacy", "exec", {
+    const scoped = request("scoped", "exec", {
       executable: process.execPath,
-      writePaths: ["src"]
+      expectedChanges: ["src"]
     });
-    await expect(tools.prepare(legacy, preparation(workspace))).resolves.toMatchObject({
+    await expect(tools.prepare(scoped, preparation(workspace))).resolves.toMatchObject({
       writePaths: ["src"],
       checkpointScope: ["src"]
     });
@@ -343,7 +343,7 @@ describe("typed workspace mutation contracts", () => {
       });
       const plan = await tools.prepare(call, preparation(workspace));
       expect(plan).toMatchObject({
-        mutationAuthority: "disposable_enclosing_container_v1",
+        mutationAuthority: "disposable_enclosing_container",
         exactEffects: expect.arrayContaining([
           "process.spawn",
           "filesystem.read.external",
@@ -354,7 +354,7 @@ describe("typed workspace mutation contracts", () => {
         checkpointScope: [external]
       });
       expect(tools.descriptor("exec")).toMatchObject({
-        brokerMutationAuthority: "disposable_enclosing_container_v1"
+        brokerMutationAuthority: "disposable_enclosing_container"
       });
       await expect(tools.execute(call, {
         ...execution(workspace),
@@ -403,7 +403,7 @@ describe("typed workspace mutation contracts", () => {
     const environmentShell = tools.descriptor("environment_shell");
     expect(environmentShell).toMatchObject({
       availableModes: ["change"],
-      brokerMutationAuthority: "disposable_enclosing_container_v1"
+      brokerMutationAuthority: "disposable_enclosing_container"
     });
     const schema = JSON.stringify(environmentShell?.inputSchema);
     expect(schema).not.toContain("writeRoots");
@@ -416,7 +416,7 @@ describe("typed workspace mutation contracts", () => {
     const filesystemRoot = path.parse(path.resolve(workspace)).root;
     const plan = await tools.prepare(call, preparation(workspace));
     expect(plan).toMatchObject({
-      mutationAuthority: "disposable_enclosing_container_v1",
+      mutationAuthority: "disposable_enclosing_container",
       exactEffects: expect.arrayContaining([
         "process.spawn",
         "filesystem.read.external",

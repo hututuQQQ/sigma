@@ -158,8 +158,7 @@ function startCliSubject({ workspace, stateHome, promptPath, runMode, env, subje
     "--provider", "deepseek",
     "--model", sigmaManifest.evaluation.model,
     "--permission-mode", "auto",
-    "--output-format", "stream-json",
-    "--output-schema", "3"
+    "--output-format", "stream-json"
   ], subject);
   const launch = subjectNodeLaunch(subject);
   return {

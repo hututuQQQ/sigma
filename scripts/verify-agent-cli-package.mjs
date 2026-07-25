@@ -24,9 +24,10 @@ import {
   windowsAppContainerNodeCompatibility,
   windowsNodeGlobalPipeMarker,
   windowsNodeLocalPipeMarker,
-  v3PortablePackages,
+  portablePackages,
   workspaceRuntimePackages
 } from "./package-agent-cli.mjs";
+import { sigmaManifest } from "./lib/sigma-manifest.mjs";
 import { compareGlibcVersions, inspectLinuxElf } from "./linux-elf.mjs";
 import {
   assertLinuxRuntimeLibraryInventory,
@@ -679,7 +680,7 @@ async function verifyLinuxCompatibility(bundleDir, metadata, manifest, entries, 
 async function verifyIntegrityManifest(bundleDir, metadata, targetPlatform, targetArch, linuxCompatibilityRequired = false) {
   const descriptor = metadata.integrity;
   if (descriptor?.algorithm !== "sha256" || descriptor?.manifest !== "integrity-manifest.json") {
-    throw new Error("V3 package metadata must reference the SHA-256 integrity-manifest.json.");
+    throw new Error("Package metadata must reference the SHA-256 integrity-manifest.json.");
   }
   const manifestPath = path.join(bundleDir, "integrity-manifest.json");
   const manifestDigest = await sha256File(manifestPath);
@@ -720,7 +721,7 @@ async function verifyIntegrityManifest(bundleDir, metadata, targetPlatform, targ
     "README.md",
     "LICENSE",
     ...Object.values(portableLanguageAssets),
-    "assets/tokenizers/sigma-cjk-byte-v1.json",
+    "assets/tokenizers/sigma-cjk-byte.json",
     "sbom.cdx.json"
   ];
   if (metadata.linuxCompatibility) {
@@ -977,7 +978,7 @@ function verifyPortableProvenance(
   const expectedSubject = [{ name: path.basename(archive), digest: { sha256: archiveSha256 } }];
   assertExactJson(provenance.subject, expectedSubject, "Portable provenance subject");
   const buildDefinition = provenance.predicate?.buildDefinition;
-  if (buildDefinition?.buildType !== "https://sigma-code.dev/build-types/portable-cli/v3") {
+  if (buildDefinition?.buildType !== "https://sigma-code.dev/build-types/portable-cli") {
     throw new Error("Portable provenance has an unexpected build type.");
   }
   assertExactJson(buildDefinition.externalParameters, {
@@ -1042,7 +1043,7 @@ function verifyPortableProvenance(
     }
   }
   const runDetails = provenance.predicate?.runDetails;
-  if (runDetails?.builder?.id !== "https://sigma-code.dev/builders/local-portable-packager/v3") {
+  if (runDetails?.builder?.id !== "https://sigma-code.dev/builders/local-portable-packager") {
     throw new Error("Portable provenance has an unexpected builder identity.");
   }
   assertExactJson(runDetails.metadata, {
@@ -1068,7 +1069,7 @@ async function verifyReleaseSidecars(
   const sidecars = metadata.sidecars;
   for (const key of ["checksum", "sbom", "provenance"]) {
     if (typeof sidecars?.[key] !== "string" || path.basename(sidecars[key]) !== sidecars[key]) {
-      throw new Error(`V3 package metadata has an invalid ${key} sidecar name.`);
+      throw new Error(`Package metadata has an invalid ${key} sidecar name.`);
     }
   }
   const directory = path.dirname(archive);
@@ -1122,12 +1123,21 @@ async function verifyReleaseSidecars(
 }
 
 async function workspaceReleaseVersion(rootDir) {
-  for (const manifestPath of [path.join(rootDir, "package.json"), path.join(rootDir, "packages", "agent-cli", "package.json")]) {
-    if (!existsSync(manifestPath)) continue;
+  for (const manifestPath of [
+    path.join(rootDir, "package.json"),
+    path.join(rootDir, "packages", "agent-cli", "package.json")
+  ]) {
+    if (!existsSync(manifestPath)) {
+      throw new Error(`Sigma Code package manifest is missing: ${manifestPath}.`);
+    }
     const version = String((await readJson(manifestPath)).version ?? "");
-    if (version) return version;
+    if (version !== sigmaManifest.productVersion) {
+      throw new Error(
+        `Sigma Code package version '${version}' does not match sigma-manifest.json productVersion '${sigmaManifest.productVersion}'.`
+      );
+    }
   }
-  return null;
+  return sigmaManifest.productVersion;
 }
 
 function defaultArchivePath(rootDir, artifactsDir, targetPlatform, targetArch) {
@@ -1216,27 +1226,22 @@ export async function verifyAgentCliPackage(options = {}) {
     const license = await readFile(path.join(bundleDir, "LICENSE"), "utf8");
     const packageJson = await readJson(path.join(bundleDir, "package.json"));
     const metadata = await readJson(path.join(bundleDir, "package-metadata.json"));
-    if (metadata.schemaVersion !== 2 && metadata.schemaVersion !== 3 && metadata.schemaVersion !== 4) {
-      throw new Error(`Unsupported package metadata schemaVersion=${String(metadata.schemaVersion)}.`);
-    }
-    const isV3 = metadata.schemaVersion >= 3;
-    const expectedMajor = String(metadata.schemaVersion);
-    if (typeof packageJson.version !== "string" || !packageJson.version.startsWith(`${expectedMajor}.`)) {
-      throw new Error(`Package metadata schema ${metadata.schemaVersion} does not match version ${String(packageJson.version)}.`);
+    if (metadata.schemaVersion !== 1) {
+      throw new Error(
+        `unsupported_schema_version: path=${path.join(bundleDir, "package-metadata.json")} expected=1 actual=${String(metadata.schemaVersion)}`
+      );
     }
     const workspacePackages = [...new Set([
       ...baseWorkspacePackages,
-      ...(isV3 ? v3PortablePackages : [])
+      ...portablePackages
     ])].sort((left, right) => left.localeCompare(right, "en"));
     const requiredEntries = [
       ...baseRequiredEntries,
-      ...(isV3 ? [
-        `${bundleName}/integrity-manifest.json`,
-        `${bundleName}/sbom.cdx.json`,
-        `${bundleName}/bin/${targetPlatform === "win32" ? "sigma-exec.exe" : "sigma-exec"}`,
-        ...Object.values(portableLanguageAssets).map((assetPath) => `${bundleName}/${assetPath}`),
-        `${bundleName}/assets/tokenizers/sigma-cjk-byte-v1.json`
-      ] : []),
+      `${bundleName}/integrity-manifest.json`,
+      `${bundleName}/sbom.cdx.json`,
+      `${bundleName}/bin/${targetPlatform === "win32" ? "sigma-exec.exe" : "sigma-exec"}`,
+      ...Object.values(portableLanguageAssets).map((assetPath) => `${bundleName}/${assetPath}`),
+      `${bundleName}/assets/tokenizers/sigma-cjk-byte.json`,
       ...workspacePackages.map((name) => `${bundleName}/packages/${name}/dist/index.js`),
       ...workspacePackages.filter((name) => name !== "agent-cli")
         .map((name) => `${bundleName}/node_modules/${name}/package.json`)
@@ -1269,7 +1274,7 @@ export async function verifyAgentCliPackage(options = {}) {
     if (packageJson.license !== "MIT") {
       throw new Error(`bundle package.json has unexpected license: ${String(packageJson.license)}`);
     }
-    if (releaseVersion !== null && packageJson.version !== releaseVersion) {
+    if (packageJson.version !== releaseVersion) {
       throw new Error(`bundle package version=${String(packageJson.version)} expected ${releaseVersion}`);
     }
     if (metadata.targetPlatform !== targetPlatform) {
@@ -1281,55 +1286,47 @@ export async function verifyAgentCliPackage(options = {}) {
     if (metadata.node?.version !== pinnedNodeVersion) {
       throw new Error(`package-metadata node.version=${String(metadata.node?.version)} expected ${pinnedNodeVersion}`);
     }
-    if (isV3 && !/^[a-f0-9]{64}$/.test(String(metadata.node?.archiveSha256 ?? ""))) {
-      throw new Error("V3 package metadata is missing the verified Node runtime archive SHA-256.");
+    if (!/^[a-f0-9]{64}$/.test(String(metadata.node?.archiveSha256 ?? ""))) {
+      throw new Error("Package metadata is missing the verified Node runtime archive SHA-256.");
     }
-    const verifiedIntegrity = isV3
-      ? await verifyIntegrityManifest(
-          bundleDir, metadata, targetPlatform, targetArch,
-          requireLinuxCompatibility(options, env)
-        )
-      : null;
-    const binaryTarget = isV3
-      ? await inspectSigmaExecBinary(path.join(bundleDir, verifiedIntegrity.brokerPath))
-      : null;
-    if (isV3 && (binaryTarget.targetPlatform !== targetPlatform || binaryTarget.targetArch !== targetArch)) {
+    const verifiedIntegrity = await verifyIntegrityManifest(
+      bundleDir, metadata, targetPlatform, targetArch,
+      requireLinuxCompatibility(options, env)
+    );
+    const binaryTarget = await inspectSigmaExecBinary(path.join(bundleDir, verifiedIntegrity.brokerPath));
+    if (binaryTarget.targetPlatform !== targetPlatform || binaryTarget.targetArch !== targetArch) {
       throw new Error([
         `Bundled sigma-exec target mismatch: expected ${targetPlatform}-${targetArch},`,
         `detected ${binaryTarget.targetPlatform}-${binaryTarget.targetArch} (${binaryTarget.format} machine ${binaryTarget.machine}).`
       ].join(" "));
     }
-    if (isV3 && (metadata.sigmaExec?.format !== binaryTarget.format
-      || metadata.sigmaExec?.machine !== binaryTarget.machine)) {
+    if (metadata.sigmaExec?.format !== binaryTarget.format
+      || metadata.sigmaExec?.machine !== binaryTarget.machine) {
       throw new Error("Bundled sigma-exec executable header does not match package metadata.");
     }
-    const observedSigning = isV3
-      ? inspectWindowsAuthenticode(
-          path.join(bundleDir, verifiedIntegrity.nodePath),
-          path.join(bundleDir, verifiedIntegrity.brokerPath),
-          targetPlatform,
-          metadata.node?.compatibility,
-          options.allowedWindowsSignerCertificateSha256
-            ?? loadAllowedWindowsSignerCertificateSha256(env)
-        )
-      : null;
-    if (isV3 && JSON.stringify(authenticodeArtifactEvidence(observedSigning))
+    const observedSigning = inspectWindowsAuthenticode(
+      path.join(bundleDir, verifiedIntegrity.nodePath),
+      path.join(bundleDir, verifiedIntegrity.brokerPath),
+      targetPlatform,
+      metadata.node?.compatibility,
+      options.allowedWindowsSignerCertificateSha256
+        ?? loadAllowedWindowsSignerCertificateSha256(env)
+    );
+    if (JSON.stringify(authenticodeArtifactEvidence(observedSigning))
       !== JSON.stringify(authenticodeArtifactEvidence(metadata.signing))) {
       throw new Error("Portable signing metadata does not match independent artifact inspection.");
     }
-    const integrity = verifiedIntegrity ? { ...verifiedIntegrity, binaryTarget } : null;
-    const sidecars = isV3
-      ? await verifyReleaseSidecars(
-          archive,
-          archiveSha256,
-          bundleDir,
-          metadata,
-          integrity,
-          targetPlatform,
-          targetArch,
-          options.trustedReleasePublicKeys ?? loadTrustedReleaseProvenanceKeys(env)
-        )
-      : null;
+    const integrity = { ...verifiedIntegrity, binaryTarget };
+    const sidecars = await verifyReleaseSidecars(
+      archive,
+      archiveSha256,
+      bundleDir,
+      metadata,
+      integrity,
+      targetPlatform,
+      targetArch,
+      options.trustedReleasePublicKeys ?? loadTrustedReleaseProvenanceKeys(env)
+    );
     if (metadata.productVersion !== packageJson.version) {
       throw new Error(`package-metadata productVersion=${String(metadata.productVersion)} expected ${String(packageJson.version)}`);
     }
@@ -1375,20 +1372,18 @@ export async function verifyAgentCliPackage(options = {}) {
         metadata: true,
         bundledNode: true,
         noSystemNodeFallback: true,
-        sigmaExec: isV3 ? integrity !== null : null,
-        languageServerAssets: isV3 ? integrity?.languageServerAssetsVerified === true : null,
-        tokenizerAssets: isV3 ? integrity !== null : null,
-        integrity: isV3 ? integrity !== null : null,
-        sbom: isV3 ? sidecars !== null : null,
-        provenance: isV3 ? sidecars !== null : null,
-        provenanceSignature: isV3 ? sidecars?.provenanceSignature.verified === true : null,
-        archiveChecksum: isV3 ? sidecars !== null : null,
-        linuxCompatibility: isV3 && targetPlatform === "linux"
+        sigmaExec: true,
+        languageServerAssets: integrity.languageServerAssetsVerified === true,
+        tokenizerAssets: true,
+        integrity: true,
+        sbom: true,
+        provenance: true,
+        provenanceSignature: sidecars.provenanceSignature.verified === true,
+        archiveChecksum: true,
+        linuxCompatibility: targetPlatform === "linux"
           ? integrity?.linuxCompatibilityVerified === true
           : null,
-        windowsSignerPolicy: isV3
-          ? targetPlatform !== "win32" || observedSigning?.policyVerified === true
-          : null,
+        windowsSignerPolicy: targetPlatform !== "win32" || observedSigning?.policyVerified === true,
         hostCli: hostCli !== null,
         targetWrapper: targetWrapper.ok
       },

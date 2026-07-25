@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_PROFILE_ASSURANCE,
   DEFAULT_PROFILE_BUDGET,
   defaultSkillRoots,
   discoverSkills,
@@ -95,6 +96,7 @@ function profile(hookId: string): ResolvedAgentProfile {
       checkpointBeforeMutation: true,
       reviewMode: "advisory"
     },
+    assurancePolicy: { ...DEFAULT_PROFILE_ASSURANCE },
     allowedChildProfiles: []
   };
 }

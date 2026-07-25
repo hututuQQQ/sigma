@@ -97,16 +97,16 @@ afterEach(async () => {
 afterAll(async () => await execution.close());
 
 describe("controlled Git transactions", () => {
-  it("fails closed before the first write when the broker lacks V2 transactions", async () => {
+  it("fails closed before the first write when the broker lacks repository transactions", async () => {
     const root = await repository();
-    const legacy: ProcessExecutionPort = {
+    const unsupportedBroker: ProcessExecutionPort = {
       execute: async (request, options) => await execution.execute(request, options)
     };
 
-    await expect(transact(registry({}, legacy), root, [
-      { op: "branch", action: "create", name: "must-not-run-on-legacy" }
+    await expect(transact(registry({}, unsupportedBroker), root, [
+      { op: "branch", action: "create", name: "must-not-run-without-transaction" }
     ])).rejects.toMatchObject({ code: "repository_atomicity_unavailable" });
-    expect(() => git(root, ["show-ref", "--verify", "refs/heads/must-not-run-on-legacy"]))
+    expect(() => git(root, ["show-ref", "--verify", "refs/heads/must-not-run-without-transaction"]))
       .toThrow();
   });
 

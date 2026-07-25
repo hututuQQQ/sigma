@@ -16,8 +16,7 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const JOURNAL_VERSION: u32 = 2;
-const RUN_BASELINE_VERSION: u32 = 1;
+const REPOSITORY_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_MAX_FILES: u64 = 200_000;
 const DEFAULT_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const BROKER_FALLBACK_USER_NAME: &str = "user.name=Sigma Repository Transaction";
@@ -42,7 +41,7 @@ pub(crate) struct AcquireRepositoryTransactionLeaseParams {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct RepositoryTransactionLeaseV2 {
+pub(crate) struct RepositoryTransactionLease {
     protocol_version: u32,
     lease_id: String,
     session_id: String,
@@ -54,13 +53,12 @@ pub(crate) struct RepositoryTransactionLeaseV2 {
     executable_sha256: String,
     network: NetworkMode,
     uses: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    run_baseline: Option<RepositoryRunBaselineLeaseV1>,
+    run_baseline: Option<RepositoryRunBaselineLease>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct RepositoryRunBaselineLeaseV1 {
+struct RepositoryRunBaselineLease {
     schema_version: u32,
     baseline_id: String,
     restore_capability: String,
@@ -68,21 +66,21 @@ struct RepositoryRunBaselineLeaseV1 {
 
 #[derive(Clone)]
 struct TransactionLeaseRecord {
-    lease: RepositoryTransactionLeaseV2,
+    lease: RepositoryTransactionLease,
     max_snapshot_files: u64,
     max_snapshot_bytes: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct RepositoryOperationV2 {
+pub(crate) struct RepositoryOperation {
     operation_class: String,
     args: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RepositoryExpectedPostconditionsV3 {
+struct RepositoryExpectedPostconditions {
     schema_version: u32,
     selected_head: String,
     selected_symbolic_ref: Option<String>,
@@ -94,9 +92,9 @@ struct RepositoryExpectedPostconditionsV3 {
 pub(crate) struct BeginRepositoryTransactionParams {
     protocol_version: u32,
     lease_id: String,
-    operations: Vec<RepositoryOperationV2>,
+    operations: Vec<RepositoryOperation>,
     #[serde(default)]
-    expected_postconditions: Option<RepositoryExpectedPostconditionsV3>,
+    expected_postconditions: Option<RepositoryExpectedPostconditions>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,7 +105,7 @@ pub(crate) struct ContinueRepositoryTransactionParams {
     session_id: String,
     run_id: String,
     #[serde(default)]
-    operations: Vec<RepositoryOperationV2>,
+    operations: Vec<RepositoryOperation>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,7 +168,7 @@ enum RunBaselineStatus {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-struct DirectoryIdentityV1 {
+struct DirectoryIdentity {
     platform: String,
     volume: u64,
     file: u64,
@@ -178,16 +176,16 @@ struct DirectoryIdentityV1 {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-struct RepositoryDirectoryIdentitiesV1 {
-    repository_root: DirectoryIdentityV1,
-    git_dir: DirectoryIdentityV1,
-    common_dir: DirectoryIdentityV1,
+struct RepositoryDirectoryIdentities {
+    repository_root: DirectoryIdentity,
+    git_dir: DirectoryIdentity,
+    common_dir: DirectoryIdentity,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RepositoryTransactionJournalV2 {
-    journal_version: u32,
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RepositoryTransactionJournal {
+    schema_version: u32,
     transaction_handle: String,
     owner_instance_id: String,
     owner_pid: u32,
@@ -198,16 +196,15 @@ struct RepositoryTransactionJournalV2 {
     repository_root: PathBuf,
     git_dir: PathBuf,
     common_dir: PathBuf,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    directory_identities: Option<RepositoryDirectoryIdentitiesV1>,
+    directory_identities: RepositoryDirectoryIdentities,
     executable: PathBuf,
     executable_sha256: String,
     network: NetworkMode,
-    operations: Vec<RepositoryOperationV2>,
+    operations: Vec<RepositoryOperation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    expected_postconditions: Option<RepositoryExpectedPostconditionsV3>,
+    expected_postconditions: Option<RepositoryExpectedPostconditions>,
     next_operation: usize,
-    pending_operation: Option<RepositoryOperationV2>,
+    pending_operation: Option<RepositoryOperation>,
     status: JournalStatus,
     preimage_digest: String,
     snapshot_worktree: bool,
@@ -215,9 +212,9 @@ struct RepositoryTransactionJournalV2 {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RepositoryRunBaselineV1 {
-    baseline_version: u32,
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RepositoryRunBaseline {
+    schema_version: u32,
     baseline_id: String,
     restore_capability: String,
     restore_capability_sha256: String,
@@ -230,20 +227,20 @@ struct RepositoryRunBaselineV1 {
     repository_root: PathBuf,
     git_dir: PathBuf,
     common_dir: PathBuf,
-    directory_identities: RepositoryDirectoryIdentitiesV1,
+    directory_identities: RepositoryDirectoryIdentities,
     executable: PathBuf,
     executable_sha256: String,
     network: NetworkMode,
     preimage_digest: String,
     snapshot_worktree: bool,
     snapshot_separate_git_dir: bool,
-    baseline_assertions: RepositorySemanticAssertionsV3,
+    baseline_assertions: RepositorySemanticAssertions,
     status: RunBaselineStatus,
 }
 
 #[derive(Clone)]
 struct RunBaselineRecord {
-    baseline: RepositoryRunBaselineV1,
+    baseline: RepositoryRunBaseline,
     restore_capability: String,
 }
 
@@ -263,8 +260,8 @@ struct GitOutput {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct RepositorySemanticAssertionsV3 {
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RepositorySemanticAssertions {
     schema_version: u32,
     head: Option<String>,
     symbolic_ref: Option<String>,
@@ -279,12 +276,12 @@ struct RepositorySemanticAssertionsV3 {
     untracked_digest: String,
     untracked_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
-    target_assertions: Option<RepositoryTargetAssertionsV3>,
+    target_assertions: Option<RepositoryTargetAssertions>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct RepositoryTargetAssertionsV3 {
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RepositoryTargetAssertions {
     schema_version: u32,
     selected_head: String,
     selected_symbolic_ref: Option<String>,
@@ -297,7 +294,7 @@ pub(crate) struct RepositoryTransactions {
     owner_process_identity: Option<String>,
     root: PathBuf,
     leases: Mutex<HashMap<String, TransactionLeaseRecord>>,
-    active: Mutex<HashMap<String, RepositoryTransactionJournalV2>>,
+    active: Mutex<HashMap<String, RepositoryTransactionJournal>>,
     consumed_handles: Mutex<HashSet<String>>,
     active_requests: Mutex<HashSet<u64>>,
     cancelled_requests: Mutex<HashSet<u64>>,
@@ -309,7 +306,7 @@ pub(crate) struct RepositoryTransactions {
 
 impl RepositoryTransactions {
     pub(crate) fn new(instance_id: &str) -> Self {
-        let root = std::env::temp_dir().join("sigma-repository-transactions-v2");
+        let root = std::env::temp_dir().join("sigma-repository-transactions");
         Self::new_with_root(instance_id, root)
     }
 
@@ -347,9 +344,9 @@ impl RepositoryTransactions {
     ) -> Result<Value, RpcError> {
         let _operation = self.operation_gate.lock().map_err(lock_error)?;
         self.available()?;
-        if params.protocol_version != 2 {
+        if params.protocol_version != 1 {
             return Err(atomicity_unavailable(
-                "RepositoryTransactionLeaseV2 is required",
+                "repository transaction protocol 1 is required",
             ));
         }
         if params.network != NetworkMode::None {
@@ -372,9 +369,9 @@ impl RepositoryTransactions {
                 "this run already owns a pending repository transaction",
             ));
         }
-        let lease_id = random_capability("rtl2")?;
-        let mut lease = RepositoryTransactionLeaseV2 {
-            protocol_version: 2,
+        let lease_id = random_capability("rtl")?;
+        let mut lease = RepositoryTransactionLease {
+            protocol_version: 1,
             lease_id: lease_id.clone(),
             session_id: params.session_id,
             run_id: params.run_id,
@@ -449,16 +446,9 @@ impl RepositoryTransactions {
     ) -> Result<Value, RpcError> {
         let _operation = self.operation_gate.lock().map_err(lock_error)?;
         self.available()?;
-        match params.protocol_version {
-            2 if params.expected_postconditions.is_none() => {}
-            3 if params.expected_postconditions.is_some() => {
-                validate_expected_postconditions(params.expected_postconditions.as_ref().unwrap())?;
-            }
-            _ => {
-                return Err(invalid_transaction(
-                    "V3 begin requires expectedPostconditions and V2 forbids them",
-                ));
-            }
+        require_protocol(params.protocol_version)?;
+        if let Some(expected) = params.expected_postconditions.as_ref() {
+            validate_expected_postconditions(expected)?;
         }
         if params.operations.is_empty() || params.operations.len() > 64 {
             return Err(invalid_transaction("begin requires 1..64 operations"));
@@ -477,7 +467,7 @@ impl RepositoryTransactions {
         self.ensure_no_active_repository(&record.lease.repository_root)?;
         self.reject_external_git_helpers(request_id, &record.lease)?;
         reject_present_runtime_state(&record.lease.repository_root)?;
-        let handle = random_capability("rth2")?;
+        let handle = random_capability("rth")?;
         let transaction_dir = self.transaction_dir(&handle);
         fs::create_dir(&transaction_dir).map_err(snapshot_error)?;
         if let Err(error) = sync_directory(&self.root) {
@@ -505,8 +495,8 @@ impl RepositoryTransactions {
         }
         let snapshot_worktree = record.lease.repository_root != record.lease.git_dir;
         let snapshot_separate_git_dir = !record.lease.git_dir.starts_with(&record.lease.common_dir);
-        let mut journal = RepositoryTransactionJournalV2 {
-            journal_version: JOURNAL_VERSION,
+        let mut journal = RepositoryTransactionJournal {
+            schema_version: REPOSITORY_SCHEMA_VERSION,
             transaction_handle: handle.clone(),
             owner_instance_id: self.instance_id.clone(),
             owner_pid: std::process::id(),
@@ -516,7 +506,7 @@ impl RepositoryTransactions {
             repository_root: record.lease.repository_root,
             git_dir: record.lease.git_dir.clone(),
             common_dir: record.lease.common_dir.clone(),
-            directory_identities: Some(directory_identities),
+            directory_identities,
             executable: record.lease.executable,
             executable_sha256: record.lease.executable_sha256,
             network: NetworkMode::None,
@@ -549,7 +539,7 @@ impl RepositoryTransactions {
         params: ContinueRepositoryTransactionParams,
     ) -> Result<Value, RpcError> {
         let _operation = self.operation_gate.lock().map_err(lock_error)?;
-        require_v2(params.protocol_version)?;
+        require_protocol(params.protocol_version)?;
         validate_identity(&params.session_id, "sessionId")?;
         validate_identity(&params.run_id, "runId")?;
         validate_operations(&params.operations, true)?;
@@ -643,7 +633,7 @@ impl RepositoryTransactions {
         params: BoundRepositoryTransactionParams,
     ) -> Result<Value, RpcError> {
         let _operation = self.operation_gate.lock().map_err(lock_error)?;
-        require_v2(params.protocol_version)?;
+        require_protocol(params.protocol_version)?;
         let mut journal = self.bound_journal(
             &params.transaction_handle,
             &params.session_id,
@@ -669,7 +659,7 @@ impl RepositoryTransactions {
             )
         })?;
         Ok(json!({
-            "protocolVersion": 2,
+            "protocolVersion": 1,
             "status": "aborted",
             "transactionHandle": params.transaction_handle,
             "rollbackState": "restored",
@@ -679,7 +669,7 @@ impl RepositoryTransactions {
 
     pub(crate) fn seal(&self, params: BoundRepositoryTransactionParams) -> Result<Value, RpcError> {
         let _operation = self.operation_gate.lock().map_err(lock_error)?;
-        require_v2(params.protocol_version)?;
+        require_protocol(params.protocol_version)?;
         let journal = self.bound_journal(
             &params.transaction_handle,
             &params.session_id,
@@ -709,7 +699,7 @@ impl RepositoryTransactions {
             };
         }
         Ok(json!({
-            "protocolVersion": 2,
+            "protocolVersion": 1,
             "status": "sealed",
             "transactionHandle": params.transaction_handle,
         }))
@@ -720,7 +710,7 @@ impl RepositoryTransactions {
         params: RecoverRepositoryTransactionsParams,
     ) -> Result<Value, RpcError> {
         let _operation = self.operation_gate.lock().map_err(lock_error)?;
-        require_v2(params.protocol_version)?;
+        require_protocol(params.protocol_version)?;
         validate_identity(&params.session_id, "sessionId")?;
         if let Some(run_id) = params.run_id.as_deref() {
             validate_identity(run_id, "runId")?;
@@ -749,7 +739,7 @@ impl RepositoryTransactions {
             })?;
             recovered += 1;
         }
-        Ok(json!({ "protocolVersion": 2, "status": "recovered", "recovered": recovered }))
+        Ok(json!({ "protocolVersion": 1, "status": "recovered", "recovered": recovered }))
     }
 
     pub(crate) fn restore_run_baseline(
@@ -779,7 +769,7 @@ impl RepositoryTransactions {
             .map_err(lock_error)?
             .remove(&baseline.baseline_id);
         let journal = run_baseline_journal(&baseline);
-        let result = (|| -> Result<RepositorySemanticAssertionsV3, RpcError> {
+        let result = (|| -> Result<RepositorySemanticAssertions, RpcError> {
             restore_preimage(&journal, &self.run_baseline_dir(&baseline.baseline_id))?;
             let assertions = repository_semantic_assertions(&journal)?;
             if assertions != baseline.baseline_assertions {
@@ -914,10 +904,10 @@ impl RepositoryTransactions {
 
     fn ensure_run_baseline(
         &self,
-        lease: &RepositoryTransactionLeaseV2,
+        lease: &RepositoryTransactionLease,
         max_snapshot_files: u64,
         max_snapshot_bytes: u64,
-    ) -> Result<RepositoryRunBaselineLeaseV1, RpcError> {
+    ) -> Result<RepositoryRunBaselineLease, RpcError> {
         if let Some(record) = self
             .run_baselines
             .lock()
@@ -941,7 +931,7 @@ impl RepositoryTransactions {
                     "the current run repository baseline no longer matches its authenticated topology",
                 ));
             }
-            return Ok(RepositoryRunBaselineLeaseV1 {
+            return Ok(RepositoryRunBaselineLease {
                 schema_version: 1,
                 baseline_id: record.baseline.baseline_id,
                 restore_capability: record.restore_capability,
@@ -999,15 +989,15 @@ impl RepositoryTransactions {
                     restore_capability: restore_capability.clone(),
                 },
             );
-            return Ok(RepositoryRunBaselineLeaseV1 {
+            return Ok(RepositoryRunBaselineLease {
                 schema_version: 1,
                 baseline_id,
                 restore_capability,
             });
         }
         fs::create_dir_all(self.run_baseline_root()).map_err(snapshot_error)?;
-        let baseline_id = random_capability("rrb1")?;
-        let restore_capability = random_capability("rrc1")?;
+        let baseline_id = random_capability("rrb")?;
+        let restore_capability = random_capability("rrc")?;
         let baseline_dir = self.run_baseline_dir(&baseline_id);
         fs::create_dir(&baseline_dir).map_err(snapshot_error)?;
         let mut budget = SnapshotBudget {
@@ -1015,12 +1005,12 @@ impl RepositoryTransactions {
             max_bytes: max_snapshot_bytes,
             ..SnapshotBudget::default()
         };
-        let result = (|| -> Result<RepositoryRunBaselineV1, RpcError> {
+        let result = (|| -> Result<RepositoryRunBaseline, RpcError> {
             let identities = repository_directory_identities(lease)?;
             let preimage_digest = capture_preimage(lease, &baseline_dir, &mut budget)?;
             validate_lease_directory_identities(lease, &identities)?;
-            let mut baseline = RepositoryRunBaselineV1 {
-                baseline_version: RUN_BASELINE_VERSION,
+            let mut baseline = RepositoryRunBaseline {
+                schema_version: REPOSITORY_SCHEMA_VERSION,
                 baseline_id: baseline_id.clone(),
                 restore_capability: restore_capability.clone(),
                 restore_capability_sha256: sha256_bytes(restore_capability.as_bytes()),
@@ -1061,14 +1051,14 @@ impl RepositoryTransactions {
                 restore_capability: restore_capability.clone(),
             },
         );
-        Ok(RepositoryRunBaselineLeaseV1 {
+        Ok(RepositoryRunBaselineLease {
             schema_version: 1,
             baseline_id,
             restore_capability,
         })
     }
 
-    fn persist_run_baseline(&self, baseline: &RepositoryRunBaselineV1) -> Result<(), RpcError> {
+    fn persist_run_baseline(&self, baseline: &RepositoryRunBaseline) -> Result<(), RpcError> {
         write_json_atomic(&self.run_baseline_path(&baseline.baseline_id), baseline)
     }
 
@@ -1080,10 +1070,10 @@ impl RepositoryTransactions {
         session_id: &str,
         run_id: &str,
         repository_root: &Path,
-    ) -> Result<RepositoryRunBaselineV1, RpcError> {
+    ) -> Result<RepositoryRunBaseline, RpcError> {
         if protocol_version != 1 {
             return Err(atomicity_unavailable(
-                "Repository run baseline V1 is required",
+                "repository run baseline protocol 1 is required",
             ));
         }
         validate_capability(baseline_id, "baselineId")?;
@@ -1141,7 +1131,7 @@ impl RepositoryTransactions {
         Ok(())
     }
 
-    fn load_all_run_baselines(&self) -> Result<Vec<RepositoryRunBaselineV1>, RpcError> {
+    fn load_all_run_baselines(&self) -> Result<Vec<RepositoryRunBaseline>, RpcError> {
         let mut values = Vec::new();
         let entries = match fs::read_dir(self.run_baseline_root()) {
             Ok(value) => value,
@@ -1161,7 +1151,7 @@ impl RepositoryTransactions {
         Ok(values)
     }
 
-    fn run_baseline_owner_is_live(&self, baseline: &RepositoryRunBaselineV1) -> bool {
+    fn run_baseline_owner_is_live(&self, baseline: &RepositoryRunBaseline) -> bool {
         if !process_alive(baseline.owner_pid) {
             return false;
         }
@@ -1179,7 +1169,7 @@ impl RepositoryTransactions {
         }
     }
 
-    fn persist_and_track(&self, journal: &RepositoryTransactionJournalV2) -> Result<(), RpcError> {
+    fn persist_and_track(&self, journal: &RepositoryTransactionJournal) -> Result<(), RpcError> {
         write_journal(&self.journal_path(&journal.transaction_handle), journal)?;
         self.active
             .lock()
@@ -1193,7 +1183,7 @@ impl RepositoryTransactions {
         handle: &str,
         session_id: &str,
         run_id: &str,
-    ) -> Result<RepositoryTransactionJournalV2, RpcError> {
+    ) -> Result<RepositoryTransactionJournal, RpcError> {
         validate_capability(handle, "transactionHandle")?;
         if self
             .consumed_handles
@@ -1232,7 +1222,7 @@ impl RepositoryTransactions {
     fn run_git(
         &self,
         request_id: Option<u64>,
-        journal: &RepositoryTransactionJournalV2,
+        journal: &RepositoryTransactionJournal,
         args: &[String],
     ) -> Result<GitOutput, RpcError> {
         run_git_bounded(journal, args, || {
@@ -1243,7 +1233,7 @@ impl RepositoryTransactions {
     fn conflict_count(
         &self,
         request_id: Option<u64>,
-        journal: &RepositoryTransactionJournalV2,
+        journal: &RepositoryTransactionJournal,
     ) -> Result<usize, RpcError> {
         let output = self.run_git(
             request_id,
@@ -1268,10 +1258,10 @@ impl RepositoryTransactions {
     fn reject_external_git_helpers(
         &self,
         request_id: u64,
-        lease: &RepositoryTransactionLeaseV2,
+        lease: &RepositoryTransactionLease,
     ) -> Result<(), RpcError> {
-        let journal = RepositoryTransactionJournalV2 {
-            journal_version: JOURNAL_VERSION,
+        let journal = RepositoryTransactionJournal {
+            schema_version: REPOSITORY_SCHEMA_VERSION,
             transaction_handle: "preflight".into(),
             owner_instance_id: "preflight".into(),
             owner_pid: std::process::id(),
@@ -1281,7 +1271,7 @@ impl RepositoryTransactions {
             repository_root: lease.repository_root.clone(),
             git_dir: lease.git_dir.clone(),
             common_dir: lease.common_dir.clone(),
-            directory_identities: Some(repository_directory_identities(lease)?),
+            directory_identities: repository_directory_identities(lease)?,
             executable: lease.executable.clone(),
             executable_sha256: lease.executable_sha256.clone(),
             network: NetworkMode::None,
@@ -1319,7 +1309,7 @@ impl RepositoryTransactions {
     fn reject_journal_runtime_state(
         &self,
         request_id: Option<u64>,
-        journal: &RepositoryTransactionJournalV2,
+        journal: &RepositoryTransactionJournal,
     ) -> Result<(), RpcError> {
         reject_present_runtime_state(&journal.repository_root)?;
         let runtime_state = self.run_git(
@@ -1345,7 +1335,7 @@ impl RepositoryTransactions {
     fn apply_remaining(
         &self,
         request_id: u64,
-        journal: &mut RepositoryTransactionJournalV2,
+        journal: &mut RepositoryTransactionJournal,
         mut output: Vec<String>,
     ) -> Result<Value, RpcError> {
         while journal.next_operation < journal.operations.len() {
@@ -1390,7 +1380,7 @@ impl RepositoryTransactions {
         journal.status = JournalStatus::CompletedPendingSeal;
         self.persist_and_track(journal)?;
         let assertions = repository_semantic_assertions(journal)?;
-        Ok(transaction_result_v3(
+        Ok(transaction_result_with_assertions(
             "completed_pending_seal",
             journal,
             output,
@@ -1401,7 +1391,7 @@ impl RepositoryTransactions {
 
     fn restore_and_consume(
         &self,
-        journal: &RepositoryTransactionJournalV2,
+        journal: &RepositoryTransactionJournal,
     ) -> Result<(), RpcError> {
         match restore_preimage(journal, &self.transaction_dir(&journal.transaction_handle)) {
             Ok(()) => self.consume_journal(journal),
@@ -1414,7 +1404,7 @@ impl RepositoryTransactions {
         }
     }
 
-    fn consume_journal(&self, journal: &RepositoryTransactionJournalV2) -> Result<(), RpcError> {
+    fn consume_journal(&self, journal: &RepositoryTransactionJournal) -> Result<(), RpcError> {
         self.active
             .lock()
             .map_err(lock_error)?
@@ -1429,7 +1419,7 @@ impl RepositoryTransactions {
         sync_directory(&self.root)
     }
 
-    fn load_all_journals(&self) -> Result<Vec<RepositoryTransactionJournalV2>, RpcError> {
+    fn load_all_journals(&self) -> Result<Vec<RepositoryTransactionJournal>, RpcError> {
         let mut values = Vec::new();
         let entries = match fs::read_dir(&self.root) {
             Ok(value) => value,
@@ -1468,7 +1458,7 @@ impl RepositoryTransactions {
         Ok(())
     }
 
-    fn journal_owner_is_live(&self, journal: &RepositoryTransactionJournalV2) -> bool {
+    fn journal_owner_is_live(&self, journal: &RepositoryTransactionJournal) -> bool {
         if !process_alive(journal.owner_pid) {
             return false;
         }
@@ -1478,8 +1468,8 @@ impl RepositoryTransactions {
             observed_identity.as_deref(),
         ) {
             (Some(expected), Some(observed)) => expected == observed,
-            // Legacy journals and platforms without a stable process birth identity
-            // remain conservative: an existing PID may still own the transaction.
+            // Platforms without a stable process birth identity remain conservative:
+            // an existing PID may still own the transaction.
             _ => {
                 journal.owner_pid != std::process::id()
                     || journal.owner_instance_id == self.instance_id
@@ -1511,12 +1501,12 @@ impl RepositoryTransactions {
     }
 }
 
-fn require_v2(version: u32) -> Result<(), RpcError> {
-    if version == 2 {
+fn require_protocol(version: u32) -> Result<(), RpcError> {
+    if version == 1 {
         Ok(())
     } else {
         Err(atomicity_unavailable(
-            "RepositoryTransactionLeaseV2 is required",
+            "repository transaction protocol 1 is required",
         ))
     }
 }
@@ -1536,9 +1526,9 @@ fn valid_object_id(value: &str) -> bool {
 }
 
 fn validate_expected_postconditions(
-    expected: &RepositoryExpectedPostconditionsV3,
+    expected: &RepositoryExpectedPostconditions,
 ) -> Result<(), RpcError> {
-    if expected.schema_version != 3 || !valid_object_id(&expected.selected_head) {
+    if expected.schema_version != 1 || !valid_object_id(&expected.selected_head) {
         return Err(invalid_transaction("invalid selectedHead postcondition"));
     }
     if let Some(reference) = expected.selected_symbolic_ref.as_deref() {
@@ -1596,7 +1586,7 @@ fn random_capability(prefix: &str) -> Result<String, RpcError> {
 }
 
 fn validate_operations(
-    operations: &[RepositoryOperationV2],
+    operations: &[RepositoryOperation],
     add_only: bool,
 ) -> Result<(), RpcError> {
     for operation in operations {
@@ -1626,7 +1616,7 @@ fn validate_operations(
     Ok(())
 }
 
-fn validate_operation_grammar(operation: &RepositoryOperationV2) -> Result<(), RpcError> {
+fn validate_operation_grammar(operation: &RepositoryOperation) -> Result<(), RpcError> {
     let args = &operation.args;
     let valid = match operation.operation_class.as_str() {
         "add" => {
@@ -1877,7 +1867,7 @@ fn abort_args(class: &str) -> Result<Vec<String>, RpcError> {
 
 fn transaction_result(
     status: &str,
-    journal: &RepositoryTransactionJournalV2,
+    journal: &RepositoryTransactionJournal,
     output: Vec<String>,
     conflicts: usize,
 ) -> Value {
@@ -1890,7 +1880,7 @@ fn transaction_result(
         bounded.truncate(16 * 1024 * 1024);
     }
     json!({
-        "protocolVersion": 2,
+        "protocolVersion": 1,
         "status": status,
         "transactionHandle": journal.transaction_handle,
         "operation": journal.pending_operation.as_ref().map(|item| item.operation_class.as_str()),
@@ -1907,7 +1897,7 @@ fn sha256_bytes(value: &[u8]) -> String {
 }
 
 fn checked_semantic_output(
-    journal: &RepositoryTransactionJournalV2,
+    journal: &RepositoryTransactionJournal,
     args: &[&str],
     component: &str,
     missing_exit_one: bool,
@@ -1945,10 +1935,10 @@ fn conflict_path_count(value: &str) -> usize {
 }
 
 fn target_assertions(
-    journal: &RepositoryTransactionJournalV2,
+    journal: &RepositoryTransactionJournal,
     head: Option<&str>,
     symbolic_ref: Option<&str>,
-) -> Result<Option<RepositoryTargetAssertionsV3>, RpcError> {
+) -> Result<Option<RepositoryTargetAssertions>, RpcError> {
     let Some(expected) = journal.expected_postconditions.as_ref() else {
         return Ok(None);
     };
@@ -1957,7 +1947,7 @@ fn target_assertions(
     {
         return Err(RpcError::new(
             "repository_postcondition_failed",
-            "selected HEAD or symbolic ref did not match the V3 transaction expectation",
+            "selected HEAD or symbolic ref did not match the transaction expectation",
         ));
     }
     for object in &expected.required_reachable_objects {
@@ -1978,8 +1968,8 @@ fn target_assertions(
             ));
         }
     }
-    Ok(Some(RepositoryTargetAssertionsV3 {
-        schema_version: 3,
+    Ok(Some(RepositoryTargetAssertions {
+        schema_version: 1,
         selected_head: expected.selected_head.clone(),
         selected_symbolic_ref: expected.selected_symbolic_ref.clone(),
         required_reachable_objects: expected.required_reachable_objects.clone(),
@@ -1988,8 +1978,8 @@ fn target_assertions(
 }
 
 fn repository_semantic_assertions(
-    journal: &RepositoryTransactionJournalV2,
-) -> Result<RepositorySemanticAssertionsV3, RpcError> {
+    journal: &RepositoryTransactionJournal,
+) -> Result<RepositorySemanticAssertions, RpcError> {
     let head = checked_semantic_output(
         journal,
         &["rev-parse", "--verify", "--quiet", "HEAD"],
@@ -2037,8 +2027,8 @@ fn repository_semantic_assertions(
         Err(error) => return Err(snapshot_error(error)),
     };
     let target_assertions = target_assertions(journal, head.as_deref(), symbolic_ref.as_deref())?;
-    Ok(RepositorySemanticAssertionsV3 {
-        schema_version: 3,
+    Ok(RepositorySemanticAssertions {
+        schema_version: 1,
         head,
         symbolic_ref,
         refs_digest: sha256_bytes(refs.as_bytes()),
@@ -2055,9 +2045,9 @@ fn repository_semantic_assertions(
     })
 }
 
-fn empty_repository_assertions() -> RepositorySemanticAssertionsV3 {
-    RepositorySemanticAssertionsV3 {
-        schema_version: 3,
+fn empty_repository_assertions() -> RepositorySemanticAssertions {
+    RepositorySemanticAssertions {
+        schema_version: 1,
         head: None,
         symbolic_ref: None,
         refs_digest: String::new(),
@@ -2074,9 +2064,9 @@ fn empty_repository_assertions() -> RepositorySemanticAssertionsV3 {
     }
 }
 
-fn run_baseline_journal(baseline: &RepositoryRunBaselineV1) -> RepositoryTransactionJournalV2 {
-    RepositoryTransactionJournalV2 {
-        journal_version: JOURNAL_VERSION,
+fn run_baseline_journal(baseline: &RepositoryRunBaseline) -> RepositoryTransactionJournal {
+    RepositoryTransactionJournal {
+        schema_version: REPOSITORY_SCHEMA_VERSION,
         transaction_handle: baseline.baseline_id.clone(),
         owner_instance_id: baseline.owner_instance_id.clone(),
         owner_pid: baseline.owner_pid,
@@ -2086,7 +2076,7 @@ fn run_baseline_journal(baseline: &RepositoryRunBaselineV1) -> RepositoryTransac
         repository_root: baseline.repository_root.clone(),
         git_dir: baseline.git_dir.clone(),
         common_dir: baseline.common_dir.clone(),
-        directory_identities: Some(baseline.directory_identities.clone()),
+        directory_identities: baseline.directory_identities.clone(),
         executable: baseline.executable.clone(),
         executable_sha256: baseline.executable_sha256.clone(),
         network: baseline.network.clone(),
@@ -2101,23 +2091,22 @@ fn run_baseline_journal(baseline: &RepositoryRunBaselineV1) -> RepositoryTransac
     }
 }
 
-fn transaction_result_v3(
+fn transaction_result_with_assertions(
     status: &str,
-    journal: &RepositoryTransactionJournalV2,
+    journal: &RepositoryTransactionJournal,
     output: Vec<String>,
     conflicts: usize,
-    assertions: RepositorySemanticAssertionsV3,
+    assertions: RepositorySemanticAssertions,
 ) -> Value {
     let mut value = transaction_result(status, journal, output, conflicts);
     if let Some(record) = value.as_object_mut() {
-        record.insert("protocolVersion".into(), json!(3));
         record.insert("semanticAssertions".into(), json!(assertions));
     }
     value
 }
 
 fn run_git_bounded(
-    journal: &RepositoryTransactionJournalV2,
+    journal: &RepositoryTransactionJournal,
     args: &[String],
     cancelled: impl Fn() -> bool,
 ) -> Result<GitOutput, RpcError> {
@@ -2140,7 +2129,7 @@ fn git_operation_may_create_commit(args: &[String]) -> bool {
 }
 
 fn repository_identity_fallbacks(
-    journal: &RepositoryTransactionJournalV2,
+    journal: &RepositoryTransactionJournal,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Vec<&'static str>, RpcError> {
     let mut fallbacks = Vec::new();
@@ -2169,7 +2158,7 @@ fn repository_identity_fallbacks(
 }
 
 fn run_git_bounded_inner(
-    journal: &RepositoryTransactionJournalV2,
+    journal: &RepositoryTransactionJournal,
     args: &[String],
     cancelled: &dyn Fn() -> bool,
     config_overrides: &[&str],
@@ -2316,9 +2305,9 @@ fn reject_present_runtime_state(repository_root: &Path) -> Result<(), RpcError> 
 }
 
 fn repository_directory_identities(
-    lease: &RepositoryTransactionLeaseV2,
-) -> Result<RepositoryDirectoryIdentitiesV1, RpcError> {
-    Ok(RepositoryDirectoryIdentitiesV1 {
+    lease: &RepositoryTransactionLease,
+) -> Result<RepositoryDirectoryIdentities, RpcError> {
+    Ok(RepositoryDirectoryIdentities {
         repository_root: directory_identity(&lease.repository_root)?,
         git_dir: directory_identity(&lease.git_dir)?,
         common_dir: directory_identity(&lease.common_dir)?,
@@ -2326,8 +2315,8 @@ fn repository_directory_identities(
 }
 
 fn validate_lease_directory_identities(
-    lease: &RepositoryTransactionLeaseV2,
-    expected: &RepositoryDirectoryIdentitiesV1,
+    lease: &RepositoryTransactionLease,
+    expected: &RepositoryDirectoryIdentities,
 ) -> Result<(), RpcError> {
     let observed = repository_directory_identities(lease)?;
     if &observed != expected {
@@ -2339,7 +2328,7 @@ fn validate_lease_directory_identities(
     Ok(())
 }
 
-fn validate_live_topology(journal: &RepositoryTransactionJournalV2) -> Result<(), RpcError> {
+fn validate_live_topology(journal: &RepositoryTransactionJournal) -> Result<(), RpcError> {
     let root = canonical_directory(&journal.repository_root, "repository root")?;
     let git_dir = canonical_directory(&journal.git_dir, "Git directory")?;
     let common_dir = canonical_directory(&journal.common_dir, "Git common directory")?;
@@ -2353,13 +2342,8 @@ fn validate_live_topology(journal: &RepositoryTransactionJournalV2) -> Result<()
         ));
     }
     validate_topology(&root, &git_dir, &common_dir)?;
-    let expected = journal.directory_identities.as_ref().ok_or_else(|| {
-        RpcError::new(
-            "repository_state_uncertain",
-            "repository transaction journal predates directory identity pinning",
-        )
-    })?;
-    let observed = RepositoryDirectoryIdentitiesV1 {
+    let expected = &journal.directory_identities;
+    let observed = RepositoryDirectoryIdentities {
         repository_root: directory_identity(&root)?,
         git_dir: directory_identity(&git_dir)?,
         common_dir: directory_identity(&common_dir)?,
@@ -2374,7 +2358,7 @@ fn validate_live_topology(journal: &RepositoryTransactionJournalV2) -> Result<()
 }
 
 fn capture_preimage(
-    lease: &RepositoryTransactionLeaseV2,
+    lease: &RepositoryTransactionLease,
     transaction_dir: &Path,
     budget: &mut SnapshotBudget,
 ) -> Result<String, RpcError> {
@@ -2401,7 +2385,7 @@ fn capture_preimage(
 }
 
 fn restore_preimage(
-    journal: &RepositoryTransactionJournalV2,
+    journal: &RepositoryTransactionJournal,
     transaction_dir: &Path,
 ) -> Result<(), RpcError> {
     let snapshot = transaction_dir.join("cas").join(&journal.preimage_digest);
@@ -2460,7 +2444,7 @@ fn tree_digest(root: &Path) -> Result<String, RpcError> {
         ));
     }
     let mut digest = Sha256::new();
-    digest.update(b"sigma-repository-preimage-cas-v1\0");
+    digest.update(b"sigma-repository-preimage-cas\0");
     digest_tree_entries(root, Path::new(""), &mut digest)?;
     Ok(format!("{:x}", digest.finalize()))
 }
@@ -2718,7 +2702,7 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), RpcErro
     Ok(())
 }
 
-fn write_journal(path: &Path, journal: &RepositoryTransactionJournalV2) -> Result<(), RpcError> {
+fn write_journal(path: &Path, journal: &RepositoryTransactionJournal) -> Result<(), RpcError> {
     write_json_atomic(path, journal)
 }
 
@@ -2756,41 +2740,68 @@ fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn read_journal(path: &Path) -> Result<RepositoryTransactionJournalV2, RpcError> {
+fn read_journal(path: &Path) -> Result<RepositoryTransactionJournal, RpcError> {
     let bytes = fs::read(path)
         .map_err(|_| invalid_handle("repository transaction handle is unknown or expired"))?;
-    let journal: RepositoryTransactionJournalV2 =
-        serde_json::from_slice(&bytes).map_err(|error| {
-            RpcError::new(
-                "repository_state_uncertain",
-                format!("transaction journal is invalid: {error}"),
-            )
-        })?;
-    if journal.journal_version != JOURNAL_VERSION {
-        return Err(RpcError::new(
-            "repository_state_uncertain",
-            "transaction journal version is unsupported",
-        ));
-    }
-    Ok(journal)
-}
-
-fn read_run_baseline(path: &Path) -> Result<RepositoryRunBaselineV1, RpcError> {
-    let bytes = fs::read(path)
-        .map_err(|_| invalid_handle("repository run baseline is unknown or expired"))?;
-    let baseline: RepositoryRunBaselineV1 = serde_json::from_slice(&bytes).map_err(|error| {
+    let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
         RpcError::new(
             "repository_state_uncertain",
-            format!("repository run baseline manifest is invalid: {error}"),
+            format!("transaction journal at '{}' is invalid: {error}", path.display()),
         )
     })?;
-    if baseline.baseline_version != RUN_BASELINE_VERSION {
+    let actual = value.get("schemaVersion").and_then(Value::as_u64);
+    if actual != Some(u64::from(REPOSITORY_SCHEMA_VERSION)) {
         return Err(RpcError::new(
-            "repository_state_uncertain",
-            "repository run baseline version is unsupported",
+            "unsupported_schema_version",
+            format!(
+                "repository transaction journal at '{}' expected schema {}, received {}; existing data was not modified",
+                path.display(),
+                REPOSITORY_SCHEMA_VERSION,
+                actual.map_or_else(|| "missing".into(), |version| version.to_string()),
+            ),
         ));
     }
-    Ok(baseline)
+    serde_json::from_value(value).map_err(|error| {
+        RpcError::new(
+            "repository_state_uncertain",
+            format!("transaction journal at '{}' is invalid: {error}", path.display()),
+        )
+    })
+}
+
+fn read_run_baseline(path: &Path) -> Result<RepositoryRunBaseline, RpcError> {
+    let bytes = fs::read(path)
+        .map_err(|_| invalid_handle("repository run baseline is unknown or expired"))?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+        RpcError::new(
+            "repository_state_uncertain",
+            format!(
+                "repository run baseline at '{}' is invalid: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    let actual = value.get("schemaVersion").and_then(Value::as_u64);
+    if actual != Some(u64::from(REPOSITORY_SCHEMA_VERSION)) {
+        return Err(RpcError::new(
+            "unsupported_schema_version",
+            format!(
+                "repository run baseline at '{}' expected schema {}, received {}; existing data was not modified",
+                path.display(),
+                REPOSITORY_SCHEMA_VERSION,
+                actual.map_or_else(|| "missing".into(), |version| version.to_string()),
+            ),
+        ));
+    }
+    serde_json::from_value(value).map_err(|error| {
+        RpcError::new(
+            "repository_state_uncertain",
+            format!(
+                "repository run baseline at '{}' is invalid: {error}",
+                path.display()
+            ),
+        )
+    })
 }
 
 fn prepare_journal_root(root: &Path) -> Result<(), RpcError> {
@@ -2812,7 +2823,7 @@ fn executable_parent_path(executable: &Path) -> String {
 }
 
 #[cfg(unix)]
-fn directory_identity(path: &Path) -> Result<DirectoryIdentityV1, RpcError> {
+fn directory_identity(path: &Path) -> Result<DirectoryIdentity, RpcError> {
     use std::os::unix::fs::MetadataExt;
     let metadata = fs::symlink_metadata(path).map_err(snapshot_error)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -2821,7 +2832,7 @@ fn directory_identity(path: &Path) -> Result<DirectoryIdentityV1, RpcError> {
             "repository identity target is not a stable directory",
         ));
     }
-    Ok(DirectoryIdentityV1 {
+    Ok(DirectoryIdentity {
         platform: "unix_dev_inode".into(),
         volume: metadata.dev(),
         file: metadata.ino(),
@@ -2829,7 +2840,7 @@ fn directory_identity(path: &Path) -> Result<DirectoryIdentityV1, RpcError> {
 }
 
 #[cfg(windows)]
-fn directory_identity(path: &Path) -> Result<DirectoryIdentityV1, RpcError> {
+fn directory_identity(path: &Path) -> Result<DirectoryIdentity, RpcError> {
     use std::iter::once;
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
@@ -2871,7 +2882,7 @@ fn directory_identity(path: &Path) -> Result<DirectoryIdentityV1, RpcError> {
                 "repository identity target is not a stable directory",
             ));
         }
-        Ok(DirectoryIdentityV1 {
+        Ok(DirectoryIdentity {
             platform: "windows_volume_file_id".into(),
             volume: information.dwVolumeSerialNumber as u64,
             file: ((information.nFileIndexHigh as u64) << 32) | information.nFileIndexLow as u64,
@@ -2880,7 +2891,7 @@ fn directory_identity(path: &Path) -> Result<DirectoryIdentityV1, RpcError> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn directory_identity(_path: &Path) -> Result<DirectoryIdentityV1, RpcError> {
+fn directory_identity(_path: &Path) -> Result<DirectoryIdentity, RpcError> {
     Err(atomicity_unavailable(
         "repository directory identity pinning is unavailable on this platform",
     ))

@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 1,
   "frozenRunPolicies": {
     "quick": {
       "schemaVersion": 1,
@@ -43,7 +43,7 @@
   },
   "scenarios": [
     {
-      "schemaVersion": 2,
+      "schemaVersion": 1,
       "id": "line-count-readonly",
       "title": "Scoped source line count without workspace mutation",
       "suites": [
@@ -141,7 +141,7 @@
       "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f"
     },
     {
-      "schemaVersion": 2,
+      "schemaVersion": 1,
       "id": "single-file-edit",
       "title": "Small exact edit constrained to one file",
       "suites": [
@@ -205,7 +205,7 @@
       "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f"
     },
     {
-      "schemaVersion": 2,
+      "schemaVersion": 1,
       "id": "fix-failing-test",
       "title": "Diagnose and fix an existing failing test",
       "suites": [
@@ -273,7 +273,7 @@
       "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f"
     },
     {
-      "schemaVersion": 2,
+      "schemaVersion": 1,
       "id": "ambiguity-one-question",
       "title": "Ask one focused question for a material ambiguity",
       "suites": [
@@ -341,7 +341,7 @@
       "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f"
     },
     {
-      "schemaVersion": 2,
+      "schemaVersion": 1,
       "id": "steer-cleanup",
       "title": "Honor a mid-run steer and clean abandoned work",
       "suites": [
@@ -415,7 +415,7 @@
       "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f"
     },
     {
-      "schemaVersion": 2,
+      "schemaVersion": 1,
       "id": "multi-file-change",
       "title": "Coordinated implementation and documentation update",
       "suites": [
@@ -484,7 +484,7 @@
       "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f"
     },
     {
-      "schemaVersion": 2,
+      "schemaVersion": 1,
       "id": "already-satisfied-noop",
       "title": "Recognize an already satisfied request without churn",
       "suites": [
@@ -537,7 +537,7 @@
       "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f"
     },
     {
-      "schemaVersion": 2,
+      "schemaVersion": 1,
       "id": "tool-failure-recovery",
       "title": "Recover from an unavailable preferred input",
       "suites": [
@@ -595,7 +595,7 @@
       "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f"
     },
     {
-      "schemaVersion": 2,
+      "schemaVersion": 1,
       "id": "dirty-worktree-preservation",
       "title": "Preserve a user's pre-existing dirty worktree",
       "suites": [
@@ -661,7 +661,7 @@
       "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f"
     },
     {
-      "schemaVersion": 2,
+      "schemaVersion": 1,
       "id": "nested-instructions-unicode",
       "title": "Respect nested instructions and Unicode paths",
       "suites": [
@@ -719,7 +719,7 @@
       "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f"
     },
     {
-      "schemaVersion": 2,
+      "schemaVersion": 1,
       "id": "large-context-lookup",
       "title": "Find one fact in a large file without repeated full reads",
       "suites": [
@@ -777,7 +777,7 @@
       "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f"
     },
     {
-      "schemaVersion": 2,
+      "schemaVersion": 1,
       "id": "validation-failure-honesty",
       "title": "Report a validation failure without claiming success",
       "suites": [
@@ -856,14 +856,14 @@
       "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f"
     },
     {
-      "schemaVersion": 2,
+      "schemaVersion": 1,
       "suites": [
         "repo-scale"
       ],
       "fixture": {
         "workspace": "scenarios/repo-scale-aggregate/workspace",
         "generator": {
-          "kind": "repo-scale-v1",
+          "kind": "repo-scale",
           "seed": 20260714,
           "fileCount": 500,
           "lineCount": 90000
@@ -903,7 +903,7 @@
       ],
       "repoScale": {
         "profile": "repo_scale",
-        "fixtureFamily": "deterministic-multilang-v1",
+        "fixtureFamily": "deterministic-multilang",
         "fileCount": 500,
         "lineCount": 90000
       },
@@ -944,14 +944,14 @@
       }
     },
     {
-      "schemaVersion": 2,
+      "schemaVersion": 1,
       "suites": [
         "repo-scale"
       ],
       "fixture": {
         "workspace": "scenarios/repo-scale-aggregate/workspace",
         "generator": {
-          "kind": "repo-scale-v1",
+          "kind": "repo-scale",
           "seed": 20260714,
           "fileCount": 500,
           "lineCount": 90000
@@ -991,7 +991,7 @@
       ],
       "repoScale": {
         "profile": "repo_scale",
-        "fixtureFamily": "deterministic-multilang-v1",
+        "fixtureFamily": "deterministic-multilang",
         "fileCount": 500,
         "lineCount": 90000
       },
@@ -1052,14 +1052,14 @@
       }
     },
     {
-      "schemaVersion": 2,
+      "schemaVersion": 1,
       "suites": [
         "repo-scale"
       ],
       "fixture": {
         "workspace": "scenarios/repo-scale-aggregate/workspace",
         "generator": {
-          "kind": "repo-scale-v1",
+          "kind": "repo-scale",
           "seed": 20260714,
           "fileCount": 500,
           "lineCount": 90000
@@ -1099,7 +1099,7 @@
       ],
       "repoScale": {
         "profile": "repo_scale",
-        "fixtureFamily": "deterministic-multilang-v1",
+        "fixtureFamily": "deterministic-multilang",
         "fileCount": 500,
         "lineCount": 90000
       },

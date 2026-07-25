@@ -2,15 +2,15 @@
 
 ## Supported versions
 
-Security fixes are provided for the newest published release only. Release
-candidates may receive fixes without a backport to an older candidate.
+Security fixes are provided for the current development baseline only. The
+project does not maintain compatibility or security backports for superseded
+preview formats.
 
 | Version | Supported |
 | --- | --- |
-| Latest `4.x` Linux stable release | Yes |
-| Latest `4.x` Windows unsigned preview | Yes, with preview limitations |
-| `3.x` release candidates | No |
-| Older versions | No |
+| Current `0.1.x` Linux development preview | Yes |
+| Current `0.1.x` Windows unsigned development preview | Yes, with preview limitations |
+| Superseded previews and other schemas | No |
 
 ## Reporting a vulnerability
 
@@ -30,39 +30,41 @@ open a minimal issue asking the maintainer to enable a private contact path.
 
 ## Release verification
 
-Portable product archives are created only by the repository's GitHub Actions release
-workflow. Each archive is accompanied by a SHA-256 checksum, CycloneDX SBOM, signed
-provenance statement, and the public provenance verification key. Linux x64 is the
-official stable binary release.
+Portable product archives are official preview candidates only when created by
+the repository's GitHub Actions release workflow. Each archive is accompanied
+by a SHA-256 checksum, CycloneDX SBOM, signed provenance statement, and the
+public provenance verification key. No `0.x` archive is a stable release.
 
-Windows x64 is published alongside the stable Linux release as an explicitly labeled
-unsigned preview. Its package, sandbox, wrapper, live-provider, checksum, SBOM, and
-signed-provenance gates must pass, but its executables do not have a trusted
-Authenticode signature. Windows SmartScreen or Smart App Control may warn or block it.
+Windows x64 is an explicitly labeled unsigned preview until trusted
+Authenticode signing is available. Its package, sandbox, wrapper, live-provider,
+checksum, SBOM, and signed-provenance gates must pass, but Windows SmartScreen
+or Smart App Control may warn or block it.
 
 A GitHub prerelease may be source-only when hosted Actions or trusted signing is
 unavailable. Such a prerelease does not contain official portable product archives
 and must state which publication gates remain unavailable.
 
-The stable GitHub Release may contain the Windows preview because the latest designation
-applies to the stable Linux channel. Release notes, the Windows asset label, its bundle
-README, and package metadata must all disclose the preview status. Trusted provenance
-is still mandatory; only the Authenticode signer policy is allowed to remain unsatisfied.
+All `0.x` GitHub Releases are prereleases and must not be marked latest.
+Release notes, asset labels, bundle READMEs, and package metadata must disclose
+the development-preview status. Trusted provenance is mandatory; an explicitly
+unsigned Windows candidate may leave only the Authenticode signer policy
+unsatisfied.
 
 Treat locally built archives, workflow artifacts, and files without matching release
 sidecars as development outputs rather than official releases.
 
 ## Runtime capability defaults
 
-Configuration schema v5 defaults to `permission_mode=workspace-auto`,
-`sandbox=required`, `read_scope=workspace`, and `network=none`. Workspace-scoped
-offline work is automatic; external reads, full network, and repository metadata
-writes remain separately authorized. No setting enables unsafe host execution.
+Configuration schema 1 defaults to `permission_mode=workspace-auto`,
+`sandbox=required`, `read_scope=workspace`, `network=full`, and
+`process_handoff=allow`. Workspace-scoped reads and declared writes are
+automatic; external reads, full-network calls, and repository metadata writes
+remain separately authorized. No setting enables unsafe host execution.
 
 Use the following configuration for the strict capability posture:
 
 ```toml
-schema_version = 5
+schema_version = 1
 
 [security]
 sandbox = "required"
@@ -75,3 +77,8 @@ Process handoff is currently advertised only on Linux when the native sandbox an
 watchdog self-tests pass. Windows and other platforms fail closed. A handed-off
 service is intentionally no longer owned or terminated by its Sigma session, so
 only independently health-checked deliverables should use this capability.
+
+Every Sigma-owned persisted artifact uses schema 1. An unknown schema, another
+store layout, or an old checkpoint journal is rejected without modifying the
+input. There is no migration or downgrade path; preserve incompatible data
+outside the active state directory if it must be retained for manual audit.

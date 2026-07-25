@@ -87,6 +87,7 @@ export class CheckpointEvidenceRecorder {
         producer: { authority: "runtime", id: "checkpoint-manager" },
         summary: `Child checkpoint '${sealed.checkpointId}' postimage was captured and content-addressed successfully.`,
         data: {
+          schemaVersion: 1,
           validator: "checkpoint_postimage_integrity",
           artifactIds: [],
           frontierRevision: session.durable.state.mutationFrontier.revision,
@@ -180,6 +181,7 @@ export class CheckpointEvidenceRecorder {
       producer: { authority: "runtime", id: "checkpoint-manager" },
       summary: `Checkpoint '${checkpointId}' postimage was captured and content-addressed successfully.`,
       data: {
+        schemaVersion: 1,
         validator: "checkpoint_postimage_integrity",
         artifactIds: [],
         frontierRevision: session.durable.state.mutationFrontier.revision,

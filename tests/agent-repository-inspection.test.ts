@@ -33,7 +33,7 @@ async function recoveryRepository(): Promise<{
   newestUnreachable: string;
   olderUnreachable: string;
 }> {
-  const root = await mkdtemp(path.join(os.tmpdir(), "sigma-inspection-v2-"));
+  const root = await mkdtemp(path.join(os.tmpdir(), "sigma-inspection-"));
   workspaces.push(root);
   git(root, ["init", "-q", "--initial-branch=main"]);
   git(root, ["config", "user.email", "sigma@example.invalid"]);
@@ -164,7 +164,7 @@ afterEach(async () => {
   await Promise.all(brokers.splice(0).map(async (broker) => await broker.close()));
 });
 
-describe("RepositoryInspectionV2", () => {
+describe("RepositoryInspection", () => {
   it("does not treat an unreachable clone baseline as lost local work", async () => {
     const fixture = await clonedBaselineRecoveryRepository();
     const broker = createHostExecutionBroker();
@@ -194,7 +194,7 @@ describe("RepositoryInspectionV2", () => {
     expect(receipt.ok).toBe(true);
     const result = receipt.result as any;
     expect(result).toMatchObject({
-      schemaVersion: 2,
+      schemaVersion: 1,
       complete: true,
       reflog: { aligned: true },
       selectionStatus: { status: "model_choice_available" }

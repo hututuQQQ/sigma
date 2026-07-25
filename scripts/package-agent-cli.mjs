@@ -44,7 +44,7 @@ export const windowsNodeLocalPipeMarker = Buffer.from("\\\\?\\pipe\\LOCAL\\%u-%u
 export const supportedTargetPlatforms = new Set(["linux", "win32"]);
 export const supportedTargetArchitectures = new Set(["x64"]);
 export const supportedReleaseTargets = new Set(sigmaManifest.release.targets);
-export const v3PortablePackages = Object.freeze([
+export const portablePackages = Object.freeze([
   "agent-execution",
   "agent-code-intel",
   "agent-checkpoint",
@@ -238,30 +238,30 @@ export async function workspaceRuntimePackages(rootDir, entryPackage = "agent-cl
 }
 
 async function workspaceRelease(rootDir) {
-  const candidates = [path.join(rootDir, "package.json"), path.join(rootDir, "packages", "agent-cli", "package.json")];
+  const candidates = [
+    path.join(rootDir, "package.json"),
+    path.join(rootDir, "packages", "agent-cli", "package.json")
+  ];
+  const expectedVersion = sigmaManifest.productVersion;
   for (const manifestPath of candidates) {
-    if (!existsSync(manifestPath)) continue;
+    if (!existsSync(manifestPath)) {
+      throw new Error(`Sigma Code package manifest is missing: ${manifestPath}.`);
+    }
     const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-    const version = String(manifest.version ?? "");
-    if (!version) continue;
-    const majorMatch = version.match(/^([1-9][0-9]*)\./u);
-    const major = majorMatch ? Number(majorMatch[1]) : null;
-    if (major !== 2 && major !== 3 && major !== 4) {
+    if (manifest.version !== expectedVersion) {
       throw new Error(
-        `Unsupported Sigma Code release version '${version}'. Portable packaging supports major versions 2, 3, and 4; a new major requires an explicit schema review.`
+        `Sigma Code package version '${String(manifest.version)}' does not match sigma-manifest.json productVersion '${expectedVersion}'.`
       );
     }
-    return { version, isV3: major >= 3, packageSchemaVersion: major };
   }
-  throw new Error(`Could not determine the Sigma Code release version below ${rootDir}.`);
+  return { version: expectedVersion };
 }
 
-async function v3RuntimePackages(rootDir, discovered, isV3) {
-  if (!isV3) return discovered;
+async function portableRuntimePackages(rootDir, discovered) {
   const result = new Set(discovered);
-  for (const packageName of v3PortablePackages) {
+  for (const packageName of portablePackages) {
     const manifestPath = path.join(rootDir, "packages", packageName, "package.json");
-    if (!existsSync(manifestPath)) throw new Error(`V3 portable package '${packageName}' is missing.`);
+    if (!existsSync(manifestPath)) throw new Error(`Portable package '${packageName}' is missing.`);
     result.add(packageName);
   }
   return [...result].sort((left, right) => left.localeCompare(right, "en"));
@@ -954,7 +954,7 @@ async function stageLinuxNode(context, nodeRuntime, runtimeRoot, runtimeSonames)
 }
 
 async function stageLinuxCompatibility(context, nodeRuntime, sigmaExec) {
-  if (context.targetPlatform !== "linux" || !context.release.isV3) return null;
+  if (context.targetPlatform !== "linux") return null;
   if (await inspectPackagedLinuxNode(context, nodeRuntime) === null) return null;
   const { runtimeRoot, buildMetadata, declaredLibraries } = await loadLinuxRuntimeMetadata(context);
   const { runtimeLibraries, runtimeSonames } = await stageLinuxRuntimeLibraries(
@@ -1372,7 +1372,7 @@ async function writeReleaseSidecars(
     predicateType: "https://slsa.dev/provenance/v1",
     predicate: {
       buildDefinition: {
-        buildType: "https://sigma-code.dev/build-types/portable-cli/v3",
+        buildType: "https://sigma-code.dev/build-types/portable-cli",
         externalParameters: { version: release.version, targetPlatform, targetArch },
         ...((nodeRuntime.compatibility || linuxCompatibility) ? {
           internalParameters: {
@@ -1400,7 +1400,7 @@ async function writeReleaseSidecars(
         ]
       },
       runDetails: {
-        builder: { id: "https://sigma-code.dev/builders/local-portable-packager/v3" },
+        builder: { id: "https://sigma-code.dev/builders/local-portable-packager" },
         metadata: { invocationId: `${release.version}:${targetPlatform}:${targetArch}`, signing }
       }
     }
@@ -1486,7 +1486,8 @@ function createBundleReadme(targetPlatform, targetArch, nodeRuntime) {
     : "";
   return `# Sigma Code CLI Bundle
 
-This archive contains a portable Sigma Code CLI for ${platformLabel}.
+This archive contains the Sigma Code ${sigmaManifest.productVersion}
+development-preview CLI for ${platformLabel}. It is not a stable release.
 ${trustNotice}
 
 ## Start
@@ -1507,7 +1508,7 @@ ${agent} inspect "Review the architecture" --workspace ${workspace}
 ${agent} sessions --workspace ${workspace}
 \`\`\`
 
-The wrapper requires the pinned bundled Node runtime. It never falls back to a system \`node\` on PATH. The archive also includes the target-native \`sigma-exec\` broker, pinned TypeScript/Python language-server assets, and the versioned offline tokenizer-estimator asset; their SHA-256 values are recorded in \`integrity-manifest.json\`.
+The wrapper requires the pinned bundled Node runtime. It never falls back to a system \`node\` on PATH. The archive also includes the target-native \`sigma-exec\` broker, pinned TypeScript/Python language-server assets, and the offline tokenizer-estimator asset; their SHA-256 values are recorded in \`integrity-manifest.json\`.
 
 ## Provider Keys
 
@@ -1522,6 +1523,8 @@ This bundle is the product CLI runtime. It should be used through user-facing co
 
 - targetArch: ${targetArch}
 - targetPlatform: ${targetPlatform}
+- productVersion: ${sigmaManifest.productVersion}
+- schemaVersion: 1
 - nodeVersion: ${pinnedNodeVersion}
 - nodeRuntimeSource: ${nodeRuntime.source}
 `;
@@ -1631,7 +1634,7 @@ async function resolvePackageContext(options) {
   const sbomOutputPath = outputPath.replace(/\.(?:zip|tgz)$/i, ".sbom.cdx.json");
   const provenancePath = outputPath.replace(/\.(?:zip|tgz)$/i, ".provenance.json");
   const release = await workspaceRelease(rootDir);
-  const packages = await v3RuntimePackages(rootDir, await workspaceRuntimePackages(rootDir), release.isV3);
+  const packages = await portableRuntimePackages(rootDir, await workspaceRuntimePackages(rootDir));
   for (const packageName of packages) assertBuiltPackage(rootDir, packageName);
   return {
     options, rootDir, env, targetPlatform, targetArch, artifactsDir, bundleName,
@@ -1693,7 +1696,7 @@ async function verifyWindowsSignedContent(nodeRuntime, sigmaExec, brokerContentI
 }
 
 async function stagePortableRuntime(context) {
-  const { rootDir, artifactsDir, targetPlatform, targetArch, env, options, bundleDir, release } = context;
+  const { rootDir, artifactsDir, targetPlatform, targetArch, env, options, bundleDir } = context;
   const resolvedNodeRuntime = await resolveNodeRuntimeArchive(
     rootDir,
     artifactsDir,
@@ -1716,24 +1719,18 @@ async function stagePortableRuntime(context) {
     nodeArchiveIntegrity,
     options.nodeVersionProbe ?? inspectBundledNodeVersion
   );
-  const sigmaExec = release.isV3
-    ? await copySigmaExec(rootDir, bundleDir, targetPlatform, targetArch, env)
-    : null;
-  const linuxCompatibility = release.isV3
-    ? await stageLinuxCompatibility(context, nodeRuntime, sigmaExec)
-    : null;
+  const sigmaExec = await copySigmaExec(rootDir, bundleDir, targetPlatform, targetArch, env);
+  const linuxCompatibility = await stageLinuxCompatibility(context, nodeRuntime, sigmaExec);
   const brokerContentIdentity = await preSigningBrokerIdentity(targetPlatform, sigmaExec);
-  const windowsSigningStage = release.isV3
-    ? await runWindowsSigningStage({
-        targetPlatform,
-        targetArch,
-        nodePath: nodeRuntime.bundledNodePath,
-        brokerPath: sigmaExec.destination,
-        signer: options.windowsSigner,
-        env,
-        spawn: options.windowsSigningSpawnSync ?? spawnSync
-      })
-    : null;
+  const windowsSigningStage = await runWindowsSigningStage({
+    targetPlatform,
+    targetArch,
+    nodePath: nodeRuntime.bundledNodePath,
+    brokerPath: sigmaExec.destination,
+    signer: options.windowsSigner,
+    env,
+    spawn: options.windowsSigningSpawnSync ?? spawnSync
+  });
   await verifyWindowsSignedContent(nodeRuntime, sigmaExec, brokerContentIdentity, targetPlatform);
   return { nodeArchiveIntegrity, nodeRuntime, sigmaExec, linuxCompatibility, windowsSigningStage };
 }
@@ -1773,10 +1770,7 @@ async function writeBundleEntrypoints(context, nodeRuntime) {
   await cp(path.join(rootDir, "LICENSE"), path.join(bundleDir, "LICENSE"));
 }
 
-async function writeV3BundleEvidence(context, runtime) {
-  if (!context.release.isV3) {
-    return { tokenizerAssets: null, sbomPath: null, integrity: null, signing: null };
-  }
+async function writeBundleEvidence(context, runtime) {
   const { rootDir, bundleDir, packages, targetPlatform, targetArch, options, env } = context;
   const { sigmaExec, nodeArchiveIntegrity, nodeRuntime, linuxCompatibility } = runtime;
   const tokenizerAssets = await copyTokenizerAssets(rootDir, bundleDir);
@@ -1841,7 +1835,7 @@ function bundleAssetMetadata(integrity, tokenizerAssets) {
   };
 }
 
-function v3PackageMetadata(context, runtime, evidence) {
+function packageMetadata(context, runtime, evidence) {
   const { integrity, signing, tokenizerAssets } = evidence;
   return {
     sigmaExec: sigmaExecPackageMetadata(context, runtime, integrity),
@@ -1865,18 +1859,20 @@ async function writePackageMetadata(context, runtime, evidence) {
   const { release, targetPlatform, targetArch, bundleDir } = context;
   const releaseChannel = targetPlatform === "win32" && evidence.signing?.policyVerified !== true
     ? "preview"
-    : release.version.includes("-")
+    : release.version.startsWith("0.")
+      ? "preview"
+      : release.version.includes("-")
       ? release.version.split("-")[1].split(".")[0]
       : "stable";
   const metadata = {
-    schemaVersion: release.packageSchemaVersion,
+    schemaVersion: 1,
     productVersion: release.version,
     releaseChannel,
     tier: "tier1",
     targetPlatform,
     targetArch,
     node: nodePackageMetadata(runtime, evidence.integrity),
-    ...(evidence.integrity ? v3PackageMetadata(context, runtime, evidence) : {})
+    ...packageMetadata(context, runtime, evidence)
   };
   await writeFile(
     path.join(bundleDir, "package-metadata.json"),
@@ -1888,7 +1884,6 @@ async function writePackageMetadata(context, runtime, evidence) {
 async function finalizePackage(context, runtime, evidence) {
   const { outputPath, artifactsDir, bundleName, targetPlatform, rootDir, release, options, env } = context;
   createBundleArchive(outputPath, artifactsDir, bundleName, targetPlatform, rootDir);
-  if (!release.isV3) return null;
   return writeReleaseSidecars(
     outputPath, evidence.sbomPath, release, targetPlatform, context.targetArch,
     evidence.integrity, evidence.signing, runtime.nodeArchiveIntegrity, runtime.nodeRuntime,
@@ -1903,7 +1898,7 @@ export async function packageAgentCli(options = {}) {
   await copyBundlePackages(context);
   const runtime = await stagePortableRuntime(context);
   await writeBundleEntrypoints(context, runtime.nodeRuntime);
-  const evidence = await writeV3BundleEvidence(context, runtime);
+  const evidence = await writeBundleEvidence(context, runtime);
   await writePackageMetadata(context, runtime, evidence);
   const sidecars = await finalizePackage(context, runtime, evidence);
   return {

@@ -14,6 +14,7 @@ import type {
   SigmaExecBrokerClientOptions
 } from "./types.js";
 import { parseDoctor, parseHello } from "./values.js";
+import { SIGMA_PROJECT_FACTS } from "./generated-project-facts.js";
 
 export interface BrokerClientStartupResult {
   instanceId: string;
@@ -31,7 +32,7 @@ export async function startBrokerClient(
   assertTrustedToolchainsAvailable(trustedToolchains, options.sandboxMode);
   transport.start();
   const hello = parseHello(await transport.request("hello", {
-    clientVersion: "3.0.0",
+    clientVersion: SIGMA_PROJECT_FACTS.productVersion,
     redactionSecrets: redactionSecrets(options.secrets)
   }, { signal, timeoutMs: 5_000 }));
   await configureArtifactRoot(hello.artifactRoot);

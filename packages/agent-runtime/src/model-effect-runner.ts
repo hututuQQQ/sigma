@@ -227,7 +227,6 @@ export class ModelEffectRunner {
       frameMode: turn.frameMode,
       toolChoice: turn.toolChoice ?? null
     });
-    await this.longHorizon.markActionRequiredConsumed(session);
     await this.longHorizon.markRepairTurnConsumed(session);
     await this.options.emit(session, "diagnostic", "runtime", {
       kind: "deadline.stage",

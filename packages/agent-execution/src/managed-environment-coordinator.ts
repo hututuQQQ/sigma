@@ -5,10 +5,10 @@ import {
 import { protocolRecord } from "./protocol.js";
 import { stableSha256 } from "./container-attestation.js";
 import type {
-  BrokerRuntimeClosureV1,
-  ManagedEnvironmentPrepareRequestV1,
-  ManagedEnvironmentPrepareResultV1,
-  ManagedSessionBindingV1
+  BrokerRuntimeClosure,
+  ManagedEnvironmentPrepareRequest,
+  ManagedEnvironmentPrepareResult,
+  ManagedSessionBinding
 } from "./types.js";
 
 const PACKAGE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9+._-]{0,127}$/u;
@@ -32,8 +32,8 @@ function digestField(value: unknown, name: string): string {
 }
 
 export function canonicalManagedEnvironmentRequest(
-  request: ManagedEnvironmentPrepareRequestV1
-): ManagedEnvironmentPrepareRequestV1 {
+  request: ManagedEnvironmentPrepareRequest
+): ManagedEnvironmentPrepareRequest {
   const executable = request.requestedExecutable;
   const validExecutable = EXECUTABLE_ALIAS_PATTERN.test(executable)
     || (/^\/(?:[^/\0]+\/)*[^/\0]+$/u.test(executable) && !executable.split("/").includes(".."));
@@ -49,7 +49,7 @@ export function canonicalManagedEnvironmentRequest(
   return { ...request, packages };
 }
 
-function runtimeClosure(value: unknown): BrokerRuntimeClosureV1 {
+function runtimeClosure(value: unknown): BrokerRuntimeClosure {
   const closure = protocolRecord(value, "managed environment runtime closure");
   if (closure.protocolVersion !== 1 || typeof closure.complete !== "boolean") {
     throw new ContainerAttestationInvalidError("Managed environment runtime closure is invalid.");
@@ -75,7 +75,7 @@ function runtimeClosure(value: unknown): BrokerRuntimeClosureV1 {
   };
 }
 
-export function parseManagedEnvironmentResult(input: unknown): ManagedEnvironmentPrepareResultV1 {
+export function parseManagedEnvironmentResult(input: unknown): ManagedEnvironmentPrepareResult {
   const value = protocolRecord(input, "managed environment preparation result");
   if (value.protocolVersion !== 1 || value.status !== "prepared"
     || !Array.isArray(value.packages) || value.packages.length === 0 || value.packages.length > 32
@@ -107,7 +107,7 @@ export function parseManagedEnvironmentResult(input: unknown): ManagedEnvironmen
     requestedExecutable: stringField(value.requestedExecutable, "requestedExecutable", 256),
     packages: [...new Set(value.packages as string[])].sort(),
     installedPackages,
-    packageManager: packageManager as ManagedEnvironmentPrepareResultV1["packageManager"],
+    packageManager: packageManager as ManagedEnvironmentPrepareResult["packageManager"],
     signaturePolicy: "trusted-system-package-manager-defaults",
     attemptDigest: digestField(value.attemptDigest, "attemptDigest"),
     installedEvidenceDigest: digestField(value.installedEvidenceDigest, "installedEvidenceDigest"),
@@ -134,9 +134,9 @@ export class ManagedEnvironmentCoordinator {
   }
 
   authorize(
-    binding: ManagedSessionBindingV1,
-    request: ManagedEnvironmentPrepareRequestV1
-  ): ManagedEnvironmentPrepareRequestV1 {
+    binding: ManagedSessionBinding,
+    request: ManagedEnvironmentPrepareRequest
+  ): ManagedEnvironmentPrepareRequest {
     const canonical = canonicalManagedEnvironmentRequest(request);
     if (canonical.sessionId !== binding.sessionId || binding.network !== "full") {
       throw new ContainerUnavailableError(
@@ -159,11 +159,11 @@ export class ManagedEnvironmentCoordinator {
   }
 
   accept(
-    request: ManagedEnvironmentPrepareRequestV1,
+    request: ManagedEnvironmentPrepareRequest,
     previousRuntimeClosureDigest: string,
-    rawResult: ManagedEnvironmentPrepareResultV1,
-    currentRuntimeClosure: BrokerRuntimeClosureV1
-  ): ManagedEnvironmentPrepareResultV1 {
+    rawResult: ManagedEnvironmentPrepareResult,
+    currentRuntimeClosure: BrokerRuntimeClosure
+  ): ManagedEnvironmentPrepareResult {
     const result = parseManagedEnvironmentResult(rawResult);
     const opportunity = stableSha256({
       sessionId: request.sessionId,

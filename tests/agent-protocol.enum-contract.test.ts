@@ -49,12 +49,12 @@ function evidenceVariants(): EvidenceRecord[] {
     } },
     { ...base, kind: "command", data: { command: "pnpm test", exitCode: 0 } },
     { ...base, kind: "validation", data: {
-      validator: "test", frontierRevision: 1,
+      schemaVersion: 1, validator: "test", frontierRevision: 1,
       stateDigest: "a".repeat(64), coveredPaths: []
     } },
     { ...base, kind: "diagnostic", data: { source: "test", diagnostic: null } },
     { ...base, kind: "review", data: {
-      reviewerId: "reviewer", verdict: "approved", findings: [],
+      schemaVersion: 1, reviewerId: "reviewer", verdict: "approved", findings: [],
       frontierRevision: 1, stateDigest: "a".repeat(64),
     } },
     { ...base, kind: "checkpoint", data: {
@@ -150,13 +150,18 @@ describe("protocol enum and invariant contracts", () => {
       ledger.reservations.push({
         reservationId: "reservation", ownerId: "owner", status: status as "reserved",
         requested: { ...ledger.consumed }, consumed: { ...ledger.consumed }, createdAt: fixtureOccurredAt,
+        ...(status === "reserved" ? {} : { settledAt: fixtureOccurredAt }),
       });
       expect(isBudgetLedgerState(ledger), status).toBe(true);
     }
   });
 
   it("accepts all plan states, owners, and non-cyclic dependency shapes", () => {
-    const evidence = [{ evidenceId: "evidence", kind: "diagnostic" as const }];
+    const evidence = [{
+      evidenceId: "evidence",
+      kind: "diagnostic" as const,
+      claim: "acceptance_met" as const,
+    }];
     const node = {
       id: "node", title: "work", dependencies: [], status: "pending" as const,
       owner: { kind: "root" as const }, acceptanceCriteria: [], evidence: [],
@@ -186,7 +191,9 @@ describe("protocol enum and invariant contracts", () => {
       expect(evidenceKindSchema.safeParse(kind).success, kind).toBe(true);
       expect(isPlanGraph({
         revision: 1, goal: "goal", nodes: [{
-          ...node, status: "completed", evidence: [{ evidenceId: "evidence", kind }],
+          ...node, status: "completed", evidence: [{
+            evidenceId: "evidence", kind, claim: "acceptance_met",
+          }],
         }],
       }), kind).toBe(true);
     }
@@ -257,11 +264,14 @@ describe("protocol enum and invariant contracts", () => {
     expect(isAgentEventEnvelope(eventWithPayload("run.suspended", {
       ...agentEventPayloadFixtures["run.suspended"], choices: ["restore", "keep"],
     }))).toBe(true);
-    for (const type of ["tool.approval_requested", "tool.approval_resolved"] as const) {
-      expect(isAgentEventEnvelope(eventWithPayload(type, {
-        ...agentEventPayloadFixtures[type], delegated: true,
-      }))).toBe(true);
-    }
+    expect(isAgentEventEnvelope(eventWithPayload("tool.approval_requested", {
+      requestId: "delegated", callId: "call", toolName: "exec", childId: "child",
+      effects: ["network"], reason: "Child requests network.", delegated: true
+    }))).toBe(true);
+    expect(isAgentEventEnvelope(eventWithPayload("tool.approval_resolved", {
+      requestId: "delegated", callId: "call", childId: "child",
+      decision: "allow", delegated: true
+    }))).toBe(true);
   });
 
   it("rejects emptied nested schemas and invalid optional object shapes", () => {
@@ -279,11 +289,102 @@ describe("protocol enum and invariant contracts", () => {
         ...agentEventPayloadFixtures["tool.approval_requested"],
         plan: { ...agentEventPayloadFixtures["tool.approval_requested"].plan, checkpointAction: {} },
       }),
+      eventWithPayload("tool.approval_requested", {
+        ...agentEventPayloadFixtures["tool.approval_requested"],
+        plan: undefined,
+      }),
       eventWithPayload("tool.completed", {
         ...agentEventPayloadFixtures["tool.completed"], artifactRefs: [{}],
       }),
     ];
     for (const value of invalid) expect(isAgentEventEnvelope(value)).toBe(false);
+  });
+
+  it("rejects incomplete approval bindings and non-atomic model completions", () => {
+    const localApproval = agentEventPayloadFixtures["tool.approval_requested"];
+    const delegatedApproval = {
+      requestId: "delegated",
+      callId: "call",
+      toolName: "exec",
+      effects: ["network"],
+      reason: "Child requests network.",
+      delegated: true,
+    };
+    const completion = agentEventPayloadFixtures["model.completed"];
+    const cases = [
+      [
+        eventWithPayload("tool.approval_requested", delegatedApproval),
+        ["payload", "childId"],
+        "Delegated approvals require a child id",
+      ],
+      [
+        eventWithPayload("tool.approval_requested", {
+          ...delegatedApproval,
+          childId: "child",
+          plan: localApproval.plan,
+        }),
+        ["payload", "delegated"],
+        "Delegated approvals must not contain a local execution plan or approval mode",
+      ],
+      [
+        eventWithPayload("tool.approval_requested", {
+          ...localApproval,
+          arguments: undefined,
+        }),
+        ["payload", "arguments"],
+        "Local approvals require exact tool arguments",
+      ],
+      [
+        eventWithPayload("tool.approval_requested", {
+          ...localApproval,
+          approvalMode: undefined,
+        }),
+        ["payload", "approvalMode"],
+        "Local approvals require an approval mode",
+      ],
+      [
+        eventWithPayload("tool.approval_resolved", {
+          requestId: "delegated",
+          callId: "call",
+          decision: "allow",
+          delegated: true,
+        }),
+        ["payload", "childId"],
+        "Delegated approval resolutions require a child id",
+      ],
+      [
+        eventWithPayload("tool.approval_resolved", {
+          requestId: "local",
+          callId: "call",
+          decision: "allow",
+        }),
+        ["payload", "turnId"],
+        "Local approval resolutions require their model turn binding",
+      ],
+      [
+        eventWithPayload("model.completed", {
+          ...completion,
+          text: "different",
+        }),
+        ["payload", "message", "content"],
+        "The durable assistant message and completion text must be atomic",
+      ],
+      [
+        eventWithPayload("model.completed", {
+          ...completion,
+          toolCalls: [{ id: "call", name: "read", arguments: {} }],
+        }),
+        ["payload", "message", "toolCalls"],
+        "The durable assistant reasoning/message and tool calls must be stored atomically",
+      ],
+    ] as const;
+    for (const [value, path, message] of cases) {
+      expect(validateAgentEventEnvelope(value)).toContainEqual({
+        path,
+        code: "custom",
+        message,
+      });
+    }
   });
 
   it("preserves exact structured issues for each plan and scope invariant", () => {

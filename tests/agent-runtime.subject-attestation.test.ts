@@ -5,10 +5,10 @@ import { afterEach, describe, expect, it } from "vitest";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { EffectToolRegistry } from "../packages/agent-tools/src/index.js";
 import {
-  assertSubjectAttestationContextV1,
-  assertSubjectProductAttestationV1,
-  createSubjectAttestationContextV1,
-  SUBJECT_ATTESTATION_SOURCE_V1
+  assertSubjectAttestationContext,
+  assertSubjectProductAttestation,
+  createSubjectAttestationContext,
+  SUBJECT_ATTESTATION_SOURCE
 } from "../packages/agent-runtime/src/index.js";
 import { createRuntime } from "../packages/agent-runtime/src/testing.js";
 import { deriveSubjectMetadataFromEvents } from "../scripts/eval/optimizer-observe.mjs";
@@ -34,18 +34,18 @@ function productAttestation() {
 
 describe("runtime subject attestation", () => {
   it("rejects unavailable or evaluator-shaped launcher input", () => {
-    expect(() => assertSubjectProductAttestationV1({
+    expect(() => assertSubjectProductAttestation({
       ...productAttestation(),
       taskId: "forbidden"
     })).toThrow(/contain exactly/iu);
-    expect(() => assertSubjectProductAttestationV1({
+    expect(() => assertSubjectProductAttestation({
       ...productAttestation(),
       productDigest: "ba691ba042bcedd9a61a36f5969026bc95859dccdc7e47f24e6bce35673baf2f"
     })).toThrow(/available lowercase SHA-256/iu);
-    const context = createSubjectAttestationContextV1(
+    const context = createSubjectAttestationContext(
       productAttestation(), { permissionMode: "auto" }, "cli", process.platform
     );
-    expect(() => assertSubjectAttestationContextV1({ ...context, verifier: "forbidden" }))
+    expect(() => assertSubjectAttestationContext({ ...context, verifier: "forbidden" }))
       .toThrow(/contain exactly/iu);
   });
 
@@ -54,7 +54,7 @@ describe("runtime subject attestation", () => {
     temporary.push(workspace);
     const storeRootDir = path.join(workspace, ".agent");
     const gateway = new SmokeFakeGateway([fakeFinalTurn("Attestation smoke completed.")]);
-    const subjectAttestation = createSubjectAttestationContextV1(
+    const subjectAttestation = createSubjectAttestationContext(
       productAttestation(),
       { permissionMode: "auto", networkMode: "none" },
       "cli",
@@ -81,7 +81,7 @@ describe("runtime subject attestation", () => {
     const events = [];
     for await (const event of runtime.sessionEvents(session.sessionId)) events.push(event);
     const attestations = events.filter((event) => event.type === "evidence.recorded"
-      && (event.payload as { data?: { source?: string } }).data?.source === SUBJECT_ATTESTATION_SOURCE_V1);
+      && (event.payload as { data?: { source?: string } }).data?.source === SUBJECT_ATTESTATION_SOURCE);
     expect(attestations).toHaveLength(1);
     expect(attestations[0]).toMatchObject({
       authority: "runtime",

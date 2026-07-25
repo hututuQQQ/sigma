@@ -39,12 +39,9 @@ export interface ModelToolProjectionCapabilities {
   executableSkillResourcesLoaded: boolean;
 }
 
-/** Frozen sessions never acquire capabilities from changed live state.
- * Legacy sessions may use current catalog entries or runtime-authored durable
- * skill snapshots, subject to their currently bound profile. */
+/** Frozen sessions never acquire capabilities from changed live state. */
 export function sessionSkillProjectionCapabilities(input: {
-  frozenCustomization?: { readonly skills: readonly { qualifiedName: string }[] };
-  liveSkillDescriptors?: readonly { qualifiedName: string }[];
+  frozenCustomization: { readonly skills: readonly { qualifiedName: string }[] };
   loadedSkills: readonly {
     qualifiedName: string;
     executionManifestArtifactId?: string;
@@ -53,12 +50,7 @@ export function sessionSkillProjectionCapabilities(input: {
   profileSkillNames?: readonly string[];
 }): ModelToolProjectionCapabilities {
   const allowed = input.profileSkillNames ? new Set(input.profileSkillNames) : undefined;
-  const candidates = input.frozenCustomization
-    ? input.frozenCustomization.skills.map((skill) => skill.qualifiedName)
-    : [
-        ...(input.liveSkillDescriptors ?? []).map((skill) => skill.qualifiedName),
-        ...input.loadedSkills.map((skill) => skill.qualifiedName)
-      ];
+  const candidates = input.frozenCustomization.skills.map((skill) => skill.qualifiedName);
   const available = new Set(candidates.filter((name) => !allowed || allowed.has(name)));
   return {
     skillsAvailable: available.size > 0,
@@ -241,7 +233,7 @@ export async function writeScopeFailure(
   startedAt: string,
   plan?: ToolCallPlan
 ): Promise<ToolReceipt | null> {
-  if (plan?.mutationAuthority === "disposable_enclosing_container_v1") return null;
+  if (plan?.mutationAuthority === "disposable_enclosing_container") return null;
   if (!session.identity.strictWriteScope || !needsWriteScope(plan, descriptor)) return null;
   const input = structuredArguments(call);
   if (!input) return failed(call, startedAt, "Scoped writer tools require structured path arguments.", "write_scope_denied");

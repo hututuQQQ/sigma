@@ -1,18 +1,11 @@
 import type {
-  AssuranceResourcePolicyV1,
-  AssuranceReserveStateV1,
-  AssuranceReserveStateV2,
-  ContextArchiveV1,
-  ContextItem,
-  LongHorizonActionOutcomeV1,
-  LongHorizonStateV1,
-  LongHorizonStateV2,
-  ReasoningTrajectoryStateV1,
-  RuntimePromptStateV2,
-  StrategyResetActionV1,
-  StrategyResetV1,
-  StrategyResetV2,
-  ToolResultPruneStateV1
+  AssuranceResourcePolicy,
+  AssuranceReserveState,
+  LongHorizonActionOutcome,
+  LongHorizonState,
+  ReasoningTrajectoryState,
+  StrategyReset,
+  ToolResultPruneState
 } from "./context.js";
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -21,61 +14,12 @@ function record(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-export function isContextItem(value: unknown): value is ContextItem {
-  const item = record(value);
-  return Boolean(item
-    && typeof item.id === "string" && item.id.length > 0
-    && ["system", "developer", "user", "project", "runtime", "tool"].includes(String(item.authority))
-    && typeof item.provenance === "string" && item.provenance.length > 0
-    && typeof item.content === "string"
-    && Number.isSafeInteger(item.tokenCount) && Number(item.tokenCount) >= 0
-    && typeof item.priority === "number" && Number.isFinite(item.priority)
-    && (item.cacheKey === undefined || typeof item.cacheKey === "string"));
-}
-
-export function isContextArchiveV1(value: unknown): value is ContextArchiveV1 {
-  const archive = record(value);
-  return Boolean(archive
-    && archive.schemaVersion === 1
-    && isContextItem(archive.item)
-    && Number.isSafeInteger(archive.omittedHistoryTurns)
-    && Number(archive.omittedHistoryTurns) >= 0
-    && isDigest(archive.sourceDigest)
-    && archive.item.cacheKey === archive.sourceDigest);
-}
-
 function isDigest(value: unknown): value is string {
   return typeof value === "string" && /^[a-f0-9]{64}$/u.test(value);
 }
 
-export function isRuntimePromptStateV2(value: unknown): value is RuntimePromptStateV2 {
-  const state = record(value);
-  const sections = record(state?.sectionDigests);
-  if (!state || state.schemaVersion !== 2 || !sections) return false;
-  const allowed = new Set(["repository", "completion", "plan", "budget", "longHorizon"]);
-  if (Object.keys(sections).some((key) => !allowed.has(key))) return false;
-  return [
-    sections.repository,
-    sections.completion,
-    sections.plan,
-    sections.budget,
-    sections.longHorizon
-  ].every((digest) => digest === undefined || isDigest(digest))
-    && [100, 50, 25, 10, 0].includes(Number(state.budgetBand))
-    && (state.archiveSourceDigest === undefined
-      || isDigest(state.archiveSourceDigest));
-}
-
 function isNonNegativeInteger(value: unknown): boolean {
   return Number.isSafeInteger(value) && Number(value) >= 0;
-}
-
-function isStrategyResetActionV1(value: unknown): value is StrategyResetActionV1 {
-  const action = record(value);
-  return Boolean(action
-    && typeof action.title === "string" && action.title.length > 0
-    && typeof action.expectedSignal === "string" && action.expectedSignal.length > 0
-    && ["inspect", "change", "validate", "ask"].includes(String(action.kind)));
 }
 
 function isBoundedNonemptyStrings(value: unknown, maximum: number): value is string[] {
@@ -84,92 +28,50 @@ function isBoundedNonemptyStrings(value: unknown, maximum: number): value is str
     && value.every((item) => typeof item === "string" && item.length > 0);
 }
 
-export function isStrategyResetV1(value: unknown): value is StrategyResetV1 {
+const STRATEGY_DECISIONS = new Set([
+  "continue_exploring",
+  "implement_candidate",
+  "revise_plan",
+  "validate_current",
+  "request_user_input"
+]);
+
+const STRATEGY_TRIGGERS = new Set([
+  "model_request",
+  "input_request",
+  "duplicate_result",
+  "evidence_window",
+  "resource_band"
+]);
+
+function isNonemptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function hasStrategyText(strategy: Record<string, unknown>): boolean {
+  return isNonemptyString(strategy.hypothesis)
+    && isNonemptyString(strategy.nextDiscriminatingAction)
+    && isNonemptyString(strategy.expectedSignal)
+    && (strategy.validationTarget === undefined || isNonemptyString(strategy.validationTarget))
+    && isNonemptyString(strategy.decisionRationale);
+}
+
+function hasStrategyClassification(strategy: Record<string, unknown>): boolean {
+  return typeof strategy.decision === "string"
+    && STRATEGY_DECISIONS.has(strategy.decision)
+    && typeof strategy.trigger === "string"
+    && STRATEGY_TRIGGERS.has(strategy.trigger);
+}
+
+export function isStrategyReset(value: unknown): value is StrategyReset {
   const strategy = record(value);
   return Boolean(strategy
     && strategy.schemaVersion === 1
     && isDigest(strategy.basisDigest)
     && isBoundedNonemptyStrings(strategy.establishedFacts, 12)
-    && isBoundedNonemptyStrings(strategy.lowYieldApproaches, 8)
-    && typeof strategy.hypothesis === "string" && strategy.hypothesis.length > 0
-    && Array.isArray(strategy.nextActions)
-    && strategy.nextActions.length >= 1 && strategy.nextActions.length <= 3
-    && strategy.nextActions.every(isStrategyResetActionV1)
-    && (strategy.validationTarget === undefined
-      || (typeof strategy.validationTarget === "string"
-        && strategy.validationTarget.length > 0)));
-}
-
-function validOptionalStrategyTarget(strategy: Record<string, unknown>): boolean {
-  return strategy.validationTarget === undefined
-    || (typeof strategy.validationTarget === "string"
-      && strategy.validationTarget.length > 0);
-}
-
-function validStrategyDecision(strategy: Record<string, unknown>): boolean {
-  const decision = strategy.decision;
-  const rationale = strategy.decisionRationale;
-  if (decision === undefined) return rationale === undefined;
-  return [
-    "continue_exploring",
-    "implement_candidate",
-    "revise_plan",
-    "validate_current",
-    "request_user_input"
-  ].includes(String(decision))
-    && typeof rationale === "string"
-    && rationale.length > 0;
-}
-
-function validStrategyResetV2Core(strategy: Record<string, unknown>): boolean {
-  return strategy.schemaVersion === 2
-    && isDigest(strategy.basisDigest)
-    && isBoundedNonemptyStrings(strategy.establishedFacts, 12)
     && isBoundedNonemptyStrings(strategy.falsifiedApproaches, 8)
-    && typeof strategy.hypothesis === "string"
-    && strategy.hypothesis.length > 0
-    && typeof strategy.nextDiscriminatingAction === "string"
-    && strategy.nextDiscriminatingAction.length > 0
-    && typeof strategy.expectedSignal === "string"
-    && strategy.expectedSignal.length > 0;
-}
-
-export function isStrategyResetV2(value: unknown): value is StrategyResetV2 {
-  const strategy = record(value);
-  return Boolean(strategy
-    && validStrategyResetV2Core(strategy)
-    && [
-      "model_request",
-      "input_request",
-      "duplicate_result",
-      "evidence_window",
-      "resource_band"
-    ]
-      .includes(String(strategy.trigger))
-    && validStrategyDecision(strategy)
-    && validOptionalStrategyTarget(strategy));
-}
-
-function isAssuranceReserveStateV1(value: unknown): value is AssuranceReserveStateV1 {
-  const reserve = record(value);
-  return Boolean(reserve
-    && reserve.schemaVersion === 1
-    && reserve.maxAuxiliaryCalls === 3
-    && reserve.maxAuxiliaryBudgetBps === 2000
-    && [
-      reserve.strategistCalls,
-      reserve.reviewerCalls,
-      reserve.auxiliaryInputTokens,
-      reserve.auxiliaryOutputTokens,
-      reserve.auxiliaryCostMicroUsd,
-      reserve.protectedRepairTurnsRemaining,
-      reserve.protectedToolCallsRemaining
-    ].every(isNonNegativeInteger)
-    && Number(reserve.strategistCalls) <= 1
-    && Number(reserve.reviewerCalls) <= 2
-    && Number(reserve.strategistCalls) + Number(reserve.reviewerCalls) <= 3
-    && Number(reserve.protectedRepairTurnsRemaining) <= 2
-    && Number(reserve.protectedToolCallsRemaining) <= 4);
+    && hasStrategyText(strategy)
+    && hasStrategyClassification(strategy));
 }
 
 function isPercentage(value: unknown): boolean {
@@ -182,9 +84,9 @@ function isBoundedInteger(value: unknown, minimum: number, maximum: number): boo
     && Number(value) <= maximum;
 }
 
-export function isAssuranceResourcePolicyV1(
+export function isAssuranceResourcePolicy(
   value: unknown
-): value is AssuranceResourcePolicyV1 {
+): value is AssuranceResourcePolicy {
   const policy = record(value);
   return Boolean(policy
     && isPercentage(policy.budgetPercent)
@@ -199,58 +101,36 @@ export function isAssuranceResourcePolicyV1(
     && isPercentage(policy.strategyRemainingPercent));
 }
 
-function validAssurancePolicyV2(
-  reserve: Record<string, unknown>,
-  strategistCapacity: number
-): boolean {
-  return isAssuranceResourcePolicyV1(reserve)
+export function isAssuranceReserveState(value: unknown): value is AssuranceReserveState {
+  const reserve = record(value);
+  if (!reserve || reserve.schemaVersion !== 1) return false;
+  const strategistCapacity = reserve.strategistMode === "off" ? 0 : 1;
+  return isAssuranceResourcePolicy(reserve)
     && isNonNegativeInteger(reserve.maxAuxiliaryCalls)
     && Number(reserve.maxAuxiliaryCalls)
       === Number(reserve.reviewRounds) * Number(reserve.reviewerMaxTurns)
         + strategistCapacity
-    && Number(reserve.maxAuxiliaryBudgetBps) === Number(reserve.budgetPercent) * 100;
-}
-
-function validAssuranceUsageV2(
-  reserve: Record<string, unknown>,
-  strategistCapacity: number
-): boolean {
-  return [
-    reserve.strategistCalls,
-    reserve.reviewerCalls,
-    reserve.repairEpisodes,
-    reserve.auxiliaryInputTokens,
-    reserve.auxiliaryOutputTokens,
-    reserve.auxiliaryCostMicroUsd
-  ].every(isNonNegativeInteger)
+    && Number(reserve.maxAuxiliaryBudgetBps) === Number(reserve.budgetPercent) * 100
+    && [
+      reserve.strategistCalls,
+      reserve.reviewerCalls,
+      reserve.repairEpisodes,
+      reserve.auxiliaryInputTokens,
+      reserve.auxiliaryOutputTokens,
+      reserve.auxiliaryCostMicroUsd,
+      reserve.protectedRepairTurnsRemaining,
+      reserve.protectedToolCallsRemaining
+    ].every(isNonNegativeInteger)
     && Number(reserve.strategistCalls) <= strategistCapacity
     && Number(reserve.reviewerCalls) <= Number(reserve.reviewRounds)
-    && Number(reserve.repairEpisodes) <= Number(reserve.repairRounds);
-}
-
-function validAssuranceRepairReserveV2(
-  reserve: Record<string, unknown>
-): boolean {
-  return [
-    reserve.protectedRepairTurnsRemaining,
-    reserve.protectedToolCallsRemaining
-  ].every(isNonNegativeInteger)
+    && Number(reserve.repairEpisodes) <= Number(reserve.repairRounds)
     && Number(reserve.protectedRepairTurnsRemaining)
       <= Number(reserve.repairRounds) * Number(reserve.repairMaxTurns)
     && Number(reserve.protectedToolCallsRemaining)
       <= Number(reserve.repairRounds) * Number(reserve.repairMaxToolCalls);
 }
 
-export function isAssuranceReserveStateV2(value: unknown): value is AssuranceReserveStateV2 {
-  const reserve = record(value);
-  if (!reserve || reserve.schemaVersion !== 2) return false;
-  const strategistCapacity = reserve.strategistMode === "off" ? 0 : 1;
-  return validAssurancePolicyV2(reserve, strategistCapacity)
-    && validAssuranceUsageV2(reserve, strategistCapacity)
-    && validAssuranceRepairReserveV2(reserve);
-}
-
-function isLongHorizonActionOutcomeV1(value: unknown): value is LongHorizonActionOutcomeV1 {
+function isLongHorizonActionOutcome(value: unknown): value is LongHorizonActionOutcome {
   const outcome = record(value);
   return Boolean(outcome
     && isNonNegativeInteger(outcome.batch)
@@ -263,65 +143,24 @@ function isLongHorizonActionOutcomeV1(value: unknown): value is LongHorizonActio
     && typeof outcome.summary === "string");
 }
 
-function validLongHorizonCounters(state: Record<string, unknown>): boolean {
-  const counters = [
-    state.goalEpoch,
-    state.settledBatchCount,
-    state.noProgressBatches,
-    state.maxNoProgressBatches,
-    state.mutationBatchesWithoutValidation
-  ];
-  return counters.every(isNonNegativeInteger)
-    && Number(state.maxNoProgressBatches) >= Number(state.noProgressBatches);
-}
-
-function validLongHorizonStrategy(state: Record<string, unknown>): boolean {
-  return (state.checkpointBasisDigest === undefined
-      || isDigest(state.checkpointBasisDigest))
-    && (state.strategy === undefined || isStrategyResetV1(state.strategy))
-    && (state.strategyResetBatchCount === undefined
-      || isNonNegativeInteger(state.strategyResetBatchCount))
-    && typeof state.actionRequiredConsumed === "boolean";
-}
-
-export function isLongHorizonStateV1(value: unknown): value is LongHorizonStateV1 {
-  const state = record(value);
-  if (!state || state.schemaVersion !== 1) return false;
-  return validLongHorizonCounters(state)
-    && isDigest(state.progressBasisDigest)
-    && Array.isArray(state.recentOutcomes)
-    && state.recentOutcomes.length <= 8
-    && state.recentOutcomes.every(isLongHorizonActionOutcomeV1)
-    && [
-      "normal",
-      "checkpoint",
-      "strategy_required",
-      "strategy_reset",
-      "action_required"
-    ].includes(String(state.stage))
-    && typeof state.validationDue === "boolean"
-    && validLongHorizonStrategy(state)
-    && isAssuranceReserveStateV1(state.assurance);
-}
-
-export function isLongHorizonStateV2(value: unknown): value is LongHorizonStateV2 {
+export function isLongHorizonState(value: unknown): value is LongHorizonState {
   const state = record(value);
   return Boolean(state
-    && state.schemaVersion === 2
+    && state.schemaVersion === 1
     && isNonNegativeInteger(state.goalEpoch)
     && isNonNegativeInteger(state.settledBatchCount)
     && Array.isArray(state.recentOutcomes)
     && state.recentOutcomes.length <= 8
-    && state.recentOutcomes.every(isLongHorizonActionOutcomeV1)
+    && state.recentOutcomes.every(isLongHorizonActionOutcome)
     && isNonNegativeInteger(state.duplicateStreak)
     && Number(state.duplicateStreak) <= Number(state.settledBatchCount)
     && typeof state.strategyRequested === "boolean"
     && typeof state.resourceBandTriggered === "boolean"
-    && (state.strategy === undefined || isStrategyResetV2(state.strategy))
-    && isAssuranceReserveStateV2(state.assurance));
+    && (state.strategy === undefined || isStrategyReset(state.strategy))
+    && isAssuranceReserveState(state.assurance));
 }
 
-export function isToolResultPruneStateV1(value: unknown): value is ToolResultPruneStateV1 {
+export function isToolResultPruneState(value: unknown): value is ToolResultPruneState {
   const state = record(value);
   return Boolean(state
     && state.schemaVersion === 1
@@ -332,9 +171,9 @@ export function isToolResultPruneStateV1(value: unknown): value is ToolResultPru
       || isDigest(state.archiveSourceDigest)));
 }
 
-export function isReasoningTrajectoryStateV1(
+export function isReasoningTrajectoryState(
   value: unknown
-): value is ReasoningTrajectoryStateV1 {
+): value is ReasoningTrajectoryState {
   const state = record(value);
   return Boolean(state
     && state.schemaVersion === 1

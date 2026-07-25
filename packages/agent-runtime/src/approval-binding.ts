@@ -27,7 +27,7 @@ export interface ApprovalBinding {
 
 export interface RecoveredApprovalMetadata {
   effects: ToolEffect[];
-  binding?: ApprovalBinding;
+  binding: ApprovalBinding;
 }
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -58,8 +58,8 @@ function validPlanScalars(
     && typeof checkpoint.checkpointId === "string"
     && checkpoint.checkpointId.length > 0);
   const validMutationAuthority = plan.mutationAuthority === undefined
-    || plan.mutationAuthority === "broker_repository_transaction_v2"
-    || plan.mutationAuthority === "disposable_enclosing_container_v1";
+    || plan.mutationAuthority === "broker_repository_transaction"
+    || plan.mutationAuthority === "disposable_enclosing_container";
   return (plan.network === "none" || plan.network === "loopback" || plan.network === "full")
     && ["none", "pipe", "pty", "background"].includes(String(plan.processMode))
     && ["read_only", "replay_safe", "non_replayable"].includes(String(plan.idempotence))

@@ -1,7 +1,7 @@
 /** Semantic execution request produced by an agent-facing command tool. The
  * model describes what it intends to do; trusted runtime adapters resolve the
  * host-specific roots needed to do it. */
-export interface ExecutionIntentV1 {
+export interface ExecutionIntent {
   invocation: {
     executable: string;
     args: string[];
@@ -13,7 +13,7 @@ export interface ExecutionIntentV1 {
   purpose: "probe" | "build" | "lint" | "test" | "serve" | "custom";
 }
 
-export interface ResolvedExecutionCapabilityV1 {
+export interface ResolvedExecutionCapability {
   profileId: string;
   traversalRoots: string[];
   workspaceReadRoots: string[];
@@ -25,7 +25,7 @@ export interface ResolvedExecutionCapabilityV1 {
   backend: "native" | "oci";
 }
 
-export interface SandboxLeaseV1 {
+export interface SandboxLease {
   leaseId: string;
   workspaceIdentity: string;
   generation: number;
@@ -35,7 +35,7 @@ export interface SandboxLeaseV1 {
   state: "preparing" | "active" | "revoking" | "retired" | "tainted";
 }
 
-export type SandboxCapabilityFailureV1 =
+export type SandboxCapabilityFailure =
   | "filesystem_acl_unsupported"
   | "external_read_required"
   | "write_scope_invalid"
@@ -44,7 +44,7 @@ export type SandboxCapabilityFailureV1 =
   | "container_unavailable"
   | "sandbox_recovery_required";
 
-export type ValidationClaimKindV1 =
+export type ValidationClaimKind =
   | "probe"
   | "syntax"
   | "typecheck"
@@ -53,8 +53,8 @@ export type ValidationClaimKindV1 =
   | "integration"
   | "acceptance";
 
-export interface ValidationClaimV1 {
-  kind: ValidationClaimKindV1;
+export interface ValidationClaim {
+  kind: ValidationClaimKind;
   commandDigest: string;
   subject: {
     projectId?: string;
@@ -65,13 +65,13 @@ export interface ValidationClaimV1 {
   status: "passed" | "failed" | "unavailable";
 }
 
-export interface AssuranceRequirementV1 {
+export interface AssuranceRequirement {
   risk: "read_only" | "low" | "medium" | "high";
-  requiredClaims: ValidationClaimKindV1[];
+  requiredClaims: ValidationClaimKind[];
   review: "off" | "advisory" | "required";
 }
 
-export interface RepositoryTopologyV1 {
+export interface RepositoryTopology {
   kind: "worktree" | "linked_worktree" | "submodule" | "bare";
   worktreeRoot: string | null;
   gitDir: string;

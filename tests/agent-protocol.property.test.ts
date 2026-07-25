@@ -31,7 +31,7 @@ function invalidOptional(type: string, field: string, value: unknown): Record<st
     ...evidenceFixture(), kind, data: kind === "command"
       ? { command: "pnpm test", exitCode: 0 }
       : {
-          validator: "tests", command: "pnpm test", exitCode: 0, artifactIds: [],
+          schemaVersion: 1, validator: "tests", command: "pnpm test", exitCode: 0, artifactIds: [],
           frontierRevision: 1, stateDigest: "a".repeat(64), coveredPaths: []
         }
   };
@@ -41,7 +41,7 @@ function invalidOptional(type: string, field: string, value: unknown): Record<st
   };
 }
 
-describe("V5 protocol properties", () => {
+describe("protocol properties", () => {
   it("round-trips every producer event through JSON and the consumer parser", () => {
     fc.assert(fc.property(
       fc.constantFrom(...AGENT_EVENT_TYPES),

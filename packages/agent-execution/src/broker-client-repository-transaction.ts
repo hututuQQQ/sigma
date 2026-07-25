@@ -1,12 +1,13 @@
 import path from "node:path";
 import { BrokerTransport } from "./broker-transport.js";
-import { BrokerError, BrokerPolicyError, BrokerProtocolError } from "./errors.js";
+import { BrokerPolicyError, BrokerProtocolError } from "./errors.js";
 import type {
-  BrokerRequestOptions, RepositoryOperationV2, RepositoryTransactionBeginRequestV2,
-  RepositoryTransactionBoundRequestV2, RepositoryTransactionContinueRequestV2,
-  RepositoryTransactionLeaseRequestV2, RepositoryTransactionLeaseV2,
-  RepositoryTransactionRecoverRequestV2, RepositoryTransactionResultV2,
-  RepositoryRunBaselineBoundRequestV1, RepositoryRunBaselineResultV1
+  BrokerRequestOptions, RepositoryOperation, RepositoryTransactionBeginRequest,
+  RepositoryTransactionBoundRequest, RepositoryTransactionContinueRequest,
+  RepositoryTransactionLeaseRequest,
+  RepositoryTransactionWireLease,
+  RepositoryTransactionRecoverRequest, RepositoryTransactionResult,
+  RepositoryRunBaselineBoundRequest, RepositoryRunBaselineResult
 } from "./types.js";
 
 function record(value: unknown, label: string): Record<string, unknown> {
@@ -25,21 +26,20 @@ function validDigest(value: unknown): value is string {
   return typeof value === "string" && /^[a-f0-9]{64}$/u.test(value);
 }
 
-export function parseRepositoryTransactionLease(input: unknown): RepositoryTransactionLeaseV2 {
+export function parseRepositoryTransactionLease(input: unknown): RepositoryTransactionWireLease {
   const value = record(input, "Repository transaction lease");
-  if (value.protocolVersion !== 2 || value.network !== "none" || value.uses !== 1
+  if (value.protocolVersion !== 1 || value.network !== "none" || value.uses !== 1
     || !validDigest(value.executableSha256)) {
     throw new BrokerProtocolError("Repository transaction lease has unsupported semantics.");
   }
-  const runBaseline = value.runBaseline === undefined
-    ? undefined : record(value.runBaseline, "Repository run baseline lease");
-  if (runBaseline && (runBaseline.schemaVersion !== 1
+  const runBaseline = record(value.runBaseline, "Repository run baseline lease");
+  if (runBaseline.schemaVersion !== 1
     || typeof runBaseline.baselineId !== "string" || !runBaseline.baselineId
-    || typeof runBaseline.restoreCapability !== "string" || !runBaseline.restoreCapability)) {
+    || typeof runBaseline.restoreCapability !== "string" || !runBaseline.restoreCapability) {
     throw new BrokerProtocolError("Repository run baseline lease has unsupported semantics.");
   }
   return {
-    protocolVersion: 2,
+    protocolVersion: 1,
     leaseId: text(value.leaseId, "Repository transaction leaseId"),
     sessionId: text(value.sessionId, "Repository transaction sessionId"),
     runId: text(value.runId, "Repository transaction runId"),
@@ -50,22 +50,20 @@ export function parseRepositoryTransactionLease(input: unknown): RepositoryTrans
     executableSha256: value.executableSha256,
     network: "none",
     uses: 1,
-    ...(runBaseline ? {
-      runBaseline: {
-        schemaVersion: 1,
-        baselineId: runBaseline.baselineId as string,
-        restoreCapability: runBaseline.restoreCapability as string
-      }
-    } : {})
+    runBaseline: {
+      schemaVersion: 1,
+      baselineId: runBaseline.baselineId as string,
+      restoreCapability: runBaseline.restoreCapability as string
+    }
   };
 }
 
-export function parseRepositoryRunBaselineResult(input: unknown): RepositoryRunBaselineResultV1 {
+export function parseRepositoryRunBaselineResult(input: unknown): RepositoryRunBaselineResult {
   const value = record(input, "Repository run baseline result");
   if (value.protocolVersion !== 1 || !["restored", "released"].includes(String(value.status))) {
     throw new BrokerProtocolError("Repository run baseline result has unsupported semantics.");
   }
-  const result: RepositoryRunBaselineResultV1 = {
+  const result: RepositoryRunBaselineResult = {
     protocolVersion: 1,
     status: value.status as "restored" | "released",
     baselineId: text(value.baselineId, "Repository run baseline baselineId"),
@@ -75,7 +73,7 @@ export function parseRepositoryRunBaselineResult(input: unknown): RepositoryRunB
   };
   if (result.status === "restored") {
     const parsed = parseRepositoryTransactionResult({
-      protocolVersion: 3,
+      protocolVersion: 1,
       status: "sealed",
       semanticAssertions: value.semanticAssertions
     });
@@ -106,7 +104,7 @@ function assertRepositoryTargetAssertions(input: unknown): void {
   const required = target.requiredReachableObjects;
   const requiredValid = Array.isArray(required) && required.length >= 1
     && required.every((item) => typeof item === "string" && /^[a-f0-9]{40,64}$/u.test(item));
-  if (target.schemaVersion !== 3 || target.satisfied !== true
+  if (target.schemaVersion !== 1 || target.satisfied !== true
     || !selectedHeadValid || !selectedRefValid || !requiredValid) {
     throw new BrokerProtocolError("Repository transaction target assertions are invalid.");
   }
@@ -125,7 +123,7 @@ function assertRepositorySemanticAssertions(input: unknown): void {
     assertions.reachableObjectCount, assertions.conflictCount,
     assertions.trackedCount, assertions.untrackedCount
   ];
-  if (assertions.schemaVersion !== 3 || !headValid || !refValid
+  if (assertions.schemaVersion !== 1 || !headValid || !refValid
     || !digests.every(validDigest) || !counts.every(validNonNegativeCount)) {
     throw new BrokerProtocolError("Repository transaction semantic assertions are invalid.");
   }
@@ -134,10 +132,9 @@ function assertRepositorySemanticAssertions(input: unknown): void {
   }
 }
 
-export function parseRepositoryTransactionResult(input: unknown): RepositoryTransactionResultV2 {
+export function parseRepositoryTransactionResult(input: unknown): RepositoryTransactionResult {
   const value = record(input, "Repository transaction result");
-  if ((value.protocolVersion !== 2 && value.protocolVersion !== 3)
-    || typeof value.status !== "string" || !statuses.has(value.status)) {
+  if (value.protocolVersion !== 1 || typeof value.status !== "string" || !statuses.has(value.status)) {
     throw new BrokerProtocolError("Repository transaction result has unsupported semantics.");
   }
   if (value.transactionHandle !== undefined && typeof value.transactionHandle !== "string") {
@@ -151,10 +148,10 @@ export function parseRepositoryTransactionResult(input: unknown): RepositoryTran
     && (!Number.isSafeInteger(value.recovered) || (value.recovered as number) < 0)) {
     throw new BrokerProtocolError("Repository transaction recovered count is invalid.");
   }
-  if (value.protocolVersion === 3) {
+  if (value.semanticAssertions !== undefined) {
     assertRepositorySemanticAssertions(value.semanticAssertions);
   }
-  return value as unknown as RepositoryTransactionResultV2;
+  return value as unknown as RepositoryTransactionResult;
 }
 
 function validateBinding(value: string, label: string): void {
@@ -163,7 +160,7 @@ function validateBinding(value: string, label: string): void {
   }
 }
 
-function operations(value: RepositoryOperationV2[]): RepositoryOperationV2[] {
+function operations(value: RepositoryOperation[]): RepositoryOperation[] {
   if (!Array.isArray(value) || value.length > 64) {
     throw new BrokerPolicyError("Repository transaction operations are invalid.");
   }
@@ -178,10 +175,10 @@ function operations(value: RepositoryOperationV2[]): RepositoryOperationV2[] {
 }
 
 function expectedPostconditions(
-  value: RepositoryTransactionBeginRequestV2["expectedPostconditions"]
-): RepositoryTransactionBeginRequestV2["expectedPostconditions"] {
+  value: RepositoryTransactionBeginRequest["expectedPostconditions"]
+): RepositoryTransactionBeginRequest["expectedPostconditions"] {
   if (!value) return undefined;
-  if (value.schemaVersion !== 3 || !/^[a-f0-9]{40,64}$/u.test(value.selectedHead)
+  if (value.schemaVersion !== 1 || !/^[a-f0-9]{40,64}$/u.test(value.selectedHead)
     || (value.selectedSymbolicRef !== null
       && (typeof value.selectedSymbolicRef !== "string" || !value.selectedSymbolicRef))
     || !Array.isArray(value.requiredReachableObjects)
@@ -194,11 +191,11 @@ function expectedPostconditions(
 
 export async function acquireRepositoryTransactionLease(
   transport: BrokerTransport,
-  request: RepositoryTransactionLeaseRequestV2,
+  request: RepositoryTransactionLeaseRequest,
   options: BrokerRequestOptions
-): Promise<RepositoryTransactionLeaseV2> {
-  if (request.protocolVersion !== 2 || request.network !== "none") {
-    throw new BrokerPolicyError("Repository write transactions require a local-only V2 lease.");
+): Promise<RepositoryTransactionWireLease> {
+  if (request.protocolVersion !== 1 || request.network !== "none") {
+    throw new BrokerPolicyError("Repository write transactions require the current local-only lease.");
   }
   validateBinding(request.sessionId, "sessionId");
   validateBinding(request.runId, "runId");
@@ -207,36 +204,20 @@ export async function acquireRepositoryTransactionLease(
   })) {
     if (!path.isAbsolute(value)) throw new BrokerPolicyError(`Repository transaction ${label} must be absolute.`);
   }
-  try {
-    return parseRepositoryTransactionLease(await transport.request("repositoryTransaction.acquire", {
-      ...request,
-      repositoryRoot: path.resolve(request.repositoryRoot),
-      gitDir: path.resolve(request.gitDir),
-      commonDir: path.resolve(request.commonDir)
-    }, options));
-  } catch (error) {
-    if ((error as { code?: unknown }).code === "method_not_found") {
-      throw new BrokerError(
-        "The connected broker predates RepositoryTransactionLeaseV2; no repository write was attempted.",
-        "repository_atomicity_unavailable",
-        { requiredProtocol: 2 },
-        { cause: error }
-      );
-    }
-    throw error;
-  }
+  return parseRepositoryTransactionLease(await transport.request("repositoryTransaction.acquire", {
+    ...request,
+    repositoryRoot: path.resolve(request.repositoryRoot),
+    gitDir: path.resolve(request.gitDir),
+    commonDir: path.resolve(request.commonDir)
+  }, options));
 }
 
 export async function beginRepositoryTransaction(
   transport: BrokerTransport,
-  request: RepositoryTransactionBeginRequestV2,
+  request: RepositoryTransactionBeginRequest,
   options: BrokerRequestOptions
-): Promise<RepositoryTransactionResultV2> {
-  if ((request.protocolVersion === 3) !== (request.expectedPostconditions !== undefined)) {
-    throw new BrokerPolicyError(
-      "Repository transaction V3 requires expectedPostconditions and V2 forbids them."
-    );
-  }
+): Promise<RepositoryTransactionResult> {
+  if (request.protocolVersion !== 1) throw new BrokerPolicyError("Unsupported repository transaction protocol.");
   return parseRepositoryTransactionResult(await transport.request("repositoryTransaction.begin", {
     protocolVersion: request.protocolVersion,
     leaseId: request.leaseId,
@@ -248,63 +229,63 @@ export async function beginRepositoryTransaction(
 
 export async function continueRepositoryTransaction(
   transport: BrokerTransport,
-  request: RepositoryTransactionContinueRequestV2,
+  request: RepositoryTransactionContinueRequest,
   options: BrokerRequestOptions
-): Promise<RepositoryTransactionResultV2> {
+): Promise<RepositoryTransactionResult> {
   validateBinding(request.sessionId, "sessionId");
   validateBinding(request.runId, "runId");
   return parseRepositoryTransactionResult(await transport.request("repositoryTransaction.continue", {
-    ...request, protocolVersion: 2, operations: operations(request.operations ?? [])
+    ...request, protocolVersion: 1, operations: operations(request.operations ?? [])
   }, options));
 }
 
 async function boundRequest(
   transport: BrokerTransport,
   method: "abort" | "seal",
-  request: RepositoryTransactionBoundRequestV2,
+  request: RepositoryTransactionBoundRequest,
   options: BrokerRequestOptions
-): Promise<RepositoryTransactionResultV2> {
+): Promise<RepositoryTransactionResult> {
   validateBinding(request.sessionId, "sessionId");
   validateBinding(request.runId, "runId");
   return parseRepositoryTransactionResult(await transport.request(`repositoryTransaction.${method}`, {
-    ...request, protocolVersion: 2
+    ...request, protocolVersion: 1
   }, options));
 }
 
 export async function abortRepositoryTransaction(
   transport: BrokerTransport,
-  request: RepositoryTransactionBoundRequestV2,
+  request: RepositoryTransactionBoundRequest,
   options: BrokerRequestOptions
-): Promise<RepositoryTransactionResultV2> {
+): Promise<RepositoryTransactionResult> {
   return await boundRequest(transport, "abort", request, options);
 }
 
 export async function sealRepositoryTransaction(
   transport: BrokerTransport,
-  request: RepositoryTransactionBoundRequestV2,
+  request: RepositoryTransactionBoundRequest,
   options: BrokerRequestOptions
-): Promise<RepositoryTransactionResultV2> {
+): Promise<RepositoryTransactionResult> {
   return await boundRequest(transport, "seal", request, options);
 }
 
 export async function recoverRepositoryTransactions(
   transport: BrokerTransport,
-  request: RepositoryTransactionRecoverRequestV2,
+  request: RepositoryTransactionRecoverRequest,
   options: BrokerRequestOptions
-): Promise<RepositoryTransactionResultV2> {
+): Promise<RepositoryTransactionResult> {
   validateBinding(request.sessionId, "sessionId");
   if (request.runId !== undefined) validateBinding(request.runId, "runId");
   return parseRepositoryTransactionResult(await transport.request("repositoryTransaction.recover", {
-    ...request, protocolVersion: 2
+    ...request, protocolVersion: 1
   }, options));
 }
 
 async function repositoryRunBaselineRequest(
   transport: BrokerTransport,
   method: "restore" | "release",
-  request: RepositoryRunBaselineBoundRequestV1,
+  request: RepositoryRunBaselineBoundRequest,
   options: BrokerRequestOptions
-): Promise<RepositoryRunBaselineResultV1> {
+): Promise<RepositoryRunBaselineResult> {
   validateBinding(request.sessionId, "run baseline sessionId");
   validateBinding(request.runId, "run baseline runId");
   validateBinding(request.baselineId, "run baseline baselineId");
@@ -321,16 +302,16 @@ async function repositoryRunBaselineRequest(
 
 export async function restoreRepositoryRunBaseline(
   transport: BrokerTransport,
-  request: RepositoryRunBaselineBoundRequestV1,
+  request: RepositoryRunBaselineBoundRequest,
   options: BrokerRequestOptions
-): Promise<RepositoryRunBaselineResultV1> {
+): Promise<RepositoryRunBaselineResult> {
   return await repositoryRunBaselineRequest(transport, "restore", request, options);
 }
 
 export async function releaseRepositoryRunBaseline(
   transport: BrokerTransport,
-  request: RepositoryRunBaselineBoundRequestV1,
+  request: RepositoryRunBaselineBoundRequest,
   options: BrokerRequestOptions
-): Promise<RepositoryRunBaselineResultV1> {
+): Promise<RepositoryRunBaselineResult> {
   return await repositoryRunBaselineRequest(transport, "release", request, options);
 }

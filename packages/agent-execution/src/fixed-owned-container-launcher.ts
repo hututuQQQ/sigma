@@ -12,7 +12,7 @@ import { DockerCompatibleOciEngine } from "./owned-oci-engine.js";
 import type {
   ContainerEngine,
   ResolvedContainerEngine,
-  TrustedContainerLauncherV1
+  TrustedContainerLauncher
 } from "./types.js";
 
 export const FIXED_DOCKER_ENGINE_SOCKET = "/var/run/docker.sock";
@@ -117,7 +117,7 @@ export async function loadFixedOwnedContainerLauncher(
   workspace: string,
   engine: ContainerEngine,
   platform: NodeJS.Platform = process.platform
-): Promise<TrustedContainerLauncherV1 | undefined> {
+): Promise<TrustedContainerLauncher | undefined> {
   if (platform !== "linux") return undefined;
   const canonicalWorkspace = await realpath(workspace);
   const helperPath = await assertTrustedExecutable(defaultSigmaExecPath({}), "packaged sigma-exec OCI helper");

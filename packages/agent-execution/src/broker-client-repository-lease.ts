@@ -3,18 +3,18 @@ import { BrokerTransport } from "./broker-transport.js";
 import { BrokerPolicyError } from "./errors.js";
 import type {
   BrokerRequestOptions,
-  RepositoryMetadataLeaseRequestV1,
-  RepositoryMetadataLeaseV1
+  RepositoryMetadataLeaseRequest,
+  RepositoryMetadataLease
 } from "./types.js";
 import { parseRepositoryMetadataLease } from "./values.js";
 
 export async function requestRepositoryMetadataLease(
   transport: BrokerTransport,
-  request: RepositoryMetadataLeaseRequestV1,
+  request: RepositoryMetadataLeaseRequest,
   options: BrokerRequestOptions
-): Promise<RepositoryMetadataLeaseV1> {
+): Promise<RepositoryMetadataLease> {
   if (request.protocolVersion !== 1 || request.network !== "none") {
-    throw new BrokerPolicyError("Repository metadata lease requests must be protocol V1 and local-only.");
+    throw new BrokerPolicyError("Repository metadata lease requests must use protocol version 1 and be local-only.");
   }
   for (const [name, value] of Object.entries({
     repositoryRoot: request.repositoryRoot,

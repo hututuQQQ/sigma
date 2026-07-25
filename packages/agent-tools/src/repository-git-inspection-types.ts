@@ -1,4 +1,4 @@
-export interface RepositoryInspectionProbeV2 {
+export interface RepositoryInspectionProbe {
   ok: boolean;
   exitCode: number | null;
   failureCode?: string;
@@ -7,7 +7,7 @@ export interface RepositoryInspectionProbeV2 {
   lines: string[];
 }
 
-export interface RepositoryReflogEntryV2 {
+export interface RepositoryReflogEntry {
   object: string;
   ordinalSelector: string;
   rawSelector: string;
@@ -19,21 +19,21 @@ export interface RepositoryReflogEntryV2 {
   subjectTrusted: false;
 }
 
-export type RepositoryHeadRelationV2 =
+export type RepositoryHeadRelation =
   | "same"
   | "ancestor_of_head"
   | "descendant_of_head"
   | "diverged"
   | "unknown";
 
-export interface RepositoryRecoveryCandidateV2 extends RepositoryReflogEntryV2 {
+export interface RepositoryRecoveryCandidate extends RepositoryReflogEntry {
   candidateId: string;
-  relationToHead: RepositoryHeadRelationV2;
+  relationToHead: RepositoryHeadRelation;
   /** Runtime-issued, freshness-bound capability used if the model selects this candidate. */
   selectionEvidenceId?: string;
 }
 
-export type RepositoryRecoverySelectionStatusV2 =
+export type RepositoryRecoverySelectionStatus =
   | { status: "none" }
   | { status: "unavailable"; reason: string }
   | { status: "model_choice_available"; candidateIds: string[] }
@@ -44,21 +44,21 @@ export type RepositoryRecoverySelectionStatusV2 =
       selectionKind: "unique";
     };
 
-export interface RepositoryInspectionV2 {
-  schemaVersion: 2;
+export interface RepositoryInspection {
+  schemaVersion: 1;
   repositoryRoot: ".";
   topology: "worktree" | "linked_worktree" | "submodule";
   complete: boolean;
   head: string | null;
   symbolicRef: string | null;
-  status: RepositoryInspectionProbeV2;
-  refs: RepositoryInspectionProbeV2;
-  reflog: RepositoryInspectionProbeV2 & {
+  status: RepositoryInspectionProbe;
+  refs: RepositoryInspectionProbe;
+  reflog: RepositoryInspectionProbe & {
     aligned: boolean;
-    entries: RepositoryReflogEntryV2[];
+    entries: RepositoryReflogEntry[];
   };
-  unreachable: RepositoryInspectionProbeV2;
+  unreachable: RepositoryInspectionProbe;
   basisDigest: string;
-  recoveryCandidates: RepositoryRecoveryCandidateV2[];
-  selectionStatus: RepositoryRecoverySelectionStatusV2;
+  recoveryCandidates: RepositoryRecoveryCandidate[];
+  selectionStatus: RepositoryRecoverySelectionStatus;
 }

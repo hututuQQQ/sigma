@@ -1,17 +1,17 @@
 import type {
-  RepositoryMetadataLeaseRequestV1,
-  RepositoryMetadataLeaseV1
+  RepositoryMetadataLeaseRequest,
+  RepositoryMetadataLease
 } from "./repository-metadata-lease-types.js";
 import type {
-  RepositoryRunBaselineRequestV1,
-  RepositoryRunBaselineResultV1,
-  RepositoryTransactionBeginRequestV2,
-  RepositoryTransactionBoundRequestV2,
-  RepositoryTransactionContinueRequestV2,
-  RepositoryTransactionLeaseRequestV2,
-  RepositoryTransactionLeaseV2,
-  RepositoryTransactionRecoverRequestV2,
-  RepositoryTransactionResultV2
+  RepositoryRunBaselineRequest,
+  RepositoryRunBaselineResult,
+  RepositoryTransactionBeginRequest,
+  RepositoryTransactionBoundRequest,
+  RepositoryTransactionContinueRequest,
+  RepositoryTransactionLeaseRequest,
+  RepositoryTransactionLease,
+  RepositoryTransactionRecoverRequest,
+  RepositoryTransactionResult
 } from "./repository-transaction-types.js";
 
 export interface RepositoryBrokerRequestOptions {
@@ -23,39 +23,39 @@ export interface RepositoryBrokerRequestOptions {
  * never inherits these authorities. */
 export interface RepositoryExecutionBroker {
   acquireRepositoryMetadataLease?(
-    request: RepositoryMetadataLeaseRequestV1,
+    request: RepositoryMetadataLeaseRequest,
     options?: RepositoryBrokerRequestOptions
-  ): Promise<RepositoryMetadataLeaseV1>;
+  ): Promise<RepositoryMetadataLease>;
   acquireRepositoryTransactionLease?(
-    request: RepositoryTransactionLeaseRequestV2,
+    request: RepositoryTransactionLeaseRequest,
     options?: RepositoryBrokerRequestOptions
-  ): Promise<RepositoryTransactionLeaseV2>;
+  ): Promise<RepositoryTransactionLease>;
   beginRepositoryTransaction?(
-    request: RepositoryTransactionBeginRequestV2,
+    request: RepositoryTransactionBeginRequest,
     options?: RepositoryBrokerRequestOptions
-  ): Promise<RepositoryTransactionResultV2>;
+  ): Promise<RepositoryTransactionResult>;
   continueRepositoryTransaction?(
-    request: RepositoryTransactionContinueRequestV2,
+    request: RepositoryTransactionContinueRequest,
     options?: RepositoryBrokerRequestOptions
-  ): Promise<RepositoryTransactionResultV2>;
+  ): Promise<RepositoryTransactionResult>;
   abortRepositoryTransaction?(
-    request: RepositoryTransactionBoundRequestV2,
+    request: RepositoryTransactionBoundRequest,
     options?: RepositoryBrokerRequestOptions
-  ): Promise<RepositoryTransactionResultV2>;
+  ): Promise<RepositoryTransactionResult>;
   recoverRepositoryTransactions?(
-    request: RepositoryTransactionRecoverRequestV2,
+    request: RepositoryTransactionRecoverRequest,
     options?: RepositoryBrokerRequestOptions
-  ): Promise<RepositoryTransactionResultV2>;
+  ): Promise<RepositoryTransactionResult>;
   sealRepositoryTransaction?(
-    request: RepositoryTransactionBoundRequestV2,
+    request: RepositoryTransactionBoundRequest,
     options?: RepositoryBrokerRequestOptions
-  ): Promise<RepositoryTransactionResultV2>;
+  ): Promise<RepositoryTransactionResult>;
   restoreRepositoryRunBaseline?(
-    request: RepositoryRunBaselineRequestV1,
+    request: RepositoryRunBaselineRequest,
     options?: RepositoryBrokerRequestOptions
-  ): Promise<RepositoryRunBaselineResultV1>;
+  ): Promise<RepositoryRunBaselineResult>;
   releaseRepositoryRunBaseline?(
-    request: RepositoryRunBaselineRequestV1,
+    request: RepositoryRunBaselineRequest,
     options?: RepositoryBrokerRequestOptions
-  ): Promise<RepositoryRunBaselineResultV1>;
+  ): Promise<RepositoryRunBaselineResult>;
 }

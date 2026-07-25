@@ -19,7 +19,7 @@ import type {
   ModelResponse,
   ModelStreamEvent
 } from "../packages/agent-protocol/src/index.js";
-import { SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1 } from "../packages/agent-protocol/src/index.js";
+import { SUBJECT_ATTESTATION_EVIDENCE_SOURCE } from "../packages/agent-protocol/src/index.js";
 import {
   createConfiguredRuntime,
   type RuntimeCompositionConfig
@@ -491,7 +491,7 @@ describe("configured runtime execution capabilities", () => {
 
       expect(events.filter((event) => event.type === "evidence.recorded"
         && (event.payload as { data?: { source?: string } }).data?.source
-          === SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1)).toHaveLength(1);
+          === SUBJECT_ATTESTATION_EVIDENCE_SOURCE)).toHaveLength(1);
     } finally {
       await configuredRuntime.close();
     }

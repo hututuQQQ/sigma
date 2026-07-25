@@ -89,8 +89,7 @@ function reviewProvenance(
     durableEvidenceIds,
     acceptedEvidenceReferences: durableEvidenceIds.length,
     droppedEvidenceReferences: rawEvidenceIds.length - durableEvidenceIds.length,
-    approvedEvidenceAuthentic: raw.data.schemaVersion !== 3
-      || rawVerdict !== "approved"
+    approvedEvidenceAuthentic: rawVerdict !== "approved"
       || criteriaAuthentic
         && reviewChecksAuthentic(session, raw, reviewRequestId)
   };
@@ -114,7 +113,7 @@ function normalizedReviewData(input: {
   const completionDigest = input.raw.data.completionCandidateDigest
     ?? input.completionCandidateDigest;
   return {
-    schemaVersion: input.raw.data.schemaVersion === 3 ? 3 : 2,
+    schemaVersion: 1,
     reviewerId: input.raw.data.reviewerId,
     ...(input.reviewRequestId ? { reviewRequestId: input.reviewRequestId } : {}),
     verdict: input.verdict,
@@ -175,8 +174,7 @@ export function normalizeReview(
     reviewRequestId
   );
   const verdict = provenance.approvedEvidenceAuthentic ? rawVerdict : "blocked";
-  const protocolEvidenceFailure = raw.data.schemaVersion === 3
-    && rawVerdict === "approved"
+  const protocolEvidenceFailure = rawVerdict === "approved"
     && !provenance.approvedEvidenceAuthentic;
   const findings = protocolEvidenceFailure
     ? [...raw.data.findings, "Reviewer approval cited missing or non-durable evidence."]

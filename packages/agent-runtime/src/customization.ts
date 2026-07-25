@@ -89,8 +89,8 @@ function builtinProfile(
   return {
     id: mode,
     description: mode === "strict"
-      ? "Sigma Code V6 local coding profile with required review"
-      : "Sigma Code V6 local coding profile with advisory review",
+      ? "Sigma Code local coding profile with required review"
+      : "Sigma Code local coding profile with advisory review",
     roleRoutes: {
       orchestrator: "default", planner: "default", reviewer: "default",
       child_analyze: "default", child_write: "default", summarizer: "default"

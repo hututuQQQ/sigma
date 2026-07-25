@@ -2,7 +2,7 @@ import { lstat, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { runProcess, type ProcessExecutionPort, type ProcessResult } from "./process.js";
 
-export interface RepositoryTopologyV1 {
+export interface RepositoryTopology {
   kind: "worktree" | "linked_worktree" | "submodule" | "bare";
   worktreeRoot: string | null;
   gitDir: string;
@@ -18,7 +18,7 @@ export interface RepositoryTopologyV1 {
  */
 export async function repositoryMetadataTopologyCandidate(
   workspace: string
-): Promise<RepositoryTopologyV1 | null> {
+): Promise<RepositoryTopology | null> {
   const root = await realpath(path.resolve(workspace));
   const markerPath = path.join(root, ".git");
   const marker = await lstat(markerPath).catch((error: NodeJS.ErrnoException) => {
@@ -151,7 +151,7 @@ async function commonGitDirectory(gitDir: string): Promise<string> {
     path.resolve(gitDir, commondir.trim()));
 }
 
-async function bareRepositoryTopology(root: string): Promise<RepositoryTopologyV1 | null> {
+async function bareRepositoryTopology(root: string): Promise<RepositoryTopology | null> {
   const [head, objects] = await Promise.all([
     lstat(path.join(root, "HEAD")).catch(() => null),
     lstat(path.join(root, "objects")).catch(() => null)
@@ -168,7 +168,7 @@ async function directoryRepositoryTopology(
   markerPath: string,
   signal: AbortSignal | undefined,
   execution: ProcessExecutionPort
-): Promise<RepositoryTopologyV1 | null> {
+): Promise<RepositoryTopology | null> {
   const worktreeRoot = await selfContainedGitRoot(root, signal, execution);
   if (!worktreeRoot) return null;
   return {
@@ -185,7 +185,7 @@ async function indirectRepositoryTopology(
   root: string,
   markerPath: string,
   allowExternalMetadata: boolean
-): Promise<RepositoryTopologyV1> {
+): Promise<RepositoryTopology> {
   const lexicalGitDir = await gitFileTarget(root, markerPath);
   if (!isInside(root, lexicalGitDir) && !allowExternalMetadata) {
     return {
@@ -212,7 +212,7 @@ export async function repositoryTopology(
   signal: AbortSignal | undefined,
   execution: ProcessExecutionPort,
   options: { allowExternalMetadata?: boolean } = {}
-): Promise<RepositoryTopologyV1 | null> {
+): Promise<RepositoryTopology | null> {
   signal?.throwIfAborted();
   const root = await realpath(path.resolve(workspace));
   const markerPath = path.join(root, ".git");

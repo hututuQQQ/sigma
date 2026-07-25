@@ -11,16 +11,16 @@ import type {
   ExecutionBroker,
   ExecutionRequest,
   ExecutionResult,
-  ManagedEnvironmentPrepareRequestV1,
-  ManagedEnvironmentPrepareResultV1,
-  ManagedSessionBindingRequestV1,
-  ManagedSessionBindingV1,
+  ManagedEnvironmentPrepareRequest,
+  ManagedEnvironmentPrepareResult,
+  ManagedSessionBindingRequest,
+  ManagedSessionBinding,
   ProcessHandle,
   ProcessHandoffResult,
   ProcessPollResult,
   ProcessSpawnRequest,
-  ScratchLeaseRequestV1, ScratchLeaseV1,
-  TrustedManagedContainerAttestationV1
+  ScratchLeaseRequest, ScratchLease,
+  TrustedManagedContainerAttestation
 } from "./types.js";
 import {
   assertContainerExecutionConfig,
@@ -43,7 +43,7 @@ import {
 } from "./repository-execution-broker-base.js";
 export {
   assertContainerExecutionConfig,
-  MANAGED_ENVIRONMENT_PROTECTED_PATHS_V1,
+  MANAGED_ENVIRONMENT_PROTECTED_PATHS,
   managedContainerAttestationDigest,
   managedEnvironmentProofDigest,
   ownedContainerImageDigest
@@ -51,7 +51,7 @@ export {
 
 export interface ContainerExecutionBrokerOptions {
   config: ContainerExecutionConfig;
-  managedAttestation?: TrustedManagedContainerAttestationV1;
+  managedAttestation?: TrustedManagedContainerAttestation;
   workspace?: string;
   managedEnvironmentMode?: "disabled" | "required";
 }
@@ -66,7 +66,7 @@ export interface ContainerExecutionBrokerOptions {
  */
 export class AttestedContainerExecutionBroker extends RepositoryExecutionBrokerBase implements ExecutionBroker {
   private pinned?: PinnedContainerIdentity;
-  private readonly managedBindings = new Map<string, ManagedSessionBindingV1>();
+  private readonly managedBindings = new Map<string, ManagedSessionBinding>();
   private readonly managedEnvironment = new ManagedEnvironmentCoordinator();
 
   constructor(
@@ -119,9 +119,9 @@ export class AttestedContainerExecutionBroker extends RepositoryExecutionBrokerB
   }
 
   async acquireScratchLease(
-    request: ScratchLeaseRequestV1,
+    request: ScratchLeaseRequest,
     options?: BrokerRequestOptions
-  ): Promise<ScratchLeaseV1> {
+  ): Promise<ScratchLease> {
     await this.verify(options?.signal);
     if (!this.broker.acquireScratchLease) {
       throw new ContainerUnavailableError("OCI broker does not expose RuntimeSession scratch leases.");
@@ -130,9 +130,9 @@ export class AttestedContainerExecutionBroker extends RepositoryExecutionBrokerB
   }
 
   async bindManagedSession(
-    request: ManagedSessionBindingRequestV1,
+    request: ManagedSessionBindingRequest,
     options?: BrokerRequestOptions
-  ): Promise<ManagedSessionBindingV1> {
+  ): Promise<ManagedSessionBinding> {
     const report = await this.verify(options?.signal);
     const observed = containerIdentity(report);
     if (this.options.managedEnvironmentMode === "required"
@@ -216,9 +216,9 @@ export class AttestedContainerExecutionBroker extends RepositoryExecutionBrokerB
   }
 
   async prepareManagedEnvironment(
-    request: ManagedEnvironmentPrepareRequestV1,
+    request: ManagedEnvironmentPrepareRequest,
     options?: BrokerRequestOptions
-  ): Promise<ManagedEnvironmentPrepareResultV1> {
+  ): Promise<ManagedEnvironmentPrepareResult> {
     const before = await this.verify(options?.signal);
     if (!managedEnvironmentProofAvailable(this.options.managedAttestation)) {
       throw Object.assign(new ContainerUnavailableError(
@@ -381,7 +381,7 @@ export class AttestedContainerExecutionBroker extends RepositoryExecutionBrokerB
 
   private assertManagedAttestation(
     observed: PinnedContainerIdentity,
-    attestation: TrustedManagedContainerAttestationV1
+    attestation: TrustedManagedContainerAttestation
   ): void {
     if (attestation.protocolVersion !== 1
       || observed.engine !== attestation.engine
