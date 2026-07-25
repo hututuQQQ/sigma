@@ -1555,7 +1555,8 @@ function normalizedLinuxArchiveCommand(
     `find /tmp/sigma-bundle/${bundleName} -type d -exec chmod 0755 {} +`,
     `find /tmp/sigma-bundle/${bundleName} -type f -exec chmod 0644 {} +`,
     `for file in agent node sigma-exec bwrap; do test ! -e /tmp/sigma-bundle/${bundleName}/bin/$file || chmod 0755 /tmp/sigma-bundle/${bundleName}/bin/$file; done`,
-    `tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -czf /tmp/agent-cli.tgz -C /tmp/sigma-bundle ${bundleName}`
+    `tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -cf /tmp/agent-cli.tar -C /tmp/sigma-bundle ${bundleName}`,
+    "gzip -n -c /tmp/agent-cli.tar > /tmp/agent-cli.tgz"
   ].join(" && ");
 }
 
