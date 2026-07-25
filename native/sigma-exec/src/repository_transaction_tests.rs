@@ -984,7 +984,13 @@ fn selected_head_postconditions_are_returned_and_sealed() {
     git_ok(&root, &["commit", "-qm", "second"]);
     let target = git_ok(&root, &["rev-parse", "HEAD~1"]);
     let store = test_store("test-selected-head");
-    let Some(lease_id) = acquire(&store, &root, "session-postcondition", "run-postcondition", None) else {
+    let Some(lease_id) = acquire(
+        &store,
+        &root,
+        "session-postcondition",
+        "run-postcondition",
+        None,
+    ) else {
         let _ = remove_any(&root);
         return;
     };
@@ -1034,7 +1040,13 @@ fn wrong_selected_head_assertion_aborts_and_restores_preimage() {
     let before = git_ok(&root, &["rev-parse", "HEAD"]);
     let target = git_ok(&root, &["rev-parse", "HEAD~1"]);
     let store = test_store("test-wrong-head");
-    let Some(lease_id) = acquire(&store, &root, "session-postcondition-b", "run-postcondition-b", None) else {
+    let Some(lease_id) = acquire(
+        &store,
+        &root,
+        "session-postcondition-b",
+        "run-postcondition-b",
+        None,
+    ) else {
         let _ = remove_any(&root);
         return;
     };

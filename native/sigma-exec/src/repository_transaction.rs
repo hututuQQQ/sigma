@@ -1389,10 +1389,7 @@ impl RepositoryTransactions {
         ))
     }
 
-    fn restore_and_consume(
-        &self,
-        journal: &RepositoryTransactionJournal,
-    ) -> Result<(), RpcError> {
+    fn restore_and_consume(&self, journal: &RepositoryTransactionJournal) -> Result<(), RpcError> {
         match restore_preimage(journal, &self.transaction_dir(&journal.transaction_handle)) {
             Ok(()) => self.consume_journal(journal),
             Err(error) => {
@@ -1585,10 +1582,7 @@ fn random_capability(prefix: &str) -> Result<String, RpcError> {
     Ok(value)
 }
 
-fn validate_operations(
-    operations: &[RepositoryOperation],
-    add_only: bool,
-) -> Result<(), RpcError> {
+fn validate_operations(operations: &[RepositoryOperation], add_only: bool) -> Result<(), RpcError> {
     for operation in operations {
         if operation.args.is_empty() || operation.args.len() > 256 {
             return Err(invalid_transaction("operation has invalid argument count"));
@@ -2746,7 +2740,10 @@ fn read_journal(path: &Path) -> Result<RepositoryTransactionJournal, RpcError> {
     let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
         RpcError::new(
             "repository_state_uncertain",
-            format!("transaction journal at '{}' is invalid: {error}", path.display()),
+            format!(
+                "transaction journal at '{}' is invalid: {error}",
+                path.display()
+            ),
         )
     })?;
     let actual = value.get("schemaVersion").and_then(Value::as_u64);
@@ -2764,7 +2761,10 @@ fn read_journal(path: &Path) -> Result<RepositoryTransactionJournal, RpcError> {
     serde_json::from_value(value).map_err(|error| {
         RpcError::new(
             "repository_state_uncertain",
-            format!("transaction journal at '{}' is invalid: {error}", path.display()),
+            format!(
+                "transaction journal at '{}' is invalid: {error}",
+                path.display()
+            ),
         )
     })
 }
