@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { EventEmitter } from "node:events";
 import { describe, expect, it } from "vitest";
 import {
   assertUniqueHarborTaskExecutionIdentities,
@@ -31,6 +32,7 @@ import {
   resolveRunOptions,
   suggestedOwnerForFailureCategory,
   taskSelectionIdentitySha256,
+  terminateProcessTree,
   terminalBenchDataset
 } from "../scripts/bench-common.mjs";
 
@@ -47,6 +49,31 @@ async function writeHarborJobResult(jobDir: string, total: number, errored = 0, 
 }
 
 describe("Terminal-Bench command construction", () => {
+  it("rejects unknown options and positional arguments before a run is created", () => {
+    expect(() => resolveRunOptions(["--unknown-option"])).toThrow("Unknown option: --unknown-option");
+    expect(() => resolveRunOptions(["unexpected-task-name"])).toThrow("Unexpected positional argument");
+  });
+
+  it("uses taskkill tree termination on Windows", async () => {
+    const calls: Array<{ command: string; args: string[]; options: unknown }> = [];
+    const killer = new EventEmitter();
+    const child = { pid: 4321, kill: () => false };
+    const pending = terminateProcessTree(child, {
+      platform: "win32",
+      spawnProcess(command: string, args: string[], options: unknown) {
+        calls.push({ command, args, options });
+        queueMicrotask(() => killer.emit("close", 0));
+        return killer;
+      }
+    });
+    await pending;
+    expect(calls).toEqual([{
+      command: "taskkill.exe",
+      args: ["/PID", "4321", "/T", "/F"],
+      options: { stdio: "ignore", windowsHide: true }
+    }]);
+  });
+
   it("loads an exact pinned external task batch without losing Git provenance", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "sigma-batch-tasks-"));
     const tasksFile = path.join(directory, "tasks.json");
@@ -201,6 +228,13 @@ describe("Terminal-Bench command construction", () => {
       execution_mode: "sandboxed",
       agent_profile: "standard"
     });
+  });
+
+  it("defaults every benchmark run to full network and records it in Harbor configuration", () => {
+    const options = resolveRunOptions(["--mode", "task", "--task-id", "generic-task"], {});
+    expect(options.networkMode).toBe("full");
+    expect(buildHarborJobConfig(options, "jobs").agents[0].kwargs)
+      .toMatchObject({ network_mode: "full" });
   });
 
   it("accepts loopback without promoting it to full network", () => {
@@ -1757,7 +1791,44 @@ describe("benchmark report generation", () => {
           metadata: { event_type: "usage.recorded", inputTokens: 10, outputTokens: 3 },
           sigma_event: {
             type: "usage.recorded",
-            payload: { inputTokens: 10, outputTokens: 3, cacheReadTokens: 1, cacheWriteTokens: 0 }
+            payload: {
+              role: "orchestrator",
+              providerReported: true,
+              inputTokens: 10,
+              outputTokens: 3,
+              cacheReadTokens: 1,
+              cacheWriteTokens: 0
+            }
+          }
+        }),
+        JSON.stringify({
+          type: "usage",
+          metadata: { event_type: "usage.recorded", inputTokens: 20, outputTokens: 1 },
+          sigma_event: {
+            type: "usage.recorded",
+            payload: {
+              role: "orchestrator",
+              providerReported: true,
+              inputTokens: 20,
+              outputTokens: 1,
+              cacheReadTokens: 18,
+              cacheWriteTokens: 0
+            }
+          }
+        }),
+        JSON.stringify({
+          type: "usage",
+          metadata: { event_type: "usage.recorded", inputTokens: 30, outputTokens: 0 },
+          sigma_event: {
+            type: "usage.recorded",
+            payload: {
+              role: "orchestrator",
+              providerReported: false,
+              inputTokens: 30,
+              outputTokens: 0,
+              cacheReadTokens: 0,
+              cacheWriteTokens: 0
+            }
           }
         }),
         JSON.stringify({
@@ -1796,7 +1867,16 @@ describe("benchmark report generation", () => {
       input_tokens: 20,
       output_tokens: 5,
       duration_ms: 1234,
+      provider_reported_input_tokens: 30,
+      provider_reported_cache_read_tokens: 19,
+      warm_provider_input_tokens: 20,
+      warm_provider_cache_read_tokens: 18,
+      provider_reported_model_records: 2,
       failure_category: "agent_timeout"
+    });
+    expect(report).toMatchObject({
+      provider_cache_read_ratio: 19 / 30,
+      warm_provider_cache_read_ratio: 18 / 20
     });
   });
 

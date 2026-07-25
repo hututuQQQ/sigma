@@ -390,6 +390,188 @@ describe("agent experience event metrics", () => {
       workspaceDeltaEvents: 0
     });
   });
+
+  it("reports V9 plan normalization, strategy reset, assurance, validation, and review outcomes", () => {
+    const make = eventFactory("long-horizon-session");
+    const longHorizon = {
+      progressBasisDigest: "a".repeat(64),
+      noProgressBatches: 0,
+      maxNoProgressBatches: 8,
+      observationOnlyBatches: 8,
+      mutationWithoutValidationBatches: 6,
+      recentActions: [],
+      repeatedResultDigest: "b".repeat(64),
+      repeatedResultCount: 3,
+      stage: "strategy_reset",
+      strategy: {
+        schemaVersion: 1,
+        progressBasisDigest: "a".repeat(64),
+        confirmedFacts: ["fact"],
+        lowYieldRoutes: ["route"],
+        currentHypothesis: "hypothesis",
+        nextSteps: ["act"],
+        validationTarget: "validate"
+      },
+      strategyResetBatchCount: 8,
+      actionRequiredConsumed: false,
+      settledBatchCount: 8,
+      validationDue: true,
+      assurance: {
+        auxiliaryCalls: 1,
+        auxiliaryInputTokens: 1_000,
+        auxiliaryOutputTokens: 100,
+        auxiliaryCostMicroUsd: 400,
+        strategistCalls: 1,
+        reviewerCalls: 0,
+        protectedRepairTurnsRemaining: 2,
+        protectedToolCallsRemaining: 4
+      }
+    };
+    const events = [
+      make("run.started", { mode: "change" }),
+      make("tool.requested", { callId: "plan", name: "update_plan", arguments: {} }),
+      make("tool.completed", {
+        callId: "plan",
+        name: "update_plan",
+        ok: true,
+        result: { status: "normalized" }
+      }),
+      make("long_horizon.updated", { state: longHorizon, reason: "strategy_reset" }),
+      make("long_horizon.updated", { state: longHorizon, reason: "batch_settled" }),
+      make("tool.requested", { callId: "action", name: "shell", arguments: {} }),
+      make("tool.completed", {
+        callId: "action",
+        name: "shell",
+        ok: true,
+        actualEffects: ["validation"]
+      }),
+      make("usage.recorded", {
+        ...usage("long-horizon-session", "run", 1),
+        role: "planner",
+        costMicroUsd: 400
+      }),
+      make("review.completed", {
+        status: "failed",
+        data: { verdict: "changes_requested" }
+      }),
+      make("usage.recorded", {
+        ...usage("long-horizon-session", "run", 2),
+        role: "reviewer",
+        costMicroUsd: 600
+      }),
+      make("review.completed", {
+        status: "passed",
+        data: { verdict: "approved" }
+      }),
+      make("usage.recorded", {
+        ...usage("long-horizon-session", "run", 3),
+        costMicroUsd: 4_000
+      }),
+      make("run.failed", {
+        kind: "recoverable_failure",
+        code: "budget_exhausted",
+        message: "budget exhausted"
+      })
+    ];
+
+    const metrics = reduceAgentEvents(events);
+
+    expect(metrics.longHorizon).toMatchObject({
+      plan: {
+        requested: 1,
+        accepted: 1,
+        normalized: 1,
+        rejected: 0,
+        acceptanceRate: 1,
+        rejectionRate: 0
+      },
+      maximumNoProgressStreak: 8,
+      strategyResets: 1,
+      validationDueEver: true,
+      validationAttempts: 1,
+      resourceExhausted: true,
+      validationBeforeExhaustion: true,
+      review: {
+        attempts: 2,
+        initialVerdict: "changes_requested",
+        finalVerdict: "approved",
+        repairResult: "approved_after_repair"
+      },
+      assurance: {
+        calls: 2,
+        strategistCalls: 1,
+        reviewerCalls: 1,
+        costMicroUsd: 1_000,
+        costUsd: 0.001,
+        shareOfSessionCost: 0.2
+      },
+      thinkingProtocolFailures: 0
+    });
+    expect(metrics.longHorizon.resetActions).toEqual([{
+      resetSeq: 4,
+      firstActionSeq: 6,
+      firstActionTool: "shell"
+    }]);
+    expect(renderSessionMetricsMarkdown(metrics)).toContain(
+      "| Plan accepted / normalized / rejected | 1 / 1 / 0 |"
+    );
+  });
+
+  it("does not report internal checkpoint integrity as a task validation attempt", () => {
+    const make = eventFactory("validation-semantics-session");
+    const events = [
+      make("run.started", { mode: "change" }),
+      make("evidence.recorded", {
+        evidenceId: "checkpoint-integrity",
+        kind: "validation",
+        status: "passed",
+        producer: { authority: "runtime", id: "checkpoint-manager" },
+        data: {
+          validator: "checkpoint_postimage_integrity",
+          frontierRevision: 1,
+          stateDigest: "a".repeat(64),
+          coveredPaths: []
+        }
+      }),
+      make("run.failed", {
+        kind: "recoverable_failure",
+        code: "budget_exhausted",
+        message: "budget exhausted"
+      })
+    ];
+
+    const internalOnly = reduceAgentEvents(events);
+    expect(internalOnly.longHorizon).toMatchObject({
+      validationAttempts: 0,
+      validationBeforeExhaustion: false
+    });
+    expect(internalOnly.timing.firstValidationMs).toBeNull();
+
+    events.pop();
+    events.push(make("evidence.recorded", {
+      evidenceId: "task-validation",
+      kind: "validation",
+      status: "failed",
+      producer: { authority: "tool", id: "validate" },
+      data: {
+        validator: "command",
+        command: "pnpm test",
+        frontierRevision: 1,
+        stateDigest: "a".repeat(64),
+        coveredPaths: ["src/index.ts"]
+      }
+    }), make("run.failed", {
+      kind: "recoverable_failure",
+      code: "budget_exhausted",
+      message: "budget exhausted"
+    }));
+    const withTaskValidation = reduceAgentEvents(events);
+    expect(withTaskValidation.longHorizon).toMatchObject({
+      validationAttempts: 1,
+      validationBeforeExhaustion: true
+    });
+    expect(withTaskValidation.timing.firstValidationMs).not.toBeNull();
+  });
 });
 
 describe("V5 historical session audit", () => {

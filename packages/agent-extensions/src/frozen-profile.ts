@@ -1,19 +1,32 @@
 import { createHash } from "node:crypto";
 import type { ModelRole } from "agent-model";
-import { freezeAgentProfile, type FrozenAgentProfile, type ProfileBudget, type ProfileMutationPolicy, type ResolvedAgentProfile } from "./profiles.js";
+import {
+  DEFAULT_PROFILE_ASSURANCE,
+  freezeAgentProfile,
+  type FrozenAgentProfile,
+  type ProfileAssurancePolicy,
+  type ProfileBudget,
+  type ProfileMutationPolicy,
+  type ResolvedAgentProfile
+} from "./profiles.js";
 
 const ROLES: readonly ModelRole[] = [
   "orchestrator", "planner", "reviewer", "child_analyze", "child_write", "summarizer"
 ];
 const ROOT_KEYS = new Set([
   "id", "description", "roleRoutes", "toolAllow", "toolDeny", "skills", "hooks", "permissionMode",
-  "budget", "mutationPolicy", "allowedChildProfiles"
+  "budget", "mutationPolicy", "assurancePolicy", "allowedChildProfiles"
 ]);
 const BUDGET_KEYS = new Set<keyof ProfileBudget>([
   "maxInputTokens", "maxOutputTokens", "maxCostMicroUsd", "maxModelTurns", "maxToolCalls", "maxChildren", "maxDepth"
 ]);
 const MUTATION_KEYS = new Set<keyof ProfileMutationPolicy>([
   "requirePlanBeforeMutation", "checkpointBeforeMutation", "reviewMode"
+]);
+const ASSURANCE_KEYS = new Set<keyof ProfileAssurancePolicy>([
+  "budgetPercent", "reviewRounds", "repairRounds", "reviewerMaxTurns",
+  "reviewerMaxToolCalls", "repairMaxTurns", "repairMaxToolCalls",
+  "strategistMode", "duplicateThreshold", "strategyRemainingPercent"
 ]);
 
 /** Restores only the canonical, digest-bound profile artifact emitted at session creation. */
@@ -26,16 +39,29 @@ export function restoreFrozenAgentProfile(canonicalJson: string, expectedDigest:
   try { parsed = JSON.parse(canonicalJson); } catch (error) {
     throw new Error(`Frozen Agent Profile is not valid JSON: ${messageOf(error)}`, { cause: error });
   }
-  const restored = freezeAgentProfile(profileValue(parsed));
-  if (restored.canonicalJson !== canonicalJson || restored.digest !== expectedDigest) {
+  const profile = profileValue(parsed);
+  const restored = freezeAgentProfile(profile);
+  const legacy = !Object.hasOwn(object(parsed, "frozen Agent Profile"), "assurancePolicy");
+  if ((!legacy && restored.canonicalJson !== canonicalJson)
+    || createHash("sha256").update(canonicalJson).digest("hex") !== expectedDigest) {
     throw new Error("Frozen Agent Profile artifact is not in canonical form.");
   }
-  return restored;
+  return legacy
+    ? {
+        profile: restored.profile,
+        canonicalJson,
+        digest: expectedDigest
+      }
+    : restored;
 }
 
 function profileValue(value: unknown): ResolvedAgentProfile {
   const root = object(value, "frozen Agent Profile");
-  exactKeys(root, ROOT_KEYS, "frozen Agent Profile");
+  allowedKeys(root, ROOT_KEYS, "frozen Agent Profile");
+  const required = [...ROOT_KEYS].filter((key) =>
+    key !== "description" && key !== "assurancePolicy");
+  const missing = required.find((key) => !(key in root));
+  if (missing) throw new Error(`Frozen Agent Profile 'frozen Agent Profile' has missing key '${missing}'.`);
   const routes = object(root.roleRoutes, "roleRoutes");
   allowedKeys(routes, new Set(ROLES), "roleRoutes");
   return {
@@ -49,6 +75,9 @@ function profileValue(value: unknown): ResolvedAgentProfile {
     permissionMode: oneOf(root.permissionMode, ["deny", "ask", "auto"], "permissionMode"),
     budget: budgetValue(root.budget),
     mutationPolicy: mutationValue(root.mutationPolicy),
+    assurancePolicy: root.assurancePolicy === undefined
+      ? { ...DEFAULT_PROFILE_ASSURANCE }
+      : assuranceValue(root.assurancePolicy),
     allowedChildProfiles: strings(root.allowedChildProfiles, "allowedChildProfiles")
   };
 }
@@ -74,6 +103,32 @@ function mutationValue(value: unknown): ProfileMutationPolicy {
     requirePlanBeforeMutation: bool(mutation.requirePlanBeforeMutation, "mutationPolicy.requirePlanBeforeMutation"),
     checkpointBeforeMutation: bool(mutation.checkpointBeforeMutation, "mutationPolicy.checkpointBeforeMutation"),
     reviewMode: oneOf(mutation.reviewMode, ["off", "advisory", "required"], "mutationPolicy.reviewMode")
+  };
+}
+
+function assuranceValue(value: unknown): ProfileAssurancePolicy {
+  const assurance = object(value, "assurancePolicy");
+  exactKeys(assurance, ASSURANCE_KEYS, "assurancePolicy");
+  return {
+    budgetPercent: bounded(assurance.budgetPercent, "assurancePolicy.budgetPercent", 1, 100),
+    reviewRounds: bounded(assurance.reviewRounds, "assurancePolicy.reviewRounds", 1, 8),
+    repairRounds: bounded(assurance.repairRounds, "assurancePolicy.repairRounds", 0, 4),
+    reviewerMaxTurns: bounded(assurance.reviewerMaxTurns, "assurancePolicy.reviewerMaxTurns", 1, 32),
+    reviewerMaxToolCalls: bounded(assurance.reviewerMaxToolCalls, "assurancePolicy.reviewerMaxToolCalls", 0, 128),
+    repairMaxTurns: bounded(assurance.repairMaxTurns, "assurancePolicy.repairMaxTurns", 1, 32),
+    repairMaxToolCalls: bounded(assurance.repairMaxToolCalls, "assurancePolicy.repairMaxToolCalls", 0, 128),
+    strategistMode: oneOf(
+      assurance.strategistMode,
+      ["off", "on_demand", "adaptive"],
+      "assurancePolicy.strategistMode"
+    ),
+    duplicateThreshold: bounded(assurance.duplicateThreshold, "assurancePolicy.duplicateThreshold", 2, 16),
+    strategyRemainingPercent: bounded(
+      assurance.strategyRemainingPercent,
+      "assurancePolicy.strategyRemainingPercent",
+      1,
+      100
+    )
   };
 }
 
@@ -107,6 +162,12 @@ function strings(value: unknown, label: string): string[] {
 }
 function integer(value: unknown, label: string, zero = false): number {
   if (!Number.isSafeInteger(value) || Number(value) < (zero ? 0 : 1)) throw new Error(`Frozen Agent Profile '${label}' is invalid.`);
+  return Number(value);
+}
+function bounded(value: unknown, label: string, minimum: number, maximum: number): number {
+  if (!Number.isSafeInteger(value) || Number(value) < minimum || Number(value) > maximum) {
+    throw new Error(`Frozen Agent Profile '${label}' is invalid.`);
+  }
   return Number(value);
 }
 function bool(value: unknown, label: string): boolean {

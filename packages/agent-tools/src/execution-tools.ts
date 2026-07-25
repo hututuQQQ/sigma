@@ -1,12 +1,11 @@
 import {
-  SandboxUnavailableError,
   type ExecutionBroker,
-  type ExecutionResult,
-  type ProcessHandle
+  type ExecutionResult
 } from "agent-execution";
-import type { JsonValue, ToolDescriptor, ToolReceipt, ToolRequest } from "agent-protocol";
+import type { JsonValue, ToolReceipt, ToolRequest } from "agent-protocol";
 import { resolveWorkspacePath } from "agent-platform";
-import { commandReceipt, processReceipt } from "./execution-output-artifacts.js";
+import { commandReceipt } from "./execution-output-artifacts.js";
+import { backgroundProcessTools } from "./background-process-tools.js";
 import {
   approvedProcessPlan,
   executionPolicy,
@@ -20,13 +19,12 @@ import {
   assertAvailableShell,
   availableNetworkModes,
   availableShells,
-  executableCapabilitySchema,
   executionArgs,
   executionEnvironment,
   executionStrings,
   executionText,
-  executionToolSchema,
   normalizeWindowsShellInvocation,
+  resolvedShell,
   shellInvocation
 } from "./execution-tool-values.js";
 import type { PlannedToolExecutionContext, RegisteredEffectTool } from "./registry.js";
@@ -34,11 +32,13 @@ import {
   lockWindowsMutationRoots,
   pinProcessReadRoots
 } from "./windows-mutation-lock.js";
-import { processHandoffTool } from "./process-handoff-tool.js";
-import { foregroundExecutionSchema } from "./execution-foreground-schema.js";
-
+import {
+  foregroundExecutionSchema
+} from "./execution-foreground-schema.js";
+import { simpleExecutionReceipt } from "./execution-tool-receipts.js";
+import { environmentShellTools } from "./environment-shell-tool.js";
 export type { ExecutionToolOptions } from "./execution-tool-types.js";
-
+export { unavailableExecutionBroker } from "./execution-tool-receipts.js";
 function networkProperty(options: ExecutionToolOptions): JsonValue {
   return {
     type: "string",
@@ -46,7 +46,6 @@ function networkProperty(options: ExecutionToolOptions): JsonValue {
     description: `Per-call network policy; configured default is '${options.networkMode}'. none denies sockets, loopback is limited to local test services when supported, and full always requires fresh approval.`
   };
 }
-
 async function closeLocks(
   ...locks: Array<{ close(): Promise<void> } | undefined>
 ): Promise<void> {
@@ -134,7 +133,7 @@ function assertForegroundInvocation(
   return shellCommand;
 }
 
-async function executeForegroundCommand(
+export async function executeForegroundCommand(
   kind: "exec" | "shell" | "validate",
   options: ExecutionToolOptions,
   request: ToolRequest,
@@ -147,7 +146,7 @@ async function executeForegroundCommand(
   let skillResource = await loadedSkillResource(input, context.runtimeControl, "execute");
   let approvedPlan = await approvedProcessPlan(input, context, options, skillResource, validation);
   const invocation = shellCommand
-    ? shellInvocation(executionText(input, "shell"), executionText(input, "command"))
+    ? shellInvocation(resolvedShell(input, options), executionText(input, "command"))
     : normalizeWindowsShellInvocation(
       executionText(input, "executable"),
       [...(skillResource ? [skillResource.absolutePath] : []), ...executionStrings(input, "args")]
@@ -171,10 +170,12 @@ async function executeForegroundCommand(
     );
     const writeRoots = validation ? [] : await resolvedWriteRoots(context, approvedPlan);
     await readLock.verify();
-    const scratchLease = await options.broker.acquireScratchLease?.({
-      protocolVersion: 1,
-      sessionId: context.sessionId
-    }, { signal: context.signal });
+    const scratchLease = approvedPlan.mutationAuthority === "disposable_enclosing_container_v1"
+      ? undefined
+      : await options.broker.acquireScratchLease?.({
+          protocolVersion: 1,
+          sessionId: context.sessionId
+        }, { signal: context.signal });
     const result = await options.broker.execute({
       command: { ...invocation, cwd, environment: executionEnvironment(input) },
       policy: executionPolicy(
@@ -214,6 +215,10 @@ function foregroundTool(kind: "exec" | "shell" | "validate", options: ExecutionT
   return {
     descriptor: {
       ...schema,
+      ...(options.writeScope === "enclosing-container"
+        && options.enclosingContainerRoot === true
+        ? { brokerMutationAuthority: "disposable_enclosing_container_v1" as const }
+        : {}),
       prepare(value, context) {
         const input = executionArgs(value);
         if (kind === "shell" || (validation && input.shell !== undefined)) assertAvailableShell(input, options);
@@ -224,17 +229,29 @@ function foregroundTool(kind: "exec" | "shell" | "validate", options: ExecutionT
   };
 }
 
-function handle(input: Record<string, JsonValue>): ProcessHandle {
-  return {
-    id: executionText(input, "handleId"),
-    brokerInstanceId: executionText(input, "brokerInstanceId")
-  };
+async function approvedBackgroundPlan(
+  input: Record<string, JsonValue>,
+  context: PlannedToolExecutionContext,
+  options: ExecutionToolOptions,
+  skillResource: Awaited<ReturnType<typeof loadedSkillResource>>,
+  allowEnclosingContainerDeliverable: boolean
+) {
+  return await approvedProcessPlan(
+    input,
+    context,
+    options,
+    skillResource,
+    false,
+    true,
+    allowEnclosingContainerDeliverable
+  );
 }
 
 async function executeBackgroundProcess(
   options: ExecutionToolOptions,
   request: ToolRequest,
-  context: PlannedToolExecutionContext
+  context: PlannedToolExecutionContext,
+  allowEnclosingContainerDeliverable = false
 ): Promise<ToolReceipt> {
   const startedAt = new Date().toISOString();
   const input = executionArgs(request.arguments);
@@ -249,21 +266,28 @@ async function executeBackgroundProcess(
   }
   assertAvailableExecutable(input, options);
   let skillResource = await loadedSkillResource(input, context.runtimeControl, "execute");
-  let approvedPlan = await approvedProcessPlan(input, context, options, skillResource, false, true);
+  let approvedPlan = await approvedBackgroundPlan(
+    input, context, options, skillResource, allowEnclosingContainerDeliverable
+  );
   const readLock = await pinProcessReadRoots(context, approvedPlan);
   let failed = false;
   let primary: unknown;
   try {
     skillResource = await revalidateSkillResource(input, context, skillResource);
-    approvedPlan = await approvedProcessPlan(input, context, options, skillResource, false, true);
+    approvedPlan = await approvedBackgroundPlan(
+      input, context, options, skillResource, allowEnclosingContainerDeliverable
+    );
     const cwd = await resolveWorkspacePath(
       context.workspacePath, typeof input.cwd === "string" ? input.cwd : "."
     );
     await readLock.verify();
-    const scratchLease = await options.broker.acquireScratchLease?.({
-      protocolVersion: 1,
-      sessionId: context.sessionId
-    }, { signal: context.signal });
+    const writeRoots = await resolvedWriteRoots(context, approvedPlan);
+    const scratchLease = approvedPlan.mutationAuthority === "disposable_enclosing_container_v1"
+      ? undefined
+      : await options.broker.acquireScratchLease?.({
+          protocolVersion: 1,
+          sessionId: context.sessionId
+        }, { signal: context.signal });
     const processHandle = await options.broker.spawn({
       command: {
         executable: executionText(input, "executable"),
@@ -271,13 +295,24 @@ async function executeBackgroundProcess(
         cwd,
         environment: executionEnvironment(input)
       },
-      policy: executionPolicy(context, approvedPlan, options, [], skillResource, false, scratchLease),
+      policy: executionPolicy(
+        context,
+        approvedPlan,
+        options,
+        writeRoots,
+        skillResource,
+        false,
+        scratchLease
+      ),
       lifecycle,
       ...(input.pty === true ? { pty: true } : {})
     }, { signal: context.signal });
-    return simpleReceipt(request, startedAt, processHandle, [
-      "process.spawn.readonly", ...(skillResource ? ["filesystem.read" as const] : [])
-    ]);
+    return simpleExecutionReceipt(
+      request,
+      startedAt,
+      processHandle,
+      approvedPlan.exactEffects
+    );
   } catch (error) {
     failed = true;
     primary = error;
@@ -287,86 +322,17 @@ async function executeBackgroundProcess(
   }
 }
 
-function backgroundTools(options: ExecutionToolOptions): RegisteredEffectTool[] {
-  const handleProperties = { handleId: { type: "string" }, brokerInstanceId: { type: "string" } };
-  return [{
-    descriptor: {
-      ...executionToolSchema("process_spawn", "Start a sandboxed background process and return an in-session handle.", {
-        executable: executableCapabilitySchema(options),
-        args: { type: "array", items: { type: "string" } }, cwd: { type: "string" },
-        network: networkProperty(options),
-        env: { type: "object", additionalProperties: { type: "string" } },
-        ...(options.pty === false ? {} : { pty: { type: "boolean" } }),
-        ...(options.handoff === true ? {
-          lifecycle: {
-            type: "string", enum: ["session", "deliverable"],
-            description: "Use deliverable only for a service that must survive successful task completion; verify it through a separate interface probe, then call process_handoff."
-          }
-        } : {}),
-        access: { type: "string", enum: ["readonly"] }
-      }, ["executable"], ["process.spawn.readonly", "filesystem.read", "filesystem.read.external", "network", "open_world"]),
-      prepare(value, context) { return prepareExecutionCallPlan(value, context, options, false, true); }
-    },
-    async execute(request, context) { return await executeBackgroundProcess(options, request, context); }
-  }, {
-    descriptor: executionToolSchema("process_poll", "Poll incremental output from an in-session background process.", handleProperties, ["handleId", "brokerInstanceId"], ["process.spawn.readonly"]),
-    async execute(request: ToolRequest, context: PlannedToolExecutionContext) {
-      const startedAt = new Date().toISOString();
-      const result = await options.broker.poll(handle(executionArgs(request.arguments)), { signal: context.signal });
-      return await processReceipt(
-        request, startedAt, result, ["process.spawn.readonly"], context, options.broker, "poll"
-      );
-    }
-  }, ...(options.stdin === false ? [] : [{
-    descriptor: executionToolSchema("process_write", "Write UTF-8 input to an in-session background process.", {
-      ...handleProperties, data: { type: "string" }
-    }, ["handleId", "brokerInstanceId", "data"], ["process.spawn.readonly"]),
-    async execute(request: ToolRequest, context: PlannedToolExecutionContext) {
-      const startedAt = new Date().toISOString();
-      const input = executionArgs(request.arguments);
-      await options.broker.write(handle(input), executionText(input, "data"), { signal: context.signal });
-      return simpleReceipt(request, startedAt, { written: true }, ["process.spawn.readonly"]);
-    }
-  }]), {
-    descriptor: executionToolSchema("process_terminate", "Terminate an in-session background process tree.", handleProperties, ["handleId", "brokerInstanceId"], ["process.spawn.readonly"]),
-    async execute(request, context) {
-      const startedAt = new Date().toISOString();
-      const result = await options.broker.terminate(handle(executionArgs(request.arguments)), { signal: context.signal });
-      return await processReceipt(
-        request, startedAt, result, ["process.spawn.readonly"], context, options.broker, "terminate"
-      );
-    }
-  }, ...(options.handoff === true ? [processHandoffTool(options, handleProperties)] : [])];
-}
-
-function simpleReceipt(
-  request: ToolRequest,
-  startedAt: string,
-  value: unknown,
-  effects: ToolDescriptor["possibleEffects"]
-): ToolReceipt {
-  return {
-    callId: request.callId, ok: true, output: JSON.stringify(value), observedEffects: effects, actualEffects: effects,
-    artifacts: [], diagnostics: [], evidence: [], startedAt, completedAt: new Date().toISOString()
-  };
-}
-
-export function unavailableExecutionBroker(message = "sigma-exec broker is not configured"): ExecutionBroker {
-  const fail = async (): Promise<never> => { throw new SandboxUnavailableError(message); };
-  return {
-    lostProcessHandles: [], connect: fail, doctor: fail, execute: fail, spawn: fail, poll: fail,
-    write: fail, terminate: fail, close: async () => undefined
-  };
-}
-
 export function executionTools(options: ExecutionToolOptions): RegisteredEffectTool[] {
   if (availableNetworkModes(options).length === 0) return [];
   return [
     ...(options.foreground === false ? [] : [
       foregroundTool("exec", options),
       ...(availableShells(options).length > 0 ? [foregroundTool("shell", options)] : []),
-      foregroundTool("validate", options)
+      foregroundTool("validate", options),
+      ...environmentShellTools(options, executeForegroundCommand)
     ]),
-    ...(options.background === false ? [] : backgroundTools(options))
+    ...(options.background === false
+      ? []
+      : backgroundProcessTools(options, executeBackgroundProcess))
   ];
 }

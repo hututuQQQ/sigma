@@ -49,6 +49,34 @@ export const defaultAgentTimeoutLeniencyMinExtraSec = 600;
 export const defaultBenchmarkTurnCadenceSec = 5;
 export const defaultBenchmarkMaxTurnsCap = 1000;
 export const defaultConcurrentTrials = 5;
+export const terminalBenchCliFlags = Object.freeze([
+  "agent-profile",
+  "agent-timeout-grace-sec",
+  "attempts",
+  "benchmark-class",
+  "command-timeout-sec",
+  "concurrency",
+  "dataset",
+  "execution-mode",
+  "expected-archive-sha256",
+  "harbor-topology",
+  "help",
+  "k",
+  "managed-environment-mode",
+  "max-turns",
+  "mode",
+  "model",
+  "network",
+  "provider",
+  "retries",
+  "reuse-package",
+  "run-label",
+  "smoke",
+  "task-id",
+  "tasks-file",
+  "timeout-leniency-min-extra-sec",
+  "timeout-leniency-multiplier"
+]);
 
 const COUNT_KEYS = [
   "passed", "failed", "infra_failed", "structured_blocker", "timeout", "api_error",
@@ -148,6 +176,21 @@ export function parseArgs(argv) {
     } else {
       flags[name] = true;
     }
+  }
+  return flags;
+}
+
+export function parseTerminalBenchArgs(argv) {
+  const flags = parseArgs(argv);
+  if (flags._.length > 0) {
+    throw new Error(`Unexpected positional argument${flags._.length === 1 ? "" : "s"}: ${flags._.join(", ")}`);
+  }
+  const allowed = new Set(terminalBenchCliFlags);
+  const unknown = Object.keys(flags)
+    .filter((name) => name !== "_" && !allowed.has(name))
+    .sort();
+  if (unknown.length > 0) {
+    throw new Error(`Unknown option${unknown.length === 1 ? "" : "s"}: ${unknown.map((name) => `--${name}`).join(", ")}`);
   }
   return flags;
 }
@@ -255,7 +298,7 @@ function asNonNegativeInt(value, fallback, name) {
   return parsed;
 }
 
-function networkMode(value, fallback = "none") {
+function networkMode(value, fallback = "full") {
   const mode = asString(value, fallback);
   if (mode !== "none" && mode !== "loopback" && mode !== "full") {
     throw new Error("network mode must be none, loopback, or full.");
@@ -315,7 +358,7 @@ export function readTaskSelectionFile(filePath) {
 }
 
 export function resolveRunOptions(argv, env = process.env) {
-  const flags = parseArgs(argv);
+  const flags = parseTerminalBenchArgs(argv);
   const mode = flags.smoke ? "smoke" : asString(flags.mode, "k");
   if (!["smoke", "k", "task", "batch"].includes(mode)) {
     throw new Error(`Unsupported benchmark mode: ${mode}`);
@@ -629,7 +672,7 @@ function benchmarkAgentKwargs(options, timeoutPlan = null) {
     agent_cli_tarball: resolveAgentCliTarballPath(options, options.env ?? process.env),
     provider: options.provider,
     agent_profile: options.agentProfile ?? "standard",
-    network_mode: options.networkMode ?? "none",
+    network_mode: options.networkMode ?? "full",
     execution_mode: options.executionMode ?? "sandboxed",
     managed_environment_mode: options.managedEnvironmentMode ?? "disabled",
     harbor_topology: options.harborTopology ?? "main_only"
@@ -935,7 +978,42 @@ export async function runProcess(command, args, options = {}) {
 
   const result = await new Promise((resolve) => {
     let settled = false;
+    let terminationRequested = false;
+    let timeout;
     let child;
+    const settle = (value) => {
+      if (settled) return;
+      settled = true;
+      if (timeout) clearTimeout(timeout);
+      options.signal?.removeEventListener("abort", abort);
+      resolve(value);
+    };
+    const abort = () => {
+      if (terminationRequested || !child) return;
+      terminationRequested = true;
+      const reason = options.signal?.reason;
+      const detail = reason instanceof Error ? reason.message : String(reason ?? "cancelled");
+      stderr += `${stderr ? "\n" : ""}Process cancelled: ${detail}`;
+      void terminateProcessTree(child, options).catch(() => {
+        try {
+          child.kill();
+        } catch {
+          // The child may already have exited.
+        }
+      });
+    };
+    if (options.signal?.aborted) {
+      settle({
+        command,
+        args,
+        cwd,
+        exitCode: 1,
+        stdout,
+        stderr: `Process cancelled before start: ${String(options.signal.reason ?? "cancelled")}`,
+        cancelled: true
+      });
+      return;
+    }
     try {
       child = spawn(command, args, {
         cwd,
@@ -944,7 +1022,7 @@ export async function runProcess(command, args, options = {}) {
         windowsHide: true
       });
     } catch (error) {
-      resolve({
+      settle({
         command,
         args,
         cwd,
@@ -954,6 +1032,22 @@ export async function runProcess(command, args, options = {}) {
         error
       });
       return;
+    }
+    options.signal?.addEventListener("abort", abort, { once: true });
+    if (Number.isFinite(options.timeoutMs) && options.timeoutMs > 0) {
+      timeout = setTimeout(() => {
+        if (terminationRequested) return;
+        terminationRequested = true;
+        stderr += `${stderr ? "\n" : ""}Process timed out after ${options.timeoutMs}ms.`;
+        void terminateProcessTree(child, options).catch(() => {
+          try {
+            child.kill();
+          } catch {
+            // The child may already have exited.
+          }
+        });
+      }, options.timeoutMs);
+      timeout.unref?.();
     }
 
     child.stdout?.on("data", (chunk) => {
@@ -968,9 +1062,7 @@ export async function runProcess(command, args, options = {}) {
     });
 
     child.on("error", (error) => {
-      if (settled) return;
-      settled = true;
-      resolve({
+      settle({
         command,
         args,
         cwd,
@@ -982,15 +1074,14 @@ export async function runProcess(command, args, options = {}) {
     });
 
     child.on("close", (code) => {
-      if (settled) return;
-      settled = true;
-      resolve({
+      settle({
         command,
         args,
         cwd,
         exitCode: code ?? 1,
         stdout,
-        stderr
+        stderr,
+        ...(terminationRequested ? { cancelled: true } : {})
       });
     });
   });
@@ -1014,6 +1105,55 @@ export async function runProcess(command, args, options = {}) {
   }
 
   return result;
+}
+
+export async function terminateProcessTree(child, options = {}) {
+  const pid = child?.pid;
+  if (!Number.isSafeInteger(pid) || pid <= 0) return;
+  const platform = options.platform ?? process.platform;
+  if (platform !== "win32") {
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      // The child may already have exited.
+    }
+    return;
+  }
+
+  const spawnProcess = options.spawnProcess ?? spawn;
+  await new Promise((resolve) => {
+    let killer;
+    try {
+      killer = spawnProcess(
+        "taskkill.exe",
+        ["/PID", String(pid), "/T", "/F"],
+        { stdio: "ignore", windowsHide: true }
+      );
+    } catch {
+      try {
+        child.kill();
+      } catch {
+        // The child may already have exited.
+      }
+      resolve();
+      return;
+    }
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      resolve();
+    };
+    killer.once("error", () => {
+      try {
+        child.kill();
+      } catch {
+        // The child may already have exited.
+      }
+      finish();
+    });
+    killer.once("close", finish);
+  });
 }
 
 export async function packageAgentCli(options = {}) {
@@ -1320,6 +1460,11 @@ function summarizeTraceEvents(events) {
     reasoning_tokens: 0,
     cache_tokens: 0,
     cache_read_tokens: 0,
+    provider_reported_input_tokens: 0,
+    provider_reported_cache_read_tokens: 0,
+    warm_provider_input_tokens: 0,
+    warm_provider_cache_read_tokens: 0,
+    provider_reported_model_records: 0,
     length_finish_count: 0,
     converge_turns: 0,
     cost_usd: null,
@@ -1355,6 +1500,17 @@ function summarizeTraceEvents(events) {
       const usageCost = Number(usage.costUsd ?? usage.cost_usd
         ?? (Number.isFinite(Number(usage.costMicroUsd)) ? Number(usage.costMicroUsd) / 1_000_000 : NaN));
       if (Number.isFinite(usageCost)) summary.cost_usd = (summary.cost_usd ?? 0) + usageCost;
+      if (usage.providerReported === true && usage.role === "orchestrator") {
+        const input = Number(usage.inputTokens ?? usage.input_tokens ?? 0);
+        const cacheRead = Number(usage.cacheReadTokens ?? usage.cache_read_tokens ?? 0);
+        summary.provider_reported_model_records += 1;
+        summary.provider_reported_input_tokens += input;
+        summary.provider_reported_cache_read_tokens += cacheRead;
+        if (summary.provider_reported_model_records > 1) {
+          summary.warm_provider_input_tokens += input;
+          summary.warm_provider_cache_read_tokens += cacheRead;
+        }
+      }
     }
     if (event?.type === "model_end"
       && (metadata.finishReason ?? metadata.finish_reason) === "length") {
@@ -1929,6 +2085,13 @@ function mergeHarborTrialResult(task, trialResult) {
       task.cache_read_tokens || traceSummary.cache_read_tokens || agentResult.n_cache_read_tokens
       || 0
     ),
+    provider_reported_input_tokens: Number(traceSummary.provider_reported_input_tokens ?? 0),
+    provider_reported_cache_read_tokens: Number(
+      traceSummary.provider_reported_cache_read_tokens ?? 0
+    ),
+    warm_provider_input_tokens: Number(traceSummary.warm_provider_input_tokens ?? 0),
+    warm_provider_cache_read_tokens: Number(traceSummary.warm_provider_cache_read_tokens ?? 0),
+    provider_reported_model_records: Number(traceSummary.provider_reported_model_records ?? 0),
     output_tokens: Number(agentResult.n_output_tokens ?? (task.output_tokens || traceSummary.output_tokens || 0)),
     reasoning_tokens: Number(
       task.reasoning_tokens || traceSummary.reasoning_tokens || agentResult.n_reasoning_tokens || 0
@@ -2336,6 +2499,8 @@ export function formatMarkdownReport(report) {
     `- Input tokens: ${report.usage?.input_tokens ?? 0}`,
     `- Cache tokens: ${report.usage?.cache_tokens ?? 0}`,
     `- Cache read ratio: ${report.cache_read_ratio ?? "unknown"}`,
+    `- Provider-reported cache read ratio: ${report.provider_cache_read_ratio ?? "unknown"}`,
+    `- Warm provider cache read ratio: ${report.warm_provider_cache_read_ratio ?? "unknown"}`,
     `- Output tokens: ${report.usage?.output_tokens ?? 0}`,
     `- Reasoning tokens: ${report.reasoning_tokens ?? report.usage?.reasoning_tokens ?? 0}`,
     `- Reasoning/output ratio: ${report.reasoning_output_ratio ?? "unknown"}`,
@@ -2582,10 +2747,37 @@ export async function generateBenchReport(runDir) {
     input_tokens: total.input_tokens + Number(task.input_tokens ?? 0),
     cache_tokens: total.cache_tokens + Number(task.cache_tokens ?? 0),
     cache_read_tokens: total.cache_read_tokens + Number(task.cache_read_tokens ?? 0),
+    provider_reported_input_tokens: total.provider_reported_input_tokens
+      + Number(task.provider_reported_input_tokens ?? 0),
+    provider_reported_cache_read_tokens: total.provider_reported_cache_read_tokens
+      + Number(task.provider_reported_cache_read_tokens ?? 0),
+    warm_provider_input_tokens: total.warm_provider_input_tokens
+      + Number(task.warm_provider_input_tokens ?? 0),
+    warm_provider_cache_read_tokens: total.warm_provider_cache_read_tokens
+      + Number(task.warm_provider_cache_read_tokens ?? 0),
+    provider_reported_model_records: total.provider_reported_model_records
+      + Number(task.provider_reported_model_records ?? 0),
     output_tokens: total.output_tokens + Number(task.output_tokens ?? 0),
     reasoning_tokens: total.reasoning_tokens + Number(task.reasoning_tokens ?? 0)
-  }), { input_tokens: 0, cache_tokens: 0, cache_read_tokens: 0, output_tokens: 0, reasoning_tokens: 0 });
+  }), {
+    input_tokens: 0,
+    cache_tokens: 0,
+    cache_read_tokens: 0,
+    provider_reported_input_tokens: 0,
+    provider_reported_cache_read_tokens: 0,
+    warm_provider_input_tokens: 0,
+    warm_provider_cache_read_tokens: 0,
+    provider_reported_model_records: 0,
+    output_tokens: 0,
+    reasoning_tokens: 0
+  });
   const cacheReadRatio = usage.input_tokens > 0 ? usage.cache_read_tokens / usage.input_tokens : null;
+  const providerCacheReadRatio = usage.provider_reported_input_tokens > 0
+    ? usage.provider_reported_cache_read_tokens / usage.provider_reported_input_tokens
+    : null;
+  const warmProviderCacheReadRatio = usage.warm_provider_input_tokens > 0
+    ? usage.warm_provider_cache_read_tokens / usage.warm_provider_input_tokens
+    : null;
   const reasoningOutputRatio = usage.output_tokens > 0 ? usage.reasoning_tokens / usage.output_tokens : null;
   const lengthFinishCount = tasks.reduce(
     (total, task) => total + Number(task.length_finish_count ?? 0), 0
@@ -2632,6 +2824,8 @@ export async function generateBenchReport(runDir) {
     usage,
     reasoning_tokens: usage.reasoning_tokens,
     cache_read_ratio: cacheReadRatio,
+    provider_cache_read_ratio: providerCacheReadRatio,
+    warm_provider_cache_read_ratio: warmProviderCacheReadRatio,
     reasoning_output_ratio: reasoningOutputRatio,
     length_finish_count: lengthFinishCount,
     converge_turns: convergeTurns,

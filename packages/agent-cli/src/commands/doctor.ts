@@ -62,6 +62,25 @@ function managedEnvironmentCheck(
   };
 }
 
+function enclosingContainerCheck(
+  report: BrokerDoctorReport | undefined,
+  required: boolean
+): DoctorCheck | undefined {
+  if (!required) return undefined;
+  const capability = report?.capabilities.enclosingContainerRoot;
+  const ready = capability?.available === true
+    && capability.rootKind === "container_cow"
+    && Boolean(capability.attestationDigest);
+  return {
+    name: "enclosing_container",
+    status: ready ? "ok" : "error",
+    message: ready
+      ? `root=${capability!.rootKind}; attestation=${capability!.attestationDigest}`
+      : capability?.reason
+        ?? "required disposable enclosing-container proof is unavailable"
+  };
+}
+
 function languageServerChecks(presets: LanguageServerPreset[]): DoctorCheck[] {
   return presets.map((preset) => ({
     name: `lsp_${preset.id}`,
@@ -192,6 +211,10 @@ async function executeDoctor(
       sandbox.report, config.managedEnvironmentMode === "required"
     );
     if (managed) checks.push(managed);
+    const enclosing = enclosingContainerCheck(
+      sandbox.report, config.writeScope === "enclosing-container"
+    );
+    if (enclosing) checks.push(enclosing);
     checks.push(...languageServerChecks(deps.languageServers ?? discoverLanguageServers()));
     checks.push(await apiCheck(config.provider, config.model, flags["check-api"] === true));
     const strict = flags.strict === true;

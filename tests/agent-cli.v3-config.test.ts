@@ -11,7 +11,7 @@ class Capture {
 }
 
 describe("Sigma config", () => {
-  it("defaults to workspace-auto, required sandbox, workspace reads, no network, and hard shared budgets", () => {
+  it("defaults to workspace-auto, required sandbox, workspace reads, full network, and hard shared budgets", () => {
     const config = loadCliConfig({}, { env: {}, cwd: process.cwd(), homeDir: path.join(process.cwd(), ".missing-home") });
     expect(config).toMatchObject({
       sandboxMode: "required",
@@ -19,7 +19,7 @@ describe("Sigma config", () => {
       managedEnvironmentMode: "disabled",
       permissionMode: "workspace-auto",
       readScope: "workspace",
-      networkMode: "none",
+      networkMode: "full",
       processHandoff: "allow",
       outputSchema: 3,
       legacySingleModelRoute: false,

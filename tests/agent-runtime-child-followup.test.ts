@@ -171,7 +171,12 @@ describe("child follow-up lifecycle", () => {
     const completed = await supervisor.join(child.id);
     expect(completed).toMatchObject({
       status: "completed",
-      result: { outcome: { kind: "completed", message: "follow-up run complete" } },
+      result: {
+        outcome: {
+          kind: "completed",
+          message: expect.stringContaining("follow-up run complete")
+        }
+      },
       isolation: { cleanup: "retained" }
     });
     const worktree = completed.isolation?.worktreePath;
@@ -187,11 +192,9 @@ describe("child follow-up lifecycle", () => {
     if (!childSession) throw new Error("Expected a durable child session.");
     const childEvents = [];
     for await (const event of store.events(childSession.sessionId)) childEvents.push(event);
-    const initialPlan = childEvents.find((event) => event.type === "plan.updated")?.payload as {
-      plan?: { goal?: string; nodes?: Array<{ title?: string }> };
-    } | undefined;
-    expect(initialPlan?.plan?.goal).toBe(instruction);
-    expect(initialPlan?.plan?.nodes?.[0]?.title).toBe(instruction.slice(0, 80).trim());
+    expect(childEvents.some((event) => event.type === "plan.updated")).toBe(false);
+    expect(childEvents.find((event) => event.type === "user.message")?.payload)
+      .toMatchObject({ text: expect.stringContaining(instruction) });
     await execution.close();
   }, 30_000);
 });

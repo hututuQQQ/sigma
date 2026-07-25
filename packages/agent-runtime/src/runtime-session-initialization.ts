@@ -8,12 +8,10 @@ import {
   type RuntimeHookArtifact,
   type SkillCatalog
 } from "agent-extensions";
-import type {
-  PlanGraph,
-  StartSession
-} from "agent-protocol";
+import type { StartSession } from "agent-protocol";
 import type { RuntimeAgentProfile, RuntimeSession } from "./types.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
+import { assurancePolicyFromState } from "./assurance-policy.js";
 import { persistFrozenWorkspaceHookAssets } from "./frozen-hook-assets.js";
 import { emitSubjectAttestationV1, type SubjectAttestationContextV1 } from "./subject-attestation.js";
 
@@ -35,25 +33,6 @@ export interface RuntimeSessionInitializationOptions {
   emit: RuntimeEventEmitter;
   dispatchHook: DispatchHook;
   subjectAttestation?: SubjectAttestationContextV1;
-}
-
-function initialPlan(input: StartSession): PlanGraph {
-  const title = input.title?.trim();
-  const goal = input.goal?.trim();
-  return {
-    revision: 1,
-    goal: goal || title || "Complete the user's stated task.",
-    activeNodeId: "root",
-    nodes: [{
-      id: "root",
-      title: title || "Complete the task",
-      dependencies: [],
-      status: "in_progress",
-      owner: { kind: "root" },
-      acceptanceCriteria: ["Complete the user's stated task with durable evidence."],
-      evidence: []
-    }]
-  };
 }
 
 async function emitResolvedProfile(
@@ -159,7 +138,8 @@ export async function initializeRuntimeSession(
     strictWriteScope: session.identity.strictWriteScope,
     modelRole: session.services.modelRole,
     ...(session.identity.parentSessionId ? { parentSessionId: session.identity.parentSessionId } : {}),
-    budgetLimits: session.durable.state.budget.limits
+    budgetLimits: session.durable.state.budget.limits,
+    assurancePolicy: assurancePolicyFromState(session.durable.state)
   });
   await emitSubjectAttestationV1(session, options.subjectAttestation, options.emit);
   await emitResolvedProfile(session, options);
@@ -170,13 +150,6 @@ export async function initializeRuntimeSession(
     workspacePath: session.identity.workspacePath,
     mode: session.durable.mode,
     profileId: options.profile?.profile.id ?? null
-  }, new AbortController().signal);
-  const plan = initialPlan(input);
-  await options.emit(session, "plan.updated", "runtime", { previousRevision: 0, plan });
-  await options.dispatchHook(session, "plan_changed", {
-    previousRevision: 0,
-    plan,
-    source: "session"
   }, new AbortController().signal);
   await emitReviewerWaiver(session, input.reviewerWaiverReason, options.emit);
 }

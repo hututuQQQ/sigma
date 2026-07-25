@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type {
   CommandEvidence,
   DiagnosticEvidence,
@@ -15,6 +15,7 @@ import type {
   WorkspaceDeltaEvidence
 } from "agent-protocol";
 import { frontierAfterEvidence } from "agent-kernel";
+import { enclosingContainerMutationDiagnostic } from "./enclosing-container-evidence.js";
 
 export interface ReceiptEvidenceScope {
   sessionId: string;
@@ -24,6 +25,11 @@ export interface ReceiptEvidenceScope {
     frontierRevision: number;
     stateDigest: string;
     coveredPaths: string[];
+    intent?: {
+      purpose?: string;
+      subjects: string[];
+      criterionIds: string[];
+    };
     claim?: Omit<import("agent-protocol").ValidationClaimV1, "status">;
   };
   repositoryScope?: {
@@ -73,16 +79,25 @@ function sanitizeValidation(
     status: receipt.ok && raw.status === "passed" ? "passed" : "failed",
     summary: raw.summary,
     data: {
+      schemaVersion: 2,
+      ...(frontier.intent ? {
+        intent: {
+          ...frontier.intent,
+          subjects: [...frontier.intent.subjects],
+          criterionIds: [...frontier.intent.criterionIds]
+        }
+      } : {}),
       validator: raw.data.validator,
       ...(raw.data.command ? { command: raw.data.command } : {}),
       ...(raw.data.exitCode === undefined ? {} : { exitCode: raw.data.exitCode }),
       ...(raw.data.termination ? { termination: { ...raw.data.termination } } : {}),
       artifactIds: [...new Set(receipt.artifacts)],
+      output: boundedValidationOutput(receipt.output),
       frontierRevision: frontier.frontierRevision,
       stateDigest: frontier.stateDigest,
       coveredPaths: [...frontier.coveredPaths],
       ...(frontier.claim ? {
-        claim: {
+        adapterInference: {
           ...frontier.claim,
           subject: { ...frontier.claim.subject },
           status: raw.data.termination?.processStarted === false
@@ -91,6 +106,31 @@ function sanitizeValidation(
         }
       } : {})
     }
+  };
+}
+
+const VALIDATION_OUTPUT_PREVIEW_CHARACTERS = 4_096;
+
+function boundedValidationOutput(output: string): {
+  sha256: string;
+  byteLength: number;
+  preview: string;
+  truncated: boolean;
+} {
+  const characters = [...output];
+  const truncated = characters.length > VALIDATION_OUTPUT_PREVIEW_CHARACTERS;
+  const preview = truncated
+    ? [
+        ...characters.slice(0, 3_072),
+        "\n...[validation output omitted; full content is available by artifact ID]...\n",
+        ...characters.slice(-1_024)
+      ].join("")
+    : output;
+  return {
+    sha256: createHash("sha256").update(output, "utf8").digest("hex"),
+    byteLength: Buffer.byteLength(output, "utf8"),
+    preview,
+    truncated
   };
 }
 
@@ -314,7 +354,12 @@ function normalizeEvidenceRecord(
       effect === "process.spawn" || effect === "process.spawn.readonly")
       ? [sanitizeCommand(raw, receipt, scope)] : [];
   }
-  if (raw.kind === "diagnostic") return [sanitizeDiagnostic(raw, receipt, scope)];
+  if (raw.kind === "diagnostic") {
+    // This source identifies runtime-bound mutation authority and can never
+    // be minted by a tool-provided evidence payload.
+    if (raw.data.source === "enclosing_container_mutation") return [];
+    return [sanitizeDiagnostic(raw, receipt, scope)];
+  }
   if (raw.kind === "input_access") {
     return actualEffects.includes("filesystem.read")
       ? [sanitizeInputAccess(raw, receipt, scope)] : [];
@@ -339,9 +384,17 @@ export function normalizeReceiptEvidence(
   const actualEffects = [...new Set(receipt.actualEffects ?? receipt.observedEffects)];
   const evidence = (receipt.evidence ?? []).flatMap((raw) =>
     normalizeEvidenceRecord(raw, receipt, toolName, plan, scope, actualEffects));
+  const environmentMutation =
+    plan.mutationAuthority === "disposable_enclosing_container_v1"
+      && actualEffects.includes("filesystem.write")
+      ? enclosingContainerMutationDiagnostic(receipt, plan, scope, actualEffects)
+      : undefined;
+  const normalized = [...evidence, ...(environmentMutation ? [environmentMutation] : [])];
   return {
     ...receipt,
     actualEffects,
-    evidence: evidence.length > 0 ? evidence : [synthesizedDiagnostic(receipt, toolName, scope, actualEffects)]
+    evidence: normalized.length > 0
+      ? normalized
+      : [synthesizedDiagnostic(receipt, toolName, scope, actualEffects)]
   };
 }

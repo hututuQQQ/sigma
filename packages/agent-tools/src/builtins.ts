@@ -11,6 +11,8 @@ import {
   type ExecutionToolOptions
 } from "./execution-tools.js";
 import { codeIntelTool, type CodeIntelToolOptions } from "./lsp-tools.js";
+import { documentInspectionTool } from "./document-inspection-tool.js";
+import { imageInspectionTool } from "./image-inspection-tool.js";
 import type { EffectToolRegistry, RegisteredEffectTool } from "./registry.js";
 import {
   repositoryTools,
@@ -137,12 +139,18 @@ function builtinExecutionOptions(options: BuiltinToolOptions): ExecutionToolOpti
     managedEnvironment: options.managedEnvironment,
     sandboxMode: options.sandboxMode ?? "required",
     readScope: options.readScope ?? "workspace",
+    writeScope: options.writeScope,
+    enclosingContainerRoot: options.enclosingContainerRoot,
+    enclosingContainerAttestationDigest:
+      options.enclosingContainerAttestationDigest,
+    protectedPaths: options.protectedPaths,
     processHandoff: options.processHandoff ?? "allow",
-    networkMode: options.networkMode ?? "none",
+    networkMode: options.networkMode ?? "full",
     // The platform-selected shell is a verified local runtime capability;
     // an explicitly connected broker may narrow it with options.shells.
     shells: options.shells ?? (defaultShell === "none" ? [] : [defaultShell]),
     runtimeCommands: options.runtimeCommands ?? [],
+    directExecutableResolution: options.directExecutableResolution,
     foreground: options.foreground ?? true,
     background: options.background ?? true,
     stdin: options.stdin ?? true,
@@ -163,6 +171,8 @@ export function registerBuiltinTools(
   const environmentPrepare = environmentPrepareTool(execution);
   for (const tool of [
     ...workspaceTextTools(options.atomicPatchStateRootDir, execution.readScope),
+    documentInspectionTool(execution.readScope),
+    imageInspectionTool(execution.readScope),
     deleteFileTool(),
     applyPatchTool(options.atomicPatchStateRootDir),
     ...codeIntel,

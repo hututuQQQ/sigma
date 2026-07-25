@@ -310,7 +310,9 @@ describe("OpenAI-compatible model gateway", () => {
     const initialMessages: ModelRequest["messages"] = [
       { role: "system", content: "system contract" },
       { role: "developer", content: "runtime context" },
-      { role: "user", content: "read a.ts" }
+      { role: "user", content: "read a.ts" },
+      { role: "developer", content: "current runtime frame" },
+      { role: "system", content: "current system constraint" }
     ];
 
     const first = await collectStream(gateway, {
@@ -335,7 +337,8 @@ describe("OpenAI-compatible model gateway", () => {
       messages: [
         ...initialMessages,
         firstDone.response.message,
-        { role: "tool", content: "file contents", toolCallId: "call_1" }
+        { role: "tool", content: "file contents", toolCallId: "call_1" },
+        { role: "developer", content: "next runtime frame" }
       ],
       tools,
       toolChoice: "required",
@@ -346,7 +349,8 @@ describe("OpenAI-compatible model gateway", () => {
       messages: [
         ...initialMessages,
         firstDone.response.message,
-        { role: "tool", content: "tool failed: file was unavailable", toolCallId: "call_1" }
+        { role: "tool", content: "tool failed: file was unavailable", toolCallId: "call_1" },
+        { role: "developer", content: "retry runtime frame" }
       ],
       tools,
       toolChoice: "required",
@@ -359,7 +363,9 @@ describe("OpenAI-compatible model gateway", () => {
       messages: [
         { role: "system", content: "system contract" },
         { role: "system", content: "runtime context" },
-        { role: "user", content: "read a.ts" }
+        { role: "user", content: "read a.ts" },
+        { role: "latest_reminder", content: "current runtime frame" },
+        { role: "latest_reminder", content: "current system constraint" }
       ]
     });
     expect(bodies[0]).not.toHaveProperty("tool_choice");
@@ -378,6 +384,13 @@ describe("OpenAI-compatible model gateway", () => {
         reasoning_content: "inspect first",
         tool_calls: [expect.objectContaining({ id: "call_1" })]
       })])
+    });
+    const firstWireMessages = bodies[0]!.messages as unknown[];
+    const secondWireMessages = bodies[1]!.messages as unknown[];
+    expect(secondWireMessages.slice(0, firstWireMessages.length)).toEqual(firstWireMessages);
+    expect(secondWireMessages.at(-1)).toEqual({
+      role: "latest_reminder",
+      content: "next runtime frame"
     });
   });
 

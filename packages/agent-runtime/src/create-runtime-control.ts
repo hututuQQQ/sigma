@@ -26,6 +26,7 @@ export function createRuntimeControlService(
     emit,
     createArtifact: async (sessionId, content) => await artifacts.put(sessionId, content),
     readArtifact: async (sessionId, artifactId) => (await artifacts.get(sessionId, artifactId)).toString("utf8"),
+    readArtifactBytes: async (sessionId, artifactId) => await artifacts.get(sessionId, artifactId),
     hasActiveChildren: options.hasActiveChildren,
     skillMaterializer: new FrozenSkillMaterializer(options.storeRootDir, artifacts),
     planChanged: async (session, previousRevision, plan) => {

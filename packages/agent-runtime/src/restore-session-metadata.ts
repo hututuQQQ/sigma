@@ -1,7 +1,9 @@
 import {
   createBudgetLedger,
+  isAssuranceResourcePolicyV1,
   isBudgetLedgerState,
   type AgentEventEnvelope,
+  type AssuranceResourcePolicyV1,
   type BudgetLimits,
   type JsonValue,
   type ModelExecutionRole,
@@ -16,6 +18,7 @@ export interface RestoredSessionMetadata {
   strictWriteScope: boolean;
   modelRole: ModelExecutionRole;
   budgetLimits?: BudgetLimits;
+  assurancePolicy?: AssuranceResourcePolicyV1;
 }
 
 function modelExecutionRole(value: JsonValue | undefined): ModelExecutionRole {
@@ -27,6 +30,14 @@ function validBudgetLimits(value: JsonValue | undefined): { budgetLimits: Budget
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const candidate = createBudgetLedger(value as unknown as BudgetLimits);
   return isBudgetLedgerState(candidate) ? { budgetLimits: candidate.limits } : {};
+}
+
+function validAssurancePolicy(
+  value: JsonValue | undefined
+): { assurancePolicy: AssuranceResourcePolicyV1 } | Record<string, never> {
+  return isAssuranceResourcePolicyV1(value)
+    ? { assurancePolicy: { ...(value as unknown as AssuranceResourcePolicyV1) } }
+    : {};
 }
 
 export function createdSessionMetadata(event: AgentEventEnvelope | undefined): RestoredSessionMetadata | null {
@@ -42,6 +53,7 @@ export function createdSessionMetadata(event: AgentEventEnvelope | undefined): R
       ? value.writeScope.filter((item): item is string => typeof item === "string") : [],
     strictWriteScope: value.strictWriteScope === true,
     modelRole: modelExecutionRole(value.modelRole),
-    ...validBudgetLimits(value.budgetLimits)
+    ...validBudgetLimits(value.budgetLimits),
+    ...validAssurancePolicy(value.assurancePolicy)
   };
 }

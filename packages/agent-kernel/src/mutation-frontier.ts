@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type {
   CheckpointRef,
+  DiagnosticEvidence,
   EvidenceRecord,
   MutationFrontier,
   RepositoryDeltaEvidence,
@@ -15,6 +16,7 @@ export function emptyMutationFrontier(): MutationFrontier {
     baselineManifestDigest: EMPTY_FRONTIER_DIGEST,
     currentStateDigest: EMPTY_FRONTIER_DIGEST,
     changedPaths: [],
+    environmentChangedPaths: [],
     sourceCheckpointIds: []
   };
 }
@@ -25,12 +27,38 @@ export function acceptMutationFrontier(frontier: MutationFrontier): MutationFron
     baselineManifestDigest: frontier.currentStateDigest,
     currentStateDigest: frontier.currentStateDigest,
     changedPaths: [],
+    environmentChangedPaths: [],
     sourceCheckpointIds: []
   };
 }
 
 function digest(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+export function isEnclosingContainerMutationEvidence(
+  evidence: EvidenceRecord
+): evidence is DiagnosticEvidence {
+  if (evidence.kind !== "diagnostic"
+    || evidence.data.source !== "enclosing_container_mutation") return false;
+  const diagnostic = record(evidence.data.diagnostic);
+  return diagnostic?.schemaVersion === 1
+    && diagnostic.scope === "enclosing_container"
+    && Array.isArray(diagnostic.declaredPaths)
+    && diagnostic.declaredPaths.length > 0
+    && diagnostic.declaredPaths.every((item) =>
+      typeof item === "string" && item.length > 0);
+}
+
+export function mutationFrontierHasChanges(frontier: MutationFrontier): boolean {
+  return frontier.changedPaths.length > 0
+    || (frontier.environmentChangedPaths?.length ?? 0) > 0;
 }
 
 function activeDeltas(evidence: readonly EvidenceRecord[]): WorkspaceDeltaEvidence[] {
@@ -121,6 +149,26 @@ export function frontierAfterEvidence(
   mutationEvidence: readonly EvidenceRecord[],
   evidence: EvidenceRecord
 ): MutationFrontier {
+  if (isEnclosingContainerMutationEvidence(evidence)) {
+    const diagnostic = record(evidence.data.diagnostic)!;
+    const declaredPaths = diagnostic.declaredPaths as string[];
+    const environmentChangedPaths = [...new Set([
+      ...(frontier.environmentChangedPaths ?? []),
+      ...declaredPaths
+    ])].sort();
+    return {
+      ...frontier,
+      revision: frontier.revision + 1,
+      environmentChangedPaths,
+      currentStateDigest: digest({
+        priorStateDigest: frontier.currentStateDigest,
+        environmentMutationEvidenceId: evidence.evidenceId,
+        environmentChangedPaths,
+        resultDigest: diagnostic.resultDigest ?? null,
+        ok: diagnostic.ok ?? null
+      })
+    };
+  }
   if (evidence.kind === "checkpoint" && evidence.data.sourceSessionId) {
     const baselineManifestDigest = frontier.revision === 0
       ? evidence.data.preManifestDigest : frontier.baselineManifestDigest;

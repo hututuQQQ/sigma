@@ -30,6 +30,7 @@ import {
   makeRunId,
   packageAgentCli,
   packageHarborRuntime,
+  parseTerminalBenchArgs,
   parseHarborTimeoutProbe,
   resolveHarborCommand,
   resolveRunOptions,
@@ -55,6 +56,36 @@ function evaluationLane(agentProfile) {
 }
 
 const MAX_PORTABLE_RUN_ID_LENGTH = 72;
+
+export const terminalBenchHelpText = `Usage: pnpm bench:tb:k -- [options]
+
+Run Sigma Code through the neutral Terminal-Bench harness.
+
+Selection:
+  --mode <smoke|k|task|batch>       Run mode (default: k)
+  --k <count>                       Number of tasks in k mode (default: 1)
+  --task-id <id>                    External task selection for task mode
+  --tasks-file <json>               Frozen external task list for batch mode
+  --dataset <name>                  Harbor dataset identifier
+
+Agent:
+  --provider <id>                   Model provider (default: deepseek)
+  --model <id>                      Provider model
+  --agent-profile <standard|strict> Sigma profile (default: standard)
+  --max-turns <count>               Hard model-turn limit
+
+Execution:
+  --concurrency <count>             Concurrent trials
+  --attempts <count>                Attempts per task (default: 1)
+  --retries <count>                 Harness retries (default: 0)
+  --network <none|loopback|full>    Network policy
+  --execution-mode <mode>           sandboxed or container
+  --run-label <label>               Artifact label
+  --reuse-package                   Reuse a frozen CLI archive
+  --expected-archive-sha256 <hash>  Required digest for archive reuse
+
+Use --benchmark-class diagnostic for diagnostic-only timeout overrides.
+`;
 
 export function boundedBenchmarkRunId(baseRunId, runLabel) {
   if (!runLabel) return baseRunId;
@@ -143,6 +174,30 @@ async function failBeforeHarbor(runDir, config, message, exitCode) {
 }
 
 export async function runTerminalBenchCli(argv, deps = {}) {
+  const flags = parseTerminalBenchArgs(argv);
+  if (Object.hasOwn(flags, "help")) {
+    const writeOutput = deps.writeOutput ?? ((text) => process.stdout.write(text));
+    writeOutput(terminalBenchHelpText);
+    return { exitCode: 0, help: true };
+  }
+
+  const controller = new AbortController();
+  const interrupt = () => {
+    if (!controller.signal.aborted) {
+      controller.abort(new Error("benchmark runner interrupted"));
+    }
+  };
+  process.once("SIGINT", interrupt);
+  process.once("SIGTERM", interrupt);
+  try {
+    return await runTerminalBenchCliImpl(argv, deps, controller.signal);
+  } finally {
+    process.removeListener("SIGINT", interrupt);
+    process.removeListener("SIGTERM", interrupt);
+  }
+}
+
+async function runTerminalBenchCliImpl(argv, deps, signal) {
   loadDotEnv();
   const options = resolveRunOptions(argv);
   if (options.mode === "task" && !options.taskId) {
@@ -158,7 +213,11 @@ export async function runTerminalBenchCli(argv, deps = {}) {
   const jobsDir = deps.harborJobsDir ?? portableHarborJobsDir(runDir);
   const env = harborEnvForRun(runDir);
   const startedAt = new Date().toISOString();
-  const runner = deps.runProcess ?? runProcess;
+  const baseRunner = deps.runProcess ?? runProcess;
+  const runner = (command, args, runnerOptions = {}) => baseRunner(command, args, {
+    ...runnerOptions,
+    signal: runnerOptions.signal ?? signal
+  });
   const packager = deps.packageAgentCli ?? packageAgentCli;
   const harborRuntimePackager = deps.packageHarborRuntime ?? packageHarborRuntime;
   const dockerCleanup = deps.cleanupHarborDockerResources ?? cleanupHarborDockerResources;

@@ -148,7 +148,11 @@ describe("CheckpointManager", () => {
       modified: ["existing.txt"],
       deleted: ["deleted.txt"]
     });
-    await expect(manager.reviewDiff(checkpoint.sessionId, checkpoint.checkpointId)).resolves.toContain("[before]\nbefore\n[after]\nafter");
+    const reviewDiff = await manager.reviewDiff(checkpoint.sessionId, checkpoint.checkpointId);
+    expect(reviewDiff).toContain("--- a/existing.txt");
+    expect(reviewDiff).toContain("+++ b/existing.txt");
+    expect(reviewDiff).toContain("-before");
+    expect(reviewDiff).toContain("+after");
 
     const restored = await manager.undoLatest(checkpoint.sessionId);
     expect(restored.status).toBe("restored");
@@ -987,6 +991,35 @@ describe("CheckpointManager", () => {
     expect(material.opaqueArtifacts).toEqual([expect.objectContaining({
       path: "existing.txt", representation: "content_omitted"
     })]);
+  });
+
+  it("renders a large replacement without variadic stack growth", async () => {
+    const { workspace, manager } = await fixture();
+    const before = Array.from(
+      { length: 80_000 },
+      (_, index) => `before-${index.toString().padStart(6, "0")}`
+    ).join("\n");
+    await writeFile(path.join(workspace, "existing.txt"), `${before}\n`, "utf8");
+    const checkpoint = await manager.create({
+      sessionId: "session-review-stack", runId: "run-review-stack", workspacePath: workspace,
+      scopePaths: ["existing.txt"], baseSeq: 0
+    });
+    const after = Array.from(
+      { length: 80_000 },
+      (_, index) => `after-${index.toString().padStart(6, "0")}`
+    ).join("\n");
+    await writeFile(path.join(workspace, "existing.txt"), `${after}\n`, "utf8");
+    await manager.seal(checkpoint.sessionId, checkpoint.checkpointId);
+
+    const material = await manager.reviewMaterial(
+      checkpoint.sessionId,
+      checkpoint.checkpointId,
+      8 * 1024 * 1024
+    );
+    expect(material.reviewProblem).toBeUndefined();
+    expect(material.reviewDiffPaths).toEqual(["existing.txt"]);
+    expect(material.reviewDiff).toContain("-before-000000");
+    expect(material.reviewDiff).toContain("+after-079999");
   });
 
   it("returns a typed scope blocker when path identities cannot fit", async () => {

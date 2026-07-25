@@ -1,0 +1,284 @@
+import path from "node:path";
+import type {
+  ProcessHandle
+} from "agent-execution";
+import type {
+  JsonValue,
+  ToolDescriptor,
+  ToolReceipt,
+  ToolRequest
+} from "agent-protocol";
+import { processReceipt } from "./execution-output-artifacts.js";
+import { writeContractProperties } from "./execution-foreground-schema.js";
+import {
+  prepareExecutionCallPlan
+} from "./execution-tool-planning.js";
+import type { ExecutionToolOptions } from "./execution-tool-types.js";
+import {
+  availableNetworkModes,
+  executableCapabilitySchema,
+  executionArgs,
+  executionText,
+  executionToolSchema
+} from "./execution-tool-values.js";
+import { simpleExecutionReceipt } from "./execution-tool-receipts.js";
+import { processHandoffTool } from "./process-handoff-tool.js";
+import type {
+  PlannedToolExecutionContext,
+  RegisteredEffectTool
+} from "./registry.js";
+
+export type BackgroundProcessExecutor = (
+  options: ExecutionToolOptions,
+  request: ToolRequest,
+  context: PlannedToolExecutionContext,
+  allowEnclosingContainerDeliverable?: boolean
+) => Promise<ToolReceipt>;
+
+function networkProperty(options: ExecutionToolOptions): JsonValue {
+  return {
+    type: "string",
+    enum: availableNetworkModes(options),
+    description: `Per-call network policy; configured default is '${options.networkMode}'. none denies sockets, loopback is limited to local test services when supported, and full always requires fresh approval.`
+  };
+}
+
+function handle(input: Record<string, JsonValue>): ProcessHandle {
+  return {
+    id: executionText(input, "handleId"),
+    brokerInstanceId: executionText(input, "brokerInstanceId")
+  };
+}
+
+function environmentProcessAvailable(options: ExecutionToolOptions): boolean {
+  return options.background !== false
+    && options.readScope === "host"
+    && options.writeScope === "enclosing-container"
+    && options.enclosingContainerRoot === true
+    && Boolean(options.enclosingContainerAttestationDigest);
+}
+
+function environmentProcessArguments(
+  value: JsonValue,
+  workspacePath: string
+): Record<string, JsonValue> {
+  const input = executionArgs(value);
+  const root = path.parse(path.resolve(workspacePath)).root;
+  return {
+    ...input,
+    access: "write",
+    writeRoots: [root],
+    expectedChanges: [root]
+  };
+}
+
+function environmentProcessTool(
+  options: ExecutionToolOptions,
+  executeBackground: BackgroundProcessExecutor
+): RegisteredEffectTool | undefined {
+  if (!environmentProcessAvailable(options)) return undefined;
+  const lifecycle: Record<string, JsonValue> = options.handoff === true ? {
+    lifecycle: {
+      type: "string",
+      enum: ["session", "deliverable"],
+      description: "Use session for temporary work. Use deliverable only when the verified service must survive task completion, then explicitly call process_handoff."
+    }
+  } : {};
+  return {
+    descriptor: {
+      ...executionToolSchema(
+        "environment_process_spawn",
+        "Start a background process inside the broker-attested disposable outer environment. External writes are granted by the runtime while the workspace and Sigma runtime stay read-only. Use this for services that need external runtime files; use process_spawn for readonly or explicitly scoped processes.",
+        {
+          executable: executableCapabilitySchema(options),
+          args: { type: "array", items: { type: "string" } },
+          cwd: { type: "string" },
+          network: networkProperty(options),
+          env: { type: "object", additionalProperties: { type: "string" } },
+          ...(options.pty === false ? {} : { pty: { type: "boolean" } }),
+          ...lifecycle
+        },
+        ["executable"],
+        [
+          "process.spawn",
+          "filesystem.read",
+          "filesystem.read.external",
+          "filesystem.write",
+          "network",
+          "open_world"
+        ],
+        ["change"]
+      ),
+      brokerMutationAuthority: "disposable_enclosing_container_v1",
+      prepare(value, context) {
+        return prepareExecutionCallPlan(
+          environmentProcessArguments(value, context.workspacePath),
+          context,
+          options,
+          false,
+          true,
+          true
+        );
+      }
+    },
+    async execute(request, context) {
+      return await executeBackground(options, {
+        ...request,
+        arguments: environmentProcessArguments(
+          request.arguments,
+          context.workspacePath
+        )
+      }, context, true);
+    }
+  };
+}
+
+function spawnTool(
+  options: ExecutionToolOptions,
+  executeBackground: BackgroundProcessExecutor
+): RegisteredEffectTool {
+  const enclosing = options.writeScope === "enclosing-container"
+    && options.enclosingContainerRoot === true;
+  const effects: ToolDescriptor["possibleEffects"] = [
+    "process.spawn.readonly",
+    ...(enclosing ? ["process.spawn" as const, "filesystem.write" as const] : []),
+    "filesystem.read",
+    "filesystem.read.external",
+    "network",
+    "open_world"
+  ];
+  return {
+    descriptor: {
+      ...executionToolSchema(
+        "process_spawn",
+        "Start a sandboxed background process and return an in-session handle.",
+        {
+          executable: executableCapabilitySchema(options),
+          args: { type: "array", items: { type: "string" } },
+          cwd: { type: "string" },
+          network: networkProperty(options),
+          env: { type: "object", additionalProperties: { type: "string" } },
+          ...(options.pty === false ? {} : { pty: { type: "boolean" } }),
+          ...(options.handoff === true ? {
+            lifecycle: {
+              type: "string",
+              enum: ["session", "deliverable"],
+              description: "Use deliverable only for a service that must survive successful task completion; verify it through a separate interface probe, then call process_handoff."
+            }
+          } : {}),
+          readRoots: {
+            type: "array",
+            items: { type: "string" },
+            uniqueItems: true,
+            description: "Additional existing directories to read; external paths require host read scope."
+          },
+          ...writeContractProperties(options)
+        },
+        ["executable"],
+        effects
+      ),
+      ...(enclosing
+        ? { brokerMutationAuthority: "disposable_enclosing_container_v1" as const }
+        : {}),
+      prepare(value, context) {
+        return prepareExecutionCallPlan(value, context, options, false, true);
+      }
+    },
+    async execute(request, context) {
+      return await executeBackground(options, request, context);
+    }
+  };
+}
+
+function processControlTools(
+  options: ExecutionToolOptions,
+  handleProperties: Record<string, JsonValue>
+): RegisteredEffectTool[] {
+  return [{
+    descriptor: executionToolSchema(
+      "process_poll",
+      "Poll incremental output from an in-session background process.",
+      handleProperties,
+      ["handleId", "brokerInstanceId"],
+      ["process.spawn.readonly"]
+    ),
+    async execute(request: ToolRequest, context: PlannedToolExecutionContext) {
+      const startedAt = new Date().toISOString();
+      const result = await options.broker.poll(
+        handle(executionArgs(request.arguments)),
+        { signal: context.signal }
+      );
+      return await processReceipt(
+        request,
+        startedAt,
+        result,
+        ["process.spawn.readonly"],
+        context,
+        options.broker,
+        "poll"
+      );
+    }
+  }, ...(options.stdin === false ? [] : [{
+    descriptor: executionToolSchema("process_write", "Write UTF-8 input to an in-session background process.", {
+      ...handleProperties,
+      data: { type: "string" }
+    }, ["handleId", "brokerInstanceId", "data"], ["process.spawn.readonly"]),
+    async execute(request: ToolRequest, context: PlannedToolExecutionContext) {
+      const startedAt = new Date().toISOString();
+      const input = executionArgs(request.arguments);
+      await options.broker.write(
+        handle(input),
+        executionText(input, "data"),
+        { signal: context.signal }
+      );
+      return simpleExecutionReceipt(
+        request,
+        startedAt,
+        { written: true },
+        ["process.spawn.readonly"]
+      );
+    }
+  }]), {
+    descriptor: executionToolSchema(
+      "process_terminate",
+      "Terminate an in-session background process tree.",
+      handleProperties,
+      ["handleId", "brokerInstanceId"],
+      ["process.spawn.readonly"]
+    ),
+    async execute(request, context) {
+      const startedAt = new Date().toISOString();
+      const result = await options.broker.terminate(
+        handle(executionArgs(request.arguments)),
+        { signal: context.signal }
+      );
+      return await processReceipt(
+        request,
+        startedAt,
+        result,
+        ["process.spawn.readonly"],
+        context,
+        options.broker,
+        "terminate"
+      );
+    }
+  }, ...(options.handoff === true
+    ? [processHandoffTool(options, handleProperties)]
+    : [])];
+}
+
+export function backgroundProcessTools(
+  options: ExecutionToolOptions,
+  executeBackground: BackgroundProcessExecutor
+): RegisteredEffectTool[] {
+  const handleProperties = {
+    handleId: { type: "string" },
+    brokerInstanceId: { type: "string" }
+  };
+  const environmentProcess = environmentProcessTool(options, executeBackground);
+  return [
+    spawnTool(options, executeBackground),
+    ...processControlTools(options, handleProperties),
+    ...(environmentProcess ? [environmentProcess] : [])
+  ];
+}

@@ -1,4 +1,4 @@
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -11,12 +11,17 @@ import type {
   ModelRequest,
   ModelResponse,
   ModelStreamEvent,
-  ModelToolDefinition
+  ModelToolDefinition,
+  ReviewEvidence
 } from "../packages/agent-protocol/src/index.js";
 import { replayBudgetLedgerEvent } from "../packages/agent-kernel/src/index.js";
 import { createRuntime } from "../packages/agent-runtime/src/testing.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
+import type {
+  ReviewerInput,
+  ReviewerPort
+} from "../packages/agent-runtime/src/reviewer.js";
 
 class UnderestimatedGateway implements ModelGateway {
   readonly provider = "fake";
@@ -67,18 +72,25 @@ class InspectableGateway implements ModelGateway {
   readonly provider = "fake";
   readonly model = "inspectable";
   readonly requests: ModelRequest[] = [];
-  readonly capabilities: ModelCapabilities = {
-    contextWindowTokens: 128_000,
-    maxOutputTokens: 4_096,
-    tools: true,
-    parallelTools: false,
-    reasoning: true,
-    structuredOutput: false,
-    promptCache: true,
-    tokenizer: "approximate"
-  };
+  readonly capabilities: ModelCapabilities;
 
-  constructor(private readonly responses: ModelResponse[]) {}
+  constructor(
+    private readonly responses: ModelResponse[],
+    capabilityOverrides: Partial<ModelCapabilities> = {}
+  ) {
+    this.capabilities = {
+      contextWindowTokens: 128_000,
+      maxOutputTokens: 32_768,
+      tools: true,
+      parallelTools: false,
+      reasoning: true,
+      structuredOutput: false,
+      promptCache: true,
+      tokenizer: "approximate",
+      strictToolChoice: true,
+      ...capabilityOverrides
+    };
+  }
 
   async complete(_request: ModelRequest): Promise<never> {
     throw new Error("This test consumes the streaming path.");
@@ -125,15 +137,64 @@ function replayBudget(events: AgentEventEnvelope[]): BudgetLedgerState {
 }
 
 describe("provider-measured model budget settlement", () => {
-  it("uses one transient forced-tool turn after a length finish", async () => {
+  it("materializes the exact prompt-cache frame so the next request extends the prior prefix", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-prompt-prefix-workspace-"));
+    const state = await mkdtemp(path.join(os.tmpdir(), "sigma-prompt-prefix-state-"));
+    await writeFile(path.join(workspace, "seed.txt"), "seed\n", "utf8");
+    const gateway = new InspectableGateway([{
+      message: {
+        role: "assistant",
+        content: "",
+        toolCalls: [{ id: "read-once", name: "read", arguments: { path: "seed.txt" } }]
+      },
+      finishReason: "tool_calls",
+      inputTokens: 100,
+      outputTokens: 10
+    }, requestInputResponse()]);
+    const store = new SegmentedJsonlStore({ rootDir: state });
+    const runtime = createRuntime({
+      gateway,
+      store,
+      storeRootDir: state,
+      tools: registerBuiltinTools(new EffectToolRegistry()),
+      permissionMode: "auto"
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "Read seed.txt." });
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "needs_input" });
+
+    expect(gateway.requests).toHaveLength(2);
+    const firstMessages = gateway.requests[0]!.messages;
+    const secondMessages = gateway.requests[1]!.messages;
+    expect(secondMessages.slice(0, firstMessages.length)).toEqual(firstMessages);
+    expect(firstMessages.some((message) => message.content.includes("runtime_state:budget"))).toBe(true);
+    expect(JSON.stringify(firstMessages)).not.toContain("timeMs=");
+    expect(gateway.requests[1]!.tools).toEqual(gateway.requests[0]!.tools);
+
+    const promptEvents = (await storedEvents(store, session.sessionId))
+      .filter((event) => event.type === "model.prompt_materialized");
+    expect(promptEvents).toHaveLength(2);
+    expect(promptEvents[0]!.payload).toMatchObject({
+      cacheMode: "prefix_cache",
+      toolSchemaDigest: (promptEvents[1]!.payload as { toolSchemaDigest: string }).toolSchemaDigest
+    });
+    expect((promptEvents[0]!.payload as { requestDigest: string }).requestDigest)
+      .toMatch(/^[a-f0-9]{64}$/u);
+  });
+
+  it("forces one bounded action recovery after a no-action length finish", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-length-recovery-workspace-"));
     const state = await mkdtemp(path.join(os.tmpdir(), "sigma-length-recovery-state-"));
-    const gateway = new InspectableGateway([{
-      message: { role: "assistant", content: "partial", reasoningContent: "private truncated reasoning" },
+    const gateway = new InspectableGateway([1, 2, 3].map((attempt) => ({
+      message: {
+        role: "assistant",
+        content: `partial ${attempt}`,
+        reasoningContent: "private truncated reasoning"
+      },
       finishReason: "length",
       inputTokens: 100,
       outputTokens: 4_096
-    }, requestInputResponse()]);
+    })));
     const runtime = createRuntime({
       gateway,
       store: new SegmentedJsonlStore({ rootDir: state }),
@@ -145,21 +206,94 @@ describe("provider-measured model budget settlement", () => {
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect recovery" });
 
-    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "needs_input" });
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "recoverable_failure",
+      code: "model_action_recovery_failed"
+    });
     expect(gateway.requests).toHaveLength(2);
-    expect(gateway.requests[0]).toMatchObject({ maxOutputTokens: 4_096 });
+    expect(gateway.requests.map((request) => request.maxOutputTokens))
+      .toEqual([4_096, 4_096]);
     expect(gateway.requests[0].toolChoice).toBeUndefined();
-    expect(gateway.requests[1]).toMatchObject({ maxOutputTokens: 2_048, toolChoice: "required" });
-    const recoveryPrompts = gateway.requests[1].messages.filter((message) =>
-      message.content.includes("private reasoning is not replayed"));
-    expect(recoveryPrompts).toHaveLength(1);
-    expect(gateway.requests[0].messages.some((message) => message.content.includes("private reasoning is not replayed")))
-      .toBe(false);
-    expect(gateway.requests[1].messages.some((message) => message.reasoningContent === "private truncated reasoning"))
-      .toBe(false);
+    expect(gateway.requests[1].toolChoice).toBe("required");
+    expect(gateway.requests[1].messages.some((message) => message.content.includes("action-oriented")))
+      .toBe(true);
+    expect(gateway.requests[1].messages.some((message) =>
+      message.reasoningContent?.includes("private truncated reasoning") === true)).toBe(false);
   });
 
-  it("projects only terminal tools while preserving natural completion during deadline convergence", async () => {
+  it("allows one 2K bounded answer when the provider cannot force a tool", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-length-fallback-workspace-"));
+    const state = await mkdtemp(path.join(os.tmpdir(), "sigma-length-fallback-state-"));
+    const gateway = new InspectableGateway([{
+      message: { role: "assistant", content: "partial" },
+      finishReason: "length",
+      inputTokens: 100,
+      outputTokens: 8_192
+    }, {
+      message: { role: "assistant", content: "Small complete answer." },
+      finishReason: "stop",
+      inputTokens: 100,
+      outputTokens: 20
+    }], { strictToolChoice: false });
+    const runtime = createRuntime({
+      gateway,
+      store: new SegmentedJsonlStore({ rootDir: state }),
+      storeRootDir: state,
+      tools: registerBuiltinTools(new EffectToolRegistry()),
+      permissionMode: "auto",
+      outputReserveTokens: 8_192
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "answer after truncation" });
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "completed",
+      message: "Small complete answer."
+    });
+    expect(gateway.requests).toHaveLength(2);
+    expect(gateway.requests[1]).toMatchObject({
+      toolChoice: "none",
+      tools: [],
+      maxOutputTokens: 2_048
+    });
+  });
+
+  it("executes tool calls from a length finish once and continues with the settled receipt", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-length-tool-workspace-"));
+    const state = await mkdtemp(path.join(os.tmpdir(), "sigma-length-tool-state-"));
+    await writeFile(path.join(workspace, "seed.txt"), "seed\n", "utf8");
+    const gateway = new InspectableGateway([{
+      message: {
+        role: "assistant",
+        content: "I will inspect the file.",
+        toolCalls: [{ id: "length-read", name: "read", arguments: { path: "seed.txt" } }]
+      },
+      finishReason: "length",
+      inputTokens: 100,
+      outputTokens: 4_096
+    }, requestInputResponse()]);
+    const store = new SegmentedJsonlStore({ rootDir: state });
+    const runtime = createRuntime({
+      gateway,
+      store,
+      storeRootDir: state,
+      tools: registerBuiltinTools(new EffectToolRegistry()),
+      permissionMode: "auto",
+      outputReserveTokens: 4_096
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "Inspect seed.txt." });
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "needs_input" });
+
+    expect(gateway.requests.map((request) => request.maxOutputTokens)).toEqual([4_096, 16_384]);
+    expect(gateway.requests[1]!.messages.some((message) =>
+      message.content.includes("executed exactly once"))).toBe(true);
+    const events = await storedEvents(store, session.sessionId);
+    expect(events.filter((event) => event.type === "tool.completed"
+      && (event.payload as { callId?: string }).callId === "length-read")).toHaveLength(1);
+  });
+
+  it("does not forecast a terminal budget stage while the hard ledger can fund a request", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-deadline-converge-workspace-"));
     const state = await mkdtemp(path.join(os.tmpdir(), "sigma-deadline-converge-state-"));
     const gateway = new InspectableGateway([requestInputResponse()]);
@@ -176,16 +310,13 @@ describe("provider-measured model budget settlement", () => {
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "finish promptly" });
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "needs_input" });
-    expect(gateway.requests[0]).toMatchObject({ maxOutputTokens: 2_048 });
+    expect(gateway.requests[0]).toMatchObject({ maxOutputTokens: 4_096 });
     expect(gateway.requests[0].toolChoice).toBeUndefined();
-    expect(gateway.requests[0].tools.map((tool) => tool.name).sort()).toEqual([
-      "report_blocked", "request_user_input"
-    ]);
+    expect(gateway.requests[0].tools.map((tool) => tool.name)).toEqual(
+      expect.arrayContaining(["read", "shell", "validate", "report_blocked", "request_user_input"])
+    );
     expect(gateway.requests[0].messages.some((message) => message.content.includes("Budget stage is terminal")))
-      .toBe(true);
-    expect(gateway.requests[0].messages.some((message) => message.content.includes(
-      "If the task is complete, stop naturally"
-    ))).toBe(true);
+      .toBe(false);
   });
 
   it("keeps a successful response when provider usage exceeds the admission reservation", async () => {
@@ -222,7 +353,7 @@ describe("provider-measured model budget settlement", () => {
     }));
   });
 
-  it("exposes only terminal tools when one model request fits", async () => {
+  it("keeps all permitted tools visible when one hard-ledger request fits", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-terminal-budget-workspace-"));
     const state = await mkdtemp(path.join(os.tmpdir(), "sigma-terminal-budget-state-"));
     const gateway = new InspectableGateway([requestInputResponse()]);
@@ -243,9 +374,12 @@ describe("provider-measured model budget settlement", () => {
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "needs_input" });
     expect(gateway.requests).toHaveLength(1);
     expect(gateway.requests[0].toolChoice).toBeUndefined();
-    expect(gateway.requests[0].tools.map((tool) => tool.name).sort()).toEqual([
-      "report_blocked", "request_user_input"
-    ]);
+    expect(gateway.requests[0].tools.map((tool) => tool.name)).toEqual(
+      expect.arrayContaining([
+        "read", "shell", "validate", "report_blocked", "request_user_input"
+      ])
+    );
+    expect(gateway.requests[0].tools.map((tool) => tool.name)).not.toContain("runtime_finalize");
   });
 
   it("returns typed budget exhaustion before an unfundable final request", async () => {
@@ -270,6 +404,231 @@ describe("provider-measured model budget settlement", () => {
       kind: "recoverable_failure", code: "budget_exhausted"
     });
     expect(gateway.requests).toHaveLength(0);
+  });
+
+  it("transfers a mutated run from ordinary budget exhaustion to protected review", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-budget-review-workspace-"));
+    const state = await mkdtemp(path.join(os.tmpdir(), "sigma-budget-review-state-"));
+    const gateway = new InspectableGateway([{
+      message: {
+        role: "assistant",
+        content: "",
+        toolCalls: [{
+          id: "write-result",
+          name: "write",
+          arguments: { path: "result.txt", content: "done\n" }
+        }]
+      },
+      finishReason: "tool_calls",
+      inputTokens: 130,
+      outputTokens: 5
+    }]);
+    let reviewerCalls = 0;
+    const reviewer: ReviewerPort = {
+      reviewerId: "budget-boundary-reviewer",
+      async review(input: ReviewerInput): Promise<ReviewEvidence> {
+        reviewerCalls += 1;
+        const deltaId = input.workspaceDeltas.at(-1)?.evidenceId;
+        if (!deltaId) throw new Error("Expected a durable workspace delta.");
+        const criteria = input.acceptanceCriteria?.length
+          ? input.acceptanceCriteria
+          : [input.goal];
+        return {
+          evidenceId: "budget-boundary-approval",
+          sessionId: input.sessionId,
+          runId: input.runId,
+          kind: "review",
+          status: "passed",
+          createdAt: "2026-07-24T00:00:00.000Z",
+          producer: { authority: "runtime", id: "budget-boundary-reviewer" },
+          summary: "The independent reviewer approved the current frontier.",
+          data: {
+            schemaVersion: 3,
+            reviewerId: "budget-boundary-reviewer",
+            verdict: "approved",
+            findings: [],
+            criteria: criteria.map((criterion) => ({
+              criterion,
+              status: "satisfied",
+              evidence: [deltaId]
+            })),
+            requiredValidations: [],
+            frontierRevision: input.frontierRevision,
+            stateDigest: input.stateDigest,
+            reviewBasisDigest: input.reviewBasisDigest,
+            validationEvidenceIds: [],
+            durableEvidenceIds: [deltaId],
+            actualChecks: []
+          }
+        };
+      }
+    };
+    const store = new SegmentedJsonlStore({ rootDir: state });
+    const runtime = createRuntime({
+      gateway,
+      reviewer,
+      store,
+      storeRootDir: state,
+      tools: registerBuiltinTools(new EffectToolRegistry()),
+      permissionMode: "auto",
+      outputReserveTokens: 100
+    });
+    const session = await runtime.createSession({
+      workspacePath: workspace,
+      mode: "change"
+    }, {
+      inputTokens: 249,
+      outputTokens: 1_000,
+      costMicroUsd: 10_000_000,
+      modelTurns: 20,
+      toolCalls: 1_000,
+      children: 32,
+      maxDepth: 4
+    });
+    await runtime.command({
+      type: "submit",
+      sessionId: session.sessionId,
+      text: "Create result.txt containing done."
+    });
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "completed",
+      decisionAuthority: "verification_verdict"
+    });
+    expect(gateway.requests).toHaveLength(1);
+    expect(reviewerCalls).toBe(1);
+    expect(await storedEvents(store, session.sessionId)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "review.started" }),
+        expect.objectContaining({ type: "review.completed" })
+      ])
+    );
+  });
+
+  it("uses protected repair capacity and re-reviews new post-review tool evidence", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-budget-repair-workspace-"));
+    const state = await mkdtemp(path.join(os.tmpdir(), "sigma-budget-repair-state-"));
+    const gateway = new InspectableGateway([{
+      message: {
+        role: "assistant",
+        content: "",
+        toolCalls: [{
+          id: "write-before-review",
+          name: "write",
+          arguments: { path: "result.txt", content: "done\n" }
+        }]
+      },
+      finishReason: "tool_calls",
+      inputTokens: 130,
+      outputTokens: 5
+    }, {
+      message: {
+        role: "assistant",
+        content: "",
+        toolCalls: [{
+          id: "inspect-during-repair",
+          name: "read",
+          arguments: { path: "result.txt" }
+        }]
+      },
+      finishReason: "tool_calls",
+      inputTokens: 100,
+      outputTokens: 5
+    }]);
+    let reviewerCalls = 0;
+    const reviewer: ReviewerPort = {
+      reviewerId: "repair-budget-reviewer",
+      async review(input: ReviewerInput): Promise<ReviewEvidence> {
+        reviewerCalls += 1;
+        const deltaId = input.workspaceDeltas.at(-1)?.evidenceId;
+        if (!deltaId) throw new Error("Expected a durable workspace delta.");
+        const criteria = input.acceptanceCriteria?.length
+          ? input.acceptanceCriteria
+          : [input.goal];
+        const approved = reviewerCalls === 2;
+        return {
+          evidenceId: `repair-review-${reviewerCalls}`,
+          sessionId: input.sessionId,
+          runId: input.runId,
+          kind: "review",
+          status: approved ? "passed" : "failed",
+          createdAt: "2026-07-24T00:00:00.000Z",
+          producer: { authority: "runtime", id: "repair-budget-reviewer" },
+          summary: approved
+            ? "The repaired evidence was approved."
+            : "Inspect the written result before approval.",
+          data: {
+            schemaVersion: 3,
+            reviewerId: "repair-budget-reviewer",
+            verdict: approved ? "approved" : "changes_requested",
+            findings: approved ? [] : [{
+              actionable: true,
+              severity: "error",
+              summary: "Read the written result and submit the new evidence."
+            }],
+            criteria: criteria.map((criterion) => ({
+              criterion,
+              status: approved ? "satisfied" : "unverified",
+              evidence: approved ? [deltaId] : []
+            })),
+            requiredValidations: approved ? [] : [{
+              purpose: "Inspect the written result."
+            }],
+            frontierRevision: input.frontierRevision,
+            stateDigest: input.stateDigest,
+            reviewBasisDigest: input.reviewBasisDigest,
+            validationEvidenceIds: [],
+            durableEvidenceIds: approved ? [deltaId] : [],
+            actualChecks: []
+          }
+        };
+      }
+    };
+    const store = new SegmentedJsonlStore({ rootDir: state });
+    const runtime = createRuntime({
+      gateway,
+      reviewer,
+      store,
+      storeRootDir: state,
+      tools: registerBuiltinTools(new EffectToolRegistry()),
+      permissionMode: "auto",
+      outputReserveTokens: 100
+    });
+    const session = await runtime.createSession({
+      workspacePath: workspace,
+      mode: "change"
+    }, {
+      inputTokens: 330,
+      outputTokens: 1_000,
+      costMicroUsd: 10_000_000,
+      modelTurns: 20,
+      toolCalls: 1_000,
+      children: 32,
+      maxDepth: 4
+    });
+    await runtime.command({
+      type: "submit",
+      sessionId: session.sessionId,
+      text: "Create result.txt containing done."
+    });
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "completed",
+      decisionAuthority: "verification_verdict"
+    });
+    expect(gateway.requests).toHaveLength(2);
+    expect(reviewerCalls).toBe(2);
+    const events = await storedEvents(store, session.sessionId);
+    expect(events.filter((event) => event.type === "review.started")).toHaveLength(2);
+    expect(events.filter((event) => event.type === "review.completed")).toHaveLength(2);
+    expect(events.filter((event) =>
+      event.type === "diagnostic"
+      && (event.payload as { kind?: string }).kind === "assurance.review_transfer"
+    )).toHaveLength(2);
+    expect(events.some((event) =>
+      event.type === "tool.completed"
+      && (event.payload as { callId?: string }).callId === "inspect-during-repair"
+    )).toBe(true);
   });
 
   it.each(["budget.committed", "budget.overrun", "usage.recorded", "model.completed"] as const)(

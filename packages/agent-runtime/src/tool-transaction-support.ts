@@ -11,7 +11,7 @@ import { mutatingPlan, turnPayload, type ToolAttempt } from "./effect-runner-hel
 import type { RuntimeSession } from "./types.js";
 import { assertToolReceiptIdentity, normalizeReceiptEvidence } from "./tool-evidence.js";
 import { assertReceiptWithinPlan } from "./tool-plan-enforcement.js";
-import { toolTaskControlContext } from "./repository-recovery-context.js";
+import { toolRuntimeContext } from "./repository-recovery-context.js";
 
 interface NoChangePreparedTool {
   call: ModelToolCall;
@@ -21,7 +21,8 @@ interface NoChangePreparedTool {
 }
 
 export function delegatesWorkspaceMutation(plan: ToolCallPlan): boolean {
-  return plan.exactEffects.includes("agent.spawn") && plan.processMode === "background";
+  return plan.mutationAuthority === "disposable_enclosing_container_v1"
+    || (plan.exactEffects.includes("agent.spawn") && plan.processMode === "background");
 }
 
 export function isToolReceipt(value: object): value is ToolReceipt {
@@ -59,7 +60,7 @@ async function probeNoChange(
     runId: session.durable.runId,
     workspacePath: session.identity.workspacePath,
     runMode: session.durable.mode,
-    ...toolTaskControlContext(session),
+    ...toolRuntimeContext(session),
     runtimeControl: options.control.forSession(session),
     signal,
     callPlan: plan
@@ -104,7 +105,7 @@ export async function settleNoChangeProbe(
     runId: session.durable.runId,
     workspaceDeltas: []
     , repositoryScope: {
-      goalEpoch: session.durable.state.taskControl.goalEpoch,
+      goalEpoch: session.durable.state.messages.filter((message) => message.role === "user").length,
       frontier: session.durable.state.mutationFrontier,
       mutationEvidence: [...session.durable.state.mutationEvidence]
     }
@@ -121,7 +122,9 @@ export async function createMutationCheckpoint(
   session: RuntimeSession,
   plan: ToolCallPlan
 ): Promise<CheckpointRef | undefined> {
-  if (plan.checkpointAction || plan.mutationAuthority === "broker_repository_transaction_v2") {
+  if (plan.checkpointAction
+    || plan.mutationAuthority === "broker_repository_transaction_v2"
+    || plan.mutationAuthority === "disposable_enclosing_container_v1") {
     return undefined;
   }
   if (!mutatingPlan(plan) || delegatesWorkspaceMutation(plan)) return undefined;

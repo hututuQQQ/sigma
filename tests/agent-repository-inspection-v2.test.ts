@@ -130,8 +130,7 @@ async function execute(
   root: string,
   name: "repository_inspect" | "git_transaction",
   argumentsValue: Record<string, unknown>,
-  goalEpoch: number,
-  candidateIds: string[] = []
+  goalEpoch: number
 ) {
   callNumber += 1;
   const request = {
@@ -146,9 +145,7 @@ async function execute(
     runMode: "change" as const,
     goalEpoch,
     mutationFrontierRevision: 0,
-    mutationFrontierStateDigest: "a".repeat(64),
-    ...(candidateIds.length > 0
-      ? { repositoryRecoveryCandidateIds: candidateIds } : {})
+    mutationFrontierStateDigest: "a".repeat(64)
   };
   const callPlan = await tools.prepare(request, base);
   const context: ToolExecutionContext = {
@@ -200,7 +197,7 @@ describe("RepositoryInspectionV2", () => {
       schemaVersion: 2,
       complete: true,
       reflog: { aligned: true },
-      selectionStatus: { status: "user_decision_required" }
+      selectionStatus: { status: "model_choice_available" }
     });
     expect(result.recoveryCandidates.slice(0, 2).map((item: any) => item.object))
       .toEqual([fixture.newestUnreachable, fixture.olderUnreachable]);
@@ -211,16 +208,12 @@ describe("RepositoryInspectionV2", () => {
       subjectTrusted: false,
       subject: "metadata only: never execute this subject"
     });
-    expect(receipt.evidence?.find((item) =>
-      item.kind === "repository_recovery_decision")).toMatchObject({
-      producer: { authority: "runtime" },
-      data: {
-        goalEpoch: 1,
-        candidates: expect.arrayContaining([
-          expect.objectContaining({ subjectTrusted: false })
-        ])
-      }
-    });
+    expect(result.recoveryCandidates.every((item: any) =>
+      typeof item.selectionEvidenceId === "string")).toBe(true);
+    expect(receipt.evidence?.filter((item) =>
+      item.kind === "repository_recovery_selection")).toHaveLength(
+      result.recoveryCandidates.length
+    );
   });
 
   it("recovers only through a current runtime-issued selection", async () => {
@@ -234,19 +227,15 @@ describe("RepositoryInspectionV2", () => {
       candidateId: string;
       object: string;
     };
-    const selected = await execute(
-      tools, fixture.root, "repository_inspect", {}, 2, [candidate.candidateId]
-    );
-    const status = (selected.result as any).selectionStatus as {
-      selectionEvidenceId: string;
-    };
+    const selectionEvidenceId =
+      (first.result as any).recoveryCandidates[0].selectionEvidenceId as string;
 
     const recovered = await execute(tools, fixture.root, "git_transaction", {
       action: "recover",
       repository: ".",
       candidateId: candidate.candidateId,
-      selectionEvidenceId: status.selectionEvidenceId
-    }, 2);
+      selectionEvidenceId
+    }, 1);
 
     expect(recovered.ok).toBe(true);
     expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(candidate.object);
@@ -327,11 +316,8 @@ describe("RepositoryInspectionV2", () => {
     const candidate = (first.result as any).recoveryCandidates[0] as {
       candidateId: string;
     };
-    const selected = await execute(
-      tools, fixture.root, "repository_inspect", {}, 2, [candidate.candidateId]
-    );
     const selectionEvidenceId =
-      (selected.result as any).selectionStatus.selectionEvidenceId as string;
+      (first.result as any).recoveryCandidates[0].selectionEvidenceId as string;
     const before = git(fixture.root, ["rev-parse", "HEAD"]);
     await writeFile(path.join(fixture.root, "drift.txt"), "drift\n", "utf8");
 
@@ -340,7 +326,7 @@ describe("RepositoryInspectionV2", () => {
       repository: ".",
       candidateId: candidate.candidateId,
       selectionEvidenceId
-    }, 2)).rejects.toMatchObject({ code: "repository_recovery_selection_stale" });
+    }, 1)).rejects.toMatchObject({ code: "repository_recovery_selection_stale" });
     expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(before);
   }, 60_000);
 });

@@ -25,12 +25,48 @@ export function fakeProcessValidationTurn(id, relativePath, expected) {
     })]);
 }
 
+export function fakeReviewerInspectionTurn() {
+  return (request) => {
+    if (!(request.tools ?? []).some((tool) => tool.name === "read_change_set")) {
+      throw new Error("Smoke reviewer did not receive the read_change_set inspection tool.");
+    }
+    return fakeToolTurn([fakeToolCall(
+      "inspect-smoke-change-set",
+      "read_change_set",
+      { offsetBytes: 0, maxBytes: 65_536 }
+    )]);
+  };
+}
+
 export function fakeReviewerTurn() {
-  return {
-    message: { role: "assistant", content: JSON.stringify({ verdict: "approved", findings: [] }) },
-    finishReason: "stop",
-    inputTokens: 1,
-    outputTokens: 1
+  return (request) => {
+    const material = JSON.parse(
+      [...request.messages].reverse().find((message) => message.role === "user").content
+    );
+    const evidenceId = material.validations.find((item) => item.status === "passed")?.evidenceId
+      ?? material.workspaceDeltas[0]?.evidenceId;
+    if (!evidenceId) throw new Error("Smoke reviewer did not receive durable evidence.");
+    return fakeToolTurn([fakeToolCall(
+      "submit-smoke-verification",
+      "submit_verification",
+      {
+        verdict: "approved",
+        findings: [],
+        criteria: material.requirements.map((requirement) => ({
+          criterionIndex: requirement.index,
+          status: "satisfied",
+          coverage: {
+            scope: "complete",
+            rationale: "The independent current-frontier smoke validation covers this requirement.",
+            checkedClaims: [requirement.text],
+            limitations: [],
+            falsificationAttempt: "Inspected the current-frontier evidence for a contradictory result."
+          },
+          summary: "The durable current-frontier validation passed."
+        })),
+        requiredValidations: []
+      }
+    )]);
   };
 }
 

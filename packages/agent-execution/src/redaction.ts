@@ -8,6 +8,35 @@ function replaceAllLiteral(input: string, search: string, replacement: string): 
   return input.split(search).join(replacement);
 }
 
+function replaceAllBytes(
+  input: Uint8Array,
+  search: Uint8Array,
+  replacement: Uint8Array
+): Buffer {
+  const source = Buffer.from(input);
+  const needle = Buffer.from(search);
+  const chunks: Buffer[] = [];
+  let offset = 0;
+  while (offset <= source.byteLength) {
+    const found = source.indexOf(needle, offset);
+    if (found < 0) {
+      chunks.push(source.subarray(offset));
+      break;
+    }
+    chunks.push(source.subarray(offset, found), Buffer.from(replacement));
+    offset = found + needle.byteLength;
+  }
+  return Buffer.concat(chunks);
+}
+
+function utf16LeBytes(value: string): Buffer {
+  const output = Buffer.allocUnsafe(value.length * 2);
+  for (let index = 0; index < value.length; index += 1) {
+    output.writeUInt16LE(value.charCodeAt(index), index * 2);
+  }
+  return output;
+}
+
 export class SecretRedactor {
   private readonly values: Array<{ name: string; value: string }>;
 
@@ -25,6 +54,20 @@ export class SecretRedactor {
         ? "*".repeat(Buffer.byteLength(secret.value, "utf8"))
         : `[REDACTED:${secret.name}]`;
       output = replaceAllLiteral(output, secret.value, replacement);
+    }
+    return output;
+  }
+
+  /** Redact exact UTF-8 secret byte sequences without decoding arbitrary
+   * process output. This keeps binary artifacts byte-safe. */
+  redactBytes(input: Uint8Array): Uint8Array {
+    let output: Uint8Array = Buffer.from(input);
+    for (const secret of this.values) {
+      const replacement = Buffer.from(`[REDACTED:${secret.name}]`, "utf8");
+      const utf16 = utf16LeBytes(secret.value);
+      for (const encoded of [Buffer.from(secret.value, "utf8"), utf16]) {
+        output = replaceAllBytes(output, encoded, replacement);
+      }
     }
     return output;
   }

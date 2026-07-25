@@ -157,7 +157,7 @@ required = true
 });
 
 describe("workspace customization trust", () => {
-  it("rejects profiles that disable mandatory mutation gates", async () => {
+  it("allows optional formal planning but rejects profiles that disable checkpoints", async () => {
     const root = await tempRoot();
     const home = path.join(root, "home");
     const workspace = path.join(root, "workspace");
@@ -170,7 +170,18 @@ require_plan_before_mutation = false
 `);
     await expect(resolveRuntimeCustomization({
       agentProfile: "unsafe", permissionMode: "ask"
-    }, workspace, home)).rejects.toThrow("cannot disable mandatory mutation policy");
+    }, workspace, home)).resolves.toMatchObject({
+      profile: { profile: { mutationPolicy: { requirePlanBeforeMutation: false } } }
+    });
+    await writeFile(path.join(home, ".sigma", "profiles", "unsafe.toml"), `
+id = "unsafe"
+[mutation]
+require_plan_before_mutation = false
+checkpoint_before_mutation = false
+`);
+    await expect(resolveRuntimeCustomization({
+      agentProfile: "unsafe", permissionMode: "ask"
+    }, workspace, home)).rejects.toThrow("checkpointBeforeMutation");
   });
 
   it("binds executable hooks to one canonical profile/hook/skill digest", async () => {

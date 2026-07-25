@@ -51,7 +51,7 @@ function defaultProtectedPaths(policy: ExecutionPolicy): string[] {
     .filter((root) => !scratchRoots.some((scratch) => pathWithin(root, scratch)));
   const roots = resolved.filter((root) => !resolved.some((candidate) =>
     candidate !== root && pathWithin(root, candidate)
-  ));
+  )).filter((root) => path.parse(root).root !== root);
   return [...new Set([
     ...explicit,
     ...roots.flatMap((root) => [
@@ -202,6 +202,56 @@ function wireCommand(
   };
 }
 
+function rootsOverlap(left: readonly string[], right: readonly string[]): boolean {
+  return left.some((leftRoot) => right.some((rightRoot) =>
+    pathWithin(leftRoot, rightRoot) || pathWithin(rightRoot, leftRoot)));
+}
+
+function assertWirePolicyBoundaries(
+  policy: ExecutionPolicy,
+  executionRootsValue: readonly string[],
+  runtimeRoots: readonly string[],
+  writeRoots: readonly string[]
+): void {
+  if (policy.enclosingContainerRoot !== true
+    && rootsOverlap(executionRootsValue, writeRoots)) {
+    throw new BrokerPolicyError("executionRoots must not overlap writeRoots.");
+  }
+  if (policy.enclosingContainerRoot !== true
+    && rootsOverlap(runtimeRoots, writeRoots)) {
+    throw new BrokerPolicyError("trusted runtimeRoots must not overlap writeRoots.");
+  }
+  if (policy.network === "full" && policy.networkApproved !== true) {
+    throw new BrokerPolicyError("Full network access requires an explicit per-call approval.");
+  }
+  if (String(policy.sandbox) !== "required") {
+    throw new BrokerPolicyError(
+      "Unsafe host execution was removed in V5; use the required sandbox or a real OCI backend."
+    );
+  }
+}
+
+function optionalWirePolicyFields(input: {
+  executableSha256?: string;
+  disposableRoot?: string;
+  readOnlyValidationRoot?: string;
+  repositoryLeaseId?: string;
+  scratchLease?: { scratchLeaseId: string; scratchSessionId: string };
+}): Record<string, unknown> {
+  return {
+    ...(input.executableSha256 ? { executableSha256: input.executableSha256 } : {}),
+    ...(input.disposableRoot === undefined
+      ? {} : { disposableWorkspaceRoot: input.disposableRoot }),
+    ...(input.readOnlyValidationRoot === undefined ? {} : {
+      readOnlyValidationWorkspaceRoot: input.readOnlyValidationRoot
+    }),
+    ...(input.repositoryLeaseId === undefined ? {} : {
+      repositoryMetadataLeaseId: input.repositoryLeaseId
+    }),
+    ...(input.scratchLease ?? {})
+  };
+}
+
 function wirePolicy(
   command: CommandSpec,
   policy: ExecutionPolicy,
@@ -218,29 +268,23 @@ function wirePolicy(
   const readOnlyValidationRoot = readOnlyValidationWorkspaceRoot(policy);
   const repositoryLeaseId = repositoryMetadataLeaseId(policy);
   const scratchLease = scratchLeaseCapability(policy);
-  const resolvedExecutionRoots = executionRoots(command, policy, toolchains, verifiedExecutables, backend);
+  const resolvedExecutionRoots = executionRoots(
+    command,
+    policy,
+    toolchains,
+    verifiedExecutables,
+    backend
+  );
   const runtimeRoots = toolchains
     .filter((toolchain) => samePath(toolchain.executable, command.executable))
     .flatMap((toolchain) => toolchain.runtimeRoots);
   const resolvedWriteRoots = policy.writeRoots.map((root) => path.resolve(root));
-  if (resolvedExecutionRoots.some((executionRoot) => resolvedWriteRoots.some((writeRoot) =>
-    pathWithin(executionRoot, writeRoot) || pathWithin(writeRoot, executionRoot)
-  ))) {
-    throw new BrokerPolicyError("executionRoots must not overlap writeRoots.");
-  }
-  if (runtimeRoots.some((runtimeRoot) => resolvedWriteRoots.some((writeRoot) =>
-    pathWithin(runtimeRoot, writeRoot) || pathWithin(writeRoot, runtimeRoot)
-  ))) {
-    throw new BrokerPolicyError("trusted runtimeRoots must not overlap writeRoots.");
-  }
-  if (policy.network === "full" && policy.networkApproved !== true) {
-    throw new BrokerPolicyError("Full network access requires an explicit per-call approval.");
-  }
-  if (String(policy.sandbox) !== "required") {
-    throw new BrokerPolicyError(
-      "Unsafe host execution was removed in V5; use the required sandbox or a real OCI backend."
-    );
-  }
+  assertWirePolicyBoundaries(
+    policy,
+    resolvedExecutionRoots,
+    runtimeRoots,
+    resolvedWriteRoots
+  );
   return {
     sandbox: policy.sandbox,
     network: policy.network,
@@ -251,17 +295,19 @@ function wirePolicy(
     ]),
     writeRoots: resolvedWriteRoots,
     executionRoots: resolvedExecutionRoots,
-    ...(executableSha256 ? { executableSha256 } : {}),
-    protectedPaths: defaultProtectedPaths(policy)
+    protectedPaths: [...new Set([
+      ...defaultProtectedPaths(policy),
+      ...(policy.enclosingContainerRoot === true ? runtimeRoots : [])
+    ])]
       .map((item) => path.resolve(item)),
-    ...(disposableRoot === undefined ? {} : { disposableWorkspaceRoot: disposableRoot }),
-    ...(readOnlyValidationRoot === undefined ? {} : {
-      readOnlyValidationWorkspaceRoot: readOnlyValidationRoot
-    }),
-    ...(repositoryLeaseId === undefined ? {} : {
-      repositoryMetadataLeaseId: repositoryLeaseId
-    }),
-    ...(scratchLease ?? {})
+    enclosingContainerRoot: policy.enclosingContainerRoot === true,
+    ...optionalWirePolicyFields({
+      executableSha256,
+      disposableRoot,
+      readOnlyValidationRoot,
+      repositoryLeaseId,
+      scratchLease
+    })
   };
 }
 
@@ -292,7 +338,12 @@ export function requestParams(
   return {
     command: wireCommand(resolvedCommand, toolchains, options, target),
     policy: wirePolicy(
-      resolvedCommand, request.policy, options, toolchains, verifiedExecutables, executableSha256
+      resolvedCommand,
+      request.policy,
+      options,
+      toolchains,
+      verifiedExecutables,
+      executableSha256
     ),
     maxOutputBytes: positiveInteger(request.maxOutputBytes, DEFAULT_MAX_OUTPUT_BYTES, "maxOutputBytes"),
     ...("lifecycle" in request ? { lifecycle: request.lifecycle ?? "session" } : {}),

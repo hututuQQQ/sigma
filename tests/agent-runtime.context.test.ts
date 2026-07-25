@@ -5,9 +5,10 @@ describe("runtime behavior context", () => {
   it("requires clarification before inventing consequential product requirements", () => {
     const behavior = baseContext().find((item) => item.id === "system:behavior")?.content ?? "";
 
-    expect(behavior).toContain("Do not invent product requirements");
-    expect(behavior).toContain("Before mutating");
-    expect(behavior).toContain("neither the user nor repository conventions resolve it");
+    expect(behavior).toContain("do not invent requirements");
+    expect(behavior).toContain("Inspect relevant repository state");
+    expect(behavior).toContain("concrete missing decision");
     expect(behavior).toContain("request_user_input");
+    expect(behavior).toContain("stop naturally");
   });
 });

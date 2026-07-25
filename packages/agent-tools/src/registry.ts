@@ -113,6 +113,10 @@ function assertPlanEffects(descriptor: ToolDescriptor, plan: ToolCallPlan): void
     && descriptor.brokerMutationAuthority !== "repository_transaction_v2") {
     throw planError(`Tool '${descriptor.name}' cannot delegate mutation rollback to the repository broker.`);
   }
+  if (plan.mutationAuthority === "disposable_enclosing_container_v1"
+    && descriptor.brokerMutationAuthority !== "disposable_enclosing_container_v1") {
+    throw planError(`Tool '${descriptor.name}' cannot mutate an enclosing disposable container.`);
+  }
 }
 
 export async function prepareToolCallPlan(

@@ -1,70 +1,8 @@
 import type {
   OpaqueArtifactEvidence,
-  ValidationEvidence,
   WorkspaceDeltaEvidence
 } from "agent-protocol";
-import type { ReviewerInput } from "./reviewer.js";
-
-function binaryReviewEvidenceFailure(
-  delta: WorkspaceDeltaEvidence,
-  diff: string,
-  validations: readonly ValidationEvidence[]
-): string | undefined {
-  if (!diff.includes("[binary sha256=")) return undefined;
-  const markers = [...diff.matchAll(/^\[binary sha256=([a-f0-9]{64}) size=(\d+)\]$/gmu)];
-  if (markers.length === 0) return `Delta ${delta.evidenceId} has an invalid opaque artifact digest or size.`;
-  if (markers.some((match) => !Number.isSafeInteger(Number(match[2])))) {
-    return `Delta ${delta.evidenceId} has an opaque artifact size outside the supported range.`;
-  }
-  const sections = [...diff.matchAll(/^--- (?:a\/([^\s]+)|\/dev\/null)\n\+\+\+ (?:b\/([^\s]+)|\/dev\/null)$/gmu)]
-    .map((match) => (match[2] ?? match[1] ?? "").replaceAll("\\", "/"));
-  const changedPaths = new Set([
-    ...delta.data.delta.added,
-    ...delta.data.delta.modified,
-    ...delta.data.delta.deleted
-  ].map((item) => item.replaceAll("\\", "/")));
-  if (sections.length === 0 || sections.some((section) => section && !changedPaths.has(section))) {
-    return `Delta ${delta.evidenceId} is missing an opaque artifact path bound to its workspace delta.`;
-  }
-  const validated = validations.some((item) => item.status === "passed"
-    && [...delta.data.delta.added, ...delta.data.delta.modified, ...delta.data.delta.deleted]
-      .some((path) => item.data.coveredPaths.includes(path)));
-  if (!validated) return `Delta ${delta.evidenceId} has no passed validation evidence for its opaque artifact.`;
-  return undefined;
-}
-
-function legacyOpaqueArtifactReviewEvidenceFailure(
-  delta: WorkspaceDeltaEvidence,
-  validations: readonly ValidationEvidence[]
-): string | undefined {
-  const artifacts = delta.data.opaqueArtifacts;
-  if (!artifacts || artifacts.length === 0) return undefined;
-  const changedPaths = new Set([
-    ...delta.data.delta.added,
-    ...delta.data.delta.modified,
-    ...delta.data.delta.deleted
-  ].map((item) => item.replaceAll("\\", "/")));
-  const seen = new Set<string>();
-  for (const artifact of artifacts as OpaqueArtifactEvidence[]) {
-    const normalized = typeof artifact.path === "string" ? artifact.path.replaceAll("\\", "/") : "";
-    const identities = [artifact.before, artifact.after].filter((item) => item !== undefined);
-    if (!changedPaths.has(normalized) || seen.has(normalized)
-      || identities.length === 0
-      || identities.some((identity) => !/^[a-f0-9]{64}$/u.test(identity.digest)
-        || !Number.isSafeInteger(identity.sizeBytes) || identity.sizeBytes < 0)) {
-      return `Delta ${delta.evidenceId} has invalid opaque artifact evidence.`;
-    }
-    seen.add(normalized);
-  }
-  if (![...changedPaths].every((item) => seen.has(item))) {
-    return `Delta ${delta.evidenceId} has incomplete opaque artifact evidence.`;
-  }
-  const validated = validations.some((item) => item.status === "passed"
-    && [...delta.data.delta.added, ...delta.data.delta.modified, ...delta.data.delta.deleted]
-      .some((path) => item.data.coveredPaths.includes(path)));
-  if (!validated) return `Delta ${delta.evidenceId} has no passed validation evidence for its opaque artifact.`;
-  return undefined;
-}
+import type { ReviewerInput } from "./reviewer-contracts.js";
 
 type ChangeKind = "added" | "modified" | "deleted";
 
@@ -73,7 +11,9 @@ function normalizedRelativePath(value: string): string | undefined {
   if (normalized.length === 0 || normalized.startsWith("/") || /^[a-z]:\//iu.test(normalized)
     || normalized.includes("\r") || normalized.includes("\n")) return undefined;
   const segments = normalized.split("/");
-  if (segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")) return undefined;
+  if (segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")) {
+    return undefined;
+  }
   return normalized;
 }
 
@@ -94,186 +34,60 @@ function changedPathKinds(delta: WorkspaceDeltaEvidence): Map<string, ChangeKind
   return result;
 }
 
-function validOpaqueIdentity(identity: { digest: string; sizeBytes: number } | undefined): boolean {
-  return identity !== undefined && /^[a-f0-9]{64}$/u.test(identity.digest)
+function validIdentity(identity: { digest: string; sizeBytes: number } | undefined): boolean {
+  return identity === undefined || /^[a-f0-9]{64}$/u.test(identity.digest)
     && Number.isSafeInteger(identity.sizeBytes) && identity.sizeBytes >= 0;
 }
 
-function pathIsFullyOpaque(kind: ChangeKind, artifact: OpaqueArtifactEvidence | undefined): boolean {
-  if (!artifact) return false;
-  if (kind === "added") return artifact.after !== undefined;
-  if (kind === "deleted") return artifact.before !== undefined;
-  return artifact.before !== undefined && artifact.after !== undefined;
-}
-
-function expectedReviewHeader(path: string, kind: ChangeKind): string {
-  const before = kind === "added" ? "/dev/null" : `a/${path}`;
-  const after = kind === "deleted" ? "/dev/null" : `b/${path}`;
-  return `--- ${before}\n+++ ${after}\n`;
-}
-
-function hasPassedValidation(
-  delta: WorkspaceDeltaEvidence,
-  validations: readonly ValidationEvidence[]
-): boolean {
-  const paths = [...delta.data.delta.added, ...delta.data.delta.modified, ...delta.data.delta.deleted];
-  return validations.some((item) => item.status === "passed"
-    && paths.some((path) => item.data.coveredPaths.includes(path)));
-}
-
-function hasExecutedValidation(
-  delta: WorkspaceDeltaEvidence,
-  validations: readonly ValidationEvidence[]
-): boolean {
-  const paths = [...delta.data.delta.added, ...delta.data.delta.modified, ...delta.data.delta.deleted];
-  return validations.some((item) => item.status === "failed"
-    && item.data.termination?.processStarted === true
-    && item.data.termination.state === "exited"
-    && paths.some((path) => item.data.coveredPaths.includes(path)));
-}
-
-type EvidenceIndex<T> = { value: T } | { failure: string };
-
-function invalidOpaqueArtifact(
-  artifact: OpaqueArtifactEvidence,
-  normalized: string | undefined,
-  kind: ChangeKind | undefined,
-  seen: ReadonlyMap<string, OpaqueArtifactEvidence>
-): boolean {
-  if (!normalized || !kind || seen.has(normalized)) return true;
-  if (artifact.before === undefined && artifact.after === undefined) return true;
-  if (artifact.before !== undefined && !validOpaqueIdentity(artifact.before)) return true;
-  if (artifact.after !== undefined && !validOpaqueIdentity(artifact.after)) return true;
-  if (kind === "added") return artifact.before !== undefined || artifact.after === undefined;
-  if (kind === "deleted") return artifact.after !== undefined || artifact.before === undefined;
-  return false;
-}
-
-function opaqueArtifactIndex(
-  delta: WorkspaceDeltaEvidence,
-  changes: ReadonlyMap<string, ChangeKind>
-): EvidenceIndex<Map<string, OpaqueArtifactEvidence>> {
-  const result = new Map<string, OpaqueArtifactEvidence>();
-  for (const artifact of delta.data.opaqueArtifacts ?? []) {
-    const normalized = normalizedRelativePath(artifact.path);
-    const kind = normalized ? changes.get(normalized) : undefined;
-    if (invalidOpaqueArtifact(artifact, normalized, kind, result)) {
-      return { failure: `Delta ${delta.evidenceId} has invalid opaque artifact evidence.` };
-    }
-    result.set(normalized!, artifact);
-  }
-  return { value: result };
-}
-
-function reviewDiffCoverageIndex(
-  delta: WorkspaceDeltaEvidence,
-  changes: ReadonlyMap<string, ChangeKind>
-): EvidenceIndex<Set<string>> {
-  const result = new Set<string>();
-  for (const path of delta.data.reviewDiffPaths ?? []) {
-    const normalized = normalizedRelativePath(path);
-    if (!normalized || !changes.has(normalized) || result.has(normalized)) {
-      return { failure: `Delta ${delta.evidenceId} has invalid or duplicate review diff coverage.` };
-    }
-    result.add(normalized);
-  }
-  return { value: result };
-}
-
-function changedPathReviewFailure(
-  delta: WorkspaceDeltaEvidence,
-  diff: string,
-  path: string,
+function validOpaqueShape(
   kind: ChangeKind,
-  artifact: OpaqueArtifactEvidence | undefined,
-  covered: ReadonlySet<string>
-): string | undefined {
-  if (pathIsFullyOpaque(kind, artifact)) return undefined;
-  if (!covered.has(path)) return `Delta ${delta.evidenceId} has incomplete review diff coverage.`;
-  if (!diff.includes(expectedReviewHeader(path, kind))) {
-    return `Delta ${delta.evidenceId} has review diff coverage without a matching section.`;
+  artifact: OpaqueArtifactEvidence
+): boolean {
+  if (!validIdentity(artifact.before) || !validIdentity(artifact.after)) return false;
+  if (artifact.before === undefined && artifact.after === undefined) return false;
+  if (kind === "added") {
+    return artifact.before === undefined && artifact.after !== undefined;
   }
-  for (const identity of [artifact?.before, artifact?.after]) {
-    if (identity && !diff.includes(`[binary sha256=${identity.digest} size=${identity.sizeBytes}]`)) {
-      return `Delta ${delta.evidenceId} has opaque evidence not bound to its review diff.`;
-    }
+  if (kind === "deleted") {
+    return artifact.before !== undefined && artifact.after === undefined;
   }
-  return undefined;
+  return true;
 }
 
-function reviewDiffEvidenceFailure(
+function opaqueEvidenceFailure(
   delta: WorkspaceDeltaEvidence,
-  changes: ReadonlyMap<string, ChangeKind>,
-  artifacts: ReadonlyMap<string, OpaqueArtifactEvidence>,
-  covered: ReadonlySet<string>
+  changes: ReadonlyMap<string, ChangeKind>
 ): string | undefined {
-  const diff = delta.data.reviewDiff;
-  if (typeof diff !== "string") return `Delta ${delta.evidenceId} has no reviewable diff.`;
-  if (diff.includes("[review diff truncated]") || diff.includes("[file diff truncated]")
-    || diff.includes("[content truncated]")) return `Delta ${delta.evidenceId} has a truncated diff.`;
-  for (const path of covered) {
-    const kind = changes.get(path)!;
-    if (pathIsFullyOpaque(kind, artifacts.get(path)) || !diff.includes(expectedReviewHeader(path, kind))) {
-      return `Delta ${delta.evidenceId} has review diff coverage without a matching reviewable section.`;
+  const seen = new Set<string>();
+  for (const artifact of delta.data.opaqueArtifacts ?? [] as OpaqueArtifactEvidence[]) {
+    const path = normalizedRelativePath(artifact.path);
+    const kind = path ? changes.get(path) : undefined;
+    if (!path || !kind || seen.has(path) || !validOpaqueShape(kind, artifact)) {
+      return `Delta ${delta.evidenceId} has invalid opaque artifact identity evidence.`;
     }
-  }
-  for (const [path, kind] of changes) {
-    const failure = changedPathReviewFailure(delta, diff, path, kind, artifacts.get(path), covered);
-    if (failure) return failure;
+    seen.add(path);
   }
   return undefined;
 }
 
-function completeReviewEvidenceFailure(
-  delta: WorkspaceDeltaEvidence,
-  validations: readonly ValidationEvidence[],
-  reviewMode: ReviewerInput["reviewMode"]
-): string | undefined {
-  const changes = changedPathKinds(delta);
-  if (!changes) return `Delta ${delta.evidenceId} has invalid or duplicate workspace paths.`;
-  const artifactResult = opaqueArtifactIndex(delta, changes);
-  if ("failure" in artifactResult) return artifactResult.failure;
-  const coverageResult = reviewDiffCoverageIndex(delta, changes);
-  if ("failure" in coverageResult) return coverageResult.failure;
-  const diffFailure = reviewDiffEvidenceFailure(delta, changes, artifactResult.value, coverageResult.value);
-  if (diffFailure) return diffFailure;
-  const hasOpaqueContent = [...changes].some(([path, kind]) =>
-    pathIsFullyOpaque(kind, artifactResult.value.get(path)));
-  const validationAvailable = hasPassedValidation(delta, validations)
-    || reviewMode === "completion" && !hasOpaqueContent
-      && hasExecutedValidation(delta, validations);
-  if (!validationAvailable) {
-    return `Delta ${delta.evidenceId} has no passed validation evidence bound to its workspace delta.`;
-  }
-  return undefined;
-}
-
+/**
+ * V10 preflight verifies only evidence integrity. Material completeness,
+ * language type, command shape, validation coverage, and whether a change is
+ * reviewable are semantic questions for the active reviewer. Missing or
+ * truncated material therefore cannot consume a substantive review attempt.
+ */
 export function reviewInputFailure(input: ReviewerInput): string | undefined {
   for (const delta of input.workspaceDeltas) {
-    if (delta.data.reviewProblem) {
-      return `${delta.data.reviewProblem.code}: ${delta.data.reviewProblem.message} ${delta.data.reviewProblem.action}`;
-    }
-    if (delta.data.reviewDiffPaths !== undefined) {
-      const completeFailure = completeReviewEvidenceFailure(delta, input.validations, input.reviewMode);
-      if (completeFailure) return completeFailure;
-      continue;
-    }
-    const diff = delta.data.reviewDiff;
-    const opaqueFailure = legacyOpaqueArtifactReviewEvidenceFailure(delta, input.validations);
+    const changes = changedPathKinds(delta);
+    if (!changes) return `Delta ${delta.evidenceId} has invalid or duplicate workspace paths.`;
+    const opaqueFailure = opaqueEvidenceFailure(delta, changes);
     if (opaqueFailure) return opaqueFailure;
-    if (delta.data.opaqueArtifacts?.length
-      && [...new Set([
-        ...delta.data.delta.added,
-        ...delta.data.delta.modified,
-        ...delta.data.delta.deleted
-      ].map((item) => item.replaceAll("\\", "/")))].every((item) => delta.data.opaqueArtifacts!
-        .some((artifact) => artifact.path.replaceAll("\\", "/") === item))) continue;
-    if (typeof diff !== "string") return `Delta ${delta.evidenceId} has no reviewable diff.`;
-    if (diff.includes("[review diff truncated]") || diff.includes("[file diff truncated]")) {
-      return `Delta ${delta.evidenceId} has a truncated diff.`;
+    for (const path of delta.data.reviewDiffPaths ?? []) {
+      const normalized = normalizedRelativePath(path);
+      if (!normalized || !changes.has(normalized)) {
+        return `Delta ${delta.evidenceId} has review diff coverage outside its workspace delta.`;
+      }
     }
-    const binaryFailure = binaryReviewEvidenceFailure(delta, diff, input.validations);
-    if (binaryFailure) return binaryFailure;
   }
   return undefined;
 }

@@ -1,16 +1,12 @@
 import { randomUUID } from "node:crypto";
 import type {
   BudgetAmounts,
-  JsonValue,
-  InputAccessEvidence,
   ModelGateway,
   ModelMessage,
   ModelRequest,
   ModelResponse,
   ReviewEvidence,
-  UsageRecord,
-  ValidationEvidence,
-  WorkspaceDeltaEvidence
+  UsageRecord
 } from "agent-protocol";
 import type { ModelRouteConstraints } from "agent-model";
 import {
@@ -19,128 +15,59 @@ import {
   successfulModelUsage,
   type PreparedModelBudget
 } from "./model-accounting.js";
-import { reviewInputFailure } from "./review-evidence-preflight.js";
+import type {
+  AccountedReviewerResult,
+  PreparedReviewerCall,
+  ReviewerInput,
+  ReviewerPort,
+  ReviewerToolCheckV1,
+  ReviewerToolEnvironment,
+  ReviewerToolSessionPort
+} from "./reviewer-contracts.js";
+import {
+  reviewEvidence
+} from "./reviewer-result.js";
+import {
+  reviewMessages,
+  reviewResultTool,
+  reviewVerdictReminder
+} from "./reviewer-prompt.js";
+import { aggregateReviewerUsage } from "./reviewer-accounting.js";
+import {
+  protocolFailureResponse
+} from "./reviewer-turn-protocol.js";
+import {
+  activeInspectionRequired,
+  isVerdictTool,
+  settleReviewerTurn,
+  type ReviewerTurnLoopResult
+} from "./reviewer-loop-support.js";
 
-export { reviewInputFailure } from "./review-evidence-preflight.js";
-
-export interface ReviewerInput {
-  sessionId: string;
-  runId: string;
-  goal: string;
-  frontierRevision: number;
-  stateDigest: string;
-  reviewBasisDigest: string;
-  reviewMode: "workspace" | "completion";
-  completionCandidate?: string;
-  completionCandidateDigest?: string;
-  workspaceDeltas: WorkspaceDeltaEvidence[];
-  validations: ValidationEvidence[];
-  inputAccesses?: InputAccessEvidence[];
-  goalReferencedWorkspaceReads?: ReviewerWorkspaceRead[];
-}
-
-export interface ReviewerWorkspaceRead {
-  path: string;
-  sha256?: string;
-  byteLength?: number;
-  offset?: number;
-  returnedLines?: number;
-  totalLines?: number;
-  complete: boolean;
-  content: string;
-}
-
-export interface ReviewerPort {
-  readonly reviewerId?: string;
-  review(input: ReviewerInput, signal: AbortSignal): Promise<ReviewEvidence>;
-}
-
-export interface PreparedReviewerCall {
-  messages: ModelMessage[];
-  maxOutputTokens: number;
-  budget: PreparedModelBudget;
-}
-
-export interface AccountedReviewerResult {
-  evidence: ReviewEvidence;
-  usage: UsageRecord;
-}
-
-export interface AccountableReviewerPort extends ReviewerPort {
-  prepareReview(
-    input: ReviewerInput,
-    remainingBudgetMicroUsd: number,
-    maxOutputTokens?: number
-  ): Promise<PreparedReviewerCall>;
-  reviewPrepared(
-    input: ReviewerInput,
-    requestId: string,
-    prepared: PreparedReviewerCall,
-    signal: AbortSignal
-  ): Promise<AccountedReviewerResult>;
-  failedUsage(
-    input: ReviewerInput,
-    requestId: string,
-    prepared: PreparedReviewerCall,
-    latencyMs: number,
-    error: unknown
-  ): UsageRecord;
-  recoveredUsage(input: ReviewerInput, requestId: string, consumed: BudgetAmounts): UsageRecord;
-}
-
-export function isAccountableReviewer(reviewer: ReviewerPort): reviewer is AccountableReviewerPort {
-  const candidate = reviewer as Partial<AccountableReviewerPort>;
-  return typeof candidate.prepareReview === "function"
-    && typeof candidate.reviewPrepared === "function"
-    && typeof candidate.failedUsage === "function"
-    && typeof candidate.recoveredUsage === "function";
-}
-
-function responseObject(content: string): Record<string, unknown> | null {
-  try {
-    const value = JSON.parse(content.trim()) as unknown;
-    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-    const record = value as Record<string, unknown>;
-    return Object.keys(record).every((key) => key === "verdict" || key === "findings") ? record : null;
-  } catch {
-    return null;
-  }
-}
-
-export function reviewInputFailureEvidence(
-  input: ReviewerInput,
-  reviewerId: string,
-  message: string
-): ReviewEvidence {
-  return {
-    evidenceId: randomUUID(),
-    sessionId: input.sessionId,
-    runId: input.runId,
-    kind: "review",
-    status: "failed",
-    createdAt: new Date().toISOString(),
-    producer: { authority: "runtime", id: reviewerId },
-    summary: message,
-    data: {
-      reviewerId,
-      verdict: "changes_requested",
-      findings: [message],
-      frontierRevision: input.frontierRevision,
-      stateDigest: input.stateDigest,
-      reviewBasisDigest: input.reviewBasisDigest,
-      validationEvidenceIds: input.validations.map((item) => item.evidenceId),
-      ...(input.workspaceDeltas.some((item) => item.data.reviewProblem?.code === "review_scope_too_large")
-        ? { failureCode: "review_scope_too_large" as const } : {})
-    }
-  };
-}
+export {
+  isAccountableReviewer,
+  type AccountableReviewerPort,
+  type AccountedReviewerResult,
+  type PreparedReviewerCall,
+  type ReviewerInput,
+  type ReviewerPort,
+  type ReviewerWorkspaceRead
+} from "./reviewer-contracts.js";
+export {
+  isActionableErrorFinding
+} from "./reviewer-result.js";
 
 export class ModelReviewer implements ReviewerPort {
-  constructor(private readonly gateway: ModelGateway, readonly reviewerId = "builtin-reviewer") {}
+  constructor(
+    private readonly gateway: ModelGateway,
+    readonly reviewerId = "builtin-reviewer",
+    private readonly toolEnvironment?: ReviewerToolEnvironment,
+    private readonly limits: {
+      maxTurns: number;
+      maxToolCalls: number;
+    } = { maxTurns: 4, maxToolCalls: 12 }
+  ) {}
 
   async review(input: ReviewerInput, signal: AbortSignal): Promise<ReviewEvidence> {
-    const inputProblem = reviewInputFailure(input);
-    if (inputProblem) return reviewInputFailureEvidence(input, this.reviewerId, inputProblem);
     const prepared = await this.prepareReview(input, Number.MAX_SAFE_INTEGER);
     return (await this.reviewPrepared(input, randomUUID(), prepared, signal)).evidence;
   }
@@ -148,18 +75,50 @@ export class ModelReviewer implements ReviewerPort {
   async prepareReview(
     input: ReviewerInput,
     remainingBudgetMicroUsd: number,
-    outputLimit = 4_096
+    outputLimit = 2_048
   ): Promise<PreparedReviewerCall> {
     const messages = reviewMessages(input);
-    const maxOutputTokens = Math.min(outputLimit, this.gateway.capabilities.maxOutputTokens);
-    const budget = await prepareModelBudget(
+    const structured = this.gateway.capabilities.tools;
+    const tools = structured
+      ? [
+          ...(this.toolEnvironment?.definitions() ?? []),
+          reviewResultTool()
+        ]
+      : [];
+    const toolChoice = structured ? "auto" as const : undefined;
+    const maxOutputTokens = Math.min(
+      outputLimit,
+      this.gateway.capabilities.maxOutputTokens
+    );
+    const singleTurnBudget = await prepareModelBudget(
       this.gateway,
       messages,
-      [],
+      tools,
       maxOutputTokens,
       remainingBudgetMicroUsd
     );
-    return { messages, maxOutputTokens, budget };
+    const turnCapacity = this.toolEnvironment ? this.limits.maxTurns : 1;
+    const budget = turnCapacity === 1
+      ? singleTurnBudget
+      : {
+          ...singleTurnBudget,
+          estimatedInputTokens:
+            singleTurnBudget.estimatedInputTokens * turnCapacity * 2,
+          reserved: {
+            inputTokens:
+              (singleTurnBudget.reserved.inputTokens ?? 0) * turnCapacity * 2,
+            outputTokens:
+              (singleTurnBudget.reserved.outputTokens ?? 0) * turnCapacity,
+            costMicroUsd:
+              (singleTurnBudget.reserved.costMicroUsd ?? 0) * turnCapacity * 2,
+            modelTurns:
+              (singleTurnBudget.reserved.modelTurns ?? 1) * turnCapacity
+          },
+          reservedAttempts:
+            singleTurnBudget.reservedAttempts * turnCapacity,
+          attemptReservations: undefined
+        };
+    return { messages, tools, ...(toolChoice ? { toolChoice } : {}), maxOutputTokens, budget };
   }
 
   async reviewPrepared(
@@ -168,32 +127,157 @@ export class ModelReviewer implements ReviewerPort {
     prepared: PreparedReviewerCall,
     signal: AbortSignal
   ): Promise<AccountedReviewerResult> {
+    const toolSession = this.toolEnvironment
+      ? await this.toolEnvironment.open(input, requestId, signal)
+      : undefined;
+    const messages = [...prepared.messages];
+    let result: ReviewerTurnLoopResult | undefined;
+    let closeFailure: unknown;
+    try {
+      result = await this.runReviewTurns(
+        input,
+        requestId,
+        prepared,
+        messages,
+        toolSession,
+        signal
+      );
+    } finally {
+      try {
+        await toolSession?.close();
+      } catch (error) {
+        closeFailure = error;
+      }
+    }
+    if (closeFailure) throw closeFailure;
+    const response = result?.finalResponse ?? protocolFailureResponse(undefined,
+      "Independent verification ended without a verdict.");
+    return {
+      evidence: reviewEvidence(input, this.reviewerId, response, result?.checks ?? []),
+      usage: aggregateReviewerUsage(
+        input,
+        requestId,
+        result?.usages ?? [],
+        prepared,
+        this.gateway
+      )
+    };
+  }
+
+  private async completeTurn(
+    input: ReviewerInput,
+    requestId: string,
+    prepared: PreparedReviewerCall,
+    messages: ModelMessage[],
+    turn: number,
+    verdictOnly: boolean,
+    verdictAllowed: boolean,
+    signal: AbortSignal
+  ): Promise<{ response: ModelResponse; usage: UsageRecord }> {
     const startedAt = performance.now();
-    const request = {
+    const preparedTools = prepared.tools ?? [];
+    const allowedTools = verdictAllowed
+      ? preparedTools
+      : preparedTools.filter((tool) => !isVerdictTool(tool.name));
+    const tools = verdictOnly
+      ? allowedTools.filter((tool) => isVerdictTool(tool.name))
+      : allowedTools;
+    const toolChoice = tools.length === 0
+      ? undefined
+      : verdictOnly && this.gateway.capabilities.strictToolChoice
+        ? "required" as const
+        : "auto" as const;
+    const requestMessages = verdictOnly
+      ? [
+          ...messages,
+          reviewVerdictReminder(input.verificationPolicy ?? "standard")
+        ]
+      : messages;
+    const request: ModelRequest = {
       signal,
-      tools: [],
+      tools,
+      ...(toolChoice ? { toolChoice } : {}),
       temperature: 0,
       maxOutputTokens: prepared.maxOutputTokens,
-      messages: prepared.messages
+      messages: requestMessages
     };
     const constrained = this.gateway as ModelGateway & {
-      completeWithConstraints(request: ModelRequest, constraints: ModelRouteConstraints): Promise<ModelResponse>;
+      completeWithConstraints(
+        request: ModelRequest,
+        constraints: ModelRouteConstraints
+      ): Promise<ModelResponse>;
     };
-    const response = prepared.budget.routeConstraints && constrained.completeWithConstraints
-      ? await constrained.completeWithConstraints(request, prepared.budget.routeConstraints)
+    const response = prepared.budget.routeConstraints
+      && constrained.completeWithConstraints
+      ? await constrained.completeWithConstraints(
+          request,
+          prepared.budget.routeConstraints
+        )
       : await this.gateway.complete(request);
-    const evidence = reviewEvidence(input, this.reviewerId, response);
-    const usage = successfulModelUsage(
-      input,
-      this.gateway,
-      requestId,
-      { messages: prepared.messages, tools: [] },
+    return {
       response,
-      prepared.budget,
-      performance.now() - startedAt,
-      "reviewer"
+      usage: successfulModelUsage(
+        input,
+        this.gateway,
+        `${requestId}:turn:${turn}`,
+        { messages: requestMessages, tools },
+        response,
+        prepared.budget,
+        performance.now() - startedAt,
+        "reviewer"
+      )
+    };
+  }
+
+  private async runReviewTurns(
+    input: ReviewerInput,
+    requestId: string,
+    prepared: PreparedReviewerCall,
+    messages: ModelMessage[],
+    toolSession: ReviewerToolSessionPort | undefined,
+    signal: AbortSignal
+  ): Promise<ReviewerTurnLoopResult> {
+    const checks: ReviewerToolCheckV1[] = [];
+    const usages: UsageRecord[] = [];
+    let toolCalls = 0;
+    let verdictOnly = false;
+    const maximumTurns = toolSession ? this.limits.maxTurns : 1;
+    const inspectionRequired = activeInspectionRequired(
+      prepared, toolSession, maximumTurns
     );
-    return { evidence, usage };
+    for (let turn = 1; turn <= maximumTurns; turn += 1) {
+      signal.throwIfAborted();
+      const verdictAllowed = !inspectionRequired || checks.length > 0;
+      const completed = await this.completeTurn(
+        input,
+        requestId,
+        prepared,
+        messages,
+        turn,
+        Boolean(toolSession) && verdictAllowed
+          && (verdictOnly || turn === maximumTurns),
+        verdictAllowed,
+        signal
+      );
+      usages.push(completed.usage);
+      const step = await settleReviewerTurn({
+        response: completed.response,
+        toolSession,
+        turn,
+        maximumTurns,
+        toolCalls,
+        maxToolCalls: this.limits.maxToolCalls,
+        inspectionRequired,
+        messages,
+        checks,
+        usages,
+        signal
+      });
+      if (step.result) return step.result;
+      toolCalls = step.toolCalls;
+      verdictOnly = step.verdictOnly;
+    }
+    return { checks, usages };
   }
 
   failedUsage(
@@ -204,11 +288,24 @@ export class ModelReviewer implements ReviewerPort {
     error: unknown
   ): UsageRecord {
     const attempts = typeof (error as { attempts?: unknown })?.attempts === "number"
-      ? Math.max(1, Math.trunc((error as { attempts: number }).attempts)) : 1;
-    return failedModelUsage(input, this.gateway, requestId, prepared.budget, latencyMs, "reviewer", attempts);
+      ? Math.max(1, Math.trunc((error as { attempts: number }).attempts))
+      : 1;
+    return failedModelUsage(
+      input,
+      this.gateway,
+      requestId,
+      prepared.budget,
+      latencyMs,
+      "reviewer",
+      attempts
+    );
   }
 
-  recoveredUsage(input: ReviewerInput, requestId: string, consumed: BudgetAmounts): UsageRecord {
+  recoveredUsage(
+    input: ReviewerInput,
+    requestId: string,
+    consumed: BudgetAmounts
+  ): UsageRecord {
     const prepared: PreparedModelBudget = {
       estimatedInputTokens: Math.max(1, consumed.inputTokens),
       reserved: consumed,
@@ -230,136 +327,4 @@ export class ModelReviewer implements ReviewerPort {
       providerReported: false
     };
   }
-}
-
-function reviewMessages(input: ReviewerInput): ModelMessage[] {
-  return [{
-    role: "system",
-    content: "You are Sigma's independent read-only code reviewer. Review only the supplied goal, durable workspace delta, input-access evidence, goal-referenced workspace read snapshots, validation evidence, and optional completion candidate. Evaluate every explicit goal dimension in one pass, including correctness, performance, format, and delivery behavior when the goal mentions them; do not stop after the first missing proof. When the goal constrains changes by another workspace file, use complete goal-referenced read snapshots to verify the final delta against that file; if required snapshot evidence is absent or incomplete, request a focused validation instead of assuming compliance. In completion mode, compare factual claims in the completion candidate with the full supplied delta; materially omitting or understating changes is actionable. A failed validation is a real correctness signal: never describe it as passed or treat review approval as validation_passed. In completion mode, an exited failed validation may prove that a user-requested check was executed and honestly reported; approve only when the goal is satisfied by observing/reporting that result and the completion candidate accurately states the failure. If the goal requires working behavior or a passing check, request repair instead. Absence of input-access evidence is not itself a failure; only a recorded failed access to a required user-declared input is actionable. Never accept a run-created sample or fixture as a substitute for a user-declared external input whose access failed. A user-visible configuration or policy value that was neither specified by the goal nor supported by supplied workspace evidence is an actionable error with code user_decision_required; direct the agent to restore speculative changes and ask one focused question. Check that each validation command plausibly exercises every workspace delta linked to it; a file-specific syntax check cannot establish unrelated files or runtime behavior. Complete opaque or content-omitted artifacts are reviewable by workspace path, SHA-256, size, checkpoint-bound delta, and passed validation, but their hidden content must not be claimed as inspected. Return strict JSON: {\"verdict\":\"approved\"|\"changes_requested\",\"findings\":[{\"actionable\":boolean,\"severity\":\"error\"|\"warning\"|\"info\",\"summary\":string,\"code\":string optional}]}. Set changes_requested only when at least one finding is both actionable=true and severity=error. Positive observations must be non-actionable info findings. Never claim to have edited files."
-  }, {
-    role: "user",
-    content: JSON.stringify({
-      goal: input.goal,
-      frontierRevision: input.frontierRevision,
-      stateDigest: input.stateDigest,
-      reviewBasisDigest: input.reviewBasisDigest,
-      reviewMode: input.reviewMode,
-      ...(input.reviewMode === "completion" && input.completionCandidate
-        ? {
-            completionCandidate: input.completionCandidate,
-            completionCandidateDigest: input.completionCandidateDigest
-          }
-        : {}),
-      inputAccesses: input.inputAccesses ?? [],
-      goalReferencedWorkspaceReads: input.goalReferencedWorkspaceReads ?? [],
-      workspaceDeltas: input.workspaceDeltas.map((item) => ({
-        evidenceId: item.evidenceId,
-        checkpointId: item.data.checkpointId,
-        delta: item.data.delta,
-        diff: item.data.reviewDiff ?? "[diff artifact unavailable]",
-        reviewDiffPaths: item.data.reviewDiffPaths ?? [],
-        opaqueArtifacts: item.data.opaqueArtifacts ?? [],
-        reviewProblem: item.data.reviewProblem
-      })),
-      validations: input.validations.map((item) => ({ status: item.status, summary: item.summary, data: item.data }))
-    })
-  }];
-}
-
-export function isActionableErrorFinding(finding: JsonValue): boolean {
-  if (finding && typeof finding === "object" && !Array.isArray(finding)
-    && Object.hasOwn(finding, "actionable") && Object.hasOwn(finding, "severity")) {
-    const structured = finding as Record<string, JsonValue>;
-    return structured.actionable === true && structured.severity === "error";
-  }
-  // Old review evidence allowed arbitrary JSON findings. Preserve the prior
-  // conservative interpretation when reading those durable records.
-  return true;
-}
-
-interface ParsedReviewResult {
-  findings: JsonValue[];
-  protocolFailure: boolean;
-  verdict: "approved" | "changes_requested";
-}
-
-function parsedReviewResult(input: ReviewerInput, response: ModelResponse): ParsedReviewResult {
-  const parsed = responseObject(response.message.content);
-  const inputProblem = reviewInputFailure(input);
-  const rawFindings = Array.isArray(parsed?.findings) ? parsed.findings : undefined;
-  const validVerdict = parsed?.verdict === "approved" || parsed?.verdict === "changes_requested";
-  const protocolFailure = !inputProblem && (!parsed || !validVerdict || rawFindings === undefined);
-  const findings = inputProblem ? [inputProblem] : rawFindings
-    ? rawFindings.filter((item): item is JsonValue => item === null
-      || ["string", "number", "boolean", "object"].includes(typeof item))
-    : [];
-  const verdict = !inputProblem && !protocolFailure && !findings.some(isActionableErrorFinding)
-    ? "approved" : "changes_requested";
-  return { findings, protocolFailure, verdict };
-}
-
-function reviewEvidence(
-  input: ReviewerInput,
-  reviewerId: string,
-  response: ModelResponse
-): ReviewEvidence {
-    const { findings, protocolFailure, verdict } = parsedReviewResult(input, response);
-    return {
-      evidenceId: randomUUID(),
-      sessionId: input.sessionId,
-      runId: input.runId,
-      kind: "review",
-      status: verdict === "approved" ? "passed" : "failed",
-      createdAt: new Date().toISOString(),
-      producer: { authority: "runtime", id: reviewerId },
-      summary: protocolFailure ? "Independent reviewer returned an invalid protocol response."
-        : verdict === "approved" ? "Independent reviewer approved the change."
-          : "Independent reviewer requested changes.",
-      data: {
-        reviewerId,
-        verdict,
-        findings,
-        frontierRevision: input.frontierRevision,
-        stateDigest: input.stateDigest,
-        reviewBasisDigest: input.reviewBasisDigest,
-        validationEvidenceIds: input.validations.map((item) => item.evidenceId),
-        ...(protocolFailure
-          ? { failureKind: "protocol" as const, failureCode: "review_protocol_invalid" as const }
-          : {}),
-        ...(input.workspaceDeltas.some((item) => item.data.reviewProblem?.code === "review_scope_too_large")
-          ? { failureCode: "review_scope_too_large" as const } : {})
-      }
-    };
-}
-
-export function documentationOnly(evidence: WorkspaceDeltaEvidence): boolean {
-  const paths = [
-    ...evidence.data.delta.added,
-    ...evidence.data.delta.modified,
-    ...evidence.data.delta.deleted
-  ];
-  const diff = evidence.data.reviewDiff;
-  if (typeof diff !== "string" || diff.includes("[review diff truncated]")
-    || diff.includes("[file diff truncated]") || diff.includes("[binary sha256=")) return false;
-  const metadata = [...diff.matchAll(/^\[metadata before=([^ ]+) after=([^\]]+)\]$/gmu)];
-  if (metadata.length !== paths.length || metadata.some((match) => !documentationMetadata(match[1]!, match[2]!))) return false;
-  return paths.length > 0 && paths.every((file) => {
-    const normalized = file.replaceAll("\\", "/").toLowerCase();
-    const basename = normalized.split("/").at(-1) ?? "";
-    if (/\.(md|mdx|rst|adoc)$/u.test(normalized)) return true;
-    if (normalized.startsWith("docs/") && normalized.endsWith(".txt")) return true;
-    return /^(readme|license|licence|changelog|contributing|authors|notice)(\.txt)?$/u.test(basename);
-  });
-}
-
-function documentationMetadata(before: string, after: string): boolean {
-  const parse = (value: string): { kind: string; mode?: string } => {
-    if (value === "absent") return { kind: "absent" };
-    const separator = value.lastIndexOf(":");
-    return separator < 0 ? { kind: value } : { kind: value.slice(0, separator), mode: value.slice(separator + 1) };
-  };
-  const left = parse(before);
-  const right = parse(after);
-  if (![left.kind, right.kind].every((kind) => kind === "absent" || kind === "file")) return false;
-  return left.kind === "absent" || right.kind === "absent" || left.mode === right.mode;
 }

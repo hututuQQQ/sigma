@@ -334,6 +334,10 @@ impl OutputRing {
     pub fn truncated(&self) -> bool {
         self.start_offset > 0
     }
+
+    pub fn has_decoding_error(&self) -> bool {
+        self.decoding_error.is_some()
+    }
 }
 
 fn utf8_continuation(byte: u8) -> bool {

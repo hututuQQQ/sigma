@@ -240,7 +240,7 @@ describe("typed workspace mutation contracts", () => {
     });
   });
 
-  it("grants every process tool the workspace lease without exposing readRoots", async () => {
+  it("grants every process tool the workspace lease and exposes explicit bounded readRoots", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-read-scope-"));
     await mkdir(path.join(workspace, "work"));
     await mkdir(path.join(workspace, "inputs"));
@@ -291,11 +291,11 @@ describe("typed workspace mutation contracts", () => {
     expect(fixture.spawns[0]?.policy.protectedPaths).not.toContain(path.join(workspace, ".agent"));
     for (const name of ["exec", "shell", "validate", "process_spawn"]) {
       const properties = tools.descriptor(name)?.inputSchema.properties as Record<string, unknown>;
-      expect(properties).not.toHaveProperty("readRoots");
+      expect(properties).toHaveProperty("readRoots");
     }
   });
 
-  it("rejects model-supplied external read roots before capability planning", async () => {
+  it("plans model-supplied external read roots but requires a fresh execution grant", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-external-workspace-"));
     const fixture = brokerFixture();
     const tools = registerBuiltinTools(new EffectToolRegistry(), {
@@ -307,9 +307,167 @@ describe("typed workspace mutation contracts", () => {
       executable: process.execPath,
       readRoots: [path.dirname(workspace)]
     });
-    await expect(tools.prepare(call, preparation(workspace)))
-      .rejects.toMatchObject({ code: "tool_arguments_invalid" });
+    const plan = await tools.prepare(call, preparation(workspace));
+    expect(plan).toMatchObject({
+      exactEffects: expect.arrayContaining(["filesystem.read.external"]),
+      readPaths: [".", path.dirname(workspace)]
+    });
+    await expect(tools.execute(call, execution(workspace)))
+      .rejects.toMatchObject({ code: "policy_denied" });
     expect(fixture.executions).toHaveLength(0);
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "keeps workspace and attested enclosing-container mutations in separate authorities",
+    async () => {
+      const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-enclosing-workspace-"));
+      const external = await mkdtemp(path.join(os.tmpdir(), "sigma-enclosing-target-"));
+      const protectedState = await mkdtemp(path.join(os.tmpdir(), "sigma-enclosing-state-"));
+      const fixture = brokerFixture();
+      const tools = registerBuiltinTools(new EffectToolRegistry(), {
+        broker: fixture.broker,
+        readScope: "host",
+        writeScope: "enclosing-container",
+        enclosingContainerRoot: true,
+        enclosingContainerAttestationDigest: `sha256:${"a".repeat(64)}`,
+        protectedPaths: [protectedState],
+        networkMode: "none"
+      });
+      const target = path.join(external, "generated.conf");
+      const call = request("external-write", "exec", {
+        executable: process.execPath,
+        args: ["--version"],
+        access: "write",
+        writeRoots: [external],
+        expectedChanges: [target]
+      });
+      const plan = await tools.prepare(call, preparation(workspace));
+      expect(plan).toMatchObject({
+        mutationAuthority: "disposable_enclosing_container_v1",
+        exactEffects: expect.arrayContaining([
+          "process.spawn",
+          "filesystem.read.external",
+          "filesystem.write"
+        ]),
+        readPaths: [".", external],
+        writePaths: [target],
+        checkpointScope: [external]
+      });
+      expect(tools.descriptor("exec")).toMatchObject({
+        brokerMutationAuthority: "disposable_enclosing_container_v1"
+      });
+      await expect(tools.execute(call, {
+        ...execution(workspace),
+        callPlan: plan,
+        approval: {
+          callId: call.callId,
+          authority: "runtime",
+          networkApproved: false,
+          externalReadApproved: true,
+          processHandoffApproved: false,
+          openWorldApproved: false
+        }
+      })).resolves.toMatchObject({ ok: true });
+      expect(fixture.executions[0]?.policy).toMatchObject({
+        enclosingContainerRoot: true,
+        writeRoots: [external],
+        protectedPaths: expect.arrayContaining([workspace, protectedState])
+      });
+      expect(fixture.executions[0]?.policy.scratchLease).toBeUndefined();
+
+      await expect(tools.prepare(request("mixed-write", "exec", {
+        executable: process.execPath,
+        access: "write",
+        writeRoots: [external],
+        expectedChanges: [path.join(workspace, "mixed.txt")]
+      }), preparation(workspace))).rejects.toMatchObject({
+        code: "write_plan_invalid"
+      });
+    }
+  );
+
+  it("projects attested outer-environment mutation as one low-friction change-only action", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-environment-shell-workspace-"));
+    const protectedState = await mkdtemp(path.join(os.tmpdir(), "sigma-environment-shell-state-"));
+    const fixture = brokerFixture();
+    const tools = registerBuiltinTools(new EffectToolRegistry(), {
+      broker: fixture.broker,
+      readScope: "host",
+      writeScope: "enclosing-container",
+      enclosingContainerRoot: true,
+      enclosingContainerAttestationDigest: `sha256:${"a".repeat(64)}`,
+      protectedPaths: [protectedState],
+      networkMode: "none",
+      shells: [process.platform === "win32" ? "cmd" : "bash"]
+    });
+    const environmentShell = tools.descriptor("environment_shell");
+    expect(environmentShell).toMatchObject({
+      availableModes: ["change"],
+      brokerMutationAuthority: "disposable_enclosing_container_v1"
+    });
+    const schema = JSON.stringify(environmentShell?.inputSchema);
+    expect(schema).not.toContain("writeRoots");
+    expect(schema).not.toContain("expectedChanges");
+    expect(schema).not.toContain("\"access\"");
+
+    const call = request("prepare-outer-environment", "environment_shell", {
+      command: "prepare disposable environment"
+    });
+    const filesystemRoot = path.parse(path.resolve(workspace)).root;
+    const plan = await tools.prepare(call, preparation(workspace));
+    expect(plan).toMatchObject({
+      mutationAuthority: "disposable_enclosing_container_v1",
+      exactEffects: expect.arrayContaining([
+        "process.spawn",
+        "filesystem.read.external",
+        "filesystem.write"
+      ]),
+      readPaths: [".", filesystemRoot],
+      writePaths: [filesystemRoot],
+      checkpointScope: [filesystemRoot]
+    });
+
+    await expect(tools.execute(call, {
+      ...execution(workspace),
+      callPlan: plan,
+      approval: {
+        callId: call.callId,
+        authority: "runtime",
+        networkApproved: false,
+        externalReadApproved: true,
+        processHandoffApproved: false,
+        openWorldApproved: false
+      }
+    })).resolves.toMatchObject({ ok: true });
+    expect(fixture.executions).toHaveLength(1);
+    expect(fixture.executions[0]?.policy).toMatchObject({
+      enclosingContainerRoot: true,
+      writeRoots: [filesystemRoot],
+      protectedPaths: expect.arrayContaining([workspace, protectedState])
+    });
+    expect(fixture.executions[0]?.policy.scratchLease).toBeUndefined();
+  });
+
+  it("does not expose environment_shell without the complete attested boundary", () => {
+    const base = {
+      broker: brokerFixture().broker,
+      sandboxMode: "required" as const,
+      readScope: "host" as const,
+      processHandoff: "deny" as const,
+      networkMode: "none" as const,
+      shells: [process.platform === "win32" ? "cmd" as const : "bash" as const]
+    };
+    expect(executionTools({
+      ...base,
+      writeScope: "enclosing-container",
+      enclosingContainerRoot: true
+    }).find((tool) => tool.descriptor.name === "environment_shell")).toBeUndefined();
+    expect(executionTools({
+      ...base,
+      writeScope: "workspace",
+      enclosingContainerRoot: true,
+      enclosingContainerAttestationDigest: `sha256:${"a".repeat(64)}`
+    }).find((tool) => tool.descriptor.name === "environment_shell")).toBeUndefined();
   });
 
   it("rejects linked cwd ancestors even though cwd is not a read grant", async () => {

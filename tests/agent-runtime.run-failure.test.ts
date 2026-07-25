@@ -18,6 +18,7 @@ describe("runtime failure classification", () => {
 
     expect(runtimeFailureOutcome(protocolFailure, controller.signal)).toEqual({
       kind: "recoverable_failure",
+      decisionAuthority: "provider_protocol",
       code: "terminal_protocol_invalid",
       message: "terminal schema is invalid"
     });
@@ -30,6 +31,7 @@ describe("runtime failure classification", () => {
 
     expect(runtimeFailureOutcome(reason, controller.signal)).toEqual({
       kind: "recoverable_failure",
+      decisionAuthority: "resource_boundary",
       code: "budget_exhausted",
       message: "run deadline elapsed"
     });

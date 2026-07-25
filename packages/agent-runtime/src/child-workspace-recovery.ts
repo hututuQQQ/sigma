@@ -212,7 +212,7 @@ export class ChildCheckpointRecoveryCoordinator {
   private async suspend(session: RuntimeSession, recovery: ChildCheckpointRecovery): Promise<void> {
     const message = recovery.recordedDecision
       ? `The recorded '${recovery.recordedDecision}' decision for interrupted child '${recovery.childId}' cannot be applied because its workspace postimage changed. Resolve the conflict, then resume.`
-      : `Interrupted exclusive-workspace child '${recovery.childId}' left checkpoint '${recovery.checkpointId}' changes. Only the user may choose safe restore or keep; kept changes retain validation and independent-review obligations.`;
+      : `Interrupted exclusive-workspace child '${recovery.childId}' left checkpoint '${recovery.checkpointId}' changes. Only the user may choose safe restore or keep; kept changes retain their validation and independent-review status.`;
     const outcome: RunOutcome = {
       kind: "needs_input",
       requestId: `checkpoint:${recovery.checkpointId}`,

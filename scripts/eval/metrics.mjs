@@ -177,6 +177,178 @@ function usageTotals(events) {
   return totals;
 }
 
+function eventToolNames(events) {
+  const names = new Map();
+  for (const event of events) {
+    if (event.type !== "tool.requested") continue;
+    const payload = record(event.payload);
+    if (typeof payload.callId === "string" && typeof payload.name === "string") {
+      names.set(payload.callId, payload.name);
+    }
+  }
+  return names;
+}
+
+function eventToolName(event, names) {
+  const payload = record(event.payload);
+  if (typeof payload.name === "string") return payload.name;
+  return typeof payload.callId === "string" ? names.get(payload.callId) ?? "unknown" : "unknown";
+}
+
+function planToolMetrics(events, names) {
+  const result = { requested: 0, accepted: 0, normalized: 0, rejected: 0, noChange: 0 };
+  for (const event of events) {
+    if (!["tool.requested", "tool.completed", "tool.failed"].includes(event.type)
+      || eventToolName(event, names) !== "update_plan") continue;
+    if (event.type === "tool.requested") {
+      result.requested += 1;
+      continue;
+    }
+    const payload = record(event.payload);
+    const outcome = record(payload.result);
+    const status = typeof outcome.status === "string" ? outcome.status : null;
+    const rejected = event.type === "tool.failed" || payload.ok === false
+      || status === "rejected";
+    if (rejected) result.rejected += 1;
+    else result.accepted += 1;
+    if (status === "normalized") result.normalized += 1;
+    if (status === "no_change") result.noChange += 1;
+  }
+  return {
+    ...result,
+    acceptanceRate: result.requested === 0 ? null : result.accepted / result.requested,
+    rejectionRate: result.requested === 0 ? null : result.rejected / result.requested
+  };
+}
+
+function assuranceUsage(events) {
+  const result = {
+    calls: 0,
+    strategistCalls: 0,
+    reviewerCalls: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    costMicroUsd: 0,
+    costUsd: 0,
+    shareOfSessionCost: null
+  };
+  let sessionCost = 0;
+  for (const event of events) {
+    if (event.type !== "usage.recorded") continue;
+    const usage = record(event.payload);
+    sessionCost += number(usage.costMicroUsd);
+    if (usage.role !== "planner" && usage.role !== "reviewer") continue;
+    result.calls += 1;
+    result.strategistCalls += usage.role === "planner" ? 1 : 0;
+    result.reviewerCalls += usage.role === "reviewer" ? 1 : 0;
+    result.inputTokens += number(usage.inputTokens);
+    result.outputTokens += number(usage.outputTokens);
+    result.costMicroUsd += number(usage.costMicroUsd);
+  }
+  result.costUsd = result.costMicroUsd / 1_000_000;
+  result.shareOfSessionCost = sessionCost === 0 ? null : result.costMicroUsd / sessionCost;
+  return result;
+}
+
+function taskValidationEvidencePayload(payload) {
+  if (payload.kind !== "validation") return false;
+  const data = record(payload.data);
+  const coveredPaths = Array.isArray(data.coveredPaths) ? data.coveredPaths : [];
+  return data.validator !== "checkpoint_postimage_integrity"
+    && (coveredPaths.length > 0
+      || Object.keys(record(data.claim)).length > 0
+      || (typeof data.command === "string" && data.command.trim().length > 0)
+      || record(data.termination).processStarted === true);
+}
+
+function validationAttempt(event, names) {
+  const payload = record(event.payload);
+  if (event.type === "evidence.recorded") return taskValidationEvidencePayload(payload);
+  if (event.type !== "tool.completed" && event.type !== "tool.failed") return false;
+  const effects = Array.isArray(payload.actualEffects)
+    ? payload.actualEffects
+    : Array.isArray(payload.observedEffects) ? payload.observedEffects : [];
+  return effects.includes("validation") || eventToolName(event, names) === "validate";
+}
+
+function reviewMetrics(events) {
+  const reviews = events.filter((event) => event.type === "review.completed")
+    .map((event) => {
+      const payload = record(event.payload);
+      const data = record(payload.data);
+      return {
+        seq: event.seq,
+        verdict: typeof data.verdict === "string" ? data.verdict : null,
+        status: typeof payload.status === "string" ? payload.status : null,
+        failureKind: typeof data.failureKind === "string" ? data.failureKind : null
+      };
+    });
+  const initial = reviews[0]?.verdict ?? null;
+  const final = reviews.at(-1)?.verdict ?? null;
+  const repairResult = reviews.length === 0
+    ? "not_reviewed"
+    : initial === "approved"
+      ? "approved_first_pass"
+      : reviews.length === 1
+        ? "repair_requested"
+        : final === "approved" ? "approved_after_repair" : "failed_after_repair";
+  return { attempts: reviews.length, initialVerdict: initial, finalVerdict: final, repairResult, reviews };
+}
+
+function longHorizonMetrics(events) {
+  const names = eventToolNames(events);
+  const states = events.filter((event) => event.type === "long_horizon.updated")
+    .map((event) => ({ event, state: record(record(event.payload).state) }));
+  let priorStage = null;
+  let checkpointTransitions = 0;
+  for (const { state } of states) {
+    if (state.stage === "checkpoint" && priorStage !== "checkpoint") checkpointTransitions += 1;
+    if (typeof state.stage === "string") priorStage = state.stage;
+  }
+  const explicitResets = states.filter(({ event }) =>
+    record(event.payload).reason === "strategy_reset");
+  const resets = explicitResets.length > 0
+    ? explicitResets
+    : states.filter(({ state }, index) =>
+      state.stage === "strategy_reset"
+      && states[index - 1]?.state.stage !== "strategy_reset");
+  const resetActions = resets.map(({ event }) => {
+    const action = events.find((candidate) =>
+      candidate.seq > event.seq && candidate.type === "tool.requested");
+    return {
+      resetSeq: event.seq,
+      firstActionSeq: action?.seq ?? null,
+      firstActionTool: action ? eventToolName(action, names) : null
+    };
+  });
+  const terminal = [...events].reverse().find((event) => TERMINAL_TYPES.has(event.type));
+  const terminalPayload = record(terminal?.payload);
+  const resourceExhausted = Boolean(terminal && /deadline|timed?\s*out|budget_exhausted/iu
+    .test(`${terminalPayload.code ?? ""} ${terminalPayload.message ?? ""} ${terminalPayload.reason ?? ""}`));
+  const validationAttempts = events.filter((event) =>
+    (!terminal || event.seq < terminal.seq) && validationAttempt(event, names));
+  return {
+    plan: planToolMetrics(events, names),
+    maximumNoProgressStreak: states.reduce((maximum, { state }) =>
+      Math.max(maximum, number(state.maxNoProgressBatches), number(state.noProgressBatches)), 0),
+    checkpointTransitions,
+    strategyResets: resets.length,
+    resetActions,
+    validationDueEver: states.some(({ state }) => state.validationDue === true),
+    validationAttempts: validationAttempts.length,
+    resourceExhausted,
+    validationBeforeExhaustion: resourceExhausted ? validationAttempts.length > 0 : null,
+    review: reviewMetrics(events),
+    assurance: assuranceUsage(events),
+    thinkingProtocolFailures: events.filter((event) => {
+      if (event.type !== "model.failed" && event.type !== "run.failed") return false;
+      const payload = record(event.payload);
+      return payload.code === "model_reasoning_trajectory_incomplete"
+        || /reasoning_content|reasoning trajectory/iu.test(String(payload.message ?? ""));
+    }).length
+  };
+}
+
 function groupRepeatedRequests(events) {
   const groups = new Map();
   const identities = revisionAwareRequestIdentities(events);
@@ -287,7 +459,10 @@ function isAnswer(event) {
 function isSubstantiveProgress(event, seenSuccessfulOutputs) {
   if (isAnswer(event) || TERMINAL_TYPES.has(event.type)) return true;
   const payload = record(event.payload);
-  if (event.type === "evidence.recorded" && ["workspace_delta", "validation"].includes(String(payload.kind))) return true;
+  if (event.type === "evidence.recorded") {
+    if (payload.kind === "workspace_delta") return true;
+    if (taskValidationEvidencePayload(payload)) return true;
+  }
   if (event.type !== "tool.completed") return false;
   if (hasEffect(payload, "filesystem.write") || hasEffect(payload, "validation")) return true;
   const identity = outputIdentity(event);
@@ -538,7 +713,8 @@ function timing(events, durationMs) {
   const successfulTool = events.find((event) => event.type === "tool.completed");
   const mutation = events.find((event) => Boolean(workspaceDeltaFrom(event))
     || (event.type === "tool.completed" && hasEffect(record(event.payload), "filesystem.write")));
-  const validation = events.find((event) => (event.type === "evidence.recorded" && record(event.payload).kind === "validation")
+  const validation = events.find((event) => (event.type === "evidence.recorded"
+      && taskValidationEvidencePayload(record(event.payload)))
     || (event.type === "tool.completed" && hasEffect(record(event.payload), "validation")));
   const start = anchor ? timestamp(anchor) : 0;
   return {
@@ -969,6 +1145,7 @@ function sessionMetrics(events, options, boundaries, mode, workspace) {
     steer: steerMetrics(events),
     failureConvergence,
     mutationDiscipline,
+    longHorizon: longHorizonMetrics(events),
     hardFailures: hardFailures(events, mode, workspace)
   };
 }
@@ -1021,6 +1198,12 @@ export function renderSessionMetricsMarkdown(metrics) {
     `| Fail-fast missed | ${metrics.failureConvergence.failFastMissed} |`,
     `| Write-contract / checkpoint-limit failures | ${metrics.mutationDiscipline.writeContractFailures} / ${metrics.mutationDiscipline.checkpointLimitFailures} |`,
     `| Open checkpoints at terminal | ${metrics.mutationDiscipline.openCheckpointsAtTerminal} |`,
+    `| Plan accepted / normalized / rejected | ${metrics.longHorizon.plan.accepted} / ${metrics.longHorizon.plan.normalized} / ${metrics.longHorizon.plan.rejected} |`,
+    `| Maximum no-progress streak | ${metrics.longHorizon.maximumNoProgressStreak} |`,
+    `| Strategy resets / validation attempts | ${metrics.longHorizon.strategyResets} / ${metrics.longHorizon.validationAttempts} |`,
+    `| Review / repair result | ${metrics.longHorizon.review.finalVerdict ?? "none"} / ${metrics.longHorizon.review.repairResult} |`,
+    `| Auxiliary calls / cost | ${metrics.longHorizon.assurance.calls} / $${metrics.longHorizon.assurance.costUsd.toFixed(4)} |`,
+    `| Thinking protocol failures | ${metrics.longHorizon.thinkingProtocolFailures} |`,
     `| Post-answer tool calls | ${metrics.postAnswerChurn.toolCalls} |`,
     `| Stale actions after steer | ${metrics.steer.staleActions} |`,
     ""

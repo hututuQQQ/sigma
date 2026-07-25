@@ -1,9 +1,11 @@
 import { randomUUID } from "node:crypto";
 import {
+  KERNEL_STATE_VERSION,
   SNAPSHOT_SCHEMA_VERSION,
   STORE_LAYOUT_VERSION,
   createBudgetLedger,
   type AgentEventEnvelope,
+  type AssuranceResourcePolicyV1,
   type BudgetLimits,
   type ContextItem,
   type JsonValue,
@@ -19,8 +21,6 @@ import {
   createKernelState,
   evolve,
   isKernelState,
-  migratePublishedTaskControlState,
-  PUBLISHED_TASK_CONTROL_LEGACY_KEYS,
   type KernelState
 } from "agent-kernel";
 import { jsonValue } from "./json.js";
@@ -28,6 +28,7 @@ import {
   createdSessionMetadata,
   type RestoredSessionMetadata
 } from "./restore-session-metadata.js";
+import { migrateLegacySnapshot } from "./restore-v5-migration.js";
 import {
   approvalEffectsForPlan,
   createApprovalBinding,
@@ -36,6 +37,7 @@ import {
   type ApprovalBinding,
   type RecoveredApprovalMetadata
 } from "./approval-binding.js";
+import { assurancePolicyFromState } from "./assurance-policy.js";
 
 export interface RestoredSessionData {
   workspacePath: string;
@@ -57,14 +59,16 @@ function freshState(
   event: AgentEventEnvelope,
   mode: RunMode,
   runDeadlineMs: number,
-  budgetLimits?: BudgetLimits
+  budgetLimits?: BudgetLimits,
+  assurancePolicy?: AssuranceResourcePolicyV1
 ): KernelState {
   const state = createKernelState({
     sessionId,
     runId: event.runId || randomUUID(),
     mode,
     startedAt: event.occurredAt,
-    deadlineAt: new Date(Date.now() + runDeadlineMs).toISOString()
+    deadlineAt: new Date(Date.now() + runDeadlineMs).toISOString(),
+    ...(assurancePolicy ? { assurancePolicy } : {})
   });
   if (budgetLimits) state.budget = createBudgetLedger(budgetLimits);
   return state;
@@ -77,9 +81,16 @@ function eventRunMode(event: AgentEventEnvelope, fallback: RunMode): RunMode {
 }
 
 function nextRun(state: KernelState, event: AgentEventEnvelope, runDeadlineMs: number): KernelState {
-  if (event.runId === state.runId || state.phase !== "terminal" || event.type !== "run.started") return state;
+  if (event.runId === state.runId || event.type !== "run.started") return state;
   return {
-    ...freshState(state.sessionId, event, eventRunMode(event, state.mode), runDeadlineMs),
+    ...freshState(
+      state.sessionId,
+      event,
+      eventRunMode(event, state.mode),
+      runDeadlineMs,
+      undefined,
+      assurancePolicyFromState(state)
+    ),
     messages: state.messages,
     lastSeq: state.lastSeq,
     plan: state.plan,
@@ -89,7 +100,8 @@ function nextRun(state: KernelState, event: AgentEventEnvelope, runDeadlineMs: n
     frozenSkills: state.frozenSkills,
     activeProcessIds: state.activeProcessIds,
     mutationEvidence: state.mutationEvidence,
-    usage: state.usage
+    usage: state.usage,
+    contextArchive: state.contextArchive
   };
 }
 
@@ -212,6 +224,19 @@ function validSnapshotShape(state: KernelState, sessionId: string): boolean {
   return isKernelState(state) && state.sessionId === sessionId;
 }
 
+function validatedSnapshotState(
+  state: KernelState,
+  sessionId: string
+): KernelState | undefined {
+  if (!validSnapshotShape(state, sessionId)) return undefined;
+  try {
+    assertKernelInvariants(state);
+    return state;
+  } catch {
+    return undefined;
+  }
+}
+
 function snapshotState(snapshot: Awaited<ReturnType<RunStore["latestSnapshot"]>>, sessionId: string): KernelState | undefined {
   if (!snapshot?.state || typeof snapshot.state !== "object" || Array.isArray(snapshot.state)) return undefined;
   const raw = snapshot.state as unknown as Record<string, unknown>;
@@ -221,27 +246,10 @@ function snapshotState(snapshot: Awaited<ReturnType<RunStore["latestSnapshot"]>>
       code: "unsupported_experimental_session_schema"
     });
   }
-  const stored = raw as unknown as Partial<KernelState>;
-  const taskControl = migratePublishedTaskControlState(raw, Number(stored.revision ?? 0));
-  if (!taskControl) return undefined;
-  const migrated = { ...raw };
-  for (const key of PUBLISHED_TASK_CONTROL_LEGACY_KEYS) delete migrated[key];
-  const state = {
-    ...migrated,
-    toolCallIds: Array.isArray(stored.toolCallIds)
-      ? stored.toolCallIds
-      : [...new Set([...(stored.receipts ?? []).map((receipt) => receipt.callId),
-        ...(stored.pendingTools ?? []).map((pending) => pending.request.callId)])],
-    activeProcessIds: Array.isArray(stored.activeProcessIds) ? stored.activeProcessIds : [],
-    taskControl
-  } as KernelState;
-  if (!validSnapshotShape(state, sessionId)) return undefined;
-  try {
-    assertKernelInvariants(state);
-    return state;
-  } catch {
-    return undefined;
+  if (raw.schemaVersion === KERNEL_STATE_VERSION) {
+    return validatedSnapshotState(raw as unknown as KernelState, sessionId);
   }
+  return migrateLegacySnapshot(raw, sessionId);
 }
 
 function initializeFromCreated(
@@ -258,7 +266,8 @@ function initializeFromCreated(
       event,
       accumulator.metadata.mode,
       runDeadlineMs,
-      accumulator.metadata.budgetLimits
+      accumulator.metadata.budgetLimits,
+      accumulator.metadata.assurancePolicy
     );
   }
 }
@@ -308,7 +317,7 @@ export interface SnapshotRebuildInput {
   events(): AsyncIterable<AgentEventEnvelope>;
 }
 
-/** Replays the durable event log through the kernel to rebuild a V5 snapshot. */
+/** Replays the durable event log through the kernel to rebuild a current V10 snapshot. */
 export async function rebuildSnapshotFromEvents(
   input: SnapshotRebuildInput,
   runDeadlineMs = 30 * 60 * 1_000
@@ -331,12 +340,25 @@ export async function rebuildSnapshotFromEvents(
 
 export async function restoreStoredSession(store: RunStore, sessionId: string, runDeadlineMs: number): Promise<RestoredSessionData> {
   const snapshot = await store.latestSnapshot(sessionId);
+  const migratedLegacySnapshot = Number(snapshot?.schemaVersion) < SNAPSHOT_SCHEMA_VERSION
+    || Number((snapshot?.state as { schemaVersion?: unknown } | undefined)?.schemaVersion)
+      < KERNEL_STATE_VERSION;
   const restoredSnapshot = snapshotState(snapshot, sessionId);
   const accumulator = emptyAccumulator(restoredSnapshot);
   for await (const event of store.events(sessionId)) {
     replayEvent(accumulator, event, restoredSnapshot ? snapshot?.seq ?? 0 : 0, runDeadlineMs);
   }
   if (!accumulator.metadata || !accumulator.state) throw new Error(`Session '${sessionId}' was not found.`);
+  if (migratedLegacySnapshot) {
+    await store.writeSnapshot({
+      schemaVersion: SNAPSHOT_SCHEMA_VERSION,
+      storeLayoutVersion: STORE_LAYOUT_VERSION,
+      sessionId,
+      seq: accumulator.lastSeq,
+      createdAt: new Date().toISOString(),
+      state: jsonValue({ ...accumulator.state, lastSeq: accumulator.lastSeq })
+    });
+  }
   const pendingApprovals = accumulator.state.pendingTools
     .filter((item) => item.approval === "pending")
     .map((item) => {

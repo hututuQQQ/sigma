@@ -57,6 +57,10 @@ describe("runtime terminal commit", () => {
       requestId: "approval",
       message: "approval required"
     };
+    const authorizedOutcome = {
+      ...outcome,
+      decisionAuthority: "user_policy" as const
+    };
 
     await expect(finishRuntimeSession(
       fixture.finishOptions,
@@ -64,9 +68,9 @@ describe("runtime terminal commit", () => {
       outcome
     )).resolves.toBe(true);
 
-    expect(fixture.emitted).toEqual([{ type: "run.suspended", payload: outcome }]);
-    expect(fixture.session.recovery.lastOutcome).toEqual(outcome);
-    expect(resolve).toHaveBeenCalledWith(outcome);
+    expect(fixture.emitted).toEqual([{ type: "run.suspended", payload: authorizedOutcome }]);
+    expect(fixture.session.recovery.lastOutcome).toEqual(authorizedOutcome);
+    expect(resolve).toHaveBeenCalledWith(authorizedOutcome);
   });
 
   it("classifies child settlement failure before emitting a single terminal event", async () => {

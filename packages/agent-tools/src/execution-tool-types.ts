@@ -10,10 +10,17 @@ export interface ExecutionToolOptions {
   managedEnvironment?: boolean;
   sandboxMode: "required";
   readScope: "workspace" | "host";
+  writeScope?: "workspace" | "enclosing-container";
+  enclosingContainerRoot?: boolean;
+  enclosingContainerAttestationDigest?: string;
+  /** Runtime-owned paths that remain read-only during enclosing-container
+   * mutation. They are never accepted from model arguments. */
+  protectedPaths?: readonly string[];
   processHandoff: "allow" | "deny";
   networkMode: "none" | "loopback" | "full";
   shells?: readonly ShellKind[];
   runtimeCommands?: readonly string[];
+  directExecutableResolution?: boolean;
   foreground?: boolean;
   background?: boolean;
   stdin?: boolean;

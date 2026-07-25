@@ -7,6 +7,7 @@ type ProcessAccess = "readonly" | "write";
 
 export interface ProcessMutationContract {
   access: ProcessAccess;
+  scope: "workspace" | "enclosing_container";
   writeRoots: string[];
   expectedChanges: string[];
 }
@@ -62,17 +63,18 @@ function readonlyContract(declaration: ProcessMutationDeclaration): ProcessMutat
   if (declaredPaths > 0) {
     throw writePlanError("Readonly process access cannot declare write scope.", "write_plan_invalid");
   }
-  return { access: "readonly", writeRoots: [], expectedChanges: [] };
+  return {
+    access: "readonly",
+    scope: "workspace",
+    writeRoots: [],
+    expectedChanges: []
+  };
 }
 
 function writeContract(
   declaration: ProcessMutationDeclaration,
-  runMode: "analyze" | "change",
-  background: boolean
+  runMode: "analyze" | "change"
 ): ProcessMutationContract {
-  if (background) {
-    throw writePlanError("Background processes cannot receive workspace write access.", "policy_denied");
-  }
   if (runMode !== "change") {
     throw writePlanError("Process write access is unavailable in analyze mode.", "policy_denied");
   }
@@ -84,7 +86,12 @@ function writeContract(
       "write_scope_required"
     );
   }
-  return { access: "write", writeRoots: roots, expectedChanges: expected };
+  return {
+    access: "write",
+    scope: "workspace",
+    writeRoots: roots,
+    expectedChanges: expected
+  };
 }
 
 async function nearestExistingWriteRoot(workspacePath: string, requested: string): Promise<string> {
@@ -179,54 +186,194 @@ async function stableMutationPath(
   });
 }
 
-async function validateMutationContract(
-  workspacePath: string,
-  contract: ProcessMutationContract
-): Promise<ProcessMutationContract> {
-  if (contract.access === "readonly") return contract;
-  const workspaceRoot = await resolveWorkspacePath(workspacePath, ".");
-  const roots = await Promise.all(contract.writeRoots.map(async (item) =>
-    await stableMutationPath(workspaceRoot, item, true)
-  ));
-  for (const [index, root] of roots.entries()) {
-    const info = await lstat(root).catch(() => null);
-    if (!info?.isDirectory() || info.isSymbolicLink()) {
+async function stableEnclosingContainerPath(
+  requested: string,
+  requireExisting: boolean
+): Promise<string> {
+  if (!path.isAbsolute(requested)) {
+    throw writePlanError(
+      `Enclosing-container mutation paths must be canonical absolute paths: ${requested}.`,
+      "write_plan_invalid"
+    );
+  }
+  const lexical = path.resolve(requested);
+  const filesystemRoot = path.parse(lexical).root;
+  const segments = path.relative(filesystemRoot, lexical).split(path.sep).filter(Boolean);
+  let current = filesystemRoot;
+  let missing = false;
+  for (const [index, segment] of segments.entries()) {
+    current = path.join(current, segment);
+    const info = await lstat(current).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (!info) {
+      missing = true;
+      break;
+    }
+    if (info.isSymbolicLink()) {
       throw writePlanError(
-        `Process writeRoots must be stable existing directories: ${contract.writeRoots[index]}.`,
+        `Enclosing-container mutation paths cannot traverse links: ${requested}.`,
+        "write_plan_invalid"
+      );
+    }
+    if (index < segments.length - 1 && !info.isDirectory()) {
+      throw writePlanError(
+        `Enclosing-container mutation path has a non-directory parent: ${requested}.`,
         "write_plan_invalid"
       );
     }
   }
-  const expected = await Promise.all(contract.expectedChanges.map(async (item) =>
-    await stableMutationPath(workspaceRoot, item, false)
-  ));
-  if ([...roots, ...expected].some((item) => isProtectedWorkspacePath(workspaceRoot, item))) {
-    throw writePlanError("Process write scope cannot include .git or .agent metadata.", "policy_denied");
-  }
-  const outside = contract.expectedChanges.filter((_item, index) =>
-    !roots.some((root) => isInside(root, expected[index]!)));
-  if (outside.length > 0) {
+  if (requireExisting && missing) {
     throw writePlanError(
-      `Expected changes must be contained by writeRoots: ${outside.join(", ")}.`,
+      `Process writeRoots must already exist: ${requested}.`,
       "write_plan_invalid"
     );
   }
+  return lexical;
+}
+
+function mutationContractScope(
+  workspaceRoot: string,
+  contract: ProcessMutationContract
+): ProcessMutationContract["scope"] {
+  const classify = (item: string): ProcessMutationContract["scope"] => {
+    const lexical = path.isAbsolute(item)
+      ? path.resolve(item)
+      : path.resolve(workspaceRoot, item);
+    return isInside(workspaceRoot, lexical) ? "workspace" : "enclosing_container";
+  };
+  const scopes = new Set([
+    ...contract.writeRoots.map(classify),
+    ...contract.expectedChanges.map(classify)
+  ]);
+  if (scopes.size !== 1) {
+    throw writePlanError(
+      "A process call cannot mix workspace and enclosing-container mutations; use separate calls so workspace rollback remains complete.",
+      "write_plan_invalid"
+    );
+  }
+  return [...scopes][0] ?? "workspace";
+}
+
+function assertMutationScopeAllowed(
+  scope: ProcessMutationContract["scope"],
+  background: boolean,
+  writeScope: "workspace" | "enclosing-container"
+): void {
+  if (scope === "enclosing_container" && writeScope !== "enclosing-container") {
+    throw writePlanError(
+      "Absolute mutation paths outside the workspace require writeScope=enclosing-container.",
+      "policy_denied"
+    );
+  }
+  if (background && scope === "workspace") {
+    throw writePlanError(
+      "Background processes cannot receive workspace write access.",
+      "policy_denied"
+    );
+  }
+}
+
+function stablePathResolver(
+  workspaceRoot: string,
+  scope: ProcessMutationContract["scope"]
+): (item: string, requireExisting: boolean) => Promise<string> {
+  if (scope === "workspace") {
+    return async (item, requireExisting) =>
+      await stableMutationPath(workspaceRoot, item, requireExisting);
+  }
+  return async (item, requireExisting) =>
+    await stableEnclosingContainerPath(item, requireExisting);
+}
+
+async function assertStableWriteRoots(
+  roots: readonly string[],
+  declaredRoots: readonly string[]
+): Promise<void> {
+  for (const [index, root] of roots.entries()) {
+    const info = await lstat(root).catch(() => null);
+    if (!info?.isDirectory() || info.isSymbolicLink()) {
+      throw writePlanError(
+        `Process writeRoots must be stable existing directories: ${declaredRoots[index]}.`,
+        "write_plan_invalid"
+      );
+    }
+  }
+}
+
+function assertExpectedChangesContained(
+  roots: readonly string[],
+  expected: readonly string[],
+  declaredExpected: readonly string[]
+): void {
+  const outside = declaredExpected.filter((_item, index) =>
+    !roots.some((root) => isInside(root, expected[index]!)));
+  if (outside.length === 0) return;
+  throw writePlanError(
+    `Expected changes must be contained by writeRoots: ${outside.join(", ")}.`,
+    "write_plan_invalid"
+  );
+}
+
+function projectedMutationContract(
+  workspaceRoot: string,
+  scope: ProcessMutationContract["scope"],
+  roots: string[],
+  expected: string[]
+): ProcessMutationContract {
+  if (scope === "enclosing_container") {
+    return {
+      access: "write",
+      scope,
+      writeRoots: roots,
+      expectedChanges: expected
+    };
+  }
   return {
     access: "write",
+    scope,
     writeRoots: roots.map((item) => portableWorkspacePath(workspaceRoot, item)),
     expectedChanges: expected.map((item) => portableWorkspacePath(workspaceRoot, item))
   };
+}
+
+async function validateMutationContract(
+  workspacePath: string,
+  contract: ProcessMutationContract,
+  background: boolean,
+  writeScope: "workspace" | "enclosing-container"
+): Promise<ProcessMutationContract> {
+  if (contract.access === "readonly") return contract;
+  const workspaceRoot = await resolveWorkspacePath(workspacePath, ".");
+  const scope = mutationContractScope(workspaceRoot, contract);
+  assertMutationScopeAllowed(scope, background, writeScope);
+  const stable = stablePathResolver(workspaceRoot, scope);
+  const roots = await Promise.all(contract.writeRoots.map(async (item) =>
+    await stable(item, true)
+  ));
+  await assertStableWriteRoots(roots, contract.writeRoots);
+  const expected = await Promise.all(contract.expectedChanges.map(async (item) =>
+    await stable(item, false)
+  ));
+  if (scope === "workspace"
+    && [...roots, ...expected].some((item) => isProtectedWorkspacePath(workspaceRoot, item))) {
+    throw writePlanError("Process write scope cannot include .git or .agent metadata.", "policy_denied");
+  }
+  assertExpectedChangesContained(roots, expected, contract.expectedChanges);
+  return projectedMutationContract(workspaceRoot, scope, roots, expected);
 }
 
 export async function processMutationContract(
   input: Record<string, JsonValue>,
   workspacePath: string,
   runMode: "analyze" | "change",
-  background: boolean
+  background: boolean,
+  writeScope: "workspace" | "enclosing-container" = "workspace"
 ): Promise<ProcessMutationContract> {
   const declaration = await inferExpectedChangesContract(mutationDeclaration(input), workspacePath);
   const contract = declaration.access === "write" || declaration.legacy.length > 0
-    ? writeContract(declaration, runMode, background)
+    ? writeContract(declaration, runMode)
     : readonlyContract(declaration);
-  return await validateMutationContract(workspacePath, contract);
+  return await validateMutationContract(workspacePath, contract, background, writeScope);
 }

@@ -8,7 +8,7 @@ import {
   BrokerClientLifecycle, BrokerPostResponseOperations, containPostDispatchFailure, containTransportFailure,
   containReusedProcessId, createProcessRedaction,
   DEFAULT_DOCTOR_TIMEOUT_MS, DEFAULT_SANDBOX_SETUP_TIMEOUT_MS,
-  outputDecodingError, parsePostDispatchValue,
+  outputDecodingDiagnostics, parsePostDispatchValue,
   reserveProcessId, runPostResponseOperation, SerializedProcessOperations,
   type ClientState, type Cursor, type ProcessRedaction
 } from "./broker-client-support.js";
@@ -354,10 +354,7 @@ export class SigmaExecBrokerClient extends RepositoryExecutionBrokerBase impleme
     await this.lifecycle.closeForActiveOperation();
   }
   private async processResult(handle: ProcessHandle, value: ReturnType<typeof parseProcessValue>): Promise<ProcessPollResult> {
-    const decodingError = outputDecodingError(value);
-    if (decodingError) {
-      await containPostDispatchFailure(decodingError, async () => await this.closeForActiveOperation());
-    }
+    const outputDecodingErrors = outputDecodingDiagnostics(value);
     const streams = this.processRedaction.get(handle.id) ?? createProcessRedaction(this.redactor);
     this.processRedaction.set(handle.id, streams);
     const final = value.state !== "running";
@@ -367,7 +364,9 @@ export class SigmaExecBrokerClient extends RepositoryExecutionBrokerBase impleme
         error, async () => await this.closeForActiveOperation()
       )
     );
-    const result = decodedProcessPollResult(handle, value, streams, this.redactor, outputArtifacts);
+    const result = decodedProcessPollResult(
+      handle, value, streams, this.redactor, outputArtifacts, outputDecodingErrors
+    );
     if (final) {
       await this.transport.request("process.release", { handleId: handle.id }, { timeoutMs: 5_000 }).catch(
         async (error: unknown) => await containPostDispatchFailure(

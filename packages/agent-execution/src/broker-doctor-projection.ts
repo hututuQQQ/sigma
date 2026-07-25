@@ -9,9 +9,11 @@ export const verifiedShellExecutables = (report: BrokerDoctorReport | undefined)
 export const verifiedTargetExecutableEnvironment = (
   executionBackend: "native" | "oci" | undefined,
   report: BrokerDoctorReport | undefined
-): VerifiedTargetExecutableEnvironment | undefined => executionBackend === "oci" && report
+): VerifiedTargetExecutableEnvironment | undefined => report
   ? {
       platform: report.platform,
-      searchPaths: report.capabilities.executableSearchPaths ?? []
+      searchPaths: executionBackend === "oci"
+        ? report.capabilities.executableSearchPaths ?? []
+        : []
     }
   : undefined;

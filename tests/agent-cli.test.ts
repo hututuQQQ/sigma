@@ -127,7 +127,7 @@ describe("Sigma CLI", () => {
     expect(JSON.parse(stdout.text())).toMatchObject({ status: "completed", finalMessage: "analysis" });
   });
 
-  it("keeps the complete CLI instruction as the semantic goal while shortening only the title", async () => {
+  it("keeps the complete CLI instruction without synthesizing a formal plan", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-cli-goal-"));
     const workspace = path.join(root, "workspace");
     const stateRootDir = path.join(root, "state");
@@ -156,11 +156,9 @@ describe("Sigma CLI", () => {
     if (!session) throw new Error("Expected a durable CLI session.");
     const events = [];
     for await (const event of store.events(session.sessionId)) events.push(event);
-    const initialPlan = events.find((event) => event.type === "plan.updated")?.payload as {
-      plan?: { goal?: string; nodes?: Array<{ title?: string }> };
-    } | undefined;
-    expect(initialPlan?.plan?.goal).toBe(instruction);
-    expect(initialPlan?.plan?.nodes?.[0]?.title).toBe(instruction.slice(0, 80));
+    expect(events.some((event) => event.type === "plan.updated")).toBe(false);
+    expect(events.find((event) => event.type === "user.message")?.payload)
+      .toMatchObject({ text: instruction });
   });
 
   it("lists, shows, and replays sessions through RuntimeClient", async () => {

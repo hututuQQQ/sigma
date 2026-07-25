@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { createKernelState, reviewRepairObligation } from "../packages/agent-kernel/src/index.js";
+import { createKernelState } from "../packages/agent-kernel/src/index.js";
 import type {
   AgentEventEnvelope,
   EvidenceRecord,
@@ -18,21 +18,23 @@ import type {
   WorkspaceDeltaEvidence
 } from "../packages/agent-protocol/src/index.js";
 import { completionFailure } from "../packages/agent-runtime/src/effect-helpers.js";
+import { completionGateDecision } from "../packages/agent-runtime/src/completion-evidence-gate.js";
 import { assuranceRequirement, validationClaimSatisfies } from "../packages/agent-runtime/src/assurance-engine.js";
 import { evidenceLedger } from "../packages/agent-runtime/src/model-evidence-ledger.js";
 import { beginNextRun } from "../packages/agent-runtime/src/run-transitions.js";
+import { materializeLargeToolArtifacts } from "../packages/agent-runtime/src/large-tool-artifacts.js";
 import { RuntimeControlService } from "../packages/agent-runtime/src/runtime-control.js";
 import type { RuntimeControlServiceOptions } from "../packages/agent-runtime/src/runtime-control-contracts.js";
 import { assertToolReceiptIdentity, normalizeReceiptEvidence } from "../packages/agent-runtime/src/tool-evidence.js";
 import {
-  assertTaskControlPlanAllowed,
+  assertTransactionIsolationPlanAllowed,
   assertReceiptWithinPlan,
   validationScope
 } from "../packages/agent-runtime/src/tool-plan-enforcement.js";
 import { ReviewCoordinator, reviewReadiness } from "../packages/agent-runtime/src/review-coordinator.js";
 import {
+  currentFrontierValidationStatus,
   frontierValidationReadiness,
-  reviewBasisDigest,
   unresolvedWorkspaceDeltas
 } from "../packages/agent-runtime/src/mutation-evidence.js";
 import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
@@ -302,6 +304,98 @@ describe.skip("V3 validation workspace-delta scope", () => {
 });
 
 describe("V5 assurance-coordinated mutation completion", () => {
+  it("requires active review for an environment-only mutation frontier", () => {
+    const active = session([]);
+    const environment: EvidenceRecord = {
+      evidenceId: "environment-change",
+      sessionId: "session",
+      runId: "run",
+      kind: "diagnostic",
+      status: "passed",
+      createdAt: now,
+      producer: { authority: "tool", id: "exec" },
+      summary: "container path changed",
+      data: {
+        source: "enclosing_container_mutation",
+        diagnostic: {
+          schemaVersion: 1,
+          scope: "enclosing_container",
+          callId: "exec",
+          declaredPaths: ["/etc/example.conf"],
+          resultDigest: "b".repeat(64),
+          ok: true,
+          effects: ["filesystem.write"]
+        }
+      }
+    };
+    active.durable.state.evidence.push(environment);
+    active.durable.state.mutationEvidence.push(environment);
+    active.durable.state.mutationFrontier = {
+      revision: 1,
+      baselineManifestDigest: "0".repeat(64),
+      currentStateDigest: "b".repeat(64),
+      changedPaths: [],
+      environmentChangedPaths: ["/etc/example.conf"],
+      sourceCheckpointIds: []
+    };
+
+    expect(reviewReadiness(active, "completion")).toMatchObject({
+      pending: [],
+      eligible: [],
+      environmentMutations: [
+        expect.objectContaining({ evidenceId: "environment-change" })
+      ]
+    });
+    expect(evidenceLedger(active).content).toContain(
+      "enclosing-container changed paths: 1"
+    );
+  });
+
+  it("does not carry a broad reviewer waiver across follow-up runs", () => {
+    const active = session([]);
+    const environment: EvidenceRecord = {
+      evidenceId: "current-environment-change",
+      sessionId: "session",
+      runId: "run",
+      kind: "diagnostic",
+      status: "passed",
+      createdAt: now,
+      producer: { authority: "tool", id: "exec" },
+      summary: "container path changed",
+      data: {
+        source: "enclosing_container_mutation",
+        diagnostic: {
+          schemaVersion: 1,
+          scope: "enclosing_container",
+          callId: "exec",
+          declaredPaths: ["/etc/example.conf"],
+          resultDigest: "c".repeat(64),
+          ok: true,
+          effects: ["filesystem.write"]
+        }
+      }
+    };
+    active.durable.state.mutationEvidence.push(
+      waiver("prior-run-waiver", "prior-run"),
+      environment
+    );
+    active.durable.state.mutationFrontier = {
+      revision: 1,
+      baselineManifestDigest: "0".repeat(64),
+      currentStateDigest: "c".repeat(64),
+      changedPaths: [],
+      environmentChangedPaths: ["/etc/example.conf"],
+      sourceCheckpointIds: []
+    };
+
+    expect(reviewReadiness(active, "completion").environmentMutations)
+      .toContainEqual(expect.objectContaining({ evidenceId: "current-environment-change" }));
+    expect(completionGateDecision(active)).toMatchObject({
+      action: "fail",
+      code: "verification_unavailable"
+    });
+  });
+
   it("does not let a generic acceptance claim replace explicit semantic claims", () => {
     expect(validationClaimSatisfies("acceptance", "acceptance")).toBe(true);
     expect(validationClaimSatisfies("acceptance", "typecheck")).toBe(false);
@@ -337,15 +431,26 @@ describe("V5 assurance-coordinated mutation completion", () => {
     };
   }
 
-  it("derives coverage from semantic command subjects, not read roots", () => {
+  it("derives authoritative coverage from model-declared subjects, not command syntax or read roots", () => {
     const active = frontierSession();
     const scope = validationScope(active, {
-      id: "validate", name: "validate", arguments: { executable: "tsc", args: ["--noEmit"] }
+      id: "validate", name: "validate", arguments: {
+        executable: "tsc",
+        args: ["--noEmit"],
+        purpose: "Check the changed source.",
+        subjects: ["src/code.ts"],
+        criterionIds: ["source-check"]
+      }
     }, { ...validationPlan, readPaths: ["docs"] });
     expect(scope).toMatchObject({
       frontierRevision: 4,
       stateDigest: "a".repeat(64),
       coveredPaths: ["src/code.ts"],
+      intent: {
+        purpose: "Check the changed source.",
+        subjects: ["src/code.ts"],
+        criterionIds: ["source-check"]
+      },
       claim: { kind: "typecheck", subject: { projectId: "." } }
     });
     expect(scope?.claim.commandDigest).toMatch(/^[a-f0-9]{64}$/u);
@@ -358,7 +463,11 @@ describe("V5 assurance-coordinated mutation completion", () => {
     ];
     const unit = validationScope(active, {
       id: "cargo-test", name: "validate",
-      arguments: { executable: "cargo", args: ["+stable", "test", "--locked"] }
+      arguments: {
+        executable: "cargo",
+        args: ["+stable", "test", "--locked"],
+        subjects: ["native/sigma-exec/src/main.rs"]
+      }
     }, validationPlan);
     expect(unit).toMatchObject({
       coveredPaths: ["native/sigma-exec/src/main.rs"],
@@ -366,7 +475,11 @@ describe("V5 assurance-coordinated mutation completion", () => {
     });
     const acceptance = validationScope(active, {
       id: "cargo-build", name: "validate",
-      arguments: { executable: "cargo", args: ["build", "--locked"] }
+      arguments: {
+        executable: "cargo",
+        args: ["build", "--locked"],
+        subjects: ["."]
+      }
     }, validationPlan);
     expect(acceptance).toMatchObject({
       coveredPaths: ["native/sigma-exec/src/main.rs", "docs/readme.md"],
@@ -390,7 +503,11 @@ describe("V5 assurance-coordinated mutation completion", () => {
 
     expect(validationScope(active, {
       id: "coq-compile", name: "validate",
-      arguments: { shell: "bash", command: "/usr/bin/coqc -q proofs/theorem.v 2>&1" }
+      arguments: {
+        shell: "bash",
+        command: "/usr/bin/coqc -q proofs/theorem.v 2>&1",
+        subjects: ["proofs"]
+      }
     }, validationPlan)).toMatchObject({
       coveredPaths: [
         "proofs/theorem.v",
@@ -418,7 +535,8 @@ describe("V5 assurance-coordinated mutation completion", () => {
       id: "cobol-compile", name: "validate",
       arguments: {
         executable: "cobc",
-        args: ["-x", "-o", "program", "legacy/program.cbl"]
+        args: ["-x", "-o", "program", "legacy/program.cbl"],
+        subjects: ["legacy/program.cbl", "program"]
       }
     }, validationPlan)).toMatchObject({
       coveredPaths: ["legacy/program.cbl", "program"],
@@ -446,7 +564,8 @@ describe("V5 assurance-coordinated mutation completion", () => {
       id: "document-build", name: "validate",
       arguments: {
         shell: "bash",
-        command: "TEXMFVAR=/tmp/tex-var TEXMFCONFIG=/tmp/tex-config pdflatex -interaction=nonstopmode main.tex"
+        command: "TEXMFVAR=/tmp/tex-var TEXMFCONFIG=/tmp/tex-config pdflatex -interaction=nonstopmode main.tex",
+        subjects: ["."]
       }
     }, validationPlan)).toMatchObject({
       coveredPaths: ["main.tex", "chapters/input.tex"],
@@ -473,7 +592,8 @@ describe("V5 assurance-coordinated mutation completion", () => {
           "python3 reference.py > /tmp/expected",
           "diff /tmp/actual /tmp/expected",
           "echo PASS"
-        ].join(" && ")
+        ].join(" && "),
+        subjects: ["program.py", "reference.py"]
       }
     }, validationPlan)).toMatchObject({
       coveredPaths: ["program.py", "reference.py"],
@@ -517,7 +637,11 @@ describe("V5 assurance-coordinated mutation completion", () => {
     }
     expect(validationScope(active, {
       id: "strict-test", name: "validate",
-      arguments: { shell: "bash", command: "cd . && pytest tests/test_program.py && echo PASS" }
+      arguments: {
+        shell: "bash",
+        command: "cd . && pytest tests/test_program.py && echo PASS",
+        subjects: ["program.py"]
+      }
     }, validationPlan)).toMatchObject({
       coveredPaths: ["program.py"],
       claim: { kind: "unit" }
@@ -532,7 +656,8 @@ describe("V5 assurance-coordinated mutation completion", () => {
       id: "python-syntax", name: "validate",
       arguments: {
         executable: "/usr/bin/python3",
-        args: ["-m", "py_compile", "program.py"]
+        args: ["-m", "py_compile", "program.py"],
+        subjects: ["program.py"]
       }
     }, validationPlan)).toMatchObject({
       coveredPaths: ["program.py"],
@@ -562,14 +687,18 @@ describe("V5 assurance-coordinated mutation completion", () => {
 
     expect(validationScope(active, {
       id: "node-test", name: "validate",
-      arguments: { executable: "node", args: ["--test", "tests/code.test.mjs"] }
+      arguments: {
+        executable: "node",
+        args: ["--test", "tests/code.test.mjs"],
+        subjects: ["src/code.mjs"]
+      }
     }, validationPlan)).toMatchObject({
       coveredPaths: ["src/code.mjs"],
       claim: { kind: "unit", subject: { selectedTests: ["tests/code.test.mjs"] } }
     });
     expect(validationScope(active, {
       id: "node-check-script", name: "validate",
-      arguments: { executable: "node", args: ["check.mjs"] }
+      arguments: { executable: "node", args: ["check.mjs"], subjects: ["."] }
     }, validationPlan)).toMatchObject({
       coveredPaths: ["src/code.mjs", "config.json"],
       claim: { kind: "acceptance" }
@@ -586,7 +715,8 @@ describe("V5 assurance-coordinated mutation completion", () => {
       id: "inline-source", name: "validate",
       arguments: {
         executable: "node",
-        args: ["-e", "import('./src/app.mjs').then(m => { if (!m.ok) process.exit(1); })"]
+        args: ["-e", "import('./src/app.mjs').then(m => { if (!m.ok) process.exit(1); })"],
+        subjects: ["src/app.mjs"]
       }
     }, validationPlan);
     expect(source).toMatchObject({
@@ -598,7 +728,8 @@ describe("V5 assurance-coordinated mutation completion", () => {
       id: "inline-config", name: "validate",
       arguments: {
         executable: "node",
-        args: ["--eval", "const c=JSON.parse(readFileSync('config.json','utf8')); if (!c.ok) throw new Error('bad')"]
+        args: ["--eval", "const c=JSON.parse(readFileSync('config.json','utf8')); if (!c.ok) throw new Error('bad')"],
+        subjects: ["config.json"]
       }
     }, validationPlan);
     expect(config).toMatchObject({
@@ -628,7 +759,7 @@ describe("V5 assurance-coordinated mutation completion", () => {
     });
   });
 
-  it("keeps an explicitly requested direct Node check as an acceptance obligation", () => {
+  it("keeps legacy goal-derived command classification out of model-visible completion authority", () => {
     const active = frontierSession();
     active.durable.state.plan = {
       ...active.durable.state.plan,
@@ -637,9 +768,7 @@ describe("V5 assurance-coordinated mutation completion", () => {
     active.durable.state.mutationFrontier.changedPaths = ["service.mjs"];
 
     expect(assuranceRequirement(active)).toMatchObject({ requiredClaims: ["acceptance"] });
-    expect(evidenceLedger(active).content).toContain(
-      "required validation claim kinds still missing/failed: acceptance"
-    );
+    expect(evidenceLedger(active).content).not.toContain("inferred validation claim gaps");
 
     active.durable.state.plan = {
       ...active.durable.state.plan,
@@ -653,7 +782,11 @@ describe("V5 assurance-coordinated mutation completion", () => {
     active.durable.state.mutationFrontier.changedPaths = ["src/code.mjs"];
     const scope = validationScope(active, {
       id: "node-test", name: "validate",
-      arguments: { executable: "node", args: ["--test", "tests/code.test.mjs"] }
+      arguments: {
+        executable: "node",
+        args: ["--test", "tests/code.test.mjs"],
+        subjects: ["src/code.mjs"]
+      }
     }, validationPlan)!;
     active.durable.state.evidence.push({
       evidenceId: "node-test-evidence",
@@ -683,7 +816,7 @@ describe("V5 assurance-coordinated mutation completion", () => {
     });
   });
 
-  it("requires completion review before accepting an honestly reported failed check", () => {
+  it("keeps failed validation as current-frontier status without a hidden completion tool", () => {
     const active = frontierSession();
     active.durable.state.plan = {
       ...active.durable.state.plan,
@@ -692,7 +825,11 @@ describe("V5 assurance-coordinated mutation completion", () => {
     active.durable.state.mutationFrontier.changedPaths = ["service.mjs"];
     const scope = validationScope(active, {
       id: "node-check", name: "validate",
-      arguments: { executable: "node", args: ["check.mjs"] }
+      arguments: {
+        executable: "node",
+        args: ["check.mjs"],
+        subjects: ["service.mjs"]
+      }
     }, validationPlan)!;
     active.durable.state.evidence.push({
       evidenceId: "node-check-failed",
@@ -732,82 +869,23 @@ describe("V5 assurance-coordinated mutation completion", () => {
     expect(frontierValidationReadiness(active)).toMatchObject({
       ready: false,
       executionReady: true,
-      missingClaims: ["acceptance"],
+      missingClaims: [],
+      latestFailed: { evidenceId: "node-check-failed" }
+    });
+    expect(currentFrontierValidationStatus(active)).toMatchObject({
+      hasRecord: true,
+      passed: false,
       latestFailed: { evidenceId: "node-check-failed" }
     });
     expect(completionFailure(active, call, {
       possibleEffects: ["outcome.propose"]
     } as ToolDescriptor, now)).toMatchObject({
       ok: false,
-      diagnostics: ["validation_result_reporting_required"],
-      result: { nextActions: [{ tool: "request_review", arguments: {} }] }
-    });
-
-    const candidateDigest = "c".repeat(64);
-    active.durable.state.taskControl.completionCandidate = {
-      answer: "The requested check failed.",
-      digest: candidateDigest
-    };
-    active.durable.state.evidence.push({
-      evidenceId: "completion-review",
-      sessionId: "session",
-      runId: "run",
-      kind: "review",
-      status: "passed",
-      createdAt: now,
-      producer: { authority: "runtime", id: "reviewer" },
-      summary: "The requested failed check was reported honestly.",
-      data: {
-        reviewerId: "reviewer",
-        verdict: "approved",
-        findings: [],
-        frontierRevision: active.durable.state.mutationFrontier.revision,
-        stateDigest: active.durable.state.mutationFrontier.currentStateDigest,
-        reviewBasisDigest: reviewBasisDigest(active, undefined, candidateDigest),
-        validationEvidenceIds: ["node-check-failed"]
-      }
-    });
-    expect(completionFailure(active, call, {
-      possibleEffects: ["outcome.propose"]
-    } as ToolDescriptor, now)).toBeNull();
-
-    active.durable.state.mutationFrontier.changedPaths = ["packages/agent-runtime/service.mjs"];
-    const failedEvidence = active.durable.state.evidence.find(
-      (item): item is ValidationEvidence => item.evidenceId === "node-check-failed"
-    )!;
-    failedEvidence.data.coveredPaths = ["packages/agent-runtime/service.mjs"];
-    active.durable.state.evidence = active.durable.state.evidence.filter(
-      (item) => item.evidenceId !== "completion-review"
-    );
-    active.durable.state.evidence.push({
-      evidenceId: "high-risk-completion-review",
-      sessionId: "session",
-      runId: "run",
-      kind: "review",
-      status: "passed",
-      createdAt: now,
-      producer: { authority: "runtime", id: "reviewer" },
-      summary: "The failed check was reported, but high-risk validation remains required.",
-      data: {
-        reviewerId: "reviewer",
-        verdict: "approved",
-        findings: [],
-        frontierRevision: active.durable.state.mutationFrontier.revision,
-        stateDigest: active.durable.state.mutationFrontier.currentStateDigest,
-        reviewBasisDigest: reviewBasisDigest(active, undefined, candidateDigest),
-        validationEvidenceIds: ["node-check-failed"]
-      }
-    });
-    expect(assuranceRequirement(active).risk).toBe("high");
-    expect(completionFailure(active, call, {
-      possibleEffects: ["outcome.propose"]
-    } as ToolDescriptor, now)).toMatchObject({
-      ok: false,
-      diagnostics: ["validation_result_reporting_required"]
+      diagnostics: ["internal_tool_denied"]
     });
   });
 
-  it("requires unit evidence for non-source assets under tests", () => {
+  it("does not derive a required semantic claim from a test-like file path", () => {
     const active = frontierSession();
     active.durable.state.mutationFrontier.changedPaths = ["tests/fixtures/data.json"];
 
@@ -815,7 +893,7 @@ describe("V5 assurance-coordinated mutation completion", () => {
       ready: false,
       coveredPaths: [],
       missingPaths: ["tests/fixtures/data.json"],
-      missingClaims: ["unit"]
+      missingClaims: []
     });
   });
 
@@ -823,7 +901,11 @@ describe("V5 assurance-coordinated mutation completion", () => {
     const active = frontierSession();
     const syntax = validationScope(active, {
       id: "syntax", name: "validate",
-      arguments: { executable: "node", args: ["--check", "src/code.ts"] }
+      arguments: {
+        executable: "node",
+        args: ["--check", "src/code.ts"],
+        subjects: ["src/code.ts"]
+      }
     }, { ...validationPlan, readPaths: ["."] });
     expect(syntax).toMatchObject({
       coveredPaths: ["src/code.ts"],
@@ -848,7 +930,11 @@ describe("V5 assurance-coordinated mutation completion", () => {
     });
     expect(validationScope(active, {
       id: "syntax", name: "validate",
-      arguments: { executable: "node", args: ["--check", "provider-smoke.js"] }
+      arguments: {
+        executable: "node",
+        args: ["--check", "provider-smoke.js"],
+        subjects: ["provider-smoke.js"]
+      }
     }, validationPlan)).toMatchObject({
       coveredPaths: ["provider-smoke.js"],
       claim: { kind: "syntax", subject: { exactFiles: ["provider-smoke.js"] } }
@@ -872,26 +958,60 @@ describe("V5 assurance-coordinated mutation completion", () => {
     };
     expect(frontierValidationReadiness(active)).toMatchObject({
       ready: false,
-      missingPaths: ["src/code.ts"]
+      missingPaths: ["src/code.ts", "docs/readme.md"]
     });
   });
 
-  it("keeps semantic validation hard while advisory review does not block", () => {
+  it("does not let custom languages or compound shell syntax erase model-declared subjects", () => {
+    const active = frontierSession();
+    active.durable.state.mutationFrontier.changedPaths = [
+      "solver/main.scm",
+      "scripts/check-output"
+    ];
+    for (const command of [
+      "scheme solver/main.scm | tee /tmp/result",
+      "bash -c 'diff <(scheme solver/main.scm) <(cat scripts/check-output)'"
+    ]) {
+      expect(validationScope(active, {
+        id: `custom-${command.length}`,
+        name: "validate",
+        arguments: {
+          shell: "bash",
+          command,
+          purpose: "Check the declared custom-language behavior.",
+          subjects: ["solver/main.scm", "scripts/check-output"],
+          criterionIds: ["custom-behavior"]
+        }
+      }, validationPlan)).toMatchObject({
+        coveredPaths: ["solver/main.scm", "scripts/check-output"],
+        intent: {
+          purpose: "Check the declared custom-language behavior.",
+          subjects: ["solver/main.scm", "scripts/check-output"],
+          criterionIds: ["custom-behavior"]
+        }
+      });
+    }
+  });
+
+  it("never re-enables the removed completion tool based on validation state", () => {
     const active = frontierSession();
     const call: ModelToolCall = { id: "runtime_completion_intent_test", name: "runtime_finalize", arguments: { summary: "done" } };
     const descriptor = { possibleEffects: ["outcome.propose"] } as ToolDescriptor;
     expect(completionFailure(active, call, descriptor, now)).toMatchObject({
       ok: false,
-      diagnostics: ["validation_evidence_required"]
+      diagnostics: ["internal_tool_denied"]
     });
     active.durable.state.evidence.push(
       frontierValidation("code", ["src/code.ts"]),
       frontierValidation("docs", ["docs/readme.md"])
     );
-    expect(completionFailure(active, call, descriptor, now)).toBeNull();
+    expect(completionFailure(active, call, descriptor, now)).toMatchObject({
+      ok: false,
+      diagnostics: ["internal_tool_denied"]
+    });
   });
 
-  it("keeps failed goal input obligations open until that same external path is read", () => {
+  it("keeps input-access evidence as facts without creating a completion obligation", () => {
     const requiredPath = pathForInputObligation();
     const inputAccess = (
       evidenceId: string,
@@ -916,11 +1036,13 @@ describe("V5 assurance-coordinated mutation completion", () => {
 
     expect(completionFailure(target, call, descriptor, now)).toMatchObject({
       ok: false,
-      diagnostics: ["input_access_unresolved"],
-      result: { paths: [requiredPath] }
+      diagnostics: ["internal_tool_denied"]
     });
     target.durable.state.evidence.push(inputAccess("required-passed", "passed", requiredPath, "external"));
-    expect(completionFailure(target, call, descriptor, now)).toBeNull();
+    expect(completionFailure(target, call, descriptor, now)).toMatchObject({
+      ok: false,
+      diagnostics: ["internal_tool_denied"]
+    });
     expect(completionFailure(target, {
       id: "blocked", name: "report_blocked", arguments: { summary: "input inaccessible" }
     }, { possibleEffects: ["outcome.report_blocked"] } as ToolDescriptor, now)).toBeNull();
@@ -954,7 +1076,7 @@ describe("leaf-aware effect-plan enforcement", () => {
   });
 });
 
-describe("review repair plan enforcement", () => {
+describe("model-owned review repair planning", () => {
   function repairPlan(writePaths: string[]): ToolCallPlan {
     return {
       exactEffects: ["filesystem.write"], readPaths: [], writePaths,
@@ -963,34 +1085,21 @@ describe("review repair plan enforcement", () => {
     };
   }
 
-  it("allows only writes inside the runtime-authenticated finding scope", async () => {
+  it("does not turn reviewer findings into a runtime write-scope obligation", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-review-repair-plan-"));
     await mkdir(path.join(workspace, "src"));
     const active = runtimeSessionFixture({ workspacePath: workspace });
-    active.durable.state.taskControl = reviewRepairObligation(
-      active.durable.state.taskControl,
-      active.durable.state.revision,
-      "a".repeat(64),
-      ["src/target.ts"]
-    );
-
-    await expect(assertTaskControlPlanAllowed(active, repairPlan(["src/target.ts"])))
+    await expect(assertTransactionIsolationPlanAllowed(active, repairPlan(["src/target.ts"])))
       .resolves.toBeUndefined();
-    await expect(assertTaskControlPlanAllowed(active, repairPlan(["src/other.ts"])))
-      .rejects.toMatchObject({ code: "tool_unavailable_for_repair" });
+    await expect(assertTransactionIsolationPlanAllowed(active, repairPlan(["src/other.ts"])))
+      .resolves.toBeUndefined();
   });
 
-  it("rejects mutation plans without an exact write target", async () => {
+  it("does not require a synthetic repair target in the effect plan", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-review-repair-empty-plan-"));
     const active = runtimeSessionFixture({ workspacePath: workspace });
-    active.durable.state.taskControl = reviewRepairObligation(
-      active.durable.state.taskControl,
-      active.durable.state.revision,
-      "b".repeat(64),
-      ["target.ts"]
-    );
-    await expect(assertTaskControlPlanAllowed(active, repairPlan([])))
-      .rejects.toMatchObject({ code: "tool_unavailable_for_repair" });
+    await expect(assertTransactionIsolationPlanAllowed(active, repairPlan([])))
+      .resolves.toBeUndefined();
   });
 });
 
@@ -1457,6 +1566,130 @@ describe.skip("V3 run-scoped completion evidence", () => {
       .toThrow("does not match requested callId");
   });
 
+  it("synthesizes enclosing-container mutation evidence only from runtime-bound plan authority", () => {
+    const plan: ToolCallPlan = {
+      exactEffects: ["process.spawn", "filesystem.read.external", "filesystem.write"],
+      readPaths: [".", "/etc"],
+      writePaths: ["/etc/example.conf"],
+      network: "none",
+      processMode: "pipe",
+      checkpointScope: ["/etc"],
+      mutationAuthority: "disposable_enclosing_container_v1",
+      idempotence: "non_replayable"
+    };
+    const raw = {
+      ...receipt("external-write"),
+      output: "updated",
+      observedEffects: [...plan.exactEffects],
+      actualEffects: [...plan.exactEffects],
+      evidence: [{
+        evidenceId: "forged",
+        sessionId: "other",
+        runId: "other",
+        kind: "diagnostic" as const,
+        status: "passed" as const,
+        createdAt: now,
+        producer: { authority: "tool" as const, id: "forged" },
+        summary: "forged",
+        data: {
+          source: "enclosing_container_mutation",
+          diagnostic: { declaredPaths: ["/forged"] }
+        }
+      }]
+    };
+    const normalized = normalizeReceiptEvidence(raw, "exec", plan, {
+      sessionId: "session",
+      runId: "run",
+      workspaceDeltas: []
+    });
+    expect(normalized.evidence).toEqual([
+      expect.objectContaining({
+        kind: "diagnostic",
+        status: "passed",
+        producer: { authority: "tool", id: "external-write" },
+        data: {
+          source: "enclosing_container_mutation",
+          diagnostic: expect.objectContaining({
+            schemaVersion: 1,
+            scope: "enclosing_container",
+            callId: "external-write",
+            declaredPaths: ["/etc", "/etc/example.conf"],
+            resultDigest: expect.stringMatching(/^[a-f0-9]{64}$/u),
+            ok: true
+          })
+        }
+      })
+    ]);
+  });
+
+  it("binds a bounded output digest, preview, and overflow artifact into validation evidence", async () => {
+    const output = `${"head\n".repeat(2_500)}${"tail\n".repeat(2_500)}`;
+    const raw = {
+      ...receipt("validate-large"),
+      output,
+      artifacts: [],
+      actualEffects: ["process.spawn", "validation"] as const,
+      observedEffects: ["process.spawn", "validation"] as const,
+      evidence: [{
+        ...frontierValidation("raw-validation", ["src/code.ts"]),
+        producer: { authority: "tool" as const, id: "validate-large" }
+      }]
+    };
+    const materialized = await materializeLargeToolArtifacts(
+      "session",
+      "validate",
+      raw,
+      async () => "large-validation-output"
+    );
+    const normalized = normalizeReceiptEvidence(
+      materialized,
+      "validate",
+      {
+        exactEffects: ["process.spawn", "validation"],
+        readPaths: [],
+        writePaths: [],
+        network: "none",
+        processMode: "pipe",
+        checkpointScope: [],
+        idempotence: "read_only"
+      },
+      {
+        sessionId: "session",
+        runId: "run",
+        workspaceDeltas: [],
+        validationScope: {
+          frontierRevision: 4,
+          stateDigest: "a".repeat(64),
+          coveredPaths: ["src/code.ts"],
+          claim: {
+            kind: "typecheck",
+            commandDigest: "f".repeat(64),
+            subject: {
+              projectId: ".",
+              configPaths: [],
+              selectedTests: [],
+              exactFiles: []
+            }
+          }
+        }
+      }
+    );
+    const evidence = normalized.evidence?.find(
+      (item): item is ValidationEvidence => item.kind === "validation"
+    );
+
+    expect(materialized.artifacts).toContain("large-validation-output");
+    expect(evidence?.data).toMatchObject({
+      artifactIds: ["large-validation-output"],
+      output: {
+        sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        byteLength: Buffer.byteLength(output, "utf8"),
+        truncated: true,
+        preview: expect.stringContaining("full content is available by artifact ID")
+      }
+    });
+  });
+
   it("preserves a repository selection capability key while restamping its runtime authority", () => {
     const capabilityId = "repository-recovery-selection:capability";
     const selection: RepositoryRecoverySelectionEvidenceV1 = {
@@ -1582,6 +1815,46 @@ describe.skip("V3 run-scoped completion evidence", () => {
     expect(active.durable.state.evidence).toEqual([]);
     expect(active.durable.state.receipts).toEqual([]);
     expect(active.durable.state.checkpointHead).toBeUndefined();
+  });
+
+  it("preserves the frozen assurance policy while resetting per-run usage", () => {
+    const policy = {
+      budgetPercent: 17,
+      reviewRounds: 3,
+      repairRounds: 2,
+      reviewerMaxTurns: 5,
+      reviewerMaxToolCalls: 9,
+      repairMaxTurns: 4,
+      repairMaxToolCalls: 7,
+      strategistMode: "off" as const,
+      duplicateThreshold: 5,
+      strategyRemainingPercent: 31
+    };
+    const state = createKernelState({
+      sessionId: "session",
+      runId: "run",
+      mode: "change",
+      startedAt: now,
+      deadlineAt: now,
+      assurancePolicy: policy
+    });
+    state.longHorizon.assurance.reviewerCalls = 2;
+    state.longHorizon.assurance.repairEpisodes = 1;
+    state.longHorizon.assurance.auxiliaryInputTokens = 100;
+    const active = runtimeSessionFixture({ state });
+
+    beginNextRun(active, "change", 60_000);
+
+    expect(active.durable.state.longHorizon.assurance).toMatchObject({
+      ...policy,
+      maxAuxiliaryCalls: 15,
+      maxAuxiliaryBudgetBps: 1_700,
+      reviewerCalls: 0,
+      repairEpisodes: 0,
+      auxiliaryInputTokens: 0,
+      protectedRepairTurnsRemaining: 8,
+      protectedToolCallsRemaining: 14
+    });
   });
 
   it("retains unresolved mutation obligations across a follow-up run", () => {

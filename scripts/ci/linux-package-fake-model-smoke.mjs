@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   fakeFinalTurn,
+  fakeReviewerInspectionTurn,
   fakeReviewerTurn,
   fakeToolCall,
   fakeToolTurn,
@@ -42,6 +43,7 @@ export async function runLinuxPackageFakeModelSmoke() {
     })]),
     realSandboxValidationTurn,
     fakeFinalTurn("Portable package fake-model smoke completed."),
+    fakeReviewerInspectionTurn(),
     fakeReviewerTurn()
   ]);
   const composition = await createConfiguredRuntime(smokeRuntimeConfig(workspace), {

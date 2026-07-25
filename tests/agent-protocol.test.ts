@@ -15,7 +15,7 @@ import {
   usageFixture, validAgentEventFixture
 } from "./testkit/agent-event-fixtures.js";
 
-describe("AgentEventEnvelope V5 runtime boundary", () => {
+describe("AgentEventEnvelope V6 runtime boundary", () => {
   it("accepts a producer fixture for every declared durable event", () => {
     expect(Object.keys(fixtures).sort()).toEqual([...AGENT_EVENT_TYPES].sort());
     for (const type of AGENT_EVENT_TYPES) expect(isAgentEventEnvelope(validAgentEventFixture(type)), type).toBe(true);
@@ -119,6 +119,11 @@ describe("AgentEventEnvelope V5 runtime boundary", () => {
 
   it("rejects wrong versions and authority/scope violations", () => {
     expect(isAgentEventEnvelope({ ...validAgentEventFixture(), schemaVersion: 3 })).toBe(false);
+    expect(isAgentEventEnvelope({ ...validAgentEventFixture(), schemaVersion: 5 })).toBe(true);
+    expect(isAgentEventEnvelope({
+      ...validAgentEventFixture("model.prompt_materialized"),
+      schemaVersion: 5
+    })).toBe(false);
     expect(isAgentEventEnvelope({ ...validAgentEventFixture(), authority: "external_verifier" })).toBe(false);
     expect(isAgentEventEnvelope({
       ...validAgentEventFixture("checkpoint.recovery_resolved"), authority: "runtime"
@@ -129,7 +134,7 @@ describe("AgentEventEnvelope V5 runtime boundary", () => {
     expect(isSolverVisibleAuthority("external_verifier")).toBe(false);
   });
 
-  it("validates strict V5 snapshots independently", () => {
+  it("validates strict V7 snapshots independently", () => {
     const snapshot = {
       schemaVersion: SNAPSHOT_SCHEMA_VERSION, storeLayoutVersion: STORE_LAYOUT_VERSION,
       sessionId: "session", seq: 1, createdAt: fixtureOccurredAt, state: { value: 1 }

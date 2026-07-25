@@ -70,7 +70,7 @@ export const repositoryRecoverySelectionEvidenceV1Schema = z.object({
     repositoryRoot: nonEmptyStringSchema,
     candidateId: digestSchema,
     selectedObject: objectIdSchema,
-    selectionKind: z.enum(["unique", "user_selected"]),
+    selectionKind: z.enum(["unique", "user_selected", "model_selectable"]),
     inspectionBasisDigest: digestSchema,
     inspectedHead: objectIdSchema.nullable(),
     inspectedSymbolicRef: nonEmptyStringSchema.nullable(),

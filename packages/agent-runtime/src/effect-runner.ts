@@ -1,12 +1,15 @@
 import type { RunOutcome } from "agent-protocol";
-import { decide, type KernelEffect } from "agent-kernel";
+import { decide, mutationFrontierHasChanges, type KernelEffect } from "agent-kernel";
 import {
   attemptFromEffect,
   childOutcomeEvidence,
   type ExecuteToolEffect
 } from "./effect-runner-helpers.js";
 import { ModelEffectRunner } from "./model-effect-runner.js";
-import { convergenceAdmissionFailure } from "./convergence-policy.js";
+import {
+  convergenceAdmissionFailure,
+  deadlineForecast
+} from "./convergence-policy.js";
 import type { RuntimeOptions, RuntimePermissionMode, RuntimeSession } from "./types.js";
 import type { BudgetController } from "./budget-controller.js";
 import type { RuntimeControlService } from "./runtime-control.js";
@@ -18,6 +21,12 @@ import { ToolTransactionRunner } from "./tool-transaction-runner.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 import type { RunSuspensionContext } from "./runtime-session-finish.js";
 import { ToolBatchCoordinator } from "./tool-batch-coordinator.js";
+import { LongHorizonCoordinator } from "./long-horizon-coordinator.js";
+import { finishSolvingBudgetBoundary } from "./solving-budget-boundary.js";
+import {
+  completionReviewBlocker,
+  explicitReviewGateDecision
+} from "./completion-evidence-gate.js";
 
 export interface EffectRunnerOptions {
   runtime: RuntimeOptions;
@@ -45,14 +54,16 @@ export class EffectRunner {
   private readonly execution: ToolExecutionMonitor;
   private readonly transactions: ToolTransactionRunner;
   private readonly toolBatches: ToolBatchCoordinator;
+  private readonly longHorizon: LongHorizonCoordinator;
 
   constructor(private readonly options: EffectRunnerOptions) {
-    this.models = new ModelEffectRunner(options);
+    this.longHorizon = new LongHorizonCoordinator(options);
     this.reviews = new ReviewCoordinator(
       options.reviewerForSession ?? (() => options.reviewer),
       options.emit,
       options.budgets
     );
+    this.models = new ModelEffectRunner(options, this.longHorizon, this.reviews);
     this.execution = new ToolExecutionMonitor(options);
     this.transactions = new ToolTransactionRunner(options, this.execution);
     this.toolBatches = new ToolBatchCoordinator(options, this.reviews, this.transactions);
@@ -76,7 +87,16 @@ export class EffectRunner {
     effect: Extract<KernelEffect, { type: "request_model" }>
   ): Promise<boolean> {
     const failure = convergenceAdmissionFailure(session, { kind: "model" });
-    if (failure) return await this.options.finish(session, failure);
+    if (failure) {
+      return await finishSolvingBudgetBoundary(session, signal, failure, {
+        reviews: this.reviews,
+        longHorizon: this.longHorizon,
+        emit: this.options.emit,
+        finish: this.options.finish,
+        runtime: this.options.runtime,
+        createArtifact: this.options.createArtifact
+      });
+    }
     return await this.models.request(session, signal, effect);
   }
 
@@ -93,8 +113,31 @@ export class EffectRunner {
     const failure = convergenceAdmissionFailure(session, {
       kind: "tool", count: effects.length, terminalOnly
     });
-    if (failure) return await this.options.finish(session, failure);
+    // At a live deadline, cancellation remains an outer hard boundary. A
+    // mere tool-ledger shortage is instead represented by durable per-call
+    // failure receipts so pending tool calls are settled exactly once and the
+    // completion assurance can still run from a clean kernel phase.
+    if (failure && deadlineForecast(session).stage === "stop") {
+      return await this.options.finish(session, failure);
+    }
     await this.toolBatches.execute(session, effects.map(attemptFromEffect), signal);
+    if (effects.some((effect) => effect.request.name === "request_review")) {
+      await this.longHorizon.accountReview(session);
+      const decision = explicitReviewGateDecision(session);
+      if (decision?.action === "continue") {
+        await this.options.emit(session, "diagnostic", "runtime", {
+          kind: "completion.advisory",
+          message: decision.message
+        });
+      } else if (decision?.action === "fail") {
+        return await this.options.finish(session, {
+          kind: "recoverable_failure",
+          code: decision.code,
+          message: decision.message,
+          decisionAuthority: decision.authority
+        });
+      }
+    }
     return false;
   }
 
@@ -131,6 +174,13 @@ export class EffectRunner {
   ): Promise<boolean> {
     let outcome = terminal.outcome;
     let outcomeRevision = terminal.revision;
+    if (outcome.kind === "needs_input"
+      && await this.longHorizon.deferInputRequestForStrategy(
+        session,
+        outcome.message
+      )) {
+      return false;
+    }
     if (outcome.kind === "completed" && this.options.runtime.joinChildren) {
       const children = await this.options.runtime.joinChildren(session.identity.sessionId, signal);
       if (children.failures.length > 0) {
@@ -144,6 +194,14 @@ export class EffectRunner {
       for (const [index, value] of children.evidence.entries()) {
         await this.options.emit(session, "evidence.recorded", "runtime", childOutcomeEvidence(session, value, index));
       }
+      outcome = { ...outcome, evidence: [...session.durable.state.evidence] };
+      outcomeRevision = session.durable.state.revision;
+    }
+    if (outcome.kind === "completed"
+      && mutationFrontierHasChanges(session.durable.state.mutationFrontier)
+      && !completionReviewBlocker(session)) {
+      await this.reviews.maybeReview(session, signal, true, "completion");
+      await this.longHorizon.accountReview(session);
       outcome = { ...outcome, evidence: [...session.durable.state.evidence] };
       outcomeRevision = session.durable.state.revision;
     }

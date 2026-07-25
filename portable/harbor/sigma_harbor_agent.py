@@ -579,6 +579,7 @@ class SigmaCliHarborAgent(BaseAgent):
         permission_mode: str = "auto",
         network_mode: str = "full",
         execution_mode: str = "sandboxed",
+        write_scope: str = "enclosing-container",
         managed_environment_mode: str = "disabled",
         harbor_topology: str = "main_only",
         max_wall_time_sec: int = 7200,
@@ -622,6 +623,11 @@ class SigmaCliHarborAgent(BaseAgent):
                 "execution_mode must be one of: sandboxed, container"
             )
         self.execution_mode = execution_mode
+        if write_scope not in {"workspace", "enclosing-container"}:
+            raise ValueError(
+                "write_scope must be one of: workspace, enclosing-container"
+            )
+        self.write_scope = write_scope
         if managed_environment_mode not in {"disabled", "required"}:
             raise ValueError(
                 "managed_environment_mode must be one of: disabled, required"
@@ -647,6 +653,7 @@ class SigmaCliHarborAgent(BaseAgent):
         self.effective_network_mode: str | None = network_mode
         self.available_network_modes: list[str] = []
         self.effective_read_scope = "host"
+        self.effective_write_scope = write_scope
         self.process_handoff_available = False
         self.agent_timeout_grace_sec = max(0, _as_int(agent_timeout_grace_sec, 120))
         env_outer_deadline = os.environ.get("SIGMA_HARBOR_OUTER_TRIAL_DEADLINE_SEC")
@@ -943,6 +950,7 @@ class SigmaCliHarborAgent(BaseAgent):
         summary["permission_mode_effective"] = self._permission_mode()
         summary["agent_profile"] = self.agent_profile
         summary["read_scope_effective"] = self.effective_read_scope
+        summary["write_scope_effective"] = self.effective_write_scope
         summary["process_handoff_available"] = self.process_handoff_available
         if self._process_cleanup is not None:
             summary["process_cleanup"] = self._process_cleanup
@@ -1001,6 +1009,8 @@ class SigmaCliHarborAgent(BaseAgent):
             self.network_mode,
             "--read-scope",
             self.effective_read_scope,
+            "--write-scope",
+            self.effective_write_scope,
             "--process-handoff",
             "allow",
             "--permission-mode",
@@ -1437,6 +1447,8 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             self.network_mode,
             "--read-scope",
             self.effective_read_scope,
+            "--write-scope",
+            self.effective_write_scope,
             "--process-handoff",
             "allow",
         ]
@@ -1599,6 +1611,7 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "harbor_deadline_sec": self.outer_trial_deadline_sec,
             "sigma_deadline_sec": self.max_wall_time_sec,
             "read_scope_effective": self.effective_read_scope,
+            "write_scope_effective": self.effective_write_scope,
             "process_handoff_available": self.process_handoff_available,
         }
 
@@ -1632,6 +1645,7 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "network_mode_requested": self.network_mode,
             "network_mode_effective": self.effective_network_mode,
             "read_scope_effective": self.effective_read_scope,
+            "write_scope_effective": self.effective_write_scope,
             "process_handoff_available": self.process_handoff_available,
             "last_event": last_event,
             "model_turns": live_state.get("model_turns", sum(event.get("type") == "model.started" for event in events)),
@@ -1685,6 +1699,7 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "network_mode_requested": self.network_mode,
             "network_mode_effective": self.effective_network_mode,
             "read_scope_effective": self.effective_read_scope,
+            "write_scope_effective": self.effective_write_scope,
             "process_handoff_available": self.process_handoff_available,
         })
         summary_target.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -1880,6 +1895,10 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
                 shlex.quote(self.execution_mode),
                 "--network",
                 shlex.quote(self.network_mode),
+                "--read-scope",
+                shlex.quote(self.effective_read_scope),
+                "--write-scope",
+                shlex.quote(self.effective_write_scope),
                 "--managed-environment-mode",
                 shlex.quote(self.managed_environment_mode),
                 *( ["--check-api"] if self.check_api else [] ),
@@ -1911,6 +1930,18 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             )
         self.effective_network_mode = self.network_mode
         self.process_handoff_available = capabilities["processHandoff"]
+        enclosing = capabilities.get("enclosingContainerRoot")
+        if self.effective_write_scope == "enclosing-container" and (
+            not isinstance(enclosing, dict)
+            or enclosing.get("available") is not True
+            or enclosing.get("rootKind") != "container_cow"
+            or not isinstance(enclosing.get("attestationDigest"), str)
+        ):
+            self._write_setup_checks(checks, "agent_setup_failed")
+            raise RuntimeError(
+                "agent_setup_failed: requested write_scope=enclosing-container "
+                "is not attested by the native broker"
+            )
         self._managed_environment_verified = self.managed_environment_mode == "required"
         self._write_setup_checks(checks, "passed")
 
@@ -1958,6 +1989,12 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             return "capabilities.networkModes are missing or invalid"
         if not isinstance(capabilities.get("processHandoff"), bool):
             return "capabilities.processHandoff is missing or invalid"
+        if self.effective_write_scope == "enclosing-container":
+            enclosing = capabilities.get("enclosingContainerRoot")
+            if not isinstance(enclosing, dict) or enclosing.get("available") is not True \
+                    or enclosing.get("rootKind") != "container_cow" \
+                    or not isinstance(enclosing.get("attestationDigest"), str):
+                return "required enclosing-container write boundary is unavailable"
         if self.managed_environment_mode == "required":
             container = doctor_json.get("container")
             managed = capabilities.get("managedEnvironment")
@@ -1987,6 +2024,7 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             "agent_profile": self.agent_profile,
             "available_network_modes": list(self.available_network_modes),
             "read_scope_effective": self.effective_read_scope,
+            "write_scope_effective": self.effective_write_scope,
             "process_handoff_available": self.process_handoff_available,
             "checks": checks,
         }
@@ -2154,6 +2192,7 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             "network_mode_requested": summary.get("network_mode_requested", self.network_mode),
             "network_mode_effective": summary.get("network_mode_effective", self.effective_network_mode),
             "read_scope_effective": summary.get("read_scope_effective", self.effective_read_scope),
+            "write_scope_effective": summary.get("write_scope_effective", self.effective_write_scope),
             "process_handoff_available": summary.get("process_handoff_available", self.process_handoff_available),
         }
         for key, value in values.items():
@@ -2281,6 +2320,7 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             "network_mode_requested": getattr(context, "network_mode_requested", self.network_mode),
             "network_mode_effective": getattr(context, "network_mode_effective", self.effective_network_mode),
             "read_scope_effective": getattr(context, "read_scope_effective", self.effective_read_scope),
+            "write_scope_effective": getattr(context, "write_scope_effective", self.effective_write_scope),
             "process_handoff_available": getattr(context, "process_handoff_available", self.process_handoff_available),
             "artifact_warnings": getattr(context, "artifact_warnings", []),
             "commands_executed": getattr(context, "commands_executed", 0),

@@ -4,48 +4,29 @@ import {
   EVENT_SCHEMA_VERSION,
   type AgentEventEnvelope,
   type AgentEventType,
-  type EvidenceRecord,
-  type JsonValue,
-  type ToolDescriptor,
-  type ToolEffect
+  type JsonValue
 } from "../packages/agent-protocol/src/index.js";
 import {
   assertKernelInvariants,
   createKernelState,
   evolve,
-  terminalResolutionObligation,
   type KernelState
 } from "../packages/agent-kernel/src/index.js";
-import {
-  terminalProtocolAction
-} from "../packages/agent-tools/src/index.js";
-import {
-  descriptorAllowedForRepair,
-  effectsAllowedForRepair
-} from "../packages/agent-runtime/src/tool-turn-policy.js";
-import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
 
-const NOW = "2026-01-01T00:00:00.000Z";
-const nonBlankText = fc.string({ minLength: 1, maxLength: 80 })
-  .filter((value) => value.trim().length > 0);
-const completionText = nonBlankText.filter((value) => !/[?？]\s*$/u.test(value));
+const NOW = "2026-07-23T00:00:00.000Z";
 
 function initial(): KernelState {
   return createKernelState({
-    sessionId: "session",
-    runId: "run",
+    sessionId: "property-session",
+    runId: "property-run",
     mode: "change",
     startedAt: NOW,
-    deadlineAt: "2026-01-01T00:01:00.000Z"
+    deadlineAt: "2026-07-23T01:00:00.000Z"
   });
 }
 
-function event(
-  state: KernelState,
-  type: AgentEventType,
-  payload: JsonValue = {}
-): AgentEventEnvelope {
-  return {
+function apply(state: KernelState, type: AgentEventType, payload: JsonValue): KernelState {
+  const event: AgentEventEnvelope = {
     schemaVersion: EVENT_SCHEMA_VERSION,
     seq: state.lastSeq + 1,
     eventId: `event-${state.lastSeq + 1}`,
@@ -56,238 +37,137 @@ function event(
     authority: "runtime",
     payload
   };
+  return evolve(state, event);
 }
 
-function apply(state: KernelState, type: AgentEventType, payload: JsonValue = {}): KernelState {
-  return evolve(state, event(state, type, payload));
-}
-
-function startModel(state: KernelState, turnId: number): KernelState {
-  return apply(state, "model.started", { turnId, effectRevision: state.revision });
-}
-
-function settleModel(
+function toolTurn(
   state: KernelState,
-  payload: Record<string, JsonValue>
+  turnId: number,
+  name: "read" | "shell" | "exec",
+  args: Record<string, JsonValue>,
+  ok: boolean
 ): KernelState {
-  if (!state.activeModelTurn) throw new Error("Property model turn is not active.");
-  return apply(state, "model.completed", { ...payload, ...state.activeModelTurn });
-}
-
-function evidence(): EvidenceRecord {
-  return {
-    evidenceId: "property-evidence",
-    sessionId: "session",
-    runId: "run",
-    kind: "diagnostic",
-    status: "passed",
-    createdAt: NOW,
-    producer: { authority: "runtime" },
-    summary: "property evidence",
-    data: { source: "property", diagnostic: { ok: true } }
-  };
-}
-
-function protectedAnswer(answer: string): KernelState {
-  let state = apply(initial(), "user.message", { text: "answer with evidence" });
-  state = apply(state, "evidence.recorded", evidence());
-  return settleModel(startModel(state, 1), {
-    message: { role: "assistant", content: answer },
-    toolCalls: [],
-    finishReason: "stop"
+  let next = apply(state, "model.started", { turnId, effectRevision: state.revision });
+  const modelTurn = next.activeModelTurn!;
+  const callId = `call-${turnId}`;
+  next = apply(next, "model.completed", {
+    ...modelTurn,
+    message: {
+      role: "assistant",
+      content: "",
+      toolCalls: [{ id: callId, name, arguments: args }]
+    },
+    toolCalls: [{ id: callId, name, arguments: args }],
+    finishReason: "tool_calls"
   });
+  next = apply(next, ok ? "tool.completed" : "tool.failed", {
+    callId,
+    ...modelTurn,
+    ok,
+    output: ok ? "observed" : "failed",
+    outcome: {
+      status: ok ? "succeeded" : "failed",
+      output: ok ? "observed" : "failed",
+      diagnosticCodes: ok ? [] : ["command_failed"]
+    },
+    observedEffects: ["filesystem.read"],
+    actualEffects: ["filesystem.read"],
+    artifacts: [],
+    diagnostics: ok ? [] : ["command_failed"],
+    startedAt: NOW,
+    completedAt: NOW
+  });
+  return next;
 }
 
-function descriptor(
-  possibleEffects: ToolEffect[],
-  maximumEffects?: ToolEffect[],
-  name = "generated_terminal_tool"
-): ToolDescriptor {
-  return {
-    name,
-    description: "Generated terminal policy descriptor.",
-    inputSchema: { type: "object", properties: {}, additionalProperties: false },
-    possibleEffects,
-    ...(maximumEffects ? { maximumEffects } : {}),
-    executionMode: "sequential",
-    resourceKeys: ["run:outcome"],
-    approval: "auto",
-    idempotent: true,
-    timeoutMs: 1_000
-  };
-}
-
-describe("terminal convergence properties", () => {
-  it("projects only terminal effects during terminal resolution", () => {
-    const effects = fc.uniqueArray(fc.constantFrom<ToolEffect>(
-      "outcome.propose",
-      "outcome.request_input",
-      "filesystem.read",
-      "filesystem.write",
-      "network"
-    ), { maxLength: 5 });
-    const names = fc.constantFrom("runtime_finalize", "request_user_input", "generated_terminal_tool");
-    fc.assert(fc.property(effects, effects, effects, names,
-      (possibleEffects, maximumEffects, exactEffects, name) => {
-      const tool = descriptor(possibleEffects, maximumEffects, name);
-      const state = initial();
-      state.taskControl = terminalResolutionObligation(state.taskControl, state.revision, "property_terminal");
-      const session = { durable: { state } } as RuntimeSession;
-      const terminalEffects = new Set<ToolEffect>([
-        "outcome.propose", "outcome.report_blocked", "outcome.request_input"
-      ]);
-      const expectedDescriptor = name !== "request_user_input" && possibleEffects.length > 0
-        && possibleEffects.every((effect) => terminalEffects.has(effect));
-      expect(descriptorAllowedForRepair(session, tool, "terminal")).toBe(expectedDescriptor);
-      const pureAction = possibleEffects.length === 1 && maximumEffects.length === 1
-        && possibleEffects[0] === maximumEffects[0]
-        ? possibleEffects[0] === "outcome.propose" ? "complete"
-          : possibleEffects[0] === "outcome.request_input" ? "request_input" : null
-        : null;
-      expect(terminalProtocolAction(tool)).toBe(pureAction);
-      expect(effectsAllowedForRepair(session, exactEffects, "terminal")).toBe(
-        exactEffects.length > 0 && exactEffects.every((effect) => terminalEffects.has(effect))
-      );
-    }));
+describe("model-led convergence properties", () => {
+  it("never semantically terminates any finite sequence of distinct observations", () => {
+    fc.assert(fc.property(
+      fc.array(fc.record({
+        name: fc.constantFrom<"read" | "shell">("read", "shell"),
+        ok: fc.boolean(),
+        nonce: fc.integer()
+      }), { maxLength: 80 }),
+      (steps) => {
+        let state = apply(initial(), "user.message", { text: "Investigate." });
+        for (let index = 0; index < steps.length; index += 1) {
+          const step = steps[index]!;
+          state = toolTurn(state, index + 1, step.name, {
+            path: `observation-${index}-${step.nonce}`
+          }, step.ok);
+          expect(state.phase).toBe("ready_model");
+          expect(state.proposedOutcome).toBeUndefined();
+          expect(state.outcome).toBeUndefined();
+          assertKernelInvariants(state);
+        }
+      }
+    ), { numRuns: 100 });
   });
 
-  it("always converges an explicit concrete question to a typed input proposal", () => {
-    fc.assert(fc.property(completionText, nonBlankText, (answer, question) => {
-      let prepared = apply(initial(), "user.message", { text: answer });
-      prepared = apply(prepared, "evidence.recorded", evidence());
-      let attempted = settleModel(startModel(prepared, 1), {
-        message: {
-          role: "assistant",
-          content: "",
+  it("does not create semantic recovery state after a failed exec receipt", () => {
+    let state = apply(initial(), "user.message", { text: "Recover from the failure." });
+    state = toolTurn(state, 1, "exec", { command: "missing" }, false);
+    expect(state.phase).toBe("ready_model");
+    expect(state).not.toHaveProperty("taskControl");
+    expect(state.proposedOutcome).toBeUndefined();
+    expect(state.outcome).toBeUndefined();
+  });
+
+  it("adds exactly one non-binding advisory on the third identical call", () => {
+    let state = apply(initial(), "user.message", { text: "Inspect repeatedly if useful." });
+    for (let turn = 1; turn <= 6; turn += 1) {
+      state = toolTurn(state, turn, "read", { path: "same.txt" }, true);
+      expect(state.phase).toBe("ready_model");
+      expect(state.proposedOutcome).toBeUndefined();
+    }
+    const advisories = state.messages.filter((message) =>
+      message.role === "developer" && message.content.includes("only an advisory"));
+    expect(advisories).toHaveLength(1);
+  });
+
+  it("uses only explicit terminal tools for input and blocking", () => {
+    fc.assert(fc.property(
+      fc.string({ minLength: 1 }).filter((value) => value.trim().length > 0),
+      (question) => {
+        let state = apply(initial(), "user.message", { text: "Continue." });
+        state = apply(state, "model.started", { turnId: 1, effectRevision: state.revision });
+        const turn = state.activeModelTurn!;
+        state = apply(state, "model.completed", {
+          ...turn,
+          message: {
+            role: "assistant",
+            content: "",
+            toolCalls: [{
+              id: "input",
+              name: "request_user_input",
+              arguments: { message: question }
+            }]
+          },
           toolCalls: [{
-            id: "repair-input",
+            id: "input",
             name: "request_user_input",
             arguments: { message: question }
-          }]
-        },
-        toolCalls: [{
-          id: "repair-input",
-          name: "request_user_input",
-          arguments: { message: question }
-        }],
-        finishReason: "tool_calls"
-      });
-      expect(attempted).toMatchObject({
-        phase: "tool_pending",
-        pendingTools: [{ request: { callId: "repair-input", name: "request_user_input" } }]
-      });
-      const pending = attempted.pendingTools[0]!;
-      attempted = apply(attempted, "tool.completed", {
-        callId: "repair-input",
-        ...pending.modelTurn,
-        ok: true,
-        output: JSON.stringify({ message: question.trim() }),
-        observedEffects: ["outcome.request_input"],
-        artifacts: [],
-        diagnostics: [],
-        startedAt: NOW,
-        completedAt: NOW
-      });
-      expect(attempted.proposedOutcome).toEqual({
-        kind: "needs_input",
-        requestId: "repair-input",
-        message: question.trim()
-      });
-      assertKernelInvariants(attempted);
-    }));
-  });
-
-  it("always publishes ordinary text when its runtime completion intent succeeds", () => {
-    fc.assert(fc.property(completionText, nonBlankText, (answer, summary) => {
-      let state = protectedAnswer(answer);
-      const pending = state.pendingTools[0]!;
-      state = apply(state, "tool.completed", {
-        callId: pending.request.callId,
-        ...pending.modelTurn,
-        ok: true,
-        output: JSON.stringify({ summary }),
-        observedEffects: ["outcome.propose"],
-        artifacts: [],
-        diagnostics: [],
-        startedAt: NOW,
-        completedAt: NOW
-      });
-      expect(state.proposedOutcome).toMatchObject({ kind: "completed" });
-      expect(state.proposedOutcome?.message).toContain(answer.trim());
-      expect(state.proposedOutcome?.message).toContain(summary.trim());
-      assertKernelInvariants(state);
-    }));
-  });
-
-  it("accepts terminal receipts only from the two standard protocol tools", () => {
-    let state = apply(initial(), "user.message", { text: "finish through the terminal protocol" });
-    state = settleModel(startModel(state, 1), {
-      message: {
-        role: "assistant",
-        content: "",
-        toolCalls: [{ id: "custom-complete", name: "custom_terminal_alias", arguments: {} }]
-      },
-      toolCalls: [{ id: "custom-complete", name: "custom_terminal_alias", arguments: {} }],
-      finishReason: "tool_calls"
-    });
-    const pending = state.pendingTools[0]!;
-    state = apply(state, "tool.completed", {
-      callId: "custom-complete",
-      ...pending.modelTurn,
-      ok: true,
-      output: JSON.stringify({ summary: "alias completion" }),
-      observedEffects: ["outcome.propose"],
-      artifacts: [],
-      diagnostics: [],
-      startedAt: NOW,
-      completedAt: NOW
-    });
-
-    expect(state.proposedOutcome).toMatchObject({
-      kind: "recoverable_failure",
-      code: "terminal_protocol_invalid"
-    });
-    assertKernelInvariants(state);
-  });
-
-  it("rejects an input-effect receipt from a custom tool during protected recovery", () => {
-    fc.assert(fc.property(completionText, nonBlankText, (answer, question) => {
-      const protectedState = protectedAnswer(answer);
-      const modelTurn = { turnId: 2, effectRevision: protectedState.revision };
-      const recoveryState: KernelState = {
-        ...protectedState,
-        phase: "tool_pending",
-        taskControl: terminalResolutionObligation(
-          protectedState.taskControl,
-          protectedState.revision,
-          "terminal_protocol_invalid"
-        ),
-        pendingTools: [{
-          request: { callId: "custom-input", name: "custom_terminal_alias", arguments: {} },
-          modelTurn,
-          approval: "not_required",
-          started: false
-        }],
-        toolCallIds: [...protectedState.toolCallIds, "custom-input"]
-      };
-      assertKernelInvariants(recoveryState);
-      const attempted = apply(recoveryState, "tool.completed", {
-        callId: "custom-input",
-        ...modelTurn,
-        ok: true,
-        output: JSON.stringify({ message: question }),
-        observedEffects: ["outcome.request_input"],
-        artifacts: [],
-        diagnostics: [],
-        startedAt: NOW,
-        completedAt: NOW
-      });
-      expect(attempted.proposedOutcome).toMatchObject({
-        kind: "recoverable_failure",
-        code: "terminal_protocol_invalid"
-      });
-      expect(attempted.proposedOutcome?.message).toContain(answer.trim());
-      assertKernelInvariants(attempted);
-    }));
+          }],
+          finishReason: "tool_calls"
+        });
+        state = apply(state, "tool.completed", {
+          callId: "input",
+          ...turn,
+          ok: true,
+          output: question,
+          observedEffects: ["outcome.request_input"],
+          artifacts: [],
+          diagnostics: [],
+          startedAt: NOW,
+          completedAt: NOW
+        });
+        expect(state.proposedOutcome).toEqual({
+          kind: "needs_input",
+          requestId: "input",
+          message: question.trim()
+        });
+        assertKernelInvariants(state);
+      }
+    ));
   });
 });

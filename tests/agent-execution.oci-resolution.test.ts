@@ -117,3 +117,19 @@ describe("OCI executable request resolution", () => {
     expect(params.policy.protectedPaths.some((item) => pathWithin(item, scratchHome))).toBe(false);
   });
 });
+
+describe("native executable authority", () => {
+  it.each(["linux", "win32"] as const)(
+    "requires an exact trusted native primary for a %s target",
+    (platform) => {
+      const executable = path.resolve("fixture-system", "tool");
+      expect(() => requestParams(
+        request(executable),
+        options("native"),
+        normalizeTrustedToolchains([]),
+        [],
+        { platform, searchPaths: [] }
+      )).toThrow(expect.objectContaining({ code: "executable_unavailable" }));
+    }
+  );
+});

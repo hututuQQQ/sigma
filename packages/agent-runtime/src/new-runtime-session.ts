@@ -4,6 +4,7 @@ import { loadNestedInstructions } from "agent-context";
 import { createKernelState } from "agent-kernel";
 import type { RuntimeEnvironment } from "agent-platform";
 import { createBudgetLedger, type BudgetLimits, type StartSession } from "agent-protocol";
+import { normalizedAssurancePolicy } from "./assurance-policy.js";
 import { baseContext } from "./runtime-context.js";
 import type { RuntimeSession, RuntimeSessionServices } from "./types.js";
 import { createRuntimeSessionAggregate } from "./runtime-session-state.js";
@@ -26,7 +27,10 @@ export async function newRuntimeSession(
     runId,
     mode: input.mode,
     startedAt: now,
-    deadlineAt: new Date(Date.now() + runDeadlineMs).toISOString()
+    deadlineAt: new Date(Date.now() + runDeadlineMs).toISOString(),
+    assurancePolicy: normalizedAssurancePolicy(
+      identity.profile?.profile.assurancePolicy
+    )
   });
   if (budgetLimits) state.budget = createBudgetLedger(budgetLimits);
   const base = baseContext(environment);

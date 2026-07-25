@@ -505,7 +505,7 @@ required = true
       expect(outcome).toMatchObject({ kind: "completed" });
       expect(new Set(eventsSeen)).toEqual(new Set([
         "session_start", "run_start", "pre_model", "post_model", "pre_tool",
-        "post_tool", "plan_changed", "pre_complete", "run_end"
+        "post_tool", "pre_complete", "run_end"
       ]));
       expect(gateway.requests[0]?.messages.some((message: { content: string }) =>
         message.content.includes("durable policy context"))).toBe(true);

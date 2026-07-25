@@ -1,12 +1,11 @@
 import type {
   JsonValue,
-  PlanGraph,
+  ModelPlanUpdateV3,
   ToolCallPlan,
   ToolDescriptor,
   ToolReceipt,
   ToolRequest
 } from "agent-protocol";
-import { isPlanGraph } from "agent-protocol";
 import type { EffectToolRegistry, RegisteredEffectTool } from "./registry.js";
 
 function object(value: JsonValue): Record<string, JsonValue> {
@@ -62,36 +61,111 @@ function controlError(message: string, code: string): Error {
 
 function readPlanTool(): RegisteredEffectTool {
   return {
-    descriptor: descriptor("read_plan", "Read the durable plan DAG and optimistic revision.", {}),
+    descriptor: descriptor("read_plan", "Read the durable low-friction work checklist.", {}),
     async execute(request, context) {
-      return receipt(request, new Date().toISOString(), await requiredControl(context).readPlan(), ["runtime.control"]);
+      return receipt(request, new Date().toISOString(), await requiredControl(context).readWorkPlan(), ["runtime.control"]);
     }
   };
 }
 
+const UPDATE_PLAN_PROPERTIES: Record<string, JsonValue> = {
+  explanation: { type: "string" },
+  goal: { type: "string" },
+  acceptanceCriteria: {
+    type: "array",
+    maxItems: 32,
+    items: { type: "string" }
+  },
+  plan: {
+    type: "array",
+    minItems: 0,
+    maxItems: 32,
+    items: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        step: { type: "string" },
+        status: {
+          type: "string",
+          enum: ["pending", "in_progress", "blocked", "completed"]
+        },
+        blockedReason: { type: "string" }
+      },
+      required: ["step", "status"],
+      additionalProperties: false
+    }
+  }
+};
+
 function updatePlanTool(): RegisteredEffectTool {
   return {
-    descriptor: descriptor("update_plan", "Replace the durable plan DAG using optimistic revision control.", {
-      expectedRevision: { type: "number" },
-      goal: { type: "string" },
-      activeNodeId: { type: "string" },
-      nodes: { type: "array", items: { type: "object" }, maxItems: 128 }
-    }, ["expectedRevision", "goal", "nodes"]),
+    descriptor: descriptor(
+      "update_plan",
+      "Update the durable work checklist. For non-trivial work keep 3-7 meaningful steps; update it when evidence changes the active hypothesis, a step finishes, or the approach changes instead of batching status changes at the end. The runtime owns revisions, active-step normalization, dependencies, ownership, and evidence.",
+      UPDATE_PLAN_PROPERTIES,
+      ["plan"]
+    ),
     async execute(request, context) {
       const startedAt = new Date().toISOString();
       const input = object(request.arguments);
-      if (!Number.isSafeInteger(input.expectedRevision)) throw new Error("expectedRevision must be an integer.");
-      const plan = {
-        revision: Number(input.expectedRevision) + 1,
-        goal: input.goal,
-        ...(typeof input.activeNodeId === "string" ? { activeNodeId: input.activeNodeId } : {}),
-        nodes: input.nodes
-      } as unknown;
-      if (!isPlanGraph(plan)) throw new Error("Proposed plan is invalid, cyclic, or lacks required completion evidence.");
-      const updated = await requiredControl(context).updatePlan({
-        expectedRevision: Number(input.expectedRevision), plan: plan as PlanGraph
-      });
+      if (!Array.isArray(input.plan)) throw new Error("plan is required.");
+      const updated = await requiredControl(context).updateWorkPlan({
+        ...(typeof input.explanation === "string" ? { explanation: input.explanation } : {}),
+        ...(typeof input.goal === "string" ? { goal: input.goal } : {}),
+        ...(Array.isArray(input.acceptanceCriteria)
+          ? { acceptanceCriteria: input.acceptanceCriteria.filter((item): item is string => typeof item === "string") }
+          : {}),
+        plan: input.plan
+      } as unknown as ModelPlanUpdateV3);
       return receipt(request, startedAt, updated, ["runtime.control"]);
+    }
+  };
+}
+
+function workspaceFrontierTool(): RegisteredEffectTool {
+  return {
+    descriptor: descriptor(
+      "read_workspace_frontier",
+      "Page through the complete current changed-path frontier and its validation state. Cursors are bound to one frontier revision and fail if the frontier changes.",
+      {
+        cursor: { type: "string" },
+        limit: { type: "number", minimum: 1, maximum: 500 }
+      }
+    ),
+    async execute(request, context) {
+      const input = object(request.arguments);
+      return receipt(request, new Date().toISOString(), await requiredControl(context).readWorkspaceFrontier({
+        ...(typeof input.cursor === "string" ? { cursor: input.cursor } : {}),
+        ...(Number.isSafeInteger(input.limit) ? { limit: Number(input.limit) } : {})
+      }), ["runtime.control"]);
+    }
+  };
+}
+
+function readArtifactTool(): RegisteredEffectTool {
+  const effects: ToolDescriptor["possibleEffects"] = ["runtime.control", "filesystem.read"];
+  return {
+    descriptor: descriptor(
+      "read_artifact",
+      "Read a byte range from a large artifact referenced by a receipt in this session. Continue with nextOffset until eof.",
+      {
+        artifactId: { type: "string" },
+        offsetBytes: { type: "number", minimum: 0 },
+        maxBytes: { type: "number", minimum: 1, maximum: 65_536 }
+      },
+      ["artifactId"],
+      effects
+    ),
+    async execute(request, context) {
+      const input = object(request.arguments);
+      if (typeof input.artifactId !== "string" || !input.artifactId) {
+        throw new Error("artifactId is required.");
+      }
+      return receipt(request, new Date().toISOString(), await requiredControl(context).readArtifact({
+        artifactId: input.artifactId,
+        ...(Number.isSafeInteger(input.offsetBytes) ? { offsetBytes: Number(input.offsetBytes) } : {}),
+        ...(Number.isSafeInteger(input.maxBytes) ? { maxBytes: Number(input.maxBytes) } : {})
+      }), effects);
     }
   };
 }
@@ -118,7 +192,7 @@ function requestReviewTool(): RegisteredEffectTool {
   return {
     descriptor: descriptor(
       "request_review",
-      "Eligible workspace changes receive internal review automatically after passed validation. Use this tool only when completion_status requests review or to retry a prior reviewer infrastructure/interruption failure. Supply no evidence IDs: the runtime selects the current frontier and validation. Genuine changes_requested findings must be addressed and revalidated first.",
+      "Request an independent review of the current mutation frontier as a standalone tool call. Supply no evidence IDs: the runtime binds the current frontier and objective receipts. The first substantive rejection opens one repair opportunity; an unchanged repeat or non-approved final review round ends with a typed verification failure.",
       {}
     ),
     async execute(request, context) {
@@ -132,6 +206,21 @@ function requestReviewTool(): RegisteredEffectTool {
         diagnostics: [result.status === "validation_required" ? "review_validation_required"
           : result.status === "changes_required" ? "review_changes_required" : "review_unavailable"]
       } : base;
+    }
+  };
+}
+
+function requestStrategyTool(): RegisteredEffectTool {
+  return {
+    descriptor: descriptor(
+      "request_strategy",
+      "Request the one optional fresh-context strategy reset when the current approach needs an independent hypothesis and next discriminating action. This is advisory and does not terminate work or restrict tools.",
+      {}
+    ),
+    async execute(request) {
+      return receipt(request, new Date().toISOString(), {
+        status: "strategy_requested"
+      }, ["runtime.control"]);
     }
   };
 }
@@ -268,7 +357,8 @@ function loadSkillTool(): RegisteredEffectTool {
 
 export function registerControlTools(registry: EffectToolRegistry): EffectToolRegistry {
   for (const tool of [
-    readPlanTool(), updatePlanTool(), budgetTool(), checkpointTool(), requestReviewTool(),
+    readPlanTool(), updatePlanTool(), budgetTool(), workspaceFrontierTool(), readArtifactTool(),
+    checkpointTool(), requestReviewTool(), requestStrategyTool(),
     restoreRunChangesTool(), confirmRunRestoredTool(), loadSkillTool()
   ]) {
     registry.register(tool);

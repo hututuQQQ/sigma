@@ -92,12 +92,10 @@ function objectValue(raw: unknown, key: string): Record<string, unknown> {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`Configuration '${key}' requires an object.`);
   return raw as Record<string, unknown>;
 }
-
 function stringArray(raw: unknown, key: string): string[] {
   if (!Array.isArray(raw) || raw.some((value) => typeof value !== "string")) throw new Error(`Configuration '${key}' requires a string array.`);
   return [...raw];
 }
-
 function mcpServersValue(raw: unknown): McpServerConfigValue[] {
   let source = raw;
   if (typeof source === "string") source = JSON.parse(source) as unknown;
@@ -140,11 +138,9 @@ function mcpServersValue(raw: unknown): McpServerConfigValue[] {
     };
   });
 }
-
 const booleanField = (key: string, flag: string, description: string, shortFlag?: string): ConfigField<boolean> => ({
   key, flag, shortFlag, kind: "boolean", description, defaultValue: false, parse: (raw) => booleanValue(raw, key), hidden: true
 });
-
 export const SIGMA_CONFIG_SCHEMA: readonly ConfigField[] = [
   { key: "configSchemaVersion", flag: "config-schema-version", toml: "schema_version", description: "Configuration schema version", defaultValue: CONFIG_SCHEMA_VERSION, parse: (raw) => {
     const value = numberValue(raw, "configSchemaVersion", 2, CONFIG_SCHEMA_VERSION);
@@ -168,7 +164,8 @@ export const SIGMA_CONFIG_SCHEMA: readonly ConfigField[] = [
   { key: "executionMode", flag: "execution-mode", description: "Execution backend for this run", defaultValue: "sandboxed", parse: (raw) => enumValue(raw, "executionMode", ["sandboxed", "container"] as const) },
   { key: "managedEnvironmentMode", flag: "managed-environment-mode", env: "SIGMA_MANAGED_ENVIRONMENT_MODE", toml: "security.managed_environment_mode", description: "Require a launcher-attested disposable managed environment", defaultValue: "disabled", parse: (raw) => enumValue(raw, "managedEnvironmentMode", ["disabled", "required"] as const) },
   { key: "readScope", flag: "read-scope", env: "SIGMA_READ_SCOPE", toml: "security.read_scope", description: "Filesystem read scope", defaultValue: "workspace", parse: (raw) => enumValue(raw, "readScope", ["workspace", "host"] as const) },
-  { key: "networkMode", flag: "network", env: "SIGMA_NETWORK", toml: "security.network", description: "Default process network policy", defaultValue: "none", parse: (raw) => enumValue(raw, "networkMode", ["none", "loopback", "full"] as const) },
+  { key: "writeScope", flag: "write-scope", env: "SIGMA_WRITE_SCOPE", toml: "security.write_scope", description: "Process write boundary (enclosing-container requires native attestation)", defaultValue: "workspace", parse: (raw) => enumValue(raw, "writeScope", ["workspace", "enclosing-container"] as const) },
+  { key: "networkMode", flag: "network", env: "SIGMA_NETWORK", toml: "security.network", description: "Default process network policy", defaultValue: "full", parse: (raw) => enumValue(raw, "networkMode", ["none", "loopback", "full"] as const) },
   { key: "processHandoff", flag: "process-handoff", env: "SIGMA_PROCESS_HANDOFF", toml: "security.process_handoff", description: "Persistent process handoff policy", defaultValue: "allow", parse: (raw) => enumValue(raw, "processHandoff", ["allow", "deny"] as const) },
   { key: "runDeadlineSec", flag: "run-deadline-sec", env: "SIGMA_RUN_DEADLINE_SEC", toml: "runtime.run_deadline_sec", description: "Whole-run hard deadline in seconds", defaultValue: 900, parse: (raw) => numberValue(raw, "runDeadlineSec", 1) },
   { key: "modelDeadlineSec", flag: "model-deadline-sec", env: "SIGMA_MODEL_DEADLINE_SEC", toml: "runtime.model_deadline_sec", description: "Model first-byte and non-stream request deadline in seconds", defaultValue: 120, parse: (raw) => numberValue(raw, "modelDeadlineSec", 1) },
@@ -264,14 +261,14 @@ const WORKSPACE_NUMERIC_CAPS = new Set([
   "maxChildren", "maxDepth", "checkpointMaxFiles", "checkpointMaxBytes"
 ]);
 const ZERO_MEANS_UNBOUNDED_CAPS = new Set(["streamActiveSec"]);
-
 const PERMISSION_STRICTNESS: Readonly<Record<string, number>> = {
   deny: 0, ask: 1, "workspace-auto": 2, auto: 3
 };
 const NETWORK_STRICTNESS: Readonly<Record<string, number>> = { none: 0, loopback: 1, full: 2 };
 const READ_SCOPE_STRICTNESS: Readonly<Record<string, number>> = { workspace: 0, host: 1 };
+const WRITE_SCOPE_STRICTNESS: Readonly<Record<string, number>> =
+  { workspace: 0, "enclosing-container": 1 };
 const HANDOFF_STRICTNESS: Readonly<Record<string, number>> = { deny: 0, allow: 1 };
-
 function restrictWorkspaceValue(field: ConfigField, baseline: ConfigValue, workspaceRaw: unknown): ConfigValue {
   const workspaceValue = field.parse(workspaceRaw);
   if (WORKSPACE_NUMERIC_CAPS.has(field.key)) {
@@ -292,6 +289,10 @@ function restrictWorkspaceValue(field: ConfigField, baseline: ConfigValue, works
   }
   if (field.key === "readScope") {
     return READ_SCOPE_STRICTNESS[String(workspaceValue)] < READ_SCOPE_STRICTNESS[String(baseline)]
+      ? workspaceValue : baseline;
+  }
+  if (field.key === "writeScope") {
+    return WRITE_SCOPE_STRICTNESS[String(workspaceValue)] < WRITE_SCOPE_STRICTNESS[String(baseline)]
       ? workspaceValue : baseline;
   }
   if (field.key === "processHandoff") {

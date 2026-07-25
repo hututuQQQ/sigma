@@ -12,7 +12,6 @@ import type { RuntimeOptions, RuntimeSession } from "./types.js";
 import { releaseRuntimeSession } from "./release-session.js";
 import { BudgetController } from "./budget-controller.js";
 import type { RuntimeControlService } from "./runtime-control.js";
-import { ModelReviewer } from "./reviewer.js";
 import { handleChildEvent } from "./child-event-handler.js";
 import { reconcileInterruptedChildren } from "./durable-children.js";
 import { RuntimeHookCoordinator } from "./runtime-hooks.js";
@@ -36,6 +35,9 @@ import { createProductionProfileRunner } from "./production-profile-runner.js";
 import { resumeRuntimeSession } from "./runtime-session-resume.js";
 import { createRuntimeControlService } from "./create-runtime-control.js";
 import { releaseRepositoryRunBaselines } from "./runtime-restoration-control.js";
+import { runtimeReviewerFactory } from "./runtime-reviewer-factory.js";
+import { ModelReviewer } from "./reviewer.js";
+
 export class InProcessRuntimeClient implements RuntimeClient {
   private readonly sessions = new Map<string, RuntimeSession>();
   private readonly artifacts: ContentAddressedArtifactStore;
@@ -98,6 +100,13 @@ export class InProcessRuntimeClient implements RuntimeClient {
       hooks: this.hooks,
       emit: async (session, type, authority, value) => await this.emit(session, type, authority, value)
     });
+    const reviewerForSession = runtimeReviewerFactory(
+      options,
+      this.control,
+      this.artifacts,
+      async (target, type, authority, value) =>
+        await this.emit(target, type, authority, value)
+    );
     this.effects = new EffectRunner({
       runtime: options,
       maxParallelTools: options.maxParallelTools ?? 4,
@@ -110,7 +119,7 @@ export class InProcessRuntimeClient implements RuntimeClient {
       control: this.control,
       budgets: this.budgets,
       reviewer: options.reviewer ?? new ModelReviewer(options.gateway),
-      reviewerForSession: options.reviewerForSession,
+      reviewerForSession,
       hooks: this.hooks
     });
     this.runs = new RuntimeRunScheduler({
@@ -356,7 +365,6 @@ export class InProcessRuntimeClient implements RuntimeClient {
       recover: async (session) => await this.recoverSession(session)
     });
   }
-
   private async recoverSession(session: RuntimeSession): Promise<void> {
     await this.profileHookRecovery?.recoverInterrupted(session);
     const hasLiveChildren = await this.options.hasActiveChildren?.(session.identity.sessionId) ?? false;
@@ -381,13 +389,11 @@ export class InProcessRuntimeClient implements RuntimeClient {
       start: () => this.startRun(session)
     });
   }
-
   private required(sessionId: string): RuntimeSession {
     const session = this.sessions.get(sessionId);
     if (!session) throw new Error(`Unknown session '${sessionId}'.`);
     return session;
   }
-
   private startRun(session: RuntimeSession): void {
     this.runs.start(session);
   }

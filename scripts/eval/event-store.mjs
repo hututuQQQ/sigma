@@ -4,17 +4,21 @@ import os from "node:os";
 import path from "node:path";
 
 export const STORE_LAYOUT_VERSION = 5;
-const EVENT_SCHEMA_VERSION = 5;
-const SNAPSHOT_SCHEMA_VERSION = 5;
+const CURRENT_EVENT_SCHEMA_VERSION = 9;
+const EVENT_SCHEMA_VERSIONS = new Set([5, 6, 7, 8, CURRENT_EVENT_SCHEMA_VERSION]);
+const CURRENT_SNAPSHOT_SCHEMA_VERSION = 10;
+const SNAPSHOT_SCHEMA_VERSIONS = new Set([5, 6, 7, 8, 9, CURRENT_SNAPSHOT_SCHEMA_VERSION]);
 const EVENT_TYPES = new Set([
   "session.created", "run.started", "run.suspended", "run.completed", "run.cancelled", "run.failed",
-  "user.message", "user.steer", "user.follow_up", "model.started", "model.delta", "model.reasoning_delta",
-  "model.completed", "model.failed", "tool.requested", "tool.approval_requested", "tool.approval_resolved",
-  "tool.started", "tool.progress", "tool.completed", "tool.failed", "context.compacted", "child.spawned",
+  "user.message", "user.steer", "user.follow_up", "model.started", "model.prompt_materialized",
+  "model.delta", "model.reasoning_delta", "model.completed", "model.failed", "tool.requested",
+  "tool.approval_requested", "tool.approval_resolved",
+  "tool.started", "tool.progress", "tool.completed", "tool.failed", "context.compacted",
+  "context.tool_results_pruned", "context.reasoning_trajectory_tombstoned", "child.spawned",
   "child.message", "child.completed", "diagnostic", "execution.planned", "execution.started", "execution.completed",
   "execution.failed", "process.spawned", "process.output", "process.exited", "process.lost", "evidence.recorded",
   "usage.recorded", "model.route_resolved", "model.route_failed", "profile.resolved", "customization.frozen",
-  "skill.loaded", "hook.started", "hook.completed", "hook.failed", "plan.updated", "budget.reserved",
+  "skill.loaded", "hook.started", "hook.completed", "hook.failed", "plan.updated", "long_horizon.updated", "budget.reserved",
   "budget.reservation_bound", "budget.committed", "budget.released", "budget.exhausted", "budget.overrun",
   "budget.limit_increased", "checkpoint.created", "checkpoint.sealed", "checkpoint.restored",
   "checkpoint.recovery_resolved", "review.started", "review.completed", "review.waived"
@@ -24,14 +28,14 @@ let officialAssertAgentEventEnvelope = null;
 try {
   const protocol = await import("../../packages/agent-protocol/dist/index.js");
   if (protocol.STORE_LAYOUT_VERSION !== STORE_LAYOUT_VERSION
-    || protocol.EVENT_SCHEMA_VERSION !== EVENT_SCHEMA_VERSION
-    || protocol.SNAPSHOT_SCHEMA_VERSION !== SNAPSHOT_SCHEMA_VERSION) {
-    throw new Error("Built agent-protocol versions do not match the V5 audit reader.");
+    || protocol.EVENT_SCHEMA_VERSION !== CURRENT_EVENT_SCHEMA_VERSION
+    || protocol.SNAPSHOT_SCHEMA_VERSION !== CURRENT_SNAPSHOT_SCHEMA_VERSION) {
+    throw new Error("Built agent-protocol versions do not match the event-store audit reader.");
   }
   officialAssertAgentEventEnvelope = protocol.assertAgentEventEnvelope;
 } catch (error) {
   if (error?.code !== "ERR_MODULE_NOT_FOUND") throw error;
-  // Audit remains usable before a build; the complete V5 envelope
+  // Audit remains usable before a build; the complete supported envelope
   // boundary below still rejects unknown types, authorities, non-JSON payloads,
   // invalid identities, dates, and sequences. A normal built tree additionally
   // runs the production payload validator above.
@@ -49,15 +53,45 @@ function jsonValue(value, seen = new Set()) {
   return valid;
 }
 
+function eventRecord(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
+
+function validEventIdentity(event) {
+  return [event.eventId, event.sessionId, event.runId]
+    .every((item) => typeof item === "string" && item.length > 0);
+}
+
+function validEventMetadata(event) {
+  return [
+    EVENT_SCHEMA_VERSIONS.has(event.schemaVersion),
+    Number.isSafeInteger(event.seq),
+    event.seq >= 1,
+    validEventIdentity(event),
+    validDate(event.occurredAt),
+    EVENT_TYPES.has(event.type),
+    AUTHORITIES.has(event.authority)
+  ].every(Boolean);
+}
+
+function eventTypeAllowedBySchema(event) {
+  if (event.schemaVersion === 5 && event.type === "model.prompt_materialized") return false;
+  if (event.schemaVersion < 7
+    && event.type === "context.tool_results_pruned") return false;
+  if (event.schemaVersion !== CURRENT_EVENT_SCHEMA_VERSION
+    && event.type === "long_horizon.updated") return false;
+  if (event.schemaVersion !== CURRENT_EVENT_SCHEMA_VERSION
+    && event.type === "context.reasoning_trajectory_tombstoned") return false;
+  return true;
+}
+
 export function assertV5EventEnvelope(event) {
-  const valid = event && typeof event === "object" && !Array.isArray(event)
-    && event.schemaVersion === EVENT_SCHEMA_VERSION
-    && Number.isSafeInteger(event.seq) && event.seq >= 1
-    && [event.eventId, event.sessionId, event.runId].every((item) => typeof item === "string" && item.length > 0)
-    && validDate(event.occurredAt) && EVENT_TYPES.has(event.type) && AUTHORITIES.has(event.authority)
-    && jsonValue(event.payload);
-  if (!valid) throw new Error("Invalid AgentEventEnvelope V5.");
-  officialAssertAgentEventEnvelope?.(event);
+  const record = eventRecord(event);
+  if (!record || !validEventMetadata(record)
+    || !eventTypeAllowedBySchema(record) || !jsonValue(record.payload)) {
+    throw new Error("Invalid supported AgentEventEnvelope.");
+  }
+  officialAssertAgentEventEnvelope?.(record);
 }
 
 export function assertV5EventStream(input) {
@@ -99,8 +133,8 @@ function validateMeta(value, sessionId) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid V5 session metadata.");
   const valid = [
     value.schemaVersion === STORE_LAYOUT_VERSION,
-    value.eventSchemaVersion === EVENT_SCHEMA_VERSION,
-    value.snapshotSchemaVersion === SNAPSHOT_SCHEMA_VERSION,
+    EVENT_SCHEMA_VERSIONS.has(value.eventSchemaVersion),
+    SNAPSHOT_SCHEMA_VERSIONS.has(value.snapshotSchemaVersion),
     value.sessionId === sessionId,
     validDate(value.createdAt),
     validDate(value.updatedAt),

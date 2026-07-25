@@ -23,6 +23,9 @@ onlyBuiltDependencies:
   - tree-sitter-typescript
 allowBuilds:
   esbuild: true
+  # The package's only install hook prints an OpenCollective message; OCR uses
+  # its already-published JavaScript/WASM assets and needs no build step.
+  tesseract.js: false
   tree-sitter: true
   tree-sitter-go: true
   tree-sitter-javascript: true

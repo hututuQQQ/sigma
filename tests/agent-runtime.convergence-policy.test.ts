@@ -25,10 +25,6 @@ function limits(overrides: Partial<BudgetLimits> = {}): BudgetLimits {
   };
 }
 
-function event(): AgentEventEnvelope {
-  return {} as AgentEventEnvelope;
-}
-
 function controller(target: RuntimeSession): BudgetController {
   return new BudgetController(async (_session, type, _authority, payload) => {
     if (type === "budget.reserved" || type === "budget.committed") {
@@ -36,48 +32,54 @@ function controller(target: RuntimeSession): BudgetController {
         ledger: RuntimeSession["durable"]["state"]["budget"];
       }).ledger;
     }
-    return event();
+    return {} as AgentEventEnvelope;
   });
 }
 
-describe("unified convergence admission policy", () => {
-  it("uses the latest eight P90 latencies to enter converge and stop stages", () => {
+describe("hard-ledger convergence admission", () => {
+  it("keeps latency forecasts telemetry-only while absolute time remains", () => {
     const target = runtimeSessionFixture();
-    target.durable.state.usage = [10_000, 20_000, 30_000, 40_000, 50_000, 60_000, 70_000, 100_000]
+    target.durable.state.usage = [10_000, 30_000, 120_000, 180_000]
       .map((latencyMs, index) => ({
-        usageId: `usage-${index}`, requestId: `request-${index}`,
-        sessionId: target.identity.sessionId, runId: target.durable.runId,
-        role: target.services.modelRole, routeId: "route", providerId: "provider", modelId: "model",
-        tokenizerId: "tokenizer", tokenizerAccuracy: "exact" as const, providerReported: true,
-        inputTokens: 1, outputTokens: 1, reasoningTokens: 0, cacheReadTokens: 0,
-        cacheWriteTokens: 0, costMicroUsd: 0, latencyMs, attempt: 1,
+        usageId: `usage-${index}`,
+        requestId: `request-${index}`,
+        sessionId: target.identity.sessionId,
+        runId: target.durable.runId,
+        role: target.services.modelRole,
+        routeId: "route",
+        providerId: "provider",
+        modelId: "model",
+        tokenizerId: "tokenizer",
+        tokenizerAccuracy: "exact" as const,
+        providerReported: true,
+        inputTokens: 1,
+        outputTokens: 1,
+        reasoningTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        costMicroUsd: 0,
+        latencyMs,
+        attempt: 1,
         occurredAt: new Date().toISOString()
       }));
+    target.durable.state.deadlineRemainingMs = 1;
+    expect(deadlineForecast(target)).toMatchObject({ stage: "normal", remainingMs: 1 });
+    expect(convergenceAdmissionFailure(target, { kind: "model" })).toBeNull();
+    expect(convergenceAdmissionFailure(target, { kind: "tool", count: 1 })).toBeNull();
+  });
 
-    target.durable.state.deadlineRemainingMs = 459_999;
-    expect(deadlineForecast(target)).toMatchObject({
-      stage: "converge", nextModelEstimateMs: 150_000, settlementReserveMs: 10_000
-    });
-    target.durable.state.deadlineRemainingMs = 159_999;
+  it("rejects only once the absolute deadline has elapsed", () => {
+    const target = runtimeSessionFixture();
+    target.durable.state.deadlineRemainingMs = 0;
     expect(deadlineForecast(target).stage).toBe("stop");
     expect(convergenceAdmissionFailure(target, { kind: "model" })).toMatchObject({
-      kind: "recoverable_failure", code: "budget_exhausted"
-    });
-  });
-
-  it("returns a typed failure before an action that cannot settle inside active time", () => {
-    const target = runtimeSessionFixture();
-    target.durable.state.deadlineRemainingMs = 1_000;
-
-    expect(convergenceAdmissionFailure(target, { kind: "model" }, Date.now())).toMatchObject({
       kind: "recoverable_failure",
       code: "budget_exhausted",
-      message: expect.stringContaining("Stopped before the hard deadline")
+      message: expect.stringContaining("absolute run deadline")
     });
-    expect(target.durable.state.budget.reservations).toEqual([]);
   });
 
-  it("settles measured token, model-turn, and tool-call usage exactly before the next admission", async () => {
+  it("settles measured resources exactly and refuses only a request the ledger cannot fund", async () => {
     const target = runtimeSessionFixture();
     target.durable.state.deadlineRemainingMs = 60_000;
     target.durable.state.budget = createBudgetLedger(limits());
@@ -102,12 +104,6 @@ describe("unified convergence admission policy", () => {
       modelTurns: 1,
       toolCalls: 1
     });
-    expect(target.durable.state.budget.reserved).toMatchObject({
-      inputTokens: 0,
-      outputTokens: 0,
-      modelTurns: 0,
-      toolCalls: 0
-    });
     expect(convergenceAdmissionFailure(target, { kind: "model" })).toBeNull();
     expect(convergenceAdmissionFailure(target, { kind: "tool", count: 2 })).toMatchObject({
       kind: "recoverable_failure",
@@ -115,7 +111,8 @@ describe("unified convergence admission policy", () => {
       message: expect.stringContaining("only 1 tool-call budget remains")
     });
 
-    target.durable.state.budget.consumed.inputTokens = target.durable.state.budget.limits.inputTokens;
+    target.durable.state.budget.consumed.inputTokens =
+      target.durable.state.budget.limits.inputTokens;
     expect(convergenceAdmissionFailure(target, { kind: "model" })).toMatchObject({
       kind: "recoverable_failure",
       code: "budget_exhausted",

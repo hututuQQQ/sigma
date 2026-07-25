@@ -15,7 +15,10 @@ import type {
   ModelToolDefinition,
   ToolReceipt
 } from "../packages/agent-protocol/src/index.js";
-import { createRuntime } from "../packages/agent-runtime/src/testing.js";
+import {
+  createRuntime,
+  InProcessRuntimeClient
+} from "../packages/agent-runtime/src/testing.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
 
@@ -52,6 +55,12 @@ class ScriptedGateway implements ModelGateway {
   }
 }
 
+class ReviewResourceFailureCheckpointManager extends CheckpointManager {
+  override async reviewMaterial(): Promise<never> {
+    throw new RangeError("injected bounded review renderer exhaustion");
+  }
+}
+
 function toolTurn(toolCalls: NonNullable<ModelResponse["message"]["toolCalls"]>): ModelResponse {
   return { message: { role: "assistant", content: "", toolCalls }, finishReason: "tool_calls" };
 }
@@ -75,19 +84,7 @@ async function fixture(writeBeforeFailure: boolean): Promise<{
   const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
   const gateway = new ScriptedGateway([
     toolTurn([
-      { id: "failing-mutation", name: "failing_mutation", arguments: { path: "target.txt" } },
-      {
-        id: "same-turn-completion",
-        name: "runtime_finalize",
-        arguments: {
-          summary: "must not complete over an open checkpoint",
-          criteria: [{
-            criterion: "The mutation completed safely.",
-            status: "met",
-            evidence: [{ evidenceId: "invented", kind: "diagnostic" }]
-          }]
-        }
-      }
+      { id: "failing-mutation", name: "failing_mutation", arguments: { path: "target.txt" } }
     ]),
     toolTurn([{
       id: "clean-failure-observed",
@@ -131,7 +128,7 @@ async function fixture(writeBeforeFailure: boolean): Promise<{
 }
 
 describe("live mutation checkpoint failure recovery", () => {
-  it("suspends immediately when a failed mutation leaves a workspace delta", async () => {
+  it("suspends on the hard checkpoint invariant after a partial mutation failure", async () => {
     const target = await fixture(true);
     const session = await target.runtime.createSession({ workspacePath: target.workspace, mode: "change" });
     await target.runtime.command({ type: "submit", sessionId: session.sessionId, text: "exercise a partial mutation" });
@@ -144,15 +141,6 @@ describe("live mutation checkpoint failure recovery", () => {
     await expect(readFile(path.join(target.workspace, "target.txt"), "utf8")).resolves.toBe("partial");
     expect((await target.manager.list(session.sessionId)).at(-1)).toMatchObject({ status: "open" });
     const stored = await events(target.store, session.sessionId);
-    expect(stored.some((event) => event.type === "tool.requested"
-      && (event.payload as { callId?: string }).callId === "same-turn-completion")).toBe(false);
-    expect(stored).toContainEqual(expect.objectContaining({
-      type: "tool.failed",
-      payload: expect.objectContaining({
-        callId: "same-turn-completion",
-        diagnostics: expect.arrayContaining(["checkpoint_recovery_required"])
-      })
-    }));
     expect(stored).toContainEqual(expect.objectContaining({
       type: "run.suspended",
       payload: expect.objectContaining({ requestId: expect.stringMatching(/^checkpoint:/u) })
@@ -166,6 +154,7 @@ describe("live mutation checkpoint failure recovery", () => {
 
     await expect(target.runtime.waitForOutcome(session.sessionId)).resolves.toEqual({
       kind: "needs_input",
+      decisionAuthority: "user_policy",
       requestId: "clean-failure-observed",
       message: "The clean failure was recorded."
     });
@@ -174,6 +163,86 @@ describe("live mutation checkpoint failure recovery", () => {
     expect((await target.manager.list(session.sessionId)).at(-1)).toMatchObject({ status: "sealed" });
     const stored = await events(target.store, session.sessionId);
     expect(stored.some((event) => event.type === "checkpoint.sealed")).toBe(true);
+    expect(stored.some((event) => event.type === "run.suspended"
+      && String((event.payload as { requestId?: string }).requestId).startsWith("checkpoint:"))).toBe(false);
+  });
+
+  it("records bounded delta evidence instead of reopening a sealed checkpoint after review exhaustion", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-review-resource-failure-"));
+    await writeFile(path.join(workspace, "target.txt"), "before", "utf8");
+    const storeRootDir = path.join(workspace, ".agent");
+    const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
+    const gateway = new ScriptedGateway([
+      toolTurn([{
+        id: "successful-mutation", name: "successful_mutation", arguments: { path: "target.txt" }
+      }]),
+      toolTurn([{
+        id: "mutation-observed",
+        name: "request_user_input",
+        arguments: { message: "The sealed mutation was observed." }
+      }])
+    ]);
+    const tools = registerBuiltinTools(new EffectToolRegistry());
+    tools.register({
+      descriptor: {
+        name: "successful_mutation",
+        description: "Writes its declared path successfully.",
+        inputSchema: {
+          type: "object", properties: { path: { type: "string" } }, required: ["path"]
+        },
+        possibleEffects: ["filesystem.write"],
+        executionMode: "exclusive",
+        resourceKeys: ["workspace"],
+        writePathArguments: ["path"],
+        approval: "auto",
+        idempotent: false,
+        timeoutMs: 2_000
+      },
+      async execute(request): Promise<ToolReceipt> {
+        await writeFile(path.join(workspace, "target.txt"), "after", "utf8");
+        const occurredAt = new Date().toISOString();
+        return {
+          callId: request.callId,
+          ok: true,
+          output: "updated",
+          observedEffects: ["filesystem.write"],
+          actualEffects: ["filesystem.write"],
+          artifacts: [],
+          diagnostics: [],
+          startedAt: occurredAt,
+          completedAt: occurredAt
+        };
+      }
+    });
+    const manager = new ReviewResourceFailureCheckpointManager({ rootDir: storeRootDir });
+    const runtime = new InProcessRuntimeClient({
+      gateway,
+      store,
+      storeRootDir,
+      tools,
+      permissionMode: "auto",
+      runDeadlineMs: 60_000
+    }, { checkpointManager: manager });
+    const created = await runtime.createSession({ workspacePath: workspace, mode: "change" });
+    await runtime.command({
+      type: "submit", sessionId: created.sessionId, text: "perform a successful mutation"
+    });
+
+    await expect(runtime.waitForOutcome(created.sessionId)).resolves.toMatchObject({
+      kind: "needs_input", requestId: "mutation-observed"
+    });
+    expect(gateway.calls).toBe(2);
+    expect((await manager.list(created.sessionId)).at(-1)).toMatchObject({ status: "sealed" });
+    const stored = await events(store, created.sessionId);
+    expect(stored).toContainEqual(expect.objectContaining({
+      type: "evidence.recorded",
+      payload: expect.objectContaining({
+        kind: "workspace_delta",
+        data: expect.objectContaining({
+          reviewProblem: expect.objectContaining({ code: "review_scope_too_large" })
+        })
+      })
+    }));
     expect(stored.some((event) => event.type === "run.suspended"
       && String((event.payload as { requestId?: string }).requestId).startsWith("checkpoint:"))).toBe(false);
   });
@@ -255,7 +324,7 @@ describe("live mutation checkpoint failure recovery", () => {
       data: {
         frontierRevision: 1,
         stateDigest: expect.stringMatching(/^[a-f0-9]{64}$/u),
-        coveredPaths: ["target.txt"]
+        coveredPaths: []
       }
     });
   });

@@ -3,8 +3,6 @@ import {
   assertRequestSandbox,
   containPostDispatchFailure,
   decodedExecutionResult,
-  outputDecodingError,
-  rejectUndecodableExecution,
   requestExecutionValue,
   runPostResponseOperation,
   type BrokerPostResponseOperations
@@ -56,12 +54,6 @@ export async function executeBrokerForeground(
     const value = await requestExecutionValue(
       context.transport, params, options, timeoutMs, context.closeForActiveOperation
     );
-    const decodingError = outputDecodingError(value);
-    if (decodingError) {
-      await rejectUndecodableExecution(
-        context.transport, value, decodingError, context.closeForActiveOperation
-      );
-    }
     const outputArtifacts = await context.outputArtifacts.consume(value.outputArtifacts).catch(
       async (error: unknown) => await containPostDispatchFailure(
         error, context.closeForActiveOperation

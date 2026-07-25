@@ -81,6 +81,39 @@ function managedEnvironmentCapability(
   };
 }
 
+function enclosingContainerRootCapability(
+  input: unknown
+): BrokerDoctorReport["capabilities"]["enclosingContainerRoot"] | undefined {
+  if (input === undefined) return undefined;
+  const value = protocolRecord(input, "Broker enclosing-container root capability");
+  const available = booleanValue(
+    value.available,
+    "capabilities.enclosingContainerRoot.available"
+  );
+  if (value.rootKind !== "container_cow" && value.rootKind !== "unavailable") {
+    throw new BrokerProtocolError("Broker enclosing-container root kind is invalid.");
+  }
+  const attestationDigest = optionalSha256(
+    value.attestationDigest,
+    "capabilities.enclosingContainerRoot.attestationDigest"
+  );
+  const reason = optionalString(
+    value.reason,
+    "capabilities.enclosingContainerRoot.reason"
+  );
+  if (available !== (value.rootKind === "container_cow")
+    || (available && !attestationDigest)
+    || (!available && attestationDigest !== undefined)) {
+    throw new BrokerProtocolError("Broker enclosing-container root attestation is inconsistent.");
+  }
+  return {
+    available,
+    rootKind: value.rootKind,
+    ...(attestationDigest ? { attestationDigest } : {}),
+    ...(reason ? { reason } : {})
+  };
+}
+
 function parseDoctorHardening(input: unknown): BrokerDoctorReport["sandbox"]["hardening"] | undefined {
   if (input === undefined) return undefined;
   const hardening = protocolRecord(input, "Broker sandbox hardening");
@@ -144,8 +177,16 @@ function parseDoctorCapabilities(input: unknown, platform: string): BrokerDoctor
       capabilities.runtimeCommandSnapshotComplete,
       "capabilities.runtimeCommandSnapshotComplete"
     );
+  const directExecutableResolution = capabilities.directExecutableResolution === undefined
+    ? undefined : booleanValue(
+      capabilities.directExecutableResolution,
+      "capabilities.directExecutableResolution"
+    );
   const searchPaths = executableSearchPaths(capabilities.executableSearchPaths, platform);
   const managedEnvironment = managedEnvironmentCapability(capabilities.managedEnvironment);
+  const enclosingContainerRoot = enclosingContainerRootCapability(
+    capabilities.enclosingContainerRoot
+  );
   const runtimeDataDigest = optionalSha256(
     capabilities.runtimeDataDigest, "capabilities.runtimeDataDigest"
   );
@@ -164,6 +205,8 @@ function parseDoctorCapabilities(input: unknown, platform: string): BrokerDoctor
     ...(shells ? { shells } : {}),
     ...(runtimeCommands ? { runtimeCommands } : {}),
     ...(runtimeCommandSnapshotComplete === undefined ? {} : { runtimeCommandSnapshotComplete }),
+    ...(directExecutableResolution === undefined ? {} : { directExecutableResolution }),
+    ...(enclosingContainerRoot ? { enclosingContainerRoot } : {}),
     ...(searchPaths ? { executableSearchPaths: searchPaths } : {}),
     ...(runtimeDataDigest ? { runtimeDataDigest } : {}),
     ...(managedEnvironment ? { managedEnvironment } : {})

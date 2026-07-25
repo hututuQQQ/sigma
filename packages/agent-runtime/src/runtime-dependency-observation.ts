@@ -16,8 +16,8 @@ function executableArgument(call: ModelToolCall): string {
   return typeof input.executable === "string" ? input.executable : "";
 }
 
-/** Convert only a typed broker launch failure into a runtime-authority
- * recovery opportunity. Shell text and stderr are deliberately ignored. */
+/** Record only a typed broker launch failure as model-visible capability
+ * telemetry. This does not create recovery state or constrain the next call. */
 export async function recordRuntimeDependencyFailure(
   options: Pick<EffectRunnerOptions, "runtime" | "emit">,
   session: RuntimeSession,
@@ -32,7 +32,7 @@ export async function recordRuntimeDependencyFailure(
   if (!toolName || !requestedExecutable || !binding) return;
   const opportunityId = createHash("sha256").update(JSON.stringify({
     sessionId: session.identity.sessionId,
-    goalEpoch: session.durable.state.taskControl.goalEpoch,
+    userTurnCount: session.durable.state.messages.filter((message) => message.role === "user").length,
     requestedExecutable,
     probeToolName: toolName,
     runtimeClosureDigest: binding.runtimeClosure.digest

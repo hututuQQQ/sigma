@@ -1,5 +1,6 @@
 import os from "node:os";
 import {
+  DEFAULT_PROFILE_ASSURANCE,
   DEFAULT_PROFILE_BUDGET,
   HookCatalog,
   defaultHookRoots,
@@ -68,10 +69,10 @@ function qualifyProfileSkills(
 }
 
 function assertMandatoryMutationPolicy(profile: ResolvedAgentProfile): void {
-  const disabled = (["requirePlanBeforeMutation", "checkpointBeforeMutation"] as const)
-    .find((key) => profile.mutationPolicy[key] !== true);
-  if (disabled) {
-    throw new Error(`Agent Profile '${profile.id}' cannot disable mandatory mutation policy '${disabled}'.`);
+  if (profile.mutationPolicy.checkpointBeforeMutation !== true) {
+    throw new Error(
+      `Agent Profile '${profile.id}' cannot disable mandatory mutation policy 'checkpointBeforeMutation'.`
+    );
   }
 }
 
@@ -88,8 +89,8 @@ function builtinProfile(
   return {
     id: mode,
     description: mode === "strict"
-      ? "Sigma Code V5 local coding profile with required review"
-      : "Sigma Code V5 local coding profile with advisory review",
+      ? "Sigma Code V6 local coding profile with required review"
+      : "Sigma Code V6 local coding profile with advisory review",
     roleRoutes: {
       orchestrator: "default", planner: "default", reviewer: "default",
       child_analyze: "default", child_write: "default", summarizer: "default"
@@ -101,10 +102,11 @@ function builtinProfile(
     permissionMode: config.permissionMode === "workspace-auto" ? "auto" : config.permissionMode,
     budget: configuredBudget(config),
     mutationPolicy: {
-      requirePlanBeforeMutation: true,
+      requirePlanBeforeMutation: false,
       checkpointBeforeMutation: true,
       reviewMode: mode === "strict" ? "required" : "advisory"
     },
+    assurancePolicy: { ...DEFAULT_PROFILE_ASSURANCE },
     allowedChildProfiles: mode === "strict" ? ["strict"] : ["standard", "strict"]
   };
 }

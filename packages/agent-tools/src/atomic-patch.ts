@@ -48,6 +48,7 @@ export interface AtomicPatchResult {
   delta: WorkspaceDelta;
   preimageHashes: Record<string, string>;
   postimageHashes: Record<string, string>;
+  postimageByteLengths: Record<string, number>;
   cleanupWarning?: AtomicPatchCleanupWarning;
 }
 
@@ -153,6 +154,7 @@ async function patchResult(
 ): Promise<AtomicPatchResult> {
   const preimageHashes: Record<string, string> = {};
   const postimageHashes: Record<string, string> = {};
+  const postimageByteLengths: Record<string, number> = {};
   const delta: WorkspaceDelta = { added: [], modified: [], deleted: [] };
   for (const change of changes) summarizeChange(change, preimageHashes, delta);
   for (const change of changes) {
@@ -160,11 +162,12 @@ async function patchResult(
     const actual = await readPatchFile(workspace, change.target);
     if (!actual.exists) throw new AtomicPatchError(`Patch postimage disappeared: ${change.target}`);
     postimageHashes[change.target] = patchFileHash(actual.bytes);
+    postimageByteLengths[change.target] = actual.bytes.byteLength;
   }
   for (const values of [delta.added, delta.modified, delta.deleted]) values.sort();
   return {
     changed: true,
-    files: [...touched].sort(), delta, preimageHashes, postimageHashes,
+    files: [...touched].sort(), delta, preimageHashes, postimageHashes, postimageByteLengths,
     ...(cleanupWarning ? { cleanupWarning } : {})
   };
 }
@@ -176,7 +179,8 @@ function unchangedTextResult(relative: string, bytes: Buffer): AtomicPatchResult
     files: [relative],
     delta: { added: [], modified: [], deleted: [] },
     preimageHashes: { [relative]: digest },
-    postimageHashes: { [relative]: digest }
+    postimageHashes: { [relative]: digest },
+    postimageByteLengths: { [relative]: bytes.byteLength }
   };
 }
 

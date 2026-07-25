@@ -45,7 +45,12 @@ export interface ModelGateways {
 }
 
 const FALLBACK_ON = ["rate_limit", "capacity", "network", "server", "timeout"] as const;
-const TOOL_ROLES = new Set<ModelExecutionRole>(["orchestrator", "child_analyze", "child_write"]);
+const TOOL_ROLES = new Set<ModelExecutionRole>([
+  "orchestrator",
+  "reviewer",
+  "child_analyze",
+  "child_write"
+]);
 
 function hasCredential(provider: ModelSpec["providerId"], env: NodeJS.ProcessEnv): boolean {
   if (provider === "deepseek") return Boolean(env.DEEPSEEK_API_KEY?.trim());

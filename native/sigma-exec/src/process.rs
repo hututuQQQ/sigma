@@ -760,6 +760,12 @@ fn capture(
                     break;
                 }
                 Ok(count) => {
+                    // Preserve the broker-redacted byte stream independently
+                    // from its best-effort text projection. A non-UTF-8
+                    // protocol must not erase the objective execution result.
+                    if let Ok(mut capture) = artifact.lock() {
+                        capture.append(&chunk[..count]);
+                    }
                     if discard {
                         continue;
                     }
@@ -768,16 +774,10 @@ fn capture(
                             if let Ok(mut ring) = output.lock() {
                                 ring.append(&normalized);
                             }
-                            if let Ok(mut capture) = artifact.lock() {
-                                capture.append(&normalized);
-                            }
                         }
                         Err(error) => {
                             if let Ok(mut ring) = output.lock() {
                                 ring.mark_decoding_error(error);
-                            }
-                            if let Ok(mut capture) = artifact.lock() {
-                                capture.mark_incomplete();
                             }
                             discard = true;
                         }
@@ -791,16 +791,10 @@ fn capture(
                     if let Ok(mut ring) = output.lock() {
                         ring.append(&normalized);
                     }
-                    if let Ok(mut capture) = artifact.lock() {
-                        capture.append(&normalized);
-                    }
                 }
                 Err(error) => {
                     if let Ok(mut ring) = output.lock() {
                         ring.mark_decoding_error(error);
-                    }
-                    if let Ok(mut capture) = artifact.lock() {
-                        capture.mark_incomplete();
                     }
                 }
             }
@@ -829,19 +823,19 @@ fn set_exit(process: &mut ManagedProcess, status: ExitStatus) -> Result<(), RpcE
         let _ = capture.join();
     }
     let keep = !process.terminated && !process.cancelled;
-    let stdout_truncated = process
+    let preserve_stdout = process
         .stdout
         .lock()
-        .map(|ring| ring.truncated())
+        .map(|ring| ring.truncated() || ring.has_decoding_error())
         .unwrap_or(false);
-    let stderr_truncated = process
+    let preserve_stderr = process
         .stderr
         .lock()
-        .map(|ring| ring.truncated())
+        .map(|ring| ring.truncated() || ring.has_decoding_error())
         .unwrap_or(false);
     process.output_artifacts = [
-        (&process.stdout_artifact, stdout_truncated),
-        (&process.stderr_artifact, stderr_truncated),
+        (&process.stdout_artifact, preserve_stdout),
+        (&process.stderr_artifact, preserve_stderr),
     ]
     .into_iter()
     .filter_map(|(artifact, truncated)| artifact.lock().ok()?.publish(keep, truncated))
@@ -1049,6 +1043,7 @@ mod tests {
                 execution_roots: Vec::new(),
                 executable_sha256: None,
                 protected_paths: Vec::<PathBuf>::new(),
+                enclosing_container_root: false,
                 disposable_workspace_root: None,
                 read_only_validation_workspace_root: None,
                 scratch_lease_id: None,
@@ -1148,6 +1143,30 @@ mod tests {
             })
             .unwrap();
         assert!(!path.exists());
+        state.shutdown().unwrap();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn preserves_non_utf8_output_as_an_objective_artifact() {
+        let state = BrokerState::new("binary-output".into(), true);
+        let mut request = params(false);
+        request.command.args = vec!["-c".into(), "printf '\\377\\000A\\200'".into()];
+        let result = state.execute(12, request).unwrap();
+        assert_eq!(
+            result["stdout"]["decodingError"]["code"],
+            "invalid_output_encoding"
+        );
+        let artifact = &result["outputArtifacts"][0];
+        assert_eq!(artifact["stream"], "stdout");
+        assert_eq!(artifact["complete"], true);
+        let path = PathBuf::from(artifact["path"].as_str().unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), vec![0xff, 0x00, 0x41, 0x80]);
+        state
+            .release_artifacts(ReleaseArtifactParams {
+                artifact_ids: vec![artifact["artifactId"].as_str().unwrap().into()],
+            })
+            .unwrap();
         state.shutdown().unwrap();
     }
 
