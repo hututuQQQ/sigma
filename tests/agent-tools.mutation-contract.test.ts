@@ -386,7 +386,7 @@ describe("typed workspace mutation contracts", () => {
     }
   );
 
-  it("projects attested outer-environment mutation as one low-friction change-only action", async () => {
+  it("projects attested outer-environment mutation through the primary shell", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-environment-shell-workspace-"));
     const protectedState = await mkdtemp(path.join(os.tmpdir(), "sigma-environment-shell-state-"));
     const fixture = brokerFixture();
@@ -409,9 +409,17 @@ describe("typed workspace mutation contracts", () => {
     expect(schema).not.toContain("writeRoots");
     expect(schema).not.toContain("expectedChanges");
     expect(schema).not.toContain("\"access\"");
+    expect(tools.modelDescriptors().map((item) => item.name))
+      .not.toContain("environment_shell");
+    expect(tools.descriptor("shell")?.inputSchema.properties).toMatchObject({
+      target: {
+        enum: ["workspace", "environment"]
+      }
+    });
 
-    const call = request("prepare-outer-environment", "environment_shell", {
-      command: "prepare disposable environment"
+    const call = request("prepare-outer-environment", "shell", {
+      command: "prepare disposable environment",
+      target: "environment"
     });
     const filesystemRoot = path.parse(path.resolve(workspace)).root;
     const plan = await tools.prepare(call, preparation(workspace));

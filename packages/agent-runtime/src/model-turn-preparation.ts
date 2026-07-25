@@ -135,11 +135,14 @@ export async function prepareModelAttempt(
       `Session '${session.identity.sessionId}' is missing its schema 1 customization bundle.`
     ), { code: "unsupported_schema_version" });
   }
-  const capabilities = sessionSkillProjectionCapabilities({
-    frozenCustomization: session.durable.frozenCustomization,
-    loadedSkills: session.durable.state.frozenSkills,
-    profileSkillNames: session.services.profile?.profile.skills
-  });
+  const capabilities = {
+    ...sessionSkillProjectionCapabilities({
+      frozenCustomization: session.durable.frozenCustomization,
+      loadedSkills: session.durable.state.frozenSkills,
+      profileSkillNames: session.services.profile?.profile.skills
+    }),
+    environmentMutationAvailable: session.durable.mode === "change"
+  };
   const projected = await projectedModelHistory(options, session);
   const preparation: TurnPreparationInput = {
     session,

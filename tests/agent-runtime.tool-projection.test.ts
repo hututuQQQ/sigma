@@ -29,7 +29,8 @@ describe("session model-tool capability projection", () => {
       executableSkillResourcesLoaded: false
     });
     expect(projected.some((item) => item.name === "load_skill")).toBe(false);
-    for (const name of ["exec", "validate", "process_spawn"]) {
+    expect(projected.some((item) => item.name === "exec")).toBe(false);
+    for (const name of ["validate", "process_spawn"]) {
       const properties = projected.find((item) => item.name === name)?.inputSchema.properties;
       expect(properties).not.toHaveProperty("skill");
       expect(properties).not.toHaveProperty("skillScript");
@@ -42,8 +43,7 @@ describe("session model-tool capability projection", () => {
       executableSkillResourcesLoaded: false
     });
     expect(discoverable.some((item) => item.name === "load_skill")).toBe(true);
-    expect(discoverable.find((item) => item.name === "exec")?.inputSchema.properties)
-      .not.toHaveProperty("skill");
+    expect(discoverable.some((item) => item.name === "exec")).toBe(false);
 
     const loaded = projectModelToolDescriptors(descriptors, {
       skillsAvailable: true,
@@ -54,6 +54,19 @@ describe("session model-tool capability projection", () => {
     expect(loaded.find((item) => item.name === "exec")?.inputSchema.properties)
       .toHaveProperty("skillScript");
     expect(loaded.find((item) => item.name === "process_spawn")?.inputSchema.properties)
+      .not.toHaveProperty("skill");
+  });
+
+  it("retains direct execution when no shell exists", () => {
+    const projected = projectModelToolDescriptors(
+      descriptors.filter((item) => item.name !== "shell"),
+      {
+        skillsAvailable: false,
+        executableSkillResourcesLoaded: false
+      }
+    );
+    expect(projected.some((item) => item.name === "exec")).toBe(true);
+    expect(projected.find((item) => item.name === "exec")?.inputSchema.properties)
       .not.toHaveProperty("skill");
   });
 

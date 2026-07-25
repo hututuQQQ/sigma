@@ -37,6 +37,7 @@ export function modelTools(descriptors: readonly ToolDescriptor[]): ModelToolDef
 export interface ModelToolProjectionCapabilities {
   skillsAvailable: boolean;
   executableSkillResourcesLoaded: boolean;
+  environmentMutationAvailable?: boolean;
 }
 
 /** Frozen sessions never acquire capabilities from changed live state. */
@@ -67,28 +68,42 @@ export function projectModelToolDescriptors(
   descriptors: readonly ToolDescriptor[],
   capabilities: ModelToolProjectionCapabilities
 ): ToolDescriptor[] {
-  const visible = capabilities.skillsAvailable
-    ? descriptors
-    : descriptors.filter((descriptor) => descriptor.name !== "load_skill");
+  const shellAvailable = descriptors.some((descriptor) =>
+    descriptor.name === "shell");
+  const visible = descriptors.filter((descriptor) =>
+    (capabilities.skillsAvailable || descriptor.name !== "load_skill")
+    && !(descriptor.name === "exec"
+      && shellAvailable
+      && !capabilities.executableSkillResourcesLoaded));
   return visible.map((descriptor) => {
     const foregroundExecution = descriptor.name === "exec" || descriptor.name === "validate";
     const unavailable = descriptor.name === "process_spawn"
       || (foregroundExecution && !capabilities.executableSkillResourcesLoaded);
-    if (!unavailable) return descriptor;
+    const environmentUnavailable = descriptor.name === "shell"
+      && capabilities.environmentMutationAvailable === false;
+    if (!unavailable && !environmentUnavailable) return descriptor;
     const rawProperties = descriptor.inputSchema.properties;
     if (!rawProperties || typeof rawProperties !== "object" || Array.isArray(rawProperties)) return descriptor;
     const properties = { ...(rawProperties as Record<string, JsonValue>) };
-    delete properties.skill;
-    delete properties.skillScript;
+    if (unavailable) {
+      delete properties.skill;
+      delete properties.skillScript;
+    }
+    if (environmentUnavailable) delete properties.target;
     const required = Array.isArray(descriptor.inputSchema.required)
       ? descriptor.inputSchema.required.filter((item) => item !== "skill" && item !== "skillScript")
       : undefined;
     return {
       ...descriptor,
-      description: descriptor.description.replace(
-        " With skill and skillScript, the frozen script is prepended to interpreter args.",
-        ""
-      ),
+      description: descriptor.description
+        .replace(
+          " With skill and skillScript, the frozen script is prepended to interpreter args.",
+          ""
+        )
+        .replace(
+          " Set target=environment only for system-level changes in the broker-attested disposable outer environment.",
+          ""
+        ),
       inputSchema: {
         ...descriptor.inputSchema,
         properties,

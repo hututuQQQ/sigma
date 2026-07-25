@@ -38,7 +38,7 @@ function environmentWritePrompt(
   enclosingContainerAvailable: boolean
 ): string {
   if (enclosingContainerAvailable) {
-    return `The outer environment is broker-attested as disposable (${environment.enclosingContainerAttestationDigest}). When offered, use environment_shell for foreground system-level changes and environment_process_spawn for a background service that needs external runtime files; choose lifecycle=deliverable and call process_handoff only when that verified service must survive completion. The runtime supplies outer-container authority while protecting the workspace. Use ordinary shell or exec for observation and workspace write/edit/apply_patch tools for deliverables.`;
+    return `The outer environment is broker-attested as disposable (${environment.enclosingContainerAttestationDigest}). When offered, use shell with target=environment for foreground system-level changes and environment_process_spawn for a background service that needs external runtime files; choose lifecycle=deliverable and call process_handoff only when that verified service must survive completion. The runtime supplies outer-container authority while protecting the workspace. Use shell with its default workspace target for observation and workspace write/edit/apply_patch tools for deliverables.`;
   }
   if (environment.writeScope === "enclosing-container") {
     return "The outer environment requests enclosing-container writes, but no verified environment shell is available.";

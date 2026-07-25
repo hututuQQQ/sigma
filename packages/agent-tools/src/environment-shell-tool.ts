@@ -36,11 +36,11 @@ function enclosingContainerRoot(workspacePath: string): string {
   return path.parse(path.resolve(workspacePath)).root;
 }
 
-function environmentArguments(
+export function environmentShellArguments(
   value: JsonValue,
   workspacePath: string
 ): Record<string, JsonValue> {
-  const input = executionArgs(value);
+  const { target: _target, ...input } = executionArgs(value);
   const root = enclosingContainerRoot(workspacePath);
   return {
     ...input,
@@ -50,7 +50,7 @@ function environmentArguments(
   };
 }
 
-function available(options: ExecutionToolOptions): boolean {
+export function environmentShellAvailable(options: ExecutionToolOptions): boolean {
   return options.foreground !== false
     && options.readScope === "host"
     && options.writeScope === "enclosing-container"
@@ -63,9 +63,12 @@ export function environmentShellTools(
   options: ExecutionToolOptions,
   executeForeground: ForegroundExecutor
 ): RegisteredEffectTool[] {
-  if (!available(options)) return [];
+  if (!environmentShellAvailable(options)) return [];
   const shells = availableShells(options);
   return [{
+    // Keep the legacy name registered for durable recovery. New model turns
+    // use shell(target=environment), so they see one foreground shell surface.
+    modelVisible: false,
     descriptor: {
       ...executionToolSchema(
         "environment_shell",
@@ -98,7 +101,7 @@ export function environmentShellTools(
       ),
       brokerMutationAuthority: "disposable_enclosing_container",
       async prepare(value, context) {
-        const input = environmentArguments(value, context.workspacePath);
+        const input = environmentShellArguments(value, context.workspacePath);
         assertAvailableShell(input, options);
         return await prepareExecutionCallPlan(input, context, options);
       }
@@ -106,7 +109,7 @@ export function environmentShellTools(
     async execute(request, context) {
       return await executeForeground("shell", options, {
         ...request,
-        arguments: environmentArguments(
+        arguments: environmentShellArguments(
           request.arguments,
           context.workspacePath
         )

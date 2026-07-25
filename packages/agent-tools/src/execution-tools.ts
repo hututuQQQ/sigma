@@ -36,7 +36,11 @@ import {
   foregroundExecutionSchema
 } from "./execution-foreground-schema.js";
 import { simpleExecutionReceipt } from "./execution-tool-receipts.js";
-import { environmentShellTools } from "./environment-shell-tool.js";
+import {
+  environmentShellArguments,
+  environmentShellAvailable,
+  environmentShellTools
+} from "./environment-shell-tool.js";
 export type { ExecutionToolOptions } from "./execution-tool-types.js";
 export { unavailableExecutionBroker } from "./execution-tool-receipts.js";
 function networkProperty(options: ExecutionToolOptions): JsonValue {
@@ -133,6 +137,32 @@ function assertForegroundInvocation(
   return shellCommand;
 }
 
+function foregroundArguments(
+  kind: "exec" | "shell" | "validate",
+  value: JsonValue,
+  options: ExecutionToolOptions,
+  workspacePath: string
+): Record<string, JsonValue> {
+  const input = executionArgs(value);
+  if (kind !== "shell") return input;
+  const target = input.target;
+  if (target === "environment") {
+    if (!environmentShellAvailable(options)) {
+      throw Object.assign(new Error(
+        "The broker-attested disposable outer environment is unavailable."
+      ), { code: "policy_denied" });
+    }
+    return environmentShellArguments(input, workspacePath);
+  }
+  if (target !== undefined && target !== "workspace") {
+    throw Object.assign(new Error(
+      "Shell target must be 'workspace' or 'environment'."
+    ), { code: "tool_arguments_invalid" });
+  }
+  const { target: _target, ...workspaceInput } = input;
+  return workspaceInput;
+}
+
 export async function executeForegroundCommand(
   kind: "exec" | "shell" | "validate",
   options: ExecutionToolOptions,
@@ -220,12 +250,24 @@ function foregroundTool(kind: "exec" | "shell" | "validate", options: ExecutionT
         ? { brokerMutationAuthority: "disposable_enclosing_container" as const }
         : {}),
       prepare(value, context) {
-        const input = executionArgs(value);
+        const input = foregroundArguments(
+          kind, value, options, context.workspacePath
+        );
         if (kind === "shell" || (validation && input.shell !== undefined)) assertAvailableShell(input, options);
-        return prepareExecutionCallPlan(value, context, options, validation);
+        return prepareExecutionCallPlan(input, context, options, validation);
       }
     },
-    execute: async (request, context) => await executeForegroundCommand(kind, options, request, context)
+    execute: async (request, context) => await executeForegroundCommand(
+      kind,
+      options,
+      {
+        ...request,
+        arguments: foregroundArguments(
+          kind, request.arguments, options, context.workspacePath
+        )
+      },
+      context
+    )
   };
 }
 

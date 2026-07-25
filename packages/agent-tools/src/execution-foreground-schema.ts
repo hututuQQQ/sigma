@@ -5,6 +5,7 @@ import {
   executableCapabilitySchema,
   executionToolSchema
 } from "./execution-tool-values.js";
+import { environmentShellAvailable } from "./environment-shell-tool.js";
 
 type ForegroundKind = "exec" | "shell" | "validate";
 
@@ -44,7 +45,19 @@ function invocationProperties(
   const shell: Record<string, JsonValue> = shells.length > 0
     ? { shell: { type: "string", enum: shells }, command: { type: "string" } }
     : {};
-  if (kind === "shell") return shell;
+  if (kind === "shell") {
+    return {
+      ...shell,
+      ...(environmentShellAvailable(options) ? {
+        target: {
+          type: "string",
+          enum: ["workspace", "environment"],
+          description:
+            "Execution boundary. Defaults to workspace. Use environment only for system-level changes in the broker-attested disposable outer environment."
+        }
+      } : {})
+    };
+  }
   return {
     executable: executableCapabilitySchema(options),
     args: { type: "array", items: { type: "string" } },
@@ -118,7 +131,12 @@ export function foregroundExecutionSchema(
   const description = validation
     ? "Run a sandboxed validation using exactly one form: {executable,args} or {shell,command}. The runtime freezes the declared intent and objective command result; an independent reviewer decides semantic coverage."
     : kind === "shell"
-      ? "Run a sandboxed shell command. shell is optional; when omitted, the runtime chooses a deterministic broker-verified shell."
+      ? [
+          "Run a sandboxed shell command. shell is optional; when omitted, the runtime chooses a deterministic broker-verified shell.",
+          ...(environmentShellAvailable(options)
+            ? ["Set target=environment only for system-level changes in the broker-attested disposable outer environment."]
+            : [])
+        ].join(" ")
       : `Run a sandboxed ${kind} command. With skill and skillScript, the frozen script is prepended to interpreter args.`;
   const base = executionToolSchema(kind, description, properties, required, effects);
   const schema = validation
