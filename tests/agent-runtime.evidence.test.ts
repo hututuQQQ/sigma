@@ -140,7 +140,7 @@ describe("assurance-coordinated mutation completion", () => {
     );
   });
 
-  it("does not carry a broad reviewer waiver across follow-up runs", () => {
+  it("does not carry a broad reviewer waiver into current explicit-review readiness", () => {
     const active = session([]);
     const environment: EvidenceRecord = {
       evidenceId: "current-environment-change",
@@ -180,8 +180,8 @@ describe("assurance-coordinated mutation completion", () => {
     expect(reviewReadiness(active, "completion").environmentMutations)
       .toContainEqual(expect.objectContaining({ evidenceId: "current-environment-change" }));
     expect(completionGateDecision(active)).toMatchObject({
-      action: "fail",
-      code: "verification_unavailable"
+      action: "continue",
+      message: expect.stringContaining("has not been validated")
     });
   });
 

@@ -24,6 +24,7 @@ import { ToolBatchCoordinator } from "./tool-batch-coordinator.js";
 import { LongHorizonCoordinator } from "./long-horizon-coordinator.js";
 import { finishSolvingBudgetBoundary } from "./solving-budget-boundary.js";
 import {
+  automaticCompletionReviewRequired,
   completionReviewBlocker,
   explicitReviewGateDecision
 } from "./completion-evidence-gate.js";
@@ -198,6 +199,7 @@ export class EffectRunner {
       outcomeRevision = session.durable.state.revision;
     }
     if (outcome.kind === "completed"
+      && automaticCompletionReviewRequired(session)
       && mutationFrontierHasChanges(session.durable.state.mutationFrontier)
       && !completionReviewBlocker(session)) {
       await this.reviews.maybeReview(session, signal, true, "completion");

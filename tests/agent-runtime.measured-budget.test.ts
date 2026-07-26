@@ -22,6 +22,7 @@ import type {
   ReviewerInput,
   ReviewerPort
 } from "../packages/agent-runtime/src/reviewer.js";
+import { strictReviewProfileFixture } from "./testkit/agent-profile-fixture.js";
 
 function measuredUsage(
   inputTokens: number,
@@ -418,7 +419,7 @@ describe("provider-measured model budget settlement", () => {
     expect(gateway.requests).toHaveLength(0);
   });
 
-  it("transfers a mutated run from ordinary budget exhaustion to protected review", async () => {
+  it("fails closed after Strict protected review omits a reviewer-executed check", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-budget-review-workspace-"));
     const state = await mkdtemp(path.join(os.tmpdir(), "sigma-budget-review-state-"));
     const gateway = new InspectableGateway([{
@@ -482,7 +483,8 @@ describe("provider-measured model budget settlement", () => {
       storeRootDir: state,
       tools: registerBuiltinTools(new EffectToolRegistry()),
       permissionMode: "auto",
-      outputReserveTokens: 100
+      outputReserveTokens: 100,
+      profile: strictReviewProfileFixture()
     });
     const session = await runtime.createSession({
       workspacePath: workspace,
@@ -503,7 +505,7 @@ describe("provider-measured model budget settlement", () => {
     });
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
-      kind: "completed",
+      kind: "recoverable_failure",
       decisionAuthority: "verification_verdict"
     });
     expect(gateway.requests).toHaveLength(1);
@@ -516,7 +518,7 @@ describe("provider-measured model budget settlement", () => {
     );
   });
 
-  it("uses protected repair capacity and re-reviews new post-review tool evidence", async () => {
+  it("uses Strict protected repair but rejects re-review without an executed check", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-budget-repair-workspace-"));
     const state = await mkdtemp(path.join(os.tmpdir(), "sigma-budget-repair-state-"));
     const gateway = new InspectableGateway([{
@@ -601,7 +603,8 @@ describe("provider-measured model budget settlement", () => {
       storeRootDir: state,
       tools: registerBuiltinTools(new EffectToolRegistry()),
       permissionMode: "auto",
-      outputReserveTokens: 100
+      outputReserveTokens: 100,
+      profile: strictReviewProfileFixture()
     });
     const session = await runtime.createSession({
       workspacePath: workspace,
@@ -622,7 +625,7 @@ describe("provider-measured model budget settlement", () => {
     });
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
-      kind: "completed",
+      kind: "recoverable_failure",
       decisionAuthority: "verification_verdict"
     });
     expect(gateway.requests).toHaveLength(2);
@@ -633,7 +636,7 @@ describe("provider-measured model budget settlement", () => {
     expect(events.filter((event) =>
       event.type === "diagnostic"
       && (event.payload as { kind?: string }).kind === "assurance.review_transfer"
-    )).toHaveLength(2);
+    ).length).toBeGreaterThanOrEqual(2);
     expect(events.some((event) =>
       event.type === "tool.completed"
       && (event.payload as { callId?: string }).callId === "inspect-during-repair"

@@ -503,8 +503,8 @@ describe("runtime queues and non-blocking instruction steering", () => {
       kind: "completed",
       message: expect.stringContaining("validation ran and failed")
     });
-    expect(gateway.requests).toHaveLength(3);
-    expect(gateway.requests[2]?.messages.at(-1)?.content).toContain("validation");
+    expect(gateway.requests).toHaveLength(4);
+    expect(gateway.requests[3]?.messages.at(-1)?.content).toContain("validation");
     const restored = await restoreStoredSession(store, session.sessionId, 30_000);
     expect(restored.state.budget.reservations.filter((reservation) => reservation.status === "reserved"))
       .toEqual([]);

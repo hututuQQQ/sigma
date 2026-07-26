@@ -124,12 +124,15 @@ function validationRequest(): ModelResponse {
       content: "",
       toolCalls: [{
         id: "validate-approval-result",
-        name: "validate",
+        name: "shell",
         arguments: {
           shell: process.platform === "win32" ? "cmd" : "bash",
           command: "npm run build",
           cwd: ".",
-          network: "none"
+          network: "none",
+          validation: true,
+          purpose: "Validate the requested CLI test change.",
+          subjects: ["approval-result.md"]
         }
       }]
     },
@@ -404,8 +407,7 @@ describe("run command branch coverage", () => {
     const code = await runCommand([
       "write approval result",
       "--workspace", root,
-      "--permission-mode", "ask",
-      ...(allowed ? ["--waive-reviewer"] : [])
+      "--permission-mode", "ask"
     ], { stdin, stdout, stderr, ...runDeps(script) }).finally(() => {
       clearInterval(feeder);
       stdin.end();

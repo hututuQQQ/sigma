@@ -235,58 +235,27 @@ describe("Standard and Strict completion policy", () => {
     });
   });
 
-  it("requires reviewer approval for every Standard mutation completion", () => {
-    const missing = candidateSession("advisory");
-    expect(completionGateDecision(missing)).toMatchObject({
-      action: "fail",
-      code: "verification_unavailable"
-    });
-
-    const approved = candidateSession("advisory");
-    approved.durable.state.evidence.push(review(approved, "approved-review", "approved"));
-    expect(completionGateDecision(approved)).toMatchObject({
-      action: "complete",
-      statusNote: expect.stringContaining("reviewer approved")
-    });
-  });
-
-  it("allows one review repair, rejects an unchanged second stop, and rejects a failed re-review", () => {
-    const unchanged = candidateSession("advisory");
-    unchanged.durable.state.evidence.push(review(unchanged, "first-review", "changes_requested"));
-    const first = completionGateDecision(unchanged);
+  it("keeps Standard independent review explicit and relies on plan and validation evidence", () => {
+    const session = candidateSession("advisory");
+    const first = completionGateDecision(session);
     expect(first).toMatchObject({
       action: "continue",
-      message: expect.stringContaining("single repair opportunity")
+      message: expect.stringContaining("has not been validated")
     });
-    if (first.action !== "continue") throw new Error("Expected a review repair advisory.");
-    unchanged.durable.state.messages.push({ role: "developer", content: first.message });
-    expect(completionGateDecision(unchanged)).toMatchObject({
-      action: "fail",
-      code: "verification_failed",
-      message: expect.stringContaining("without changing")
+    if (first.action !== "continue") throw new Error("Expected a validation advisory.");
+    session.durable.state.messages.push({ role: "developer", content: first.message });
+    expect(completionGateDecision(session)).toMatchObject({
+      action: "complete",
+      authority: "user_policy",
+      validationStatus: "unverified"
     });
 
-    const rereviewed = candidateSession("advisory");
-    rereviewed.durable.state.evidence.push(review(rereviewed, "first-review", "changes_requested"));
-    rereviewed.durable.state.plan = {
-      revision: 1,
-      goal: "Repair the reviewed change.",
-      activeNodeId: "repair",
-      nodes: [{
-        id: "repair",
-        title: "Repair",
-        dependencies: [],
-        status: "in_progress",
-        owner: { kind: "root" },
-        acceptanceCriteria: ["Satisfy the durable user request."],
-        evidence: []
-      }]
-    };
-    rereviewed.durable.state.evidence.push(review(rereviewed, "second-review", "changes_requested"));
-    expect(completionGateDecision(rereviewed)).toMatchObject({
-      action: "fail",
-      code: "verification_failed",
-      message: expect.stringContaining("after repair and re-review")
+    const validated = candidateSession("advisory");
+    validated.durable.state.evidence.push(validation(validated, "passed"));
+    expect(completionGateDecision(validated)).toMatchObject({
+      action: "complete",
+      authority: "user_policy",
+      validationStatus: "passed"
     });
   });
 
@@ -384,7 +353,7 @@ describe("Standard and Strict completion policy", () => {
     })]);
   });
 
-  it("honors a current-delta Standard review waiver but not in Strict mode", () => {
+  it("does not let a Standard review waiver bypass Strict review", () => {
     const standard = candidateSession("advisory");
     standard.durable.state.evidence.push({
       evidenceId: "delta",
@@ -410,10 +379,7 @@ describe("Standard and Strict completion policy", () => {
       summary: "waived",
       data: { scope: "review", reason: "User explicitly waived independent review." }
     });
-    expect(completionGateDecision(standard)).toMatchObject({
-      action: "complete",
-      statusNote: expect.stringContaining("explicitly waived")
-    });
+    expect(completionGateDecision(standard)).toMatchObject({ action: "continue" });
 
     const strict = candidateSession("required");
     strict.durable.state.evidence.push(...standard.durable.state.evidence.map((item) => ({
