@@ -1,4 +1,4 @@
-import { access, mkdtemp, readFile } from "node:fs/promises";
+import { access, mkdtemp } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -70,24 +70,6 @@ async function events(
   return result;
 }
 
-function requestInputResponse(id: string): ModelResponse {
-  return {
-    message: {
-      role: "assistant",
-      content: "",
-      reasoningContent: "The write receipt is settled, so I should ask for the next instruction.",
-      toolCalls: [{
-        id,
-        name: "request_user_input",
-        arguments: { message: "The trajectory test is complete." }
-      }]
-    },
-    finishReason: "tool_calls",
-    inputTokens: 100,
-    outputTokens: 20
-  };
-}
-
 describe("thinking-provider trajectory integrity", () => {
   it("rejects a normal thinking tool call without reasoning before any side effect", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-thinking-missing-workspace-"));
@@ -131,7 +113,7 @@ describe("thinking-provider trajectory integrity", () => {
     expect(stored.filter((event) => event.type === "model.completed")).toHaveLength(0);
   });
 
-  it("keeps a strict non-thinking length tool call single-shot and starts a tombstoned trajectory", async () => {
+  it("does not execute a thinking tool call from a repeated length-limited trajectory", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-thinking-strict-workspace-"));
     const state = await mkdtemp(path.join(os.tmpdir(), "sigma-thinking-strict-state-"));
     const gateway = new ThinkingGateway([{
@@ -147,6 +129,7 @@ describe("thinking-provider trajectory integrity", () => {
       message: {
         role: "assistant",
         content: "",
+        reasoningContent: "The retry also reached its limit while forming the write call.",
         toolCalls: [{
           id: "strict-write-once",
           name: "write",
@@ -156,7 +139,7 @@ describe("thinking-provider trajectory integrity", () => {
       finishReason: "length",
       inputTokens: 100,
       outputTokens: 100
-    }, requestInputResponse("trajectory-done")], {
+    }], {
       strictToolChoiceDisablesReasoning: true
     });
     const store = new SegmentedJsonlStore({ rootDir: state });
@@ -176,46 +159,31 @@ describe("thinking-provider trajectory integrity", () => {
     });
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
-      kind: "needs_input"
+      kind: "recoverable_failure",
+      code: "model_output_limit"
     });
     expect(gateway.requests.map((request) => request.toolChoice))
-      .toEqual([undefined, "required", "auto"]);
+      .toEqual([undefined, "auto"]);
     expect(gateway.requests.map((request) => request.maxOutputTokens))
-      .toEqual([8_192, 8_192, 16_384]);
-    expect(await readFile(path.join(workspace, "once.txt"), "utf8"))
-      .toBe("written exactly once\n");
-    const thirdHistory = gateway.requests[2]!.messages;
-    expect(thirdHistory.some((message) =>
-      message.content.includes("reasoning-trajectory-tombstone"))).toBe(true);
-    expect(thirdHistory.some((message) =>
+      .toEqual([8_192, 32_000]);
+    await expect(access(path.join(workspace, "once.txt"))).rejects.toThrow();
+    expect(gateway.requests[1]!.messages.some((message) =>
       message.toolCalls?.some((call) => call.id === "strict-write-once") === true)).toBe(false);
 
     const stored = await events(store, session.sessionId);
     expect(stored.filter((event) => event.type === "tool.completed"
-      && (event.payload as { callId?: string }).callId === "strict-write-once")).toHaveLength(1);
+      && (event.payload as { callId?: string }).callId === "strict-write-once")).toHaveLength(0);
     expect(stored.filter((event) =>
-      event.type === "context.reasoning_trajectory_tombstoned")).toHaveLength(1);
+      event.type === "context.reasoning_trajectory_tombstoned")).toHaveLength(0);
     expect(stored.find((event) =>
       event.type === "model.completed"
       && (event.payload as { toolCalls?: Array<{ id: string }> }).toolCalls
-        ?.some((call) => call.id === "trajectory-done"))?.payload).toMatchObject({
-      message: {
-        reasoningContent: expect.stringContaining("write receipt is settled"),
-        toolCalls: [expect.objectContaining({ id: "trajectory-done" })]
-      },
-      toolCalls: [expect.objectContaining({ id: "trajectory-done" })]
-    });
+        ?.some((call) => call.id === "strict-write-once"))?.payload)
+      .toMatchObject({ finishReason: "length" });
     const restored = await restoreStoredSession(store, session.sessionId, 30_000);
-    expect(restored.state.reasoningTrajectory.blockDigests).toHaveLength(1);
-    expect(restored.state.messages).toContainEqual(expect.objectContaining({
-      role: "assistant",
-      toolCalls: [expect.objectContaining({ id: "strict-write-once" })]
-    }));
-    expect(restored.state.messages).toContainEqual(expect.objectContaining({
-      role: "assistant",
-      reasoningContent: expect.stringContaining("write receipt is settled"),
-      toolCalls: [expect.objectContaining({ id: "trajectory-done" })]
-    }));
+    expect(restored.state.reasoningTrajectory.blockDigests).toHaveLength(0);
+    expect(restored.state.messages.some((message) =>
+      message.toolCalls?.some((call) => call.id === "strict-write-once") === true)).toBe(false);
   });
 
   it("preserves reasoning/tool blocks atomically through tool-result compaction", () => {

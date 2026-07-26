@@ -197,7 +197,7 @@ describe("provider-measured model budget settlement", () => {
       .toMatch(/^[a-f0-9]{64}$/u);
   });
 
-  it("forces one bounded action recovery after a no-action length finish", async () => {
+  it("uses one clean higher-headroom retry and then stops on another length finish", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-length-recovery-workspace-"));
     const state = await mkdtemp(path.join(os.tmpdir(), "sigma-length-recovery-state-"));
     const gateway = new InspectableGateway([1, 2, 3].map((attempt) => ({
@@ -222,20 +222,21 @@ describe("provider-measured model budget settlement", () => {
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
       kind: "recoverable_failure",
-      code: "model_action_recovery_failed"
+      code: "model_output_limit"
     });
     expect(gateway.requests).toHaveLength(2);
     expect(gateway.requests.map((request) => request.maxOutputTokens))
-      .toEqual([4_096, 4_096]);
+      .toEqual([4_096, 32_000]);
     expect(gateway.requests[0].toolChoice).toBeUndefined();
-    expect(gateway.requests[1].toolChoice).toBe("required");
-    expect(gateway.requests[1].messages.some((message) => message.content.includes("action-oriented")))
+    expect(gateway.requests[1].toolChoice).toBe("auto");
+    expect(gateway.requests[1].messages.some((message) =>
+      message.content.includes("was discarded before any tool call could run")))
       .toBe(true);
     expect(gateway.requests[1].messages.some((message) =>
       message.reasoningContent?.includes("private truncated reasoning") === true)).toBe(false);
   });
 
-  it("allows one 2K bounded answer when the provider cannot force a tool", async () => {
+  it("allows the clean retry to answer naturally when strict tool choice is unavailable", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-length-fallback-workspace-"));
     const state = await mkdtemp(path.join(os.tmpdir(), "sigma-length-fallback-state-"));
     const gateway = new InspectableGateway([{
@@ -264,13 +265,13 @@ describe("provider-measured model budget settlement", () => {
     });
     expect(gateway.requests).toHaveLength(2);
     expect(gateway.requests[1]).toMatchObject({
-      toolChoice: "none",
-      tools: [],
-      maxOutputTokens: 2_048
+      toolChoice: "auto",
+      maxOutputTokens: 32_000
     });
+    expect(gateway.requests[1]!.tools?.length).toBeGreaterThan(0);
   });
 
-  it("executes tool calls from a length finish once and continues with the settled receipt", async () => {
+  it("discards tool calls from a length finish and retries without side effects", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-length-tool-workspace-"));
     const state = await mkdtemp(path.join(os.tmpdir(), "sigma-length-tool-state-"));
     await writeFile(path.join(workspace, "seed.txt"), "seed\n", "utf8");
@@ -296,12 +297,14 @@ describe("provider-measured model budget settlement", () => {
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "Inspect seed.txt." });
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "needs_input" });
 
-    expect(gateway.requests.map((request) => request.maxOutputTokens)).toEqual([4_096, 16_384]);
+    expect(gateway.requests.map((request) => request.maxOutputTokens)).toEqual([4_096, 32_000]);
     expect(gateway.requests[1]!.messages.some((message) =>
-      message.content.includes("executed exactly once"))).toBe(true);
+      message.content.includes("was discarded before any tool call could run"))).toBe(true);
+    expect(gateway.requests[1]!.messages.some((message) =>
+      message.toolCalls?.some((call) => call.id === "length-read") === true)).toBe(false);
     const events = await storedEvents(store, session.sessionId);
     expect(events.filter((event) => event.type === "tool.completed"
-      && (event.payload as { callId?: string }).callId === "length-read")).toHaveLength(1);
+      && (event.payload as { callId?: string }).callId === "length-read")).toHaveLength(0);
   });
 
   it("does not forecast a terminal budget stage while the hard ledger can fund a request", async () => {

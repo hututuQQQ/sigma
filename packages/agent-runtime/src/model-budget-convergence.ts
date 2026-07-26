@@ -32,6 +32,8 @@ import {
   repairEpisodeWindow
 } from "./repair-episode-policy.js";
 
+export const LENGTH_RETRY_OUTPUT_TOKENS = 32_000;
+
 const FINAL_RESPONSE_OUTPUT_TOKENS = 256;
 
 export interface PreparedModelTurn {
@@ -150,11 +152,13 @@ function requestOutputTokens(input: TurnPreparationInput): number {
       || input.descriptors.length === 0));
   const desired = repairClosure
     ? 2_048
-    : strictRecoveryUnavailable
-    ? 2_048
-    : recovery === "continue_after_tools"
-      ? Math.max(input.defaultOutputReserveTokens, 16_384)
-      : input.defaultOutputReserveTokens;
+    : recovery === "retry_with_headroom"
+      ? Math.max(input.defaultOutputReserveTokens, LENGTH_RETRY_OUTPUT_TOKENS)
+      : strictRecoveryUnavailable
+        ? 2_048
+        : recovery === "continue_after_tools"
+          ? Math.max(input.defaultOutputReserveTokens, 16_384)
+          : input.defaultOutputReserveTokens;
   const providerCapped = Math.min(
     desired,
     input.session.services.gateway.capabilities.maxOutputTokens
@@ -175,7 +179,9 @@ function recoveryNotice(input: TurnPreparationInput): ContextItem | undefined {
   const strictAvailable = input.session.services.gateway.capabilities.strictToolChoice === true
     && input.session.services.gateway.capabilities.tools
     && input.descriptors.length > 0;
-  const content = mode === "continue_after_tools"
+  const content = mode === "retry_with_headroom"
+    ? "The previous provider response reached its output limit and was discarded before any tool call could run. Retry from the durable conversation with the larger output window, take concrete actions early, and split remaining work across tool turns instead of rebuilding a long private analysis."
+    : mode === "continue_after_tools"
     ? "The previous length-limited turn issued tool calls. Their side effects were executed exactly once. Continue from the receipts without repeating those calls."
     : mode === "action_required" && strictAvailable
       ? "The previous turn exhausted its output limit without acting. Stop expanding the reasoning and take one concrete tool action now."
@@ -219,6 +225,9 @@ function recoveryRequestPolicy(
     return { tools: [], toolChoice: "none" };
   }
   const mode = session.durable.state.lengthRecovery.mode;
+  if (mode === "retry_with_headroom") {
+    return { tools: projectedTools, toolChoice: "auto" };
+  }
   if (mode === "continue_after_tools") {
     return { tools: projectedTools, toolChoice: "auto" };
   }

@@ -171,15 +171,25 @@ describe("agent-kernel reducer branch contracts", () => {
     expect(reused.proposedOutcome).toMatchObject({ code: "protocol_error" });
     const lengthCalls = [{ id: "length-call", name: "read", arguments: {} }];
     const length = complete(start(ready()), {
-      message: { role: "assistant", content: "", toolCalls: lengthCalls },
+      message: {
+        role: "assistant",
+        content: "partial response",
+        toolCalls: lengthCalls
+      },
       toolCalls: lengthCalls,
       finishReason: "length"
     });
     expect(length).toMatchObject({
-      phase: "tool_pending",
+      phase: "ready_model",
       lastModelFinishReason: "length",
-      lengthRecovery: { mode: "continue_after_tools", attempts: 1 }
+      consecutiveLengthNoAction: 1,
+      lengthRecovery: { mode: "retry_with_headroom", attempts: 1 },
+      pendingTools: []
     });
+    expect(length.toolCallIds).not.toContain("length-call");
+    expect(length.messages.some((item) =>
+      item.toolCalls?.some((call) => call.id === "length-call") === true)).toBe(false);
+    expect(length.messages.some((item) => item.content === "partial response")).toBe(false);
     const failed = apply(start(ready()), "model.failed", {
       turnId: 1,
       effectRevision: 1,

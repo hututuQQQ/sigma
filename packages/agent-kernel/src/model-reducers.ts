@@ -92,22 +92,11 @@ function stoppedOutcome(
       message: "The provider exhausted the one bounded answer-recovery turn."
     });
   }
-  if (finishReason === "length") {
-    return {
-      ...state,
-      phase: "ready_model",
-      messages: [...messages, lengthContinuationMessage(false)],
-      proposedOutcome: undefined,
-      outcome: undefined
-    };
-  }
   if (finishReason !== "stop") {
     return proposedOutcomeState({ ...state, messages }, {
       kind: "recoverable_failure",
-      code: finishReason === "length" ? "model_action_recovery_failed" : "model_protocol_error",
-      message: finishReason === "length"
-        ? "The model exhausted the one bounded action-recovery turn without taking a tool action or reaching a natural stop."
-        : `The model returned no tool calls with finish reason '${finishReason || "unknown"}'.`
+      code: "model_protocol_error",
+      message: `The model returned no tool calls with finish reason '${finishReason || "unknown"}'.`
     });
   }
   if (!answer) {
@@ -126,15 +115,13 @@ function stoppedOutcome(
 
 function nextLengthRecovery(
   state: KernelState,
-  length: boolean,
-  hasToolCalls: boolean
+  length: boolean
 ): KernelState["lengthRecovery"] {
   if (!length) return resetModelCompletion.lengthRecovery;
-  const mode = hasToolCalls ? "continue_after_tools" : "action_required";
   return {
     schemaVersion: 1,
-    mode,
-    attempts: state.lengthRecovery.mode === mode
+    mode: "retry_with_headroom",
+    attempts: state.lengthRecovery.mode === "retry_with_headroom"
       ? state.lengthRecovery.attempts + 1
       : 1
   };
@@ -170,12 +157,41 @@ const modelCompleted: KernelEventReducer = (state, _event, payload) => {
     activeModelSemanticDelta: undefined,
     lastModelFinishReason: recognizedFinishReason(finishReason),
     consecutiveLengthFinishes: length ? state.consecutiveLengthFinishes + 1 : 0,
-    consecutiveLengthNoAction: length && !hasToolCalls
+    consecutiveLengthNoAction: length
       ? state.consecutiveLengthNoAction + 1
       : 0,
     lastModelHadToolCalls: hasToolCalls,
-    lengthRecovery: nextLengthRecovery(state, length, hasToolCalls)
+    lengthRecovery: nextLengthRecovery(state, length)
   };
+  if (length) {
+    const recoveryExhausted = state.lengthRecovery.mode === "retry_with_headroom"
+      || state.lengthRecovery.mode === "continue_after_tools";
+    if (recoveryExhausted) {
+      return proposedOutcomeState(completedState, {
+        kind: "recoverable_failure",
+        code: "model_output_limit",
+        message: "The model reached its output limit again after one clean retry with additional output headroom."
+      });
+    }
+    if (state.lengthRecovery.mode === "action_required"
+      || state.lengthRecovery.mode === "bounded_answer") {
+      return proposedOutcomeState(completedState, {
+        kind: "recoverable_failure",
+        code: "model_action_recovery_failed",
+        message: "The model exhausted the bounded recovery turn without reaching a complete protocol boundary."
+      });
+    }
+    // A length-limited response is not a committed transaction boundary.
+    // Its content and tool calls may be truncated, so retain the already
+    // materialized prompt but do not replay the partial assistant trajectory
+    // or execute any calls from it.
+    return {
+      ...completedState,
+      phase: "ready_model",
+      proposedOutcome: undefined,
+      outcome: undefined
+    };
+  }
   if (!hasToolCalls) {
     return stoppedOutcome(completedState, state.lengthRecovery, payload, messages, message);
   }

@@ -127,6 +127,47 @@ describe("incremental runtime prompt state", () => {
     expect(JSON.stringify(left.turn.messages)).not.toMatch(/timeMs|remainingMs|deadlineAt/u);
   });
 
+  it("retries a discarded length response once with 32K headroom and automatic tools", async () => {
+    const session = runtimeSessionFixture();
+    session.services.gateway.capabilities.contextWindowTokens = 128_000;
+    session.services.gateway.capabilities.maxOutputTokens = 64_000;
+    session.durable.state.lengthRecovery = {
+      schemaVersion: 1,
+      mode: "retry_with_headroom",
+      attempts: 1
+    };
+    const descriptor: ToolDescriptor = {
+      name: "read",
+      description: "read",
+      inputSchema: { type: "object", properties: {} },
+      possibleEffects: ["filesystem.read"],
+      executionMode: "sequential",
+      resourceKeys: [],
+      approval: "auto",
+      idempotent: true,
+      timeoutMs: 1_000
+    };
+    const prepared = await prepareBudgetedModelTurn({
+      session,
+      turnId: 2,
+      descriptors: [descriptor],
+      capabilities: { skillsAvailable: false, executableSkillResourcesLoaded: false },
+      dynamic: [item("repo", "repository", "same repository")],
+      hookContext: [],
+      ledger: evidenceLedger(session),
+      available,
+      defaultOutputReserveTokens: 8_192
+    });
+
+    expect(prepared.turn).toMatchObject({
+      toolChoice: "auto",
+      outputReserveTokens: 32_000
+    });
+    expect(prepared.turn.tools).toEqual([expect.objectContaining({ name: "read" })]);
+    expect(prepared.turn.messages.some((message) =>
+      message.content.includes("was discarded before any tool call could run"))).toBe(true);
+  });
+
   it("uses a 2K no-tool fallback when strict tool choice is unavailable", async () => {
     const session = runtimeSessionFixture();
     session.durable.state.lengthRecovery = {
