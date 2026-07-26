@@ -50,6 +50,10 @@ export const toolCallPlanSchema = z.object({
   readPaths: z.array(z.string()),
   writePaths: z.array(z.string()),
   network: z.enum(["none", "loopback", "full"]),
+  networkTargets: z.array(z.object({
+    origin: nonEmptyStringSchema,
+    method: z.enum(["GET", "POST"])
+  }).strict()).optional(),
   processMode: z.enum(["none", "pipe", "pty", "background"]),
   checkpointScope: z.array(z.string()),
   checkpointAction: z.object({
@@ -88,7 +92,8 @@ const artifactRefSchema = z.object({
   name: nonEmptyStringSchema,
   digest: nonEmptyStringSchema,
   mediaType: z.string().optional(),
-  sizeBytes: z.number().int().nonnegative().optional()
+  sizeBytes: z.number().int().nonnegative().optional(),
+  contentTrust: z.literal("external_untrusted").optional()
 }).strict();
 
 const toolOutcomeSchema = z.object({
@@ -109,6 +114,7 @@ export const durableToolReceiptShape = {
   workspaceDelta: checkpointDeltaSchema.optional(),
   artifacts: z.array(z.string()),
   artifactRefs: z.array(artifactRefSchema).optional(),
+  contentTrust: z.literal("external_untrusted").optional(),
   diagnostics: z.array(z.string()),
   evidence: z.array(evidenceRecordSchema),
   startedAt: dateTimeSchema,

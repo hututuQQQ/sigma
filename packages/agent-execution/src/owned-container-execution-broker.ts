@@ -46,7 +46,7 @@ import type {
   ProcessHandoffResult,
   ProcessPollResult,
   ProcessSpawnRequest,
-  ScratchLeaseRequest, ScratchLease
+  ScratchLeaseRequest, ScratchLease, WebRequest, WebResponse
 } from "./types.js";
 import {
   invokeRepositoryOperation,
@@ -168,6 +168,13 @@ export class OwnedContainerExecutionBroker extends RepositoryExecutionBrokerBase
     this.assertNetwork(request.policy.network);
     const client = await this.attestedClient(options?.signal);
     return await this.guard(() => client.execute(request, options));
+  }
+
+  async webRequest(request: WebRequest, options?: BrokerRequestOptions): Promise<WebResponse> {
+    this.assertNetwork("full");
+    const client = await this.attestedClient(options?.signal);
+    if (!client.webRequest) throw new ContainerUnavailableError("Owned OCI broker Web request capability is unavailable.");
+    return await this.guard(() => client.webRequest!(request, options));
   }
 
   async spawn(request: ProcessSpawnRequest, options?: BrokerRequestOptions): Promise<ProcessHandle> {

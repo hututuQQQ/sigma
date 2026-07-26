@@ -34,7 +34,8 @@ function approvalDecision(
   requested: "allow" | "deny" | "always_allow"
 ): "allow" | "deny" | "always_allow" {
   const perCall = approval.effects.some((effect) => effect === "network" || effect === "open_world");
-  return perCall && requested === "always_allow" ? "allow" : requested;
+  return perCall && requested === "always_allow" && !approval.sessionApprovalGrant
+    ? "allow" : requested;
 }
 
 function installCallGrant(
@@ -58,7 +59,9 @@ function installCallGrant(
     externalReadApproved: approval.effects.includes("filesystem.read.external"),
     processHandoffApproved: approval.effects.includes("process.handoff"),
     openWorldApproved: approval.effects.includes("open_world"),
-    ...(decision === "always_allow"
+    ...(approval.sessionApprovalGrant
+      ? { sessionApprovalGrant: approval.sessionApprovalGrant } : {}),
+    ...(decision === "always_allow" && !approval.sessionApprovalGrant
       ? { alwaysAllowEffectGrant: approval.effects.slice().sort().join("\0") }
       : {})
   });

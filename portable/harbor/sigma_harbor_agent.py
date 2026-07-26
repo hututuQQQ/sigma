@@ -26,6 +26,7 @@ ENV_KEYS = [
     "DEEPSEEK_API_KEY",
     "GLM_API_KEY",
     "ZAI_API_KEY",
+    "EXA_API_KEY",
     "BIGMODEL_API_KEY",
     "DEEPSEEK_BASE_URL",
     "GLM_BASE_URL",

@@ -104,10 +104,11 @@ export class RuntimeInspectionControl {
             typeof value === "string" && value.length > 0)
         : [];
     });
-    const allowed = new Set([
+    const receipts = [
       ...session.durable.state.receipts,
       ...session.durable.state.reviewReceipts.map((item) => item.receipt)
-    ].flatMap((receipt) => [
+    ];
+    const allowed = new Set(receipts.flatMap((receipt) => [
         ...receipt.artifacts,
         ...(receipt.artifactRefs ?? []).map((item) => item.artifactId)
       ]).concat(lifecycleArtifacts));
@@ -122,12 +123,17 @@ export class RuntimeInspectionControl {
     const raw = this.options.readArtifactBytes
       ? await this.options.readArtifactBytes(session.identity.sessionId, input.artifactId)
       : Buffer.from(await this.options.readArtifact(session.identity.sessionId, input.artifactId), "utf8");
-    return this.artifactPage(input, Buffer.from(raw));
+    const external = receipts.some((receipt) =>
+      receipt.contentTrust === "external_untrusted"
+      && (receipt.artifacts.includes(input.artifactId)
+        || (receipt.artifactRefs ?? []).some((item) => item.artifactId === input.artifactId)));
+    return this.artifactPage(input, Buffer.from(raw), external);
   }
 
   private artifactPage(
     input: { artifactId: string; offsetBytes?: number; maxBytes?: number },
-    bytes: Buffer
+    bytes: Buffer,
+    externalUntrusted = false
   ): ArtifactPage {
     const offset = input.offsetBytes === undefined ? 0 : Math.trunc(input.offsetBytes);
     const maximum = input.maxBytes === undefined
@@ -169,7 +175,8 @@ export class RuntimeInspectionControl {
       ...(end < bytes.length ? { nextOffset: end } : {}),
       eof: end >= bytes.length,
       encoding,
-      content
+      content,
+      ...(externalUntrusted ? { contentTrust: "external_untrusted" as const } : {})
     };
   }
 }

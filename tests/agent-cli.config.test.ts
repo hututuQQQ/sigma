@@ -19,6 +19,8 @@ describe("Sigma config", () => {
       permissionMode: "workspace-auto",
       readScope: "workspace",
       networkMode: "full",
+      webMode: "auto",
+      webSearchProvider: "exa",
       processHandoff: "allow",
       commandTimeoutSec: 600,
       explicitSingleModelRoute: false,

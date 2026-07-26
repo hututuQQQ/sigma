@@ -64,6 +64,8 @@ export interface RuntimeCompositionConfig {
   readScope?: "workspace" | "host";
   writeScope?: "workspace" | "enclosing-container";
   networkMode?: "none" | "loopback" | "full";
+  webMode?: "auto" | "disabled";
+  webSearchProvider?: "exa";
   processHandoff?: "allow" | "deny";
   reviewerWaiver?: boolean;
   explicitSingleModelRoute?: boolean;

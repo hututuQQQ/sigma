@@ -98,7 +98,8 @@ export function patchOwnedContainerReport(
     sandbox: { ...report.sandbox, backend: "oci" },
     capabilities: {
       ...report.capabilities,
-      networkModes: report.capabilities.networkModes.filter((mode) => allowed.has(mode))
+      networkModes: report.capabilities.networkModes.filter((mode) => allowed.has(mode)),
+      webRequest: network === "full" && report.capabilities.webRequest === true
     },
     container: {
       available: true,

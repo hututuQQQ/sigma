@@ -51,6 +51,7 @@ describe("agent-config single-source schema", () => {
   it("only lets workspace configuration narrow authority and resource caps", () => {
     const values = resolveConfig({
       home: {
+        web: { mode: "disabled" },
         permissions: { mode: "deny" },
         security: {
           read_scope: "workspace",
@@ -63,6 +64,7 @@ describe("agent-config single-source schema", () => {
         checkpoint: { max_files: 100 }
       },
       workspace: {
+        web: { mode: "auto" },
         permissions: { mode: "auto" },
         security: {
           read_scope: "host",
@@ -78,13 +80,14 @@ describe("agent-config single-source schema", () => {
     });
     expect(values).toMatchObject({
       permissionMode: "deny", readScope: "workspace", writeScope: "workspace",
-      networkMode: "none", processHandoff: "deny",
+      networkMode: "none", webMode: "disabled", processHandoff: "deny",
       maxInputTokens: 1_000, maxToolCalls: 10, commandTimeoutSec: 120,
       checkpointMaxFiles: 100, maxParallelAgents: 2
     });
 
     const narrowed = resolveConfig({
       home: {
+        web: { mode: "auto" },
         permissions: { mode: "auto" },
         security: {
           read_scope: "host",
@@ -95,6 +98,7 @@ describe("agent-config single-source schema", () => {
         budget: { max_input_tokens: 2_000 }
       },
       workspace: {
+        web: { mode: "disabled" },
         permissions: { mode: "ask" },
         security: {
           read_scope: "workspace",
@@ -107,7 +111,7 @@ describe("agent-config single-source schema", () => {
     });
     expect(narrowed).toMatchObject({
       permissionMode: "ask", readScope: "workspace", writeScope: "workspace",
-      networkMode: "none", processHandoff: "deny",
+      networkMode: "none", webMode: "disabled", processHandoff: "deny",
       maxInputTokens: 1_000
     });
 

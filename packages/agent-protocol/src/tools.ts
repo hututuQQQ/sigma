@@ -46,6 +46,8 @@ export interface ToolDescriptor {
   contextPathArguments?: string[];
   writePathArguments?: string[];
   approval: "auto" | "prompt" | "deny";
+  /** Ephemeral, tool-scoped grant installed only for the current runtime session. */
+  sessionApprovalGrant?: "web.read";
   idempotent: boolean;
   timeoutMs: number;
   idleTimeoutMs?: number;
@@ -75,6 +77,11 @@ export interface ToolCallPlan {
    * every sandbox-authorized write recoverable. */
   writePaths: string[];
   network: "none" | "loopback" | "full";
+  /** Canonical network authority bound into approval for broker-owned requests. */
+  networkTargets?: Array<{
+    origin: string;
+    method: "GET" | "POST";
+  }>;
   processMode: "none" | "pipe" | "pty" | "background";
   /** Complete rollback scope for the call. For process tools this is also the
    * maximum filesystem scope granted write access by the execution broker. */
@@ -125,6 +132,8 @@ export interface ToolReceipt {
   workspaceDelta?: WorkspaceDelta;
   artifacts: string[];
   artifactRefs?: ArtifactRef[];
+  /** Marks the receipt projection as data that cannot provide instructions. */
+  contentTrust?: "external_untrusted";
   diagnostics: string[];
   evidence: EvidenceRecord[];
   startedAt: string;
@@ -246,6 +255,7 @@ export interface ArtifactPage {
   eof: boolean;
   encoding: "utf8" | "base64";
   content: string;
+  contentTrust?: "external_untrusted";
 }
 
 export interface ReviewRequestResult {

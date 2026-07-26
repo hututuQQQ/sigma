@@ -84,6 +84,8 @@ export interface ApprovalWaiter {
   effects: readonly ToolEffect[];
   /** Exact durable authority shown to the user for this request. */
   binding?: ApprovalBinding;
+  /** Tool-scoped authority requested for this live session only. */
+  sessionApprovalGrant?: "web.read";
   /** Marks an approval reconstructed from the current durable event log. */
   recovered?: boolean;
   resolving?: boolean;
@@ -98,6 +100,8 @@ export interface ApprovalWaiter {
 export interface CallApprovalGrant extends ToolCallApproval, ApprovalBinding {
   /** Committed to the session effect policy only after this exact grant is consumed. */
   alwaysAllowEffectGrant?: string;
+  /** Installed only after this exact approved call reaches the execution gate. */
+  sessionApprovalGrant?: "web.read";
 }
 
 export interface QueuedFollowUp {
@@ -166,6 +170,8 @@ export interface RuntimeSessionInteractionState {
   /** One-shot grants, bound to a call and intentionally not restored. */
   callApprovals: Map<string, CallApprovalGrant>;
   alwaysAllowedEffects: Set<string>;
+  /** Ephemeral and intentionally absent from durable recovery state. */
+  sessionApprovalGrants: Set<"web.read">;
   steeringPending: number;
   followUps: QueuedFollowUp[];
   contextItems: ContextItem[];

@@ -12,6 +12,7 @@
     { "path": "./packages/agent-model" },
     { "path": "./packages/agent-extensions" },
     { "path": "./packages/agent-store" },
+    { "path": "./packages/agent-web" },
     { "path": "./packages/agent-tools" },
     { "path": "./packages/agent-supervisor" },
     { "path": "./packages/agent-kernel" },

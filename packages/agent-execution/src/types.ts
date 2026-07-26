@@ -1,8 +1,6 @@
-import type {
-  BrokerEnclosingContainerRootCapability,
-  BrokerManagedEnvironmentCapability,
-  BrokerVerifiedShell
-} from "./broker-capability-types.js";
+import type { BrokerEnclosingContainerRootCapability, BrokerManagedEnvironmentCapability, BrokerVerifiedShell } from "./broker-capability-types.js";
+import type { BrokerRequestOptions } from "./request-types.js";
+import type { WebRequest, WebResponse } from "./web-types.js";
 
 export const BROKER_PROTOCOL_VERSION = 1 as const;
 export const DEFAULT_MAX_FRAME_BYTES = 8 * 1024 * 1024;
@@ -166,6 +164,8 @@ export interface BrokerCapabilities {
   pty: boolean;
   processHandoff?: boolean;
   networkModes: NetworkPolicy[];
+  /** Broker-owned, DNS-pinned public Web transport. Omission means unavailable. */
+  webRequest?: boolean;
   /** The broker enforces read/execute-only roots independently from workspace roots. */
   executionRoots?: boolean;
   /** Shells listed here have passed the native sandbox self-test. */
@@ -272,11 +272,6 @@ export interface WindowsAppContainerNodeCompatibilityProof {
   executableSha256: string;
 }
 
-export interface BrokerRequestOptions {
-  signal?: AbortSignal;
-  timeoutMs?: number;
-}
-
 export interface ExecutionBroker extends RepositoryExecutionBroker {
   readonly lostProcessHandles: readonly ProcessHandle[];
   connect(signal?: AbortSignal): Promise<BrokerDoctorReport>;
@@ -301,6 +296,10 @@ export interface ExecutionBroker extends RepositoryExecutionBroker {
     request: ManagedEnvironmentPrepareRequest,
     options?: BrokerRequestOptions
   ): Promise<ManagedEnvironmentPrepareResult>;
+  webRequest?(
+    request: WebRequest,
+    options?: BrokerRequestOptions
+  ): Promise<WebResponse>;
   execute(request: ExecutionRequest, options?: BrokerRequestOptions): Promise<ExecutionResult>;
   spawn(request: ProcessSpawnRequest, options?: BrokerRequestOptions): Promise<ProcessHandle>;
   poll(handle: ProcessHandle, options?: BrokerRequestOptions): Promise<ProcessPollResult>;
@@ -397,3 +396,5 @@ export type {
   ManagedEnvironmentPrepareResult,
   RuntimeDependencyObservation
 } from "./managed-environment-types.js";
+export type { BrokerRequestOptions } from "./request-types.js";
+export type { WebNetworkTarget, WebRequest, WebResponse } from "./web-types.js";

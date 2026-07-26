@@ -22,6 +22,7 @@ import {
 } from "./repository-tools.js";
 import { workspaceTextTools } from "./workspace-text-tools.js";
 import { environmentPrepareTool } from "./managed-environment-tool.js";
+import { webRunTool, type WebRunToolOptions } from "./web-run-tool.js";
 
 function deleteFileTool(): RegisteredEffectTool {
   return {
@@ -130,6 +131,7 @@ export interface BuiltinToolOptions extends Partial<Omit<ExecutionToolOptions, "
   repositoryTextSearch?: RepositoryTextSearchProvider;
   /** Durable external root used for atomic write/edit/apply_patch recovery. */
   atomicPatchStateRootDir?: string;
+  web?: Omit<WebRunToolOptions, "broker">;
 }
 
 function builtinExecutionOptions(options: BuiltinToolOptions): ExecutionToolOptions {
@@ -184,7 +186,9 @@ export function registerBuiltinTools(
       list: options.repositoryList,
       statistics: options.repositoryStatistics,
       textSearch: options.repositoryTextSearch
-    })
+    }),
+    ...(options.web && options.broker?.webRequest
+      ? [webRunTool({ broker: options.broker, ...options.web })] : [])
   ]) registry.register(tool);
   return registerControlTools(registerCompletionTool(registry));
 }

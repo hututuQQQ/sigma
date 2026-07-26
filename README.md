@@ -123,6 +123,7 @@ For read-only analysis:
 - **Repository intelligence:** bounded file listing and grep, repository statistics, Git status/diff, stable hash-aware workspace and declared host-input reads, nested `AGENTS.md` discovery, and LSP-backed code intelligence when a supported server is available.
 - **Scoped changes:** write and edit files, apply atomic multi-file patches, delete individual files, detect no-op writes, create mutation checkpoints, and restore the current run's latest sealed checkpoint.
 - **Sandboxed execution:** run direct executables or platform shells, execute semantic validation, manage background/PTY processes through broker-scoped session handles, and explicitly hand off verified Linux deliverable services.
+- **Read-only Web research:** use `web_run` (`web.run` in documentation) to search, open, find, and follow numbered static links. Results retain durable references and are always marked as untrusted external content.
 - **Evidence-based delivery:** record workspace deltas, commands, validation, diagnostics, reviews, child outcomes, and checkpoints in one typed evidence ledger.
 - **Durable sessions:** list, inspect, replay, resume, cancel, steer, approve, and continue sessions after a process interruption.
 - **Child agents:** delegate plan nodes to bounded child sessions; isolate writers in Git worktrees or narrow single-writer scopes, then explicitly integrate retained changes.
@@ -179,7 +180,7 @@ This separation makes replay and recovery part of the normal execution model ins
 | Contracts | `agent-protocol`, `agent-config` | Events, commands, outcomes, ports, tool effects, model capabilities, and the shared CLI/env/TOML schema. |
 | Decision engine | `agent-kernel` | Pure state reduction, convergence rules, terminal protocol repair, and effect selection. |
 | Intelligence | `agent-model`, `agent-context`, `agent-code-intel`, `agent-extensions` | Provider streaming, context fitting/compaction, repository instructions, LSP, skills, profiles, and hooks. |
-| Capabilities | `agent-tools`, `agent-mcp` | Repository/file/process/control/supervisor tools and the MCP bridge, all behind declared effects. |
+| Capabilities | `agent-tools`, `agent-web`, `agent-mcp` | Repository/file/process/control/supervisor tools, brokered Web research, and the MCP bridge, all behind declared effects. |
 | Safety boundary | `agent-execution`, `agent-platform`, `agent-checkpoint`, `native/sigma-exec` | Path containment, process policy, native sandboxing, output redaction/artifacts, and transactional recovery. |
 | Durability and coordination | `agent-store`, `agent-supervisor`, `agent-runtime` | Event persistence, snapshots, session ownership, child isolation, recovery, review, and composition. |
 | Product surfaces | `agent-presentation`, `agent-tui`, `agent-cli` | Event projection, terminal interaction, automation commands, session administration, and diagnostics. |
@@ -194,12 +195,19 @@ The production package dependency graph is checked for cycles and packages commu
 
 Configuration schema 1 defaults to `permission_mode=workspace-auto`,
 `sandbox=required`, `read_scope=workspace`, `network=full`,
-`process_handoff=allow`, and the native sandbox backend. Workspace-scoped reads
+`web.mode=auto`, `process_handoff=allow`, and the native sandbox backend. Workspace-scoped reads
 and declared writes run automatically; external reads, full-network calls, and
 repository metadata writes remain separately authorized. An explicit
 `network=none` or `network=loopback` setting narrows the capability. Required
 isolation never falls back to host execution, and `container` mode fails with
 `container_unavailable` until a real OCI backend is installed.
+
+`web_run` is exposed only when full network access is enabled, Web mode is not
+disabled, and the connected broker advertises the restricted Web protocol. Its
+session grant is scoped to read-only Web access and cannot authorize shell,
+process, or MCP networking. The broker permits public HTTP(S) ports 80/443,
+binds every request to an approved origin and method, and rejects local,
+private, reserved, credential-bearing, or active browser content.
 
 Absolute external inputs are read through stable no-follow traversal and produce `input_access` evidence with path, digest, and size. Process calls mount only their declared stable read roots. A failed goal input remains an unresolved completion obligation until the same external path is read successfully; a run-created fixture cannot replace it.
 
@@ -305,6 +313,10 @@ read_scope = "workspace"
 network = "full"
 process_handoff = "allow"
 
+[web]
+mode = "auto"
+search_provider = "exa"
+
 [runtime]
 run_deadline_sec = 900
 model_deadline_sec = 120
@@ -340,7 +352,7 @@ configuration migration command and does not read another durable store layout.
 Back up or move incompatible state yourself; rejection is deliberately
 read-only.
 
-DeepSeek uses `DEEPSEEK_API_KEY`. The runtime also recognizes `GLM_API_KEY`, `ZAI_API_KEY`, or `BIGMODEL_API_KEY` for the experimental GLM/Z.ai path. A provider is part of a formal claim only when it is frozen in that run's preregistration.
+DeepSeek uses `DEEPSEEK_API_KEY`. The runtime also recognizes `GLM_API_KEY`, `ZAI_API_KEY`, or `BIGMODEL_API_KEY` for the experimental GLM/Z.ai path. Web search uses the [Exa hosted MCP service](https://exa.ai/docs/reference/exa-mcp); `EXA_API_KEY` is optional, and a 429 response tells the operator to configure it without silently changing providers. A provider is part of a formal claim only when it is frozen in that run's preregistration.
 
 ## Evaluation and benchmark boundary
 
@@ -380,6 +392,9 @@ cargo build --release --locked --manifest-path native/sigma-exec/Cargo.toml
 
 pnpm lint
 pnpm test:coverage
+
+# Requires a packaged CLI, a model-provider key, and live network access.
+pnpm smoke:web:live
 ```
 
 Build and verify the current Windows preview candidate:
@@ -393,6 +408,8 @@ After packaging, put the development key in the repository-local, gitignored `.e
 
 ```dotenv
 DEEPSEEK_API_KEY=your-api-key
+# Optional; the hosted Exa MCP endpoint can be used without it.
+EXA_API_KEY=your-exa-key
 ```
 
 Then launch the development TUI:

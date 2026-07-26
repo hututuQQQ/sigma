@@ -22,6 +22,7 @@ import { positiveInteger, requestParams } from "./broker-request-policy.js";
 import { SecretRedactor } from "./redaction.js";
 import { normalizeTrustedToolchains, type NormalizedTrustedToolchain } from "./trusted-toolchains.js";
 import { requestManagedEnvironmentPreparation } from "./broker-client-managed-environment.js";
+import { requestBrokerWeb } from "./broker-client-web.js";
 import {
   BrokerRepositoryEnvironmentClient,
   invokeBrokerClientRepositoryOperation
@@ -31,10 +32,9 @@ import {
   type RepositoryOperationMethod
 } from "./repository-execution-broker-base.js";
 import type { BrokerDoctorReport, BrokerRequestOptions, BrokerSandboxLeaseStatus, BrokerSandboxRevokeResult,
-  ExecutionBroker, ExecutionRequest, ExecutionResult, ProcessHandle, ProcessHandoffResult,
-  ManagedEnvironmentPrepareRequest, ManagedEnvironmentPrepareResult,
-  ProcessPollResult, ProcessSpawnRequest, ScratchLeaseRequest, ScratchLease,
-  SigmaExecBrokerClientOptions } from "./types.js";
+  ExecutionBroker, ExecutionRequest, ExecutionResult, ProcessHandle, ProcessHandoffResult, ManagedEnvironmentPrepareRequest, ManagedEnvironmentPrepareResult,
+  ProcessPollResult, ProcessSpawnRequest, ScratchLeaseRequest, ScratchLease, SigmaExecBrokerClientOptions,
+  WebRequest, WebResponse } from "./types.js";
 import { parseProcessHandoff, parseProcessValue, parseSpawnedProcess } from "./values.js";
 export class SigmaExecBrokerClient extends RepositoryExecutionBrokerBase implements ExecutionBroker {
   private readonly transport: BrokerTransport;
@@ -217,6 +217,7 @@ export class SigmaExecBrokerClient extends RepositoryExecutionBrokerBase impleme
       close: async () => await this.close()
     }, request, options);
   }
+  async webRequest(request: WebRequest, options: BrokerRequestOptions = {}): Promise<WebResponse> { this.assertReady(); return await requestBrokerWeb(this.transport, this.redactor, request, options); }
   async spawn(request: ProcessSpawnRequest, options: BrokerRequestOptions = {}): Promise<ProcessHandle> {
     this.assertReady();
     assertRequestSandbox(request.policy, this.doctorValue);

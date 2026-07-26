@@ -54,6 +54,7 @@ export async function hydrateRuntimeSession(
     }])),
     callApprovals: new Map(),
     alwaysAllowedEffects: new Set(),
+    sessionApprovalGrants: new Set(),
     processHandles: new Map(),
     steeringPending: 0,
     followUps,

@@ -44,13 +44,16 @@ export function semanticApprovalReason(
   effects: readonly ToolEffect[],
   plan: ToolCallPlan,
   backend: "native" | "oci",
-  automatic = false
+  automatic = false,
+  sessionApprovalGrant?: ToolDescriptor["sessionApprovalGrant"]
 ): string {
   const risk = approvalRisk(effects, plan);
   const read = plan.readPaths.join(", ") || "none";
   const write = plan.writePaths.join(", ") || "none";
   return `command=${approvalCommand(call)}; read=${read}; write=${write}; network=${plan.network}; `
-    + `backend=${backend}; risk=${risk.level} (${risk.reason})${automatic ? "; decision=automatic" : ""}`;
+    + `backend=${backend}; risk=${risk.level} (${risk.reason})`
+    + `${sessionApprovalGrant ? "; enable=read-only Web for this runtime session" : ""}`
+    + `${automatic ? "; decision=automatic" : ""}`;
 }
 
 export function requiresPerCallApproval(plan: ToolCallPlan): boolean {
@@ -99,6 +102,10 @@ export function immediateApprovalDecision(
   if (mandatory) return mandatory;
   const perCall = requiresPerCallApproval(plan);
   const effectGrant = effects.slice().sort().join("\0");
+  if (descriptor.sessionApprovalGrant
+    && session.interaction.sessionApprovalGrants.has(descriptor.sessionApprovalGrant)) {
+    return "allow";
+  }
   if (permissionMode === "auto" && !effects.includes("open_world")) return "allow";
   if (permissionMode === "workspace-auto" && !perCall) return "allow";
   return !perCall && (descriptor.approval === "auto"
