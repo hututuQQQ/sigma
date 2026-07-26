@@ -79,6 +79,8 @@ describe("session model-tool capability projection", () => {
     expect(modelProperties).not.toHaveProperty("access");
     expect(modelProperties).not.toHaveProperty("writeRoots");
     expect(modelProperties).toHaveProperty("expectedChanges");
+    expect((modelProperties as Record<string, unknown>).expectedChanges)
+      .not.toHaveProperty("minItems");
     expect(modelProperties).not.toHaveProperty("purpose");
     expect(modelProperties).not.toHaveProperty("subjects");
     expect(modelProperties).not.toHaveProperty("criterionIds");

@@ -134,7 +134,7 @@ export function writeContractProperties(
         : "Existing sandbox ACL root directories. When omitted with expectedChanges, the nearest existing workspace directories are inferred."
     },
     expectedChanges: {
-      type: "array", items: { type: "string" }, minItems: 1, uniqueItems: true,
+      type: "array", items: { type: "string" }, uniqueItems: true,
       description: enclosing
         ? "Exact files or narrow paths approved to change. Use canonical absolute paths for enclosing-container changes. External changes persist only for the disposable task container and are independently reviewed."
         : "Exact workspace files or narrow directories this command may create, modify, or delete. Supplying this field alone grants only that write scope; new parent directories are implicit and other changes are rolled back."

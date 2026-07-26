@@ -658,6 +658,28 @@ describe("typed workspace mutation contracts", () => {
     });
   });
 
+  it("treats an empty optional expectedChanges declaration as readonly", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-empty-expected-"));
+    const fixture = brokerFixture();
+    const tools = registerBuiltinTools(new EffectToolRegistry(), {
+      broker: fixture.broker,
+      shells: [process.platform === "win32" ? "cmd" : "bash"]
+    });
+    const shell = tools.modelDescriptors().find((item) => item.name === "shell");
+    const properties = shell?.inputSchema.properties as
+      | Record<string, Record<string, JsonValue>>
+      | undefined;
+
+    expect(properties?.expectedChanges).not.toHaveProperty("minItems");
+    const plan = await tools.prepare(request("empty-expected", "shell", {
+      command: "version",
+      expectedChanges: []
+    }), preparation(workspace));
+    expect(plan.writePaths).toEqual([]);
+    expect(plan.checkpointScope).toEqual([]);
+    expect(plan.exactEffects).not.toContain("filesystem.write");
+  });
+
   it("rejects a write root that changes to a link after its plan is approved", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-plan-drift-"));
     const authorized = path.join(workspace, "authorized");
