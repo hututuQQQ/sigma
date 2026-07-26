@@ -1647,7 +1647,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
       && (event.payload as { diagnostics?: string[] }).diagnostics?.includes("nested_instructions_require_replan"))).toHaveLength(2);
   }, 30_000);
 
-  it("returns a path failure receipt and continues after an instruction preload escape", async () => {
+  it("lets the read tool deny an external path after instruction discovery skips it", async () => {
     const container = await mkdtemp(path.join(os.tmpdir(), "sigma-path-recovery-"));
     const workspace = path.join(container, "workspace");
     const outside = path.join(container, "outside");
@@ -1691,9 +1691,66 @@ describe("runtime queues and non-blocking instruction steering", () => {
     const events = await storedEvents(store, session.sessionId);
     expect(events.some((event) => event.type === "tool.failed"
       && (event.payload as { callId?: string; diagnostics?: string[] }).callId === "escape-read"
-      && (event.payload as { diagnostics?: string[] }).diagnostics?.includes("path_escape"))).toBe(true);
+      && (event.payload as { diagnostics?: string[] }).diagnostics?.includes("policy_denied"))).toBe(true);
     expect(events.some((event) => event.type === "tool.completed"
       && (event.payload as { callId?: string }).callId === "valid-read")).toBe(true);
+    await rm(container, { recursive: true, force: true });
+  });
+
+  it("allows an approved external read after instruction discovery skips it", async () => {
+    const container = await mkdtemp(path.join(os.tmpdir(), "sigma-external-read-"));
+    const workspace = path.join(container, "workspace");
+    const outside = path.join(container, "outside");
+    await mkdir(workspace);
+    await mkdir(outside);
+    const externalPath = path.join(outside, "input.txt");
+    await writeFile(externalPath, "external input\n", "utf8");
+
+    const gateway = new ScriptedGateway([
+      {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{
+            id: "external-read",
+            name: "read",
+            arguments: { path: externalPath }
+          }]
+        },
+        finishReason: "tool_calls"
+      },
+      completion("external read completed")
+    ]);
+    const storeRootDir = path.join(workspace, ".agent");
+    const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
+    const runtime = createRuntime({
+      gateway,
+      store,
+      storeRootDir,
+      tools: registerBuiltinTools(new EffectToolRegistry(), {
+        readScope: "host"
+      }),
+      permissionMode: "auto",
+      runDeadlineMs: 60_000
+    });
+    const session = await runtime.createSession({
+      workspacePath: workspace,
+      mode: "analyze"
+    });
+
+    await runtime.command({
+      type: "submit",
+      sessionId: session.sessionId,
+      text: "read the supplied external input"
+    });
+    await expect(runtime.waitForOutcome(session.sessionId))
+      .resolves.toMatchObject({ kind: "completed" });
+
+    const events = await storedEvents(store, session.sessionId);
+    expect(events.some((event) => event.type === "tool.completed"
+      && (event.payload as { callId?: string }).callId === "external-read")).toBe(true);
+    expect(events.some((event) => event.type === "tool.failed"
+      && (event.payload as { callId?: string }).callId === "external-read")).toBe(false);
     await rm(container, { recursive: true, force: true });
   });
 

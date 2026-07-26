@@ -201,7 +201,8 @@ export async function assertTransactionIsolationPlanAllowed(
   session: RuntimeSession,
   plan: ToolCallPlan
 ): Promise<void> {
-  if (plan.mutationAuthority === "disposable_enclosing_container") return;
+  if (plan.mutationAuthority === "disposable_enclosing_container"
+    && !plan.checkpointScope.some((item) => !path.isAbsolute(item))) return;
   const scope = activeConflictScope(session);
   if (scope?.length && plan.exactEffects.includes("filesystem.write")
     && !plan.exactEffects.includes("repository.write")) {
@@ -307,20 +308,40 @@ function receiptChangedPaths(receipt: ToolReceipt): ReceiptChangedPath[] {
   ];
 }
 
-function assertEnclosingReceiptWithinPlan(
+async function assertEnclosingReceiptWithinPlan(
+  session: RuntimeSession,
   outside: readonly string[],
   changedPaths: readonly ReceiptChangedPath[],
   plan: ToolCallPlan
-): void {
-  const declared = [...plan.writePaths, ...plan.checkpointScope];
-  const nonAbsolute = declared.some((item) => !path.isAbsolute(item));
-  if (outside.length === 0 && changedPaths.length === 0 && !nonAbsolute) return;
+): Promise<void> {
+  const workspaceWritePaths = plan.writePaths.filter((item) => !path.isAbsolute(item));
+  const workspaceCheckpointScope = plan.checkpointScope.filter((item) => !path.isAbsolute(item));
+  const malformedWorkspacePlan =
+    (workspaceWritePaths.length === 0) !== (workspaceCheckpointScope.length === 0);
+  const plannedWorkspacePaths = workspaceWritePaths.length > 0
+    ? workspaceWritePaths : workspaceCheckpointScope;
+  const allowedResults = await Promise.all(plannedWorkspacePaths.map(async (item) =>
+    await canonicalWrittenObjectPath(session.identity.workspacePath, item)));
+  const invalidAllowed = plannedWorkspacePaths.filter((_item, index) => !allowedResults[index]);
+  const allowed = allowedResults.filter((item): item is string => Boolean(item));
+  const outsidePaths = workspaceCheckpointScope.length > 0
+    ? await workspacePathsOutsidePlan(session, changedPaths, allowed)
+    : changedPaths.map((item) => item.path);
+  if (outside.length === 0
+    && outsidePaths.length === 0
+    && invalidAllowed.length === 0
+    && !malformedWorkspacePlan) return;
   const details = [
     ...(outside.length > 0 ? [`effects: ${outside.join(", ")}`] : []),
-    ...(changedPaths.length > 0
-      ? [`protected workspace paths changed: ${changedPaths.map((item) => item.path).join(", ")}`]
+    ...(outsidePaths.length > 0
+      ? [`workspace paths: ${outsidePaths.join(", ")}`]
       : []),
-    ...(nonAbsolute ? ["enclosing-container paths were not absolute"] : [])
+    ...(invalidAllowed.length > 0
+      ? [`invalid approved workspace paths: ${invalidAllowed.join(", ")}`]
+      : []),
+    ...(malformedWorkspacePlan
+      ? ["workspace write paths and checkpoint scope were inconsistent"]
+      : [])
   ];
   throw Object.assign(new Error(
     `Tool observed effects outside its approved enclosing-container plan (${details.join("; ")}).`
@@ -357,7 +378,7 @@ export async function assertReceiptWithinPlan(
   const outside = effectsOutsidePlan(receipt, plan);
   const changedPaths = receiptChangedPaths(receipt);
   if (plan.mutationAuthority === "disposable_enclosing_container") {
-    assertEnclosingReceiptWithinPlan(outside, changedPaths, plan);
+    await assertEnclosingReceiptWithinPlan(session, outside, changedPaths, plan);
     return;
   }
   const plannedWritePaths = plan.writePaths.length > 0

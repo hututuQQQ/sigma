@@ -20,7 +20,9 @@ type ForegroundExecutor = (
   kind: "shell",
   options: ExecutionToolOptions,
   request: ToolRequest,
-  context: PlannedToolExecutionContext
+  context: PlannedToolExecutionContext,
+  allowEnclosingContainerDeliverable?: boolean,
+  environmentExpectedChanges?: JsonValue
 ) => Promise<ToolReceipt>;
 
 function networkProperty(options: ExecutionToolOptions): JsonValue {
@@ -101,19 +103,29 @@ export function environmentShellTools(
       ),
       brokerMutationAuthority: "disposable_enclosing_container",
       async prepare(value, context) {
-        const input = environmentShellArguments(value, context.workspacePath);
+        const raw = executionArgs(value);
+        const input = environmentShellArguments(raw, context.workspacePath);
         assertAvailableShell(input, options);
-        return await prepareExecutionCallPlan(input, context, options);
+        return await prepareExecutionCallPlan(
+          input,
+          context,
+          options,
+          false,
+          false,
+          false,
+          raw.expectedChanges
+        );
       }
     },
     async execute(request, context) {
+      const raw = executionArgs(request.arguments);
       return await executeForeground("shell", options, {
         ...request,
         arguments: environmentShellArguments(
-          request.arguments,
+          raw,
           context.workspacePath
         )
-      }, context);
+      }, context, false, raw.expectedChanges);
     }
   }];
 }

@@ -454,6 +454,49 @@ describe("typed workspace mutation contracts", () => {
       protectedPaths: expect.arrayContaining([workspace, protectedState])
     });
     expect(fixture.executions[0]?.policy.scratchLease).toBeUndefined();
+
+    const deliverable = path.join(workspace, "generated", "artifact.txt");
+    const hybridCall = request("prepare-environment-and-deliverable", "shell", {
+      command: "prepare environment and generate artifact",
+      target: "environment",
+      expectedChanges: [deliverable]
+    });
+    const hybridPlan = await tools.prepare(hybridCall, preparation(workspace));
+    expect(hybridPlan).toMatchObject({
+      mutationAuthority: "disposable_enclosing_container",
+      writePaths: [filesystemRoot, "generated/artifact.txt"],
+      checkpointScope: [filesystemRoot, "."]
+    });
+    await expect(tools.execute(hybridCall, {
+      ...execution(workspace),
+      callPlan: hybridPlan,
+      approval: {
+        callId: hybridCall.callId,
+        authority: "runtime",
+        networkApproved: false,
+        externalReadApproved: true,
+        processHandoffApproved: false,
+        openWorldApproved: false
+      }
+    })).resolves.toMatchObject({ ok: true });
+    expect(fixture.executions).toHaveLength(2);
+    expect(fixture.executions[1]?.policy).toMatchObject({
+      enclosingContainerRoot: true,
+      writeRoots: [filesystemRoot],
+      protectedPaths: expect.arrayContaining([
+        path.join(workspace, ".git"),
+        path.join(workspace, ".agent"),
+        protectedState
+      ])
+    });
+    expect(fixture.executions[1]?.policy.protectedPaths).not.toContain(workspace);
+
+    await expect(tools.prepare(request("background-hybrid", "shell", {
+      command: "start environment service",
+      target: "environment",
+      background: true,
+      expectedChanges: [deliverable]
+    }), preparation(workspace))).rejects.toMatchObject({ code: "policy_denied" });
   });
 
   it("does not expose environment_shell without the complete attested boundary", () => {

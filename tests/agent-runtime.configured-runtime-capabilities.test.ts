@@ -437,10 +437,16 @@ describe("configured runtime execution capabilities", () => {
         .map((message) => message.content)
         .join("\n");
       expect(runtimeContext).toContain(
-        "use shell with target=environment for system-level changes"
+        "use shell with target=environment for commands that need system-level changes"
       );
       expect(runtimeContext).toContain(
-        "add background=true only for a service"
+        "foreground environment command may also change explicitly declared workspace expectedChanges"
+      );
+      expect(runtimeContext).toContain(
+        "Add background=true only for a service"
+      );
+      expect(runtimeContext).toContain(
+        "background environment commands cannot write the workspace"
       );
 
       const analyzeSession = await configuredRuntime.runtime.createSession({

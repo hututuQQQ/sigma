@@ -99,6 +99,15 @@ function modelForegroundInputSchema(
   // for durable recovery, but do not ask the model to coordinate all three.
   delete properties.access;
   delete properties.writeRoots;
+  if (properties.expectedChanges
+    && typeof properties.expectedChanges === "object"
+    && !Array.isArray(properties.expectedChanges)) {
+    properties.expectedChanges = {
+      ...properties.expectedChanges,
+      description:
+        "Exact workspace files or narrow directories this command may create, modify, or delete. With target=environment, these paths remain checkpointed while the same command changes the broker-attested disposable outer environment."
+    };
+  }
   return { ...schema, properties };
 }
 
@@ -111,6 +120,7 @@ interface ForegroundExecution {
   shellCommand: boolean;
   skillResource: LoadedSkillResourceAccess | undefined;
   approvedPlan: ToolCallPlan;
+  environmentExpectedChanges?: JsonValue;
   startedAt: string;
 }
 
@@ -118,7 +128,8 @@ async function executePinnedForeground(
   execution: ForegroundExecution
 ): Promise<ToolReceipt> {
   const {
-    options, request, context, input, validation, shellCommand, startedAt
+    options, request, context, input, validation, shellCommand,
+    environmentExpectedChanges, startedAt
   } = execution;
   let { skillResource, approvedPlan } = execution;
   const readLock = await pinProcessReadRoots(context, approvedPlan);
@@ -128,7 +139,14 @@ async function executePinnedForeground(
   try {
     skillResource = await revalidateSkillResource(input, context, skillResource);
     approvedPlan = await approvedProcessPlan(
-      input, context, options, skillResource, validation
+      input,
+      context,
+      options,
+      skillResource,
+      validation,
+      false,
+      false,
+      environmentExpectedChanges
     );
     const cwd = await resolveWorkspacePath(
       context.workspacePath,
@@ -137,7 +155,14 @@ async function executePinnedForeground(
     mutationLock = await lockWindowsMutationRoots(context, approvedPlan);
     if (mutationLock) {
       approvedPlan = await approvedProcessPlan(
-        input, context, options, skillResource, validation
+        input,
+        context,
+        options,
+        skillResource,
+        validation,
+        false,
+        false,
+        environmentExpectedChanges
       );
     }
     const writeRoots = validation ? [] : await resolvedWriteRoots(context, approvedPlan);
@@ -180,7 +205,8 @@ export async function executeForegroundCommand(
   options: ExecutionToolOptions,
   request: ToolRequest,
   context: PlannedToolExecutionContext,
-  allowEnclosingContainerDeliverable = false
+  allowEnclosingContainerDeliverable = false,
+  environmentExpectedChanges?: JsonValue
 ): Promise<ToolReceipt> {
   const startedAt = new Date().toISOString();
   const input = executionArgs(request.arguments);
@@ -193,12 +219,20 @@ export async function executeForegroundCommand(
       context,
       allowEnclosingContainerDeliverable,
       true,
-      startedAt
+      startedAt,
+      environmentExpectedChanges
     );
   }
   const skillResource = await loadedSkillResource(input, context.runtimeControl, "execute");
   const approvedPlan = await approvedProcessPlan(
-    input, context, options, skillResource, validation
+    input,
+    context,
+    options,
+    skillResource,
+    validation,
+    false,
+    false,
+    environmentExpectedChanges
   );
   return await executePinnedForeground({
     options,
@@ -209,6 +243,7 @@ export async function executeForegroundCommand(
     shellCommand,
     skillResource,
     approvedPlan,
+    environmentExpectedChanges,
     startedAt
   });
 }
@@ -243,7 +278,8 @@ function foregroundTool(kind: "exec" | "shell" | "validate", options: ExecutionT
           options,
           validation || invocationMode.validation,
           invocationMode.background,
-          allowEnclosingContainerDeliverable
+          allowEnclosingContainerDeliverable,
+          allowEnclosingContainerDeliverable ? raw.expectedChanges : undefined
         );
       }
     },
@@ -261,7 +297,8 @@ function foregroundTool(kind: "exec" | "shell" | "validate", options: ExecutionT
           )
         },
         context,
-        allowEnclosingContainerDeliverable
+        allowEnclosingContainerDeliverable,
+        allowEnclosingContainerDeliverable ? raw.expectedChanges : undefined
       );
     }
   };

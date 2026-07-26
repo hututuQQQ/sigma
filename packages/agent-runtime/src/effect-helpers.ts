@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { lstat, readFile, stat } from "node:fs/promises";
+import path from "node:path";
 import {
   type JsonValue, type ModelGateway, type ModelToolCall, type ModelToolDefinition,
   type ToolCallPlan, type ToolDescriptor, type ToolReceipt, type WorkspaceDelta
@@ -175,7 +176,20 @@ export async function writeScopeFailure(
   startedAt: string,
   plan?: ToolCallPlan
 ): Promise<ToolReceipt | null> {
-  if (plan?.mutationAuthority === "disposable_enclosing_container") return null;
+  if (plan?.mutationAuthority === "disposable_enclosing_container") {
+    const workspaceWritePaths =
+      plan.writePaths.filter((item) => !path.isAbsolute(item));
+    const workspaceCheckpointScope =
+      plan.checkpointScope.filter((item) => !path.isAbsolute(item));
+    if (workspaceWritePaths.length === 0
+      && workspaceCheckpointScope.length === 0) return null;
+    plan = {
+      ...plan,
+      writePaths: workspaceWritePaths,
+      checkpointScope: workspaceCheckpointScope,
+      mutationAuthority: undefined
+    };
+  }
   if (!session.identity.strictWriteScope || !needsWriteScope(plan, descriptor)) return null;
   const input = structuredArguments(call);
   if (!input) return failed(call, startedAt, "Scoped writer tools require structured path arguments.", "write_scope_denied");

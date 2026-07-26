@@ -281,17 +281,20 @@ export class ToolBatchCoordinator {
     call: ModelToolCall,
     descriptor: ToolDescriptor
   ): Promise<{ loaded: boolean; failure?: ToolReceipt }> {
-    let discovered;
-    try {
-      discovered = await Promise.all(requestTargets(call, descriptor).map(async (targetPath) =>
-        await loadNestedInstructions({ workspacePath: session.identity.workspacePath, targetPath })));
-    } catch (error) {
-      if ((error as { code?: unknown })?.code !== "path_escape") throw error;
-      return {
-        loaded: false,
-        failure: failed(call, new Date().toISOString(), error instanceof Error ? error.message : String(error), "path_escape")
-      };
-    }
+    const discovered = await Promise.all(requestTargets(call, descriptor).map(async (targetPath) => {
+      try {
+        return await loadNestedInstructions({
+          workspacePath: session.identity.workspacePath,
+          targetPath
+        });
+      } catch (error) {
+        // Nested AGENTS.md discovery is workspace-scoped. External absolute
+        // paths are still decided by the selected tool's own read policy and
+        // fresh approval, so instruction preloading must not preempt it.
+        if ((error as { code?: unknown })?.code === "path_escape") return [];
+        throw error;
+      }
+    }));
     const unseen = discovered.flat().filter((item) => !session.interaction.loadedContextIds.has(item.id));
     for (const item of unseen) {
       session.interaction.loadedContextIds.add(item.id);

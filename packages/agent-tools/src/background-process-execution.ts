@@ -49,7 +49,8 @@ async function approvedBackgroundPlan(
   context: PlannedToolExecutionContext,
   options: ExecutionToolOptions,
   skillResource: LoadedSkillResourceAccess | undefined,
-  allowEnclosingContainerDeliverable: boolean
+  allowEnclosingContainerDeliverable: boolean,
+  environmentExpectedChanges?: JsonValue
 ): Promise<ToolCallPlan> {
   return await approvedProcessPlan(
     input,
@@ -58,7 +59,8 @@ async function approvedBackgroundPlan(
     skillResource,
     false,
     true,
-    allowEnclosingContainerDeliverable
+    allowEnclosingContainerDeliverable,
+    environmentExpectedChanges
   );
 }
 
@@ -93,6 +95,7 @@ interface BackgroundExecution {
   skillResource: LoadedSkillResourceAccess | undefined;
   approvedPlan: ToolCallPlan;
   allowEnclosingContainerDeliverable: boolean;
+  environmentExpectedChanges?: JsonValue;
   startedAt: string;
 }
 
@@ -185,7 +188,8 @@ async function executePinnedBackground(
   execution: BackgroundExecution
 ): Promise<ToolReceipt> {
   const {
-    options, context, input, allowEnclosingContainerDeliverable
+    options, context, input, allowEnclosingContainerDeliverable,
+    environmentExpectedChanges
   } = execution;
   let { skillResource, approvedPlan } = execution;
   const readLock = await pinProcessReadRoots(context, approvedPlan);
@@ -198,7 +202,8 @@ async function executePinnedBackground(
       context,
       options,
       skillResource,
-      allowEnclosingContainerDeliverable
+      allowEnclosingContainerDeliverable,
+      environmentExpectedChanges
     );
     await readLock.verify();
     const processHandle = await spawnApprovedBackground(
@@ -220,7 +225,8 @@ export async function executeBackgroundProcess(
   context: PlannedToolExecutionContext,
   allowEnclosingContainerDeliverable = false,
   unifiedShell = false,
-  startedAt = new Date().toISOString()
+  startedAt = new Date().toISOString(),
+  environmentExpectedChanges?: JsonValue
 ): Promise<ToolReceipt> {
   const input = executionArgs(request.arguments);
   const lifecycle = requestedProcessLifecycle(input, options);
@@ -232,7 +238,12 @@ export async function executeBackgroundProcess(
     input, context.runtimeControl, "execute"
   );
   const approvedPlan = await approvedBackgroundPlan(
-    input, context, options, skillResource, allowEnclosingContainerDeliverable
+    input,
+    context,
+    options,
+    skillResource,
+    allowEnclosingContainerDeliverable,
+    environmentExpectedChanges
   );
   return await executePinnedBackground({
     options,
@@ -245,6 +256,7 @@ export async function executeBackgroundProcess(
     skillResource,
     approvedPlan,
     allowEnclosingContainerDeliverable,
+    environmentExpectedChanges,
     startedAt
   });
 }

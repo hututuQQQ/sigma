@@ -339,7 +339,7 @@ function executionDescription(
   return [
     "Run one sandboxed command using exactly one form: {command,shell?} or {executable,args?,skill?,skillScript?}. Foreground is the default. Workspace commands are read-only by default; to create, modify, or delete workspace paths, provide expectedChanges with exact files or narrow directories. Put disposable outputs in the process temp directory ($TMPDIR on POSIX, %TEMP% or $env:TEMP on Windows). A completed check may be marked by validation=true or by supplying purpose, subjects, or criterionIds; background=true is only for a long-running service or interactive process. Background startup waits up to yieldMs and returns either terminal status or a live handle.",
     ...(environmentShellAvailable(options)
-      ? ["Set target=environment only for system-level changes in the broker-attested disposable outer environment."]
+      ? ["Set target=environment only when the command needs system-level changes in the broker-attested disposable outer environment. If that same foreground command must also create or modify workspace deliverables, declare those workspace paths in expectedChanges so they remain checkpointed. Background environment commands cannot write the workspace."]
       : [])
   ].join(" ");
 }

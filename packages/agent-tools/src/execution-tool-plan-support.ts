@@ -144,6 +144,7 @@ export function planReadsExternal(
 export function assembledExecutionPlan(input: {
   invocation: ExecutionIntent["invocation"];
   mutation: MutationContract;
+  workspaceMutation?: MutationContract;
   readPaths: string[];
   networkMode: ToolCallPlan["network"];
   processMode: ToolCallPlan["processMode"];
@@ -154,6 +155,14 @@ export function assembledExecutionPlan(input: {
   readsExternal: boolean;
 }): ToolCallPlan {
   const writes = input.mutation.access === "write";
+  const writePaths = [...new Set([
+    ...input.mutation.expectedChanges,
+    ...(input.workspaceMutation?.expectedChanges ?? [])
+  ])];
+  const writeRoots = [...new Set([
+    ...input.mutation.writeRoots,
+    ...(input.workspaceMutation?.writeRoots ?? [])
+  ])];
   return {
     exactEffects: plannedEffects(
       writes,
@@ -163,10 +172,10 @@ export function assembledExecutionPlan(input: {
       input.readsExternal
     ),
     readPaths: input.readPaths,
-    writePaths: input.mutation.expectedChanges,
+    writePaths,
     network: input.networkMode,
     processMode: input.processMode,
-    checkpointScope: input.mutation.writeRoots,
+    checkpointScope: writeRoots,
     ...(input.mutation.scope === "enclosing_container"
       ? { mutationAuthority: "disposable_enclosing_container" as const }
       : {}),
@@ -174,8 +183,8 @@ export function assembledExecutionPlan(input: {
     executionIntent: {
       invocation: input.invocation,
       access: input.mutation.access,
-      ...(input.mutation.expectedChanges.length > 0
-        ? { expectedChanges: input.mutation.expectedChanges }
+      ...(writePaths.length > 0
+        ? { expectedChanges: writePaths }
         : {}),
       network: input.networkMode,
       purpose: executionPurpose(input.invocation, input.validation, input.background)
@@ -186,7 +195,7 @@ export function assembledExecutionPlan(input: {
       workspaceReadRoots: ["."],
       dependencyRoots: input.profile.dependencies,
       runtimeRoots: [],
-      writeRoots: input.mutation.writeRoots,
+      writeRoots,
       tempRoots: [],
       network: input.networkMode,
       backend: "native"
