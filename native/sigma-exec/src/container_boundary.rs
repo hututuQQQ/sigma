@@ -1,7 +1,9 @@
 use crate::protocol::RpcError;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -13,12 +15,19 @@ const HOST_CONTROL_SOCKETS: &[&str] = &[
     "/run/containerd/containerd.sock",
     "/run/podman/podman.sock",
 ];
-const DISPOSABLE_WRITABLE_FILESYSTEMS: &[&str] = &["tmpfs", "devtmpfs", "devpts", "mqueue", "proc"];
+const NESTED_SANDBOX_REPLACED_ROOTS: &[&str] = &["/proc", "/dev"];
+const MAX_PROTECTED_SUBMOUNTS: usize = 128;
+const MAX_MOUNT_POINT_BYTES: usize = 4_096;
+const CAP_SETGID: u32 = 6;
+const CAP_SETUID: u32 = 7;
+const CAP_SYS_ADMIN: u32 = 21;
 // Harbor grants the outer task container CAP_SYS_ADMIN solely so bubblewrap
-// can create a nested mount/user namespace. The command still runs inside
-// that nested namespace, and the attestation below independently requires a
-// copy-on-write container root with no host-control sockets. Capabilities
-// which directly inspect or control the enclosing host remain disallowed.
+// can create a nested mount namespace. Enclosing-container commands retain
+// the outer UID map so ordinary system tools can change account, but
+// bubblewrap drops CAP_SYS_ADMIN before the hardened launcher starts.
+// The attestation below independently requires a copy-on-write container
+// root with no host-control sockets. Capabilities which directly inspect or
+// control the enclosing host remain disallowed.
 const DISALLOWED_CAPABILITIES: &[u32] = &[
     16, // CAP_SYS_MODULE
     17, // CAP_SYS_RAWIO
@@ -32,6 +41,7 @@ const DISALLOWED_CAPABILITIES: &[u32] = &[
 pub(crate) struct EnclosingContainerBoundary {
     pub(crate) available: bool,
     pub(crate) attestation_digest: Option<String>,
+    pub(crate) protected_paths: Vec<PathBuf>,
     pub(crate) reason: Option<String>,
 }
 
@@ -41,6 +51,7 @@ impl EnclosingContainerBoundary {
             "available": self.available,
             "rootKind": if self.available { "container_cow" } else { "unavailable" },
             "attestationDigest": self.attestation_digest,
+            "protectedPaths": self.protected_paths,
             "reason": self.reason,
         })
     }
@@ -53,23 +64,55 @@ pub(crate) fn inspect_enclosing_container_boundary() -> &'static EnclosingContai
         inspect_inner().unwrap_or_else(|reason| EnclosingContainerBoundary {
             available: false,
             attestation_digest: None,
+            protected_paths: Vec::new(),
             reason: Some(reason),
         })
     })
 }
 
-pub(crate) fn require_enclosing_container_boundary() -> Result<(), RpcError> {
+pub(crate) fn require_enclosing_container_boundary(
+    requested_protected_paths: &[PathBuf],
+) -> Result<(), RpcError> {
     let boundary = inspect_enclosing_container_boundary();
-    if boundary.available {
-        return Ok(());
+    if !boundary.available {
+        return Err(RpcError::new(
+            "enclosing_container_unavailable",
+            boundary
+                .reason
+                .as_deref()
+                .unwrap_or("the enclosing container boundary could not be attested"),
+        ));
     }
-    Err(RpcError::new(
-        "enclosing_container_unavailable",
-        boundary
-            .reason
-            .as_deref()
-            .unwrap_or("the enclosing container boundary could not be attested"),
-    ))
+    let current = inspect_inner().map_err(|reason| {
+        RpcError::new(
+            "enclosing_container_attestation_changed",
+            format!("the enclosing container boundary no longer matches its attestation: {reason}"),
+        )
+    })?;
+    if current.attestation_digest != boundary.attestation_digest {
+        return Err(RpcError::new(
+            "enclosing_container_attestation_changed",
+            "the enclosing container mount or capability boundary changed after discovery",
+        ));
+    }
+    let protected = requested_protected_paths
+        .iter()
+        .filter_map(|path| path.canonicalize().ok())
+        .collect::<BTreeSet<_>>();
+    if let Some(missing) = current
+        .protected_paths
+        .iter()
+        .find(|path| !protected.contains(*path))
+    {
+        return Err(RpcError::new(
+            "enclosing_container_protection_required",
+            format!(
+                "enclosing-container policy must protect attested external mount '{}'",
+                missing.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn inspect_inner() -> Result<EnclosingContainerBoundary, String> {
@@ -79,7 +122,7 @@ fn inspect_inner() -> Result<EnclosingContainerBoundary, String> {
     let mounts = parse_mountinfo(&mountinfo)?;
     let root_mount = mounts
         .iter()
-        .find(|mount| mount.mount_point == "/")
+        .find(|mount| mount.mount_point == Path::new("/"))
         .ok_or_else(|| "root filesystem was not found in mountinfo".to_owned())?;
     let root_filesystem = root_mount.filesystem_type.as_str();
     if root_filesystem != "overlay" && root_filesystem != "fuse-overlayfs" {
@@ -87,7 +130,7 @@ fn inspect_inner() -> Result<EnclosingContainerBoundary, String> {
             "root filesystem '{root_filesystem}' is not an attested copy-on-write container root"
         ));
     }
-    reject_writable_host_submounts(&mounts, root_mount)?;
+    let protected_paths = writable_host_submounts(&mounts, root_mount)?;
     let effective_capabilities = effective_capabilities()?;
     let disallowed = DISALLOWED_CAPABILITIES
         .iter()
@@ -98,6 +141,23 @@ fn inspect_inner() -> Result<EnclosingContainerBoundary, String> {
         return Err(format!(
             "process retains host-control capabilities: {}",
             disallowed
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("enclosing-container mutation requires effective UID 0".into());
+    }
+    let missing = [CAP_SETGID, CAP_SETUID, CAP_SYS_ADMIN]
+        .into_iter()
+        .filter(|capability| effective_capabilities & (1_u64 << capability) == 0)
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "process lacks required enclosing-container capabilities: {}",
+            missing
                 .iter()
                 .map(u32::to_string)
                 .collect::<Vec<_>>()
@@ -118,19 +178,26 @@ fn inspect_inner() -> Result<EnclosingContainerBoundary, String> {
     let marker_metadata = fs::metadata(&marker)
         .map_err(|error| format!("cannot re-inspect container marker: {error}"))?;
     let mount_namespace_digest = format!("{:x}", Sha256::digest(mountinfo.as_bytes()));
+    let protected_paths_material = protected_paths
+        .iter()
+        .map(|path| path.as_os_str().as_bytes())
+        .collect::<Vec<_>>()
+        .join(&0);
     let material = format!(
-        "sigma-enclosing-container\0{}\0{}\0{}\0{}\0{:x}\0{}",
+        "sigma-enclosing-container\0{}\0{}\0{}\0{}\0{:x}\0{}\0{}",
         marker.display(),
         marker_metadata.dev(),
         marker_metadata.ino(),
         root_filesystem,
         effective_capabilities,
-        mount_namespace_digest
+        mount_namespace_digest,
+        String::from_utf8_lossy(&protected_paths_material)
     );
     let digest = format!("sha256:{:x}", Sha256::digest(material.as_bytes()));
     Ok(EnclosingContainerBoundary {
         available: true,
         attestation_digest: Some(digest),
+        protected_paths,
         reason: None,
     })
 }
@@ -173,7 +240,7 @@ fn trusted_container_marker() -> Result<PathBuf, String> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MountInfoEntry {
     major_minor: String,
-    mount_point: String,
+    mount_point: PathBuf,
     mount_options: String,
     filesystem_type: String,
 }
@@ -197,7 +264,7 @@ fn parse_mountinfo(mountinfo: &str) -> Result<Vec<MountInfoEntry>, String> {
         }
         mounts.push(MountInfoEntry {
             major_minor: fields[2].to_owned(),
-            mount_point: fields[4].to_owned(),
+            mount_point: decode_mountinfo_path(fields[4], index + 1)?,
             mount_options: fields[5].to_owned(),
             filesystem_type: fields[separator + 1].to_owned(),
         });
@@ -205,30 +272,85 @@ fn parse_mountinfo(mountinfo: &str) -> Result<Vec<MountInfoEntry>, String> {
     Ok(mounts)
 }
 
+fn decode_mountinfo_path(value: &str, line: usize) -> Result<PathBuf, String> {
+    let input = value.as_bytes();
+    let mut decoded = Vec::with_capacity(input.len());
+    let mut index = 0;
+    while index < input.len() {
+        if input[index] != b'\\' {
+            decoded.push(input[index]);
+            index += 1;
+            continue;
+        }
+        if index + 3 >= input.len() {
+            return Err(format!("mountinfo line {line} has a truncated path escape"));
+        }
+        let escaped = &input[index + 1..index + 4];
+        let byte = match escaped {
+            b"040" => b' ',
+            b"011" => b'\t',
+            b"012" => b'\n',
+            b"134" => b'\\',
+            _ => {
+                return Err(format!(
+                    "mountinfo line {line} has an unsupported path escape"
+                ));
+            }
+        };
+        decoded.push(byte);
+        index += 4;
+    }
+    if decoded.len() > MAX_MOUNT_POINT_BYTES {
+        return Err(format!("mountinfo line {line} mount point is too long"));
+    }
+    let decoded = String::from_utf8(decoded)
+        .map_err(|_| format!("mountinfo line {line} mount point is not UTF-8"))?;
+    let path = PathBuf::from(decoded);
+    if !path.is_absolute() {
+        return Err(format!("mountinfo line {line} mount point is not absolute"));
+    }
+    Ok(path)
+}
+
 #[cfg(test)]
 fn parse_root_filesystem_type(mountinfo: &str) -> Option<String> {
     parse_mountinfo(mountinfo)
         .ok()?
         .into_iter()
-        .find_map(|mount| (mount.mount_point == "/").then_some(mount.filesystem_type))
+        .find_map(|mount| (mount.mount_point == Path::new("/")).then_some(mount.filesystem_type))
 }
 
-fn reject_writable_host_submounts(
+fn writable_host_submounts(
     mounts: &[MountInfoEntry],
     root: &MountInfoEntry,
-) -> Result<(), String> {
-    if let Some(mount) = mounts.iter().find(|mount| {
-        mount.mount_point != "/"
-            && mount.writable()
-            && mount.major_minor != root.major_minor
-            && !DISPOSABLE_WRITABLE_FILESYSTEMS.contains(&mount.filesystem_type.as_str())
-    }) {
+) -> Result<Vec<PathBuf>, String> {
+    let paths = mounts
+        .iter()
+        .filter(|mount| {
+            mount.mount_point != Path::new("/")
+                && mount.writable()
+                && mount.major_minor != root.major_minor
+                && !NESTED_SANDBOX_REPLACED_ROOTS
+                    .iter()
+                    .map(Path::new)
+                    .any(|root| mount.mount_point.starts_with(root))
+        })
+        .map(|mount| {
+            mount.mount_point.canonicalize().map_err(|error| {
+                format!(
+                    "cannot resolve writable external submount '{}': {error}",
+                    mount.mount_point.display()
+                )
+            })
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if paths.len() > MAX_PROTECTED_SUBMOUNTS {
         return Err(format!(
-            "writable non-disposable submount '{}' ({}) prevents enclosing-container attestation",
-            mount.mount_point, mount.filesystem_type
+            "writable external submount count {} exceeds protected-path limit {MAX_PROTECTED_SUBMOUNTS}",
+            paths.len()
         ));
     }
-    Ok(())
+    Ok(paths.into_iter().collect())
 }
 
 fn effective_capabilities() -> Result<u64, String> {
@@ -263,24 +385,24 @@ mod tests {
     }
 
     #[test]
-    fn rejects_writable_host_submounts_below_a_cow_root() {
+    fn protects_writable_host_submounts_below_a_cow_root() {
         let input = concat!(
             "41 32 0:39 / / rw,relatime - overlay overlay rw,lowerdir=/lower\n",
-            "42 41 8:1 /host/project /workspace rw,relatime - ext4 /dev/sda1 rw\n",
+            "42 41 8:1 /host/project /tmp rw,relatime - ext4 /dev/sda1 rw\n",
         );
         let mounts = parse_mountinfo(input).expect("valid mountinfo");
         let root = mounts
             .iter()
-            .find(|mount| mount.mount_point == "/")
+            .find(|mount| mount.mount_point == Path::new("/"))
             .expect("root mount");
         assert_eq!(
-            reject_writable_host_submounts(&mounts, root),
-            Err("writable non-disposable submount '/workspace' (ext4) prevents enclosing-container attestation".into())
+            writable_host_submounts(&mounts, root),
+            Ok(vec![PathBuf::from("/tmp")])
         );
     }
 
     #[test]
-    fn permits_read_only_host_and_writable_disposable_submounts() {
+    fn permits_read_only_host_and_submounts_replaced_by_the_nested_sandbox() {
         let input = concat!(
             "41 32 0:39 / / rw,relatime - overlay overlay rw,lowerdir=/lower\n",
             "42 41 8:1 /host/project /workspace ro,relatime - ext4 /dev/sda1 rw\n",
@@ -290,9 +412,29 @@ mod tests {
         let mounts = parse_mountinfo(input).expect("valid mountinfo");
         let root = mounts
             .iter()
-            .find(|mount| mount.mount_point == "/")
+            .find(|mount| mount.mount_point == Path::new("/"))
             .expect("root mount");
-        assert_eq!(reject_writable_host_submounts(&mounts, root), Ok(()));
+        assert_eq!(writable_host_submounts(&mounts, root), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn decodes_mountinfo_paths_before_protecting_them() {
+        let input = concat!(
+            "41 32 0:39 / / rw,relatime - overlay overlay rw,lowerdir=/lower\n",
+            "42 41 8:1 /host/project /tmp/sigma\\040external rw,relatime - ext4 /dev/sda1 rw\n",
+        );
+        let mounts = parse_mountinfo(input).expect("valid mountinfo");
+        assert_eq!(mounts[1].mount_point, PathBuf::from("/tmp/sigma external"));
+    }
+
+    #[test]
+    fn rejects_ambiguous_mountinfo_path_escapes() {
+        let input =
+            "41 32 0:39 / /tmp/sigma\\999 rw,relatime - overlay overlay rw,lowerdir=/lower\n";
+        assert_eq!(
+            parse_mountinfo(input),
+            Err("mountinfo line 1 has an unsupported path escape".into())
+        );
     }
 
     #[test]

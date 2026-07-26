@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import {
   mkdir,
   readFile,
+  readlink,
   rm,
   writeFile
 } from "node:fs/promises";
@@ -11,6 +12,7 @@ import path from "node:path";
 const brokerPath = path.resolve(process.argv[2] ?? "/opt/sigma/sigma-exec");
 const workspacePath = path.resolve(process.argv[3] ?? "/task");
 const externalRoot = path.resolve(process.argv[4] ?? "/etc/sigma-enclosing-boundary-smoke");
+const optionalEnvironmentProbe = process.argv[5];
 const protectedFile = path.join(workspacePath, "protected.txt");
 const externalFile = path.join(externalRoot, "written.txt");
 const backgroundFile = path.join(externalRoot, "background-written.txt");
@@ -105,6 +107,54 @@ async function main() {
     if (boundary?.available !== true || boundary?.rootKind !== "container_cow") {
       throw new Error(`Enclosing-container boundary is unavailable: ${JSON.stringify(boundary)}`);
     }
+    if (!Array.isArray(boundary.protectedPaths)
+      || boundary.protectedPaths.some((item) => typeof item !== "string" || !path.isAbsolute(item))) {
+      throw new Error(`Enclosing-container protected paths are invalid: ${JSON.stringify(boundary)}`);
+    }
+    process.stdout.write(
+      `INFO enclosing-container protected paths: ${JSON.stringify(boundary.protectedPaths)}\n`
+    );
+    const protectedPaths = [...new Set([
+      ...boundary.protectedPaths,
+      workspacePath,
+      runtimeRoot
+    ])];
+    if (boundary.protectedPaths.length > 0) {
+      const omitted = boundary.protectedPaths[0];
+      process.stdout.write(
+        `INFO omission probe: ${JSON.stringify({ omitted, protectedPaths: protectedPaths.filter((item) => item !== omitted) })}\n`
+      );
+      await broker.request("exec", {
+        command: {
+          executable: "/bin/true",
+          args: [],
+          cwd: workspacePath,
+          env: {}
+        },
+        policy: {
+          sandbox: "required",
+          network: "none",
+          networkApproved: false,
+          readRoots: ["/"],
+          writeRoots: ["/"],
+          executionRoots: [],
+          protectedPaths: protectedPaths.filter((item) => item !== omitted),
+          enclosingContainerRoot: true
+        },
+        maxOutputBytes: 1048576,
+        timeoutMs: 30000,
+        idleTimeoutMs: 30000,
+        lifecycle: "session"
+      }).then(
+        () => {
+          throw new Error(`Broker accepted a policy that omitted '${omitted}'.`);
+        },
+        (error) => {
+          if (error?.brokerError?.code !== "enclosing_container_protection_required") throw error;
+        }
+      );
+    }
+    const outerNetworkNamespace = await readlink("/proc/self/ns/net");
 
     const result = await broker.request("exec", {
       command: {
@@ -116,7 +166,10 @@ async function main() {
             `printf 'outer\\n' > ${JSON.stringify(externalFile)}`,
             `if printf 'hacked\\n' > ${JSON.stringify(protectedFile)} 2>/dev/null; then exit 41; fi`,
             `if printf 'tampered\\n' > ${JSON.stringify(runtimeTamper)} 2>/dev/null; then exit 42; fi`,
-            "if printf 'tampered\\n' > /usr/local/bin/bwrap 2>/dev/null; then exit 43; fi"
+            "if printf 'tampered\\n' > /usr/local/bin/bwrap 2>/dev/null; then exit 43; fi",
+            "if command -v setpriv >/dev/null 2>&1; then test \"$(setpriv --reuid 65534 --regid 65534 --clear-groups id -u)\" = 65534; fi",
+            "grep '^CapEff:' /proc/self/status",
+            "printf 'SIGMA_NET_NS=%s\\n' \"$(readlink /proc/self/ns/net)\""
           ].join("; ")
         ],
         cwd: workspacePath,
@@ -129,7 +182,7 @@ async function main() {
         readRoots: ["/"],
         writeRoots: ["/"],
         executionRoots: [],
-        protectedPaths: [workspacePath, runtimeRoot],
+        protectedPaths,
         enclosingContainerRoot: true
       },
       maxOutputBytes: 1048576,
@@ -139,6 +192,15 @@ async function main() {
     });
     if (result.exitCode !== 0) {
       throw new Error(`Boundary probe command failed: ${JSON.stringify(result)}`);
+    }
+    const effectiveCapabilities = /^CapEff:\s*([0-9a-f]+)$/imu.exec(result.stdout.data)?.[1];
+    if (!effectiveCapabilities
+      || (BigInt(`0x${effectiveCapabilities}`) & (1n << 21n)) !== 0n) {
+      throw new Error(`The sandbox command retained CAP_SYS_ADMIN: ${JSON.stringify(result)}`);
+    }
+    const commandNetworkNamespace = /^SIGMA_NET_NS=(.+)$/mu.exec(result.stdout.data)?.[1];
+    if (!commandNetworkNamespace || commandNetworkNamespace === outerNetworkNamespace) {
+      throw new Error(`The no-network command retained the outer network namespace: ${JSON.stringify(result)}`);
     }
     if (await readFile(externalFile, "utf8") !== "outer\n") {
       throw new Error("The enclosing-container mutation did not persist.");
@@ -152,6 +214,33 @@ async function main() {
         if (error?.code !== "ENOENT") throw error;
       }
     );
+    if (optionalEnvironmentProbe) {
+      const environmentProbe = await broker.request("exec", {
+        command: {
+          executable: "/bin/sh",
+          args: ["-c", optionalEnvironmentProbe],
+          cwd: workspacePath,
+          env: { PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
+        },
+        policy: {
+          sandbox: "required",
+          network: "full",
+          networkApproved: true,
+          readRoots: ["/"],
+          writeRoots: ["/"],
+          executionRoots: [],
+          protectedPaths,
+          enclosingContainerRoot: true
+        },
+        maxOutputBytes: 1048576,
+        timeoutMs: 120000,
+        idleTimeoutMs: 120000,
+        lifecycle: "session"
+      });
+      if (environmentProbe.exitCode !== 0) {
+        throw new Error(`Optional environment probe failed: ${JSON.stringify(environmentProbe)}`);
+      }
+    }
 
     const spawned = await broker.request("process.spawn", {
       command: {
@@ -178,7 +267,7 @@ async function main() {
         readRoots: ["/"],
         writeRoots: ["/"],
         executionRoots: [],
-        protectedPaths: [workspacePath, runtimeRoot],
+        protectedPaths,
         enclosingContainerRoot: true
       },
       maxOutputBytes: 1048576,

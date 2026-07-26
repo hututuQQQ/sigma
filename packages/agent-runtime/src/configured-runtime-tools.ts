@@ -41,6 +41,21 @@ function runtimeProtectedPaths(storeRootDir: string): string[] {
   ])].filter((item) => path.parse(item).root !== item);
 }
 
+function enclosingContainerProtectedPaths(report: BrokerDoctorReport): string[] {
+  const capability = report.capabilities.enclosingContainerRoot;
+  return capability?.available === true ? capability.protectedPaths : [];
+}
+
+export function configuredProtectedPaths(
+  report: BrokerDoctorReport,
+  storeRootDir: string
+): string[] {
+  return [...new Set([
+    ...runtimeProtectedPaths(storeRootDir),
+    ...enclosingContainerProtectedPaths(report)
+  ])];
+}
+
 function configuredToolPolicy(config: ConfiguredToolOptions) {
   return {
     readScope: config.readScope ?? "workspace",
@@ -116,7 +131,7 @@ export function createConfiguredTools(
     sandboxMode: "required",
     readScope: policy.readScope,
     writeScope: policy.writeScope,
-    protectedPaths: runtimeProtectedPaths(storeRootDir),
+    protectedPaths: configuredProtectedPaths(executionReport, storeRootDir),
     processHandoff: policy.processHandoff,
     networkMode: network.defaultMode,
     networkModes: network.modes,

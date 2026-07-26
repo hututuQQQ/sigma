@@ -24,6 +24,7 @@ import {
   createConfiguredRuntime,
   type RuntimeCompositionConfig
 } from "../packages/agent-runtime/src/testing.js";
+import { configuredProtectedPaths } from "../packages/agent-runtime/src/configured-runtime-tools.js";
 import { verifiedNetworkPolicy } from "../packages/agent-runtime/src/execution-capabilities.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -186,7 +187,8 @@ function doctorReport(
         enclosingContainerRoot: {
           available: true,
           rootKind: "container_cow" as const,
-          attestationDigest: `sha256:${"a".repeat(64)}`
+          attestationDigest: `sha256:${"a".repeat(64)}`,
+          protectedPaths: []
         }
       } : {}),
       shells,
@@ -300,6 +302,27 @@ afterEach(async () => {
 });
 
 describe("configured runtime execution capabilities", () => {
+  it("carries broker-attested external mounts into every environment write policy", async () => {
+    const root = await workspace();
+    const report = doctorReport([], [], {
+      foreground: true,
+      background: false,
+      stdin: true,
+      pty: false,
+      networkModes: ["none"],
+      enclosingContainerRoot: true
+    });
+    report.capabilities.enclosingContainerRoot!.protectedPaths = [
+      "/external-state",
+      "/external-config"
+    ];
+
+    expect(configuredProtectedPaths(report, root)).toEqual(expect.arrayContaining([
+      "/external-state",
+      "/external-config"
+    ]));
+  });
+
   it("rejects a configured network mode the broker did not advertise", () => {
     expect(() => verifiedNetworkPolicy(doctorReport([], [], {
       foreground: true, background: true, stdin: true, pty: true,

@@ -264,6 +264,7 @@ pub fn doctor_report() -> Value {
         "available": false,
         "rootKind": "unavailable",
         "attestationDigest": Value::Null,
+        "protectedPaths": [],
         "reason": "enclosing-container authority is supported only on Linux",
     });
     json!({
@@ -706,7 +707,9 @@ fn validate(params: &ProcessParams, _allow_unsafe: bool) -> Result<(), RpcError>
             ));
         }
         #[cfg(target_os = "linux")]
-        crate::container_boundary::require_enclosing_container_boundary()?;
+        crate::container_boundary::require_enclosing_container_boundary(
+            &params.policy.protected_paths,
+        )?;
         #[cfg(not(target_os = "linux"))]
         return Err(RpcError::new(
             "enclosing_container_unavailable",
@@ -1075,7 +1078,11 @@ fn canonicalize_allow_missing(path: &Path) -> Result<PathBuf, RpcError> {
     let suffix = path
         .strip_prefix(ancestor)
         .map_err(|_| RpcError::new("policy_denied", "protected path normalization failed"))?;
-    Ok(canonical.join(suffix))
+    Ok(if suffix.as_os_str().is_empty() {
+        canonical
+    } else {
+        canonical.join(suffix)
+    })
 }
 
 fn canonical_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, RpcError> {
@@ -1220,10 +1227,16 @@ fn build_sandboxed_command(
     if params.lifecycle == ProcessLifecycle::Session {
         command.arg("--die-with-parent");
     }
-    command.args(["--new-session", "--unshare-all", "--as-pid-1"]);
-    if params.policy.network == NetworkMode::Full {
-        command.arg("--share-net");
-    }
+    append_linux_namespace_policy(
+        &mut command,
+        params.policy.enclosing_container_root,
+        &params.policy.network,
+    );
+    configure_linux_network_boundary(
+        &mut command,
+        params.policy.enclosing_container_root,
+        &params.policy.network,
+    );
     let system_roots = linux_system_roots();
     // Resolve every policy mount into one identity snapshot before opening any
     // bwrap source descriptor. If an ancestor is replaced between groups, at
@@ -1514,6 +1527,63 @@ fn build_sandboxed_command(
         disposable_workspace: None,
         _mount_source_descriptors: mount_source_descriptors,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn append_linux_namespace_policy(
+    command: &mut Command,
+    enclosing_container_root: bool,
+    network: &NetworkMode,
+) {
+    command.arg("--new-session");
+    if enclosing_container_root {
+        // Keep the already-attested outer container's UID/GID map so package
+        // managers and service tooling can switch to their low-privilege
+        // system accounts. The outer CAP_SYS_ADMIN is needed only while
+        // bubblewrap builds this command's mount namespace and is dropped
+        // before the hardened launcher runs.
+        command.args([
+            "--unshare-ipc",
+            "--unshare-pid",
+            "--unshare-uts",
+            "--unshare-cgroup-try",
+        ]);
+        if network == &NetworkMode::Loopback {
+            command.arg("--unshare-net");
+        }
+        command.args(["--cap-drop", "CAP_SYS_ADMIN"]);
+    } else {
+        command.arg("--unshare-all");
+        if network == &NetworkMode::Full {
+            command.arg("--share-net");
+        }
+    }
+    command.arg("--as-pid-1");
+}
+
+#[cfg(target_os = "linux")]
+fn configure_linux_network_boundary(
+    command: &mut Command,
+    enclosing_container_root: bool,
+    network: &NetworkMode,
+) {
+    if !enclosing_container_root || network != &NetworkMode::None {
+        return;
+    }
+    // Without a new user namespace bubblewrap cannot raise loopback in a new
+    // network namespace unless the outer container also grants CAP_NET_ADMIN.
+    // A no-network request does not need loopback. Create the empty namespace
+    // in the trusted pre-exec step while CAP_SYS_ADMIN is still available;
+    // bubblewrap then drops that capability before launching model code.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            if libc::unshare(libc::CLONE_NEWNET) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -2184,6 +2254,49 @@ fn detect_sandbox() -> SandboxStatus {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn enclosing_container_namespace_keeps_account_transitions_but_drops_mount_authority() {
+        let mut command = Command::new("bwrap");
+        append_linux_namespace_policy(&mut command, true, &NetworkMode::Full);
+        let arguments = command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(arguments.contains(&"--unshare-pid".into()));
+        assert!(arguments.contains(&"--unshare-ipc".into()));
+        assert!(arguments.contains(&"--unshare-uts".into()));
+        assert!(arguments.contains(&"--cap-drop".into()));
+        assert!(arguments.contains(&"CAP_SYS_ADMIN".into()));
+        assert!(!arguments.contains(&"--unshare-user".into()));
+        assert!(!arguments.contains(&"--unshare-all".into()));
+        assert!(!arguments.contains(&"--unshare-net".into()));
+
+        let mut offline = Command::new("bwrap");
+        append_linux_namespace_policy(&mut offline, true, &NetworkMode::None);
+        assert!(
+            !offline
+                .get_args()
+                .any(|value| value == std::ffi::OsStr::new("--unshare-net"))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ordinary_namespace_policy_retains_the_full_user_boundary() {
+        let mut command = Command::new("bwrap");
+        append_linux_namespace_policy(&mut command, false, &NetworkMode::Full);
+        let arguments = command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(arguments.contains(&"--unshare-all".into()));
+        assert!(arguments.contains(&"--share-net".into()));
+        assert!(!arguments.contains(&"--cap-drop".into()));
+    }
+
     #[test]
     fn selected_linux_toolchain_state_is_read_only_system_data() {
         assert!(!LINUX_SYSTEM_ROOT_CANDIDATES.contains(&"/var/lib"));
@@ -2286,6 +2399,24 @@ mod tests {
         assert!(!root.join(".git").exists());
         assert!(!root.join(".agent").exists());
         std::fs::remove_dir_all(&root).expect("remove test workspace");
+    }
+
+    #[test]
+    fn canonicalizing_an_existing_protected_file_does_not_turn_it_into_a_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "sigma-protected-file-test-{}-{}",
+            std::process::id(),
+            PROTECTED_GUARD_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).expect("create protected file test root");
+        let file = root.join("protected.txt");
+        std::fs::write(&file, "protected").expect("create protected file");
+
+        let canonical = canonicalize_allow_missing(&file).expect("canonicalize protected file");
+        assert_eq!(canonical, file.canonicalize().expect("canonical file"));
+        assert!(canonical.is_file());
+
+        std::fs::remove_dir_all(root).expect("remove protected file test root");
     }
 
     #[test]

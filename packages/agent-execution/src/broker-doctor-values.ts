@@ -82,7 +82,8 @@ function managedEnvironmentCapability(
 }
 
 function enclosingContainerRootCapability(
-  input: unknown
+  input: unknown,
+  platform: string
 ): BrokerDoctorReport["capabilities"]["enclosingContainerRoot"] | undefined {
   if (input === undefined) return undefined;
   const value = protocolRecord(input, "Broker enclosing-container root capability");
@@ -101,17 +102,46 @@ function enclosingContainerRootCapability(
     value.reason,
     "capabilities.enclosingContainerRoot.reason"
   );
+  const protectedPaths = capabilityProtectedPaths(value.protectedPaths, platform);
   if (available !== (value.rootKind === "container_cow")
     || (available && !attestationDigest)
-    || (!available && attestationDigest !== undefined)) {
+    || (!available && attestationDigest !== undefined)
+    || (!available && protectedPaths.length > 0)) {
     throw new BrokerProtocolError("Broker enclosing-container root attestation is inconsistent.");
   }
   return {
     available,
     rootKind: value.rootKind,
     ...(attestationDigest ? { attestationDigest } : {}),
+    protectedPaths,
     ...(reason ? { reason } : {})
   };
+}
+
+function capabilityProtectedPaths(input: unknown, platform: string): string[] {
+  if (input === undefined) return [];
+  if (!Array.isArray(input) || input.length > 128) {
+    throw new BrokerProtocolError("Broker enclosing-container protectedPaths are invalid.");
+  }
+  const paths = input.map((value) => {
+    if (typeof value !== "string" || !value || value.length > 4_096 || value.includes("\0")) {
+      throw new BrokerProtocolError("Broker enclosing-container protectedPaths are invalid.");
+    }
+    const absolute = platform === "windows" || platform === "win32"
+      ? path.win32.isAbsolute(value) : path.posix.isAbsolute(value);
+    if (!absolute) {
+      throw new BrokerProtocolError(
+        "Broker enclosing-container protectedPaths must be absolute."
+      );
+    }
+    return value;
+  });
+  if (new Set(paths).size !== paths.length) {
+    throw new BrokerProtocolError(
+      "Broker enclosing-container protectedPaths must not contain duplicates."
+    );
+  }
+  return paths;
 }
 
 function parseDoctorHardening(input: unknown): BrokerDoctorReport["sandbox"]["hardening"] | undefined {
@@ -185,7 +215,8 @@ function parseDoctorCapabilities(input: unknown, platform: string): BrokerDoctor
   const searchPaths = executableSearchPaths(capabilities.executableSearchPaths, platform);
   const managedEnvironment = managedEnvironmentCapability(capabilities.managedEnvironment);
   const enclosingContainerRoot = enclosingContainerRootCapability(
-    capabilities.enclosingContainerRoot
+    capabilities.enclosingContainerRoot,
+    platform
   );
   const runtimeDataDigest = optionalSha256(
     capabilities.runtimeDataDigest, "capabilities.runtimeDataDigest"
