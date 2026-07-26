@@ -526,7 +526,8 @@ describe("agent-execution protocol validation", () => {
         enclosingContainerRoot: {
           available: true,
           rootKind: "container_cow",
-          attestationDigest: `sha256:${"a".repeat(64)}`
+          attestationDigest: `sha256:${"a".repeat(64)}`,
+          protectedPaths: ["/external-state"]
         },
         managedEnvironment: { available: true, prepare: true },
         shells: [{ kind: "bash", executable: "/bin/bash", verified: true }]
@@ -549,7 +550,8 @@ describe("agent-execution protocol validation", () => {
       enclosingContainerRoot: {
         available: true,
         rootKind: "container_cow",
-        attestationDigest: `sha256:${"a".repeat(64)}`
+        attestationDigest: `sha256:${"a".repeat(64)}`,
+        protectedPaths: ["/external-state"]
       },
       managedEnvironment: { available: true, prepare: true },
       shells: [{ kind: "bash", executable: "/bin/bash", verified: true }]
@@ -581,6 +583,33 @@ describe("agent-execution protocol validation", () => {
         capabilities: { ...doctor.capabilities, enclosingContainerRoot }
       })).toThrow(BrokerProtocolError);
     }
+    for (const protectedPaths of [
+      ["relative"],
+      ["/external-state", "/external-state"],
+      Array.from({ length: 129 }, (_, index) => `/external-${index}`)
+    ]) {
+      expect(() => parseDoctor({
+        ...doctor,
+        capabilities: {
+          ...doctor.capabilities,
+          enclosingContainerRoot: {
+            ...doctor.capabilities.enclosingContainerRoot,
+            protectedPaths
+          }
+        }
+      })).toThrow(BrokerProtocolError);
+    }
+    expect(() => parseDoctor({
+      ...doctor,
+      capabilities: {
+        ...doctor.capabilities,
+        enclosingContainerRoot: {
+          available: false,
+          rootKind: "unavailable",
+          protectedPaths: ["/external-state"]
+        }
+      }
+    })).toThrow(BrokerProtocolError);
     expect(parseDoctor({
       ...doctor,
       platform: "windows",

@@ -101,7 +101,7 @@ class RecoveryGateway implements ModelGateway {
   async complete(_request: ModelRequest): Promise<ModelResponse> {
     this.calls += 1;
     this.turn += 1;
-    if (this.tryCompletion && this.turn === 1) {
+    if (this.tryCompletion) {
       return {
         message: {
           role: "assistant",
@@ -847,7 +847,7 @@ describe("durable transaction fault-injection recovery", () => {
     await runtime.command({ type: "resume", sessionId: fixture.sessionId });
     await expect(runtime.waitForOutcome(fixture.sessionId)).resolves.toMatchObject({ kind: "completed" });
     expect(executions.count).toBe(0);
-    expect(reviewer.calls).toBe(1);
+    expect(reviewer.calls).toBe(0);
     const stored = await events(fixture.store, fixture.sessionId);
     expect(stored.filter((item) => item.type === "tool.failed"
       && JSON.stringify(item.payload).includes("recovery_result_lost_no_replay"))).toHaveLength(1);
@@ -887,18 +887,10 @@ describe("durable transaction fault-injection recovery", () => {
       const outcome = await runtime.waitForOutcome(fixture.sessionId);
       const stored = await events(fixture.store, fixture.sessionId);
       expect(executions.count).toBe(0);
-      const expectedReviewCalls = boundary === "review_started"
-        || boundary === "review_completed" ? 0 : 1;
+      const expectedReviewCalls = 0;
       expect(reviewer.calls).toBe(expectedReviewCalls);
-      if (boundary === "review_started") {
-        expect(outcome).toMatchObject({
-          kind: "recoverable_failure",
-          code: "verification_unavailable"
-        });
-      } else {
-        expect(outcome).toMatchObject({ kind: "completed" });
-      }
-      expect(gateway.calls).toBe(1);
+      expect(outcome).toMatchObject({ kind: "completed" });
+      expect(gateway.calls).toBe(2);
 
       const checkpointId = fixture.checkpoint!.checkpointId;
       for (const evidenceId of [
@@ -918,7 +910,7 @@ describe("durable transaction fault-injection recovery", () => {
       expect(stored.filter((item) => item.type === "tool.approval_requested"
         && JSON.stringify(item.payload).includes("mutation-call"))).toHaveLength(0);
       expect(stored.filter((item) => item.type === "run.completed")).toHaveLength(
-        boundary === "review_started" ? 0 : 1
+        1
       );
       expect(reviewer.inputs).toHaveLength(expectedReviewCalls);
     });
@@ -930,7 +922,7 @@ describe("durable transaction fault-injection recovery", () => {
     await runtime.command({ type: "resume", sessionId: fixture.sessionId });
     await expect(runtime.waitForOutcome(fixture.sessionId)).resolves.toMatchObject({ kind: "completed" });
     expect(executions.count).toBe(0);
-    expect(reviewer.calls).toBe(1);
+    expect(reviewer.calls).toBe(0);
     expect(gateway.calls).toBe(0);
     const stored = await events(fixture.store, fixture.sessionId);
     expect(stored.filter((item) => item.type === "run.completed")).toHaveLength(1);

@@ -149,7 +149,7 @@ describe("effect-plan recovery", () => {
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
     const runtime = createRuntime({
       gateway: new SmokeFakeGateway([
-        fakeToolTurn([fakeToolCall("write", "exec", {
+        fakeToolTurn([fakeToolCall("write", "shell", {
           executable: "fixture",
           access: "write",
           writeRoots: ["src"],
@@ -184,6 +184,89 @@ describe("effect-plan recovery", () => {
     expect(stored.some((event) => event.type === "checkpoint.sealed")).toBe(false);
   });
 
+  it("checkpoints and restores workspace writes made by a foreground environment command", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-hybrid-effect-plan-"));
+    const workspace = path.join(root, "workspace");
+    const source = path.join(workspace, "src");
+    await mkdir(source, { recursive: true });
+    await writeFile(path.join(source, "sibling.txt"), "before", "utf8");
+    const broker: ExecutionBroker = {
+      lostProcessHandles: [],
+      connect: async () => report,
+      doctor: async () => report,
+      execute: async () => {
+        await writeFile(path.join(source, "sibling.txt"), "violation", "utf8");
+        return exited;
+      },
+      spawn: async () => ({ id: "process", brokerInstanceId: "broker" }),
+      poll: async () => ({ ...exited, handle: { id: "process", brokerInstanceId: "broker" } }),
+      write: async () => undefined,
+      terminate: async () => ({ ...exited, handle: { id: "process", brokerInstanceId: "broker" } }),
+      close: async () => undefined
+    };
+    const storeRootDir = path.join(root, "state");
+    const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
+    const runtime = createRuntime({
+      gateway: new SmokeFakeGateway([
+        fakeToolTurn([fakeToolCall("hybrid-write", "shell", {
+          executable: "fixture",
+          target: "environment",
+          expectedChanges: [path.join(source, "expected.txt")]
+        })]),
+        fakeToolTurn([fakeToolCall("done", "request_user_input", {
+          message: "Hybrid violation handled."
+        })])
+      ]),
+      tools: registerBuiltinTools(new EffectToolRegistry(), {
+        broker,
+        readScope: "host",
+        writeScope: "enclosing-container",
+        enclosingContainerRoot: true,
+        enclosingContainerAttestationDigest: `sha256:${"a".repeat(64)}`,
+        runtimeCommands: ["fixture"],
+        networkMode: "none"
+      }),
+      store,
+      storeRootDir,
+      permissionMode: "auto",
+      runDeadlineMs: 60_000
+    });
+    const session = await runtime.createSession({
+      workspacePath: workspace,
+      mode: "change"
+    });
+
+    await runtime.command({
+      type: "submit",
+      sessionId: session.sessionId,
+      text: "Prepare the environment and create the declared workspace output."
+    });
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "needs_input",
+      requestId: "done"
+    });
+    await expect(readFile(path.join(source, "sibling.txt"), "utf8"))
+      .resolves.toBe("before");
+
+    const stored = await events(store, session.sessionId);
+    expect(stored).toContainEqual(expect.objectContaining({
+      type: "execution.planned",
+      payload: expect.objectContaining({
+        plan: expect.objectContaining({
+          mutationAuthority: "disposable_enclosing_container",
+          writePaths: expect.arrayContaining(["src/expected.txt"]),
+          checkpointScope: expect.arrayContaining(["src"])
+        })
+      })
+    }));
+    expect(stored).toContainEqual(expect.objectContaining({
+      type: "execution.failed",
+      payload: expect.objectContaining({ code: "effect_plan_violation" })
+    }));
+    expect(stored.some((event) => event.type === "checkpoint.restored"
+      && event.authority === "runtime")).toBe(true);
+  });
+
   it("allows only regular parent directories needed to create an approved nested file", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-effect-plan-parent-"));
     const workspace = path.join(root, "workspace");
@@ -209,7 +292,7 @@ describe("effect-plan recovery", () => {
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
     const runtime = createRuntime({
       gateway: new SmokeFakeGateway([
-        fakeToolTurn([fakeToolCall("write", "exec", {
+        fakeToolTurn([fakeToolCall("write", "shell", {
           executable: "fixture",
           access: "write",
           writeRoots: ["src"],
@@ -259,7 +342,7 @@ describe("effect-plan recovery", () => {
     const storeRootDir = path.join(root, "state");
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
     const gateway = new SmokeFakeGateway([
-      fakeToolTurn([fakeToolCall("write", "exec", {
+      fakeToolTurn([fakeToolCall("write", "shell", {
         executable: "fixture",
         access: "write",
         writeRoots: ["src"],

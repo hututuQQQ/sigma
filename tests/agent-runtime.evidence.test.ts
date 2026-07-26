@@ -140,7 +140,7 @@ describe("assurance-coordinated mutation completion", () => {
     );
   });
 
-  it("does not carry a broad reviewer waiver across follow-up runs", () => {
+  it("does not carry a broad reviewer waiver into current explicit-review readiness", () => {
     const active = session([]);
     const environment: EvidenceRecord = {
       evidenceId: "current-environment-change",
@@ -180,8 +180,8 @@ describe("assurance-coordinated mutation completion", () => {
     expect(reviewReadiness(active, "completion").environmentMutations)
       .toContainEqual(expect.objectContaining({ evidenceId: "current-environment-change" }));
     expect(completionGateDecision(active)).toMatchObject({
-      action: "fail",
-      code: "verification_unavailable"
+      action: "continue",
+      message: expect.stringContaining("has not been validated")
     });
   });
 
@@ -862,6 +862,52 @@ describe("leaf-aware effect-plan enforcement", () => {
     };
 
     await expect(assertReceiptWithinPlan(active, result, plan)).resolves.toBeUndefined();
+  });
+
+  it("allows only checkpointed workspace paths in a mixed enclosing-container plan", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-hybrid-plan-"));
+    await mkdir(path.join(workspace, "src"));
+    const active = runtimeSessionFixture({ workspacePath: workspace });
+    const plan: ToolCallPlan = {
+      exactEffects: ["process.spawn", "filesystem.write"],
+      readPaths: [".", path.parse(path.resolve(workspace)).root],
+      writePaths: [
+        path.parse(path.resolve(workspace)).root,
+        "src/generated.txt"
+      ],
+      network: "none",
+      processMode: "pipe",
+      checkpointScope: [
+        path.parse(path.resolve(workspace)).root,
+        "src"
+      ],
+      mutationAuthority: "disposable_enclosing_container",
+      idempotence: "non_replayable"
+    };
+    const receipt = (changed: string): ToolReceipt => ({
+      callId: "hybrid",
+      ok: true,
+      output: "changed",
+      observedEffects: ["process.spawn", "filesystem.write"],
+      actualEffects: ["process.spawn", "filesystem.write"],
+      artifacts: [],
+      diagnostics: [],
+      evidence: [],
+      startedAt: now,
+      completedAt: now,
+      workspaceDelta: { added: [changed], modified: [], deleted: [] }
+    });
+
+    await expect(assertReceiptWithinPlan(
+      active,
+      receipt("src/generated.txt"),
+      plan
+    )).resolves.toBeUndefined();
+    await expect(assertReceiptWithinPlan(
+      active,
+      receipt("src/unexpected.txt"),
+      plan
+    )).rejects.toMatchObject({ code: "effect_plan_violation" });
   });
 });
 

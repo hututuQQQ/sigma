@@ -12,6 +12,17 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 
+PORTABLE_AGENT_ENV_KEYS = (
+    "DEEPSEEK_API_KEY",
+    "GLM_API_KEY",
+    "ZAI_API_KEY",
+    "BIGMODEL_API_KEY",
+    "DEEPSEEK_BASE_URL",
+    "GLM_BASE_URL",
+    "ZAI_BASE_URL",
+)
+
+
 def install_harbor_stubs() -> None:
     class BaseAgent:
         def __init__(self, logs_dir, model_name=None, extra_env=None, **_kwargs):
@@ -104,6 +115,75 @@ def managed_doctor_payload() -> str:
 
 
 class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._saved_agent_env = {
+            key: os.environ[key] for key in PORTABLE_AGENT_ENV_KEYS if key in os.environ
+        }
+        for key in PORTABLE_AGENT_ENV_KEYS:
+            os.environ.pop(key, None)
+
+    def tearDown(self):
+        for key in PORTABLE_AGENT_ENV_KEYS:
+            os.environ.pop(key, None)
+        os.environ.update(self._saved_agent_env)
+
+    async def test_agent_environment_uses_private_file_without_literal_exec_values(self):
+        module = import_portable_agent_module()
+
+        class RecordingEnvironment:
+            def __init__(self):
+                self.exec_calls = []
+                self.uploads = []
+
+            async def exec(self, command, **kwargs):
+                self.exec_calls.append((command, kwargs))
+                return SimpleNamespace(return_code=0, stdout="ok", stderr="")
+
+            async def upload_file(self, source, target):
+                source_path = Path(source)
+                self.uploads.append({
+                    "target": target,
+                    "content": source_path.read_text(encoding="utf-8"),
+                    "source": source_path,
+                })
+
+        env = RecordingEnvironment()
+        agent = module.SigmaCliHarborAgent(extra_env={})
+        credential = "fixture-secret-value-12345"
+
+        result = await agent._exec_with_private_env(
+            env,
+            "printf command-completed",
+            {"DEEPSEEK_API_KEY": credential, "SAFE_SETTING": "value with spaces"},
+            timeout_sec=30,
+        )
+
+        self.assertEqual(result.return_code, 0)
+        self.assertEqual(len(env.uploads), 1)
+        self.assertIn("export DEEPSEEK_API_KEY=", env.uploads[0]["content"])
+        self.assertIn(credential, env.uploads[0]["content"])
+        self.assertTrue(env.uploads[0]["target"].startswith(module.PRIVATE_ENV_DIR + "/"))
+        self.assertFalse(env.uploads[0]["source"].exists())
+
+        serialized_calls = json.dumps(env.exec_calls)
+        self.assertNotIn(credential, serialized_calls)
+        self.assertNotIn("DEEPSEEK_API_KEY=", serialized_calls)
+        self.assertTrue(all("env" not in kwargs for _, kwargs in env.exec_calls))
+        wrapped = next(command for command, _ in env.exec_calls if "printf command-completed" in command)
+        self.assertIn("/bin/rm -f", wrapped)
+        self.assertLess(
+            wrapped.index("/bin/rm -f"),
+            wrapped.index("printf command-completed"),
+        )
+
+    async def test_private_agent_environment_rejects_unsafe_shell_names_and_nul_values(self):
+        module = import_portable_agent_module()
+
+        with self.assertRaisesRegex(ValueError, "variable name"):
+            module.SigmaCliHarborAgent._private_env_script({"BAD-NAME": "value"})
+        with self.assertRaisesRegex(ValueError, "NUL"):
+            module.SigmaCliHarborAgent._private_env_script({"SAFE_NAME": "bad\0value"})
+
     async def test_model_name_is_used_unless_model_is_explicit(self):
         module = import_portable_agent_module()
 
@@ -148,6 +228,10 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                 network_mode="full",
                 managed_environment_mode="unknown",
             )
+        with self.assertRaisesRegex(ValueError, "max_turns"):
+            module.SigmaCliHarborAgent(max_turns=0)
+        with self.assertRaisesRegex(ValueError, "command_timeout_sec"):
+            module.SigmaCliHarborAgent(command_timeout_sec=601)
 
     async def test_container_execution_mode_is_forwarded_without_host_opt_in(self):
         module = import_portable_agent_module()
@@ -158,6 +242,8 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                 network_mode="full",
                 managed_environment_mode="required",
                 harbor_topology="managed_three_role",
+                max_turns=73,
+                command_timeout_sec=41,
             )
             agent._workspace = "/app"
 
@@ -171,6 +257,8 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("required", command)
             self.assertIn("--agent-profile", command)
             self.assertIn("standard", command)
+            self.assertEqual(command[command.index("--max-model-turns") + 1], "73")
+            self.assertEqual(command[command.index("--command-timeout-sec") + 1], "41")
             self.assertEqual(session_command[0], "/usr/local/bin/agent")
             self.assertIn("--execution-mode", session_command)
             self.assertIn("container", session_command)
@@ -178,6 +266,14 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("required", session_command)
             self.assertIn("--agent-profile", session_command)
             self.assertIn("standard", session_command)
+            self.assertEqual(
+                session_command[session_command.index("--max-model-turns") + 1],
+                "73",
+            )
+            self.assertEqual(
+                session_command[session_command.index("--command-timeout-sec") + 1],
+                "41",
+            )
             self.assertIn("auto", command)
             self.assertIn("auto", session_command)
             self.assertNotIn("HOME=/tmp/agent/disposable-home", command)
@@ -334,6 +430,8 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(record["classification"], "passed")
             self.assertEqual(record["execution_mode"], "container")
             self.assertEqual(record["agent_profile"], "standard")
+            self.assertEqual(record["write_scope_requested"], "auto")
+            self.assertEqual(record["write_scope_effective"], "workspace")
             self.assertEqual(
                 [check["stage"] for check in record["checks"]],
                 ["help", "strict_doctor"],
@@ -412,8 +510,9 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                     "/usr/local/bin/agent --help",
                     "/usr/local/bin/agent doctor --workspace /app --json --strict "
                     "--execution-mode sandboxed --network full --read-scope host "
-                    "--write-scope enclosing-container "
-                    "--managed-environment-mode disabled --check-api",
+                    "--write-scope workspace "
+                    "--managed-environment-mode disabled --max-model-turns 200 "
+                    "--command-timeout-sec 180 --check-api",
                 ],
             )
 
@@ -497,7 +596,65 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(record["classification"], "passed")
             self.assertEqual(record["network_mode_effective"], "full")
             self.assertEqual(record["read_scope_effective"], "host")
+            self.assertEqual(record["write_scope_requested"], "auto")
+            self.assertEqual(record["write_scope_effective"], "enclosing-container")
             self.assertTrue(record["process_handoff_available"])
+
+    async def test_auto_write_scope_falls_back_to_workspace_without_native_attestation(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            payload = json.loads(current_doctor_payload())
+            payload["capabilities"]["enclosingContainerRoot"] = {
+                "available": False,
+                "rootKind": "none",
+            }
+            env = SimpleNamespace(exec=AsyncMock(side_effect=[
+                SimpleNamespace(return_code=0, stdout="usage", stderr=""),
+                SimpleNamespace(return_code=0, stdout=json.dumps(payload), stderr=""),
+            ]))
+            agent = module.SigmaCliHarborAgent(logs_dir=Path(tmp) / "logs")
+            agent._workspace = "/app"
+
+            await agent._verify_agent_ready(env)
+
+            self.assertEqual(agent.write_scope, "auto")
+            self.assertEqual(agent.effective_write_scope, "workspace")
+            self.assertIn("--write-scope workspace", env.exec.await_args_list[1].args[0])
+            command = agent._agent_command()
+            self.assertEqual(command[command.index("--write-scope") + 1], "workspace")
+            record = json.loads((Path(tmp) / "logs" / "setup-check.json").read_text(encoding="utf-8"))
+            self.assertEqual(record["write_scope_requested"], "auto")
+            self.assertEqual(record["write_scope_effective"], "workspace")
+            self.assertEqual(
+                record["checks"][1]["write_scope_negotiation"]["doctor"],
+                "workspace",
+            )
+
+    async def test_explicit_enclosing_write_scope_still_requires_native_attestation(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            payload = json.loads(current_doctor_payload())
+            payload["capabilities"]["enclosingContainerRoot"] = {
+                "available": False,
+                "rootKind": "none",
+            }
+            env = SimpleNamespace(exec=AsyncMock(side_effect=[
+                SimpleNamespace(return_code=0, stdout="usage", stderr=""),
+                SimpleNamespace(return_code=0, stdout=json.dumps(payload), stderr=""),
+            ]))
+            agent = module.SigmaCliHarborAgent(
+                logs_dir=Path(tmp) / "logs",
+                write_scope="enclosing-container",
+            )
+            agent._workspace = "/app"
+
+            with self.assertRaisesRegex(RuntimeError, "strict_doctor_contract"):
+                await agent._verify_agent_ready(env)
+
+            self.assertIn(
+                "--write-scope enclosing-container",
+                env.exec.await_args_list[1].args[0],
+            )
 
     async def test_setup_help_failure_includes_stdout_and_stderr(self):
         module = import_portable_agent_module()
@@ -565,6 +722,8 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("--run-deadline-sec 600", command)
             self.assertIn("--permission-mode auto", command)
             self.assertIn("--agent-profile standard", command)
+            self.assertIn("--max-model-turns 200", command)
+            self.assertIn("--command-timeout-sec 180", command)
             self.assertIn("--output-format stream-json", command)
             self.assertNotIn("--output-schema", command)
             self.assertIn("--stream-json-max-line-bytes 49152", command)
@@ -1581,6 +1740,59 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             trace_lines = trace_path.read_text(encoding="utf-8").splitlines()
             self.assertTrue(any(json.loads(line).get("type") == "trace_truncated" for line in trace_lines))
             self.assertEqual(json.loads(trace_lines[-1]).get("type"), "trace_truncated")
+
+    async def test_stream_trace_buffers_transient_host_lock_without_aborting_callback(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            recorder = module._OutputRecorder(Path(tmp) / "logs")
+            writer = recorder._trace_writer
+            write_pending_once = writer._write_pending_once
+            attempts = 0
+
+            def fail_twice_then_write():
+                nonlocal attempts
+                attempts += 1
+                if attempts <= 2:
+                    raise PermissionError(13, "fixture host artifact lock", str(writer.path))
+                write_pending_once()
+
+            writer._write_pending_once = fail_twice_then_write
+            first = {
+                "kind": "event",
+                "event": {
+                    "eventId": "locked-1",
+                    "sessionId": "session",
+                    "seq": 1,
+                    "type": "model.reasoning_delta",
+                    "payload": {"delta": "first"},
+                },
+            }
+            second = {
+                "kind": "event",
+                "event": {
+                    "eventId": "locked-2",
+                    "sessionId": "session",
+                    "seq": 2,
+                    "type": "model.reasoning_delta",
+                    "payload": {"delta": "second"},
+                },
+            }
+
+            recorder.record(json.dumps(first) + "\n", "stdout")
+            self.assertEqual(len(recorder.events), 1)
+            recorder.record(json.dumps(second) + "\n", "stdout")
+            warnings = recorder.finish_artifacts()
+
+            records = [
+                json.loads(line)
+                for line in recorder.trace_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(
+                [record["sigma_event"]["eventId"] for record in records],
+                ["locked-1", "locked-2"],
+            )
+            self.assertEqual(len(recorder.events), 2)
+            self.assertTrue(any("recovered" in warning for warning in warnings))
 
     async def test_accounting_trace_is_single_copy_and_strictly_bounded(self):
         module = import_portable_agent_module()

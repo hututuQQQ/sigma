@@ -41,6 +41,15 @@ function processId(value: Record<string, unknown>): string {
   return id;
 }
 
+function processHandleValue(
+  value: Record<string, unknown>
+): Record<string, unknown> {
+  const nested = value.handle;
+  return nested && typeof nested === "object" && !Array.isArray(nested)
+    ? nested as Record<string, unknown>
+    : value;
+}
+
 async function outputEvents(
   session: RuntimeSession,
   id: string,
@@ -63,20 +72,23 @@ async function recordSpawnedProcess(
   id: string,
   emit: RuntimeEventEmitter
 ): Promise<void> {
-  const brokerInstanceId = typeof value.brokerInstanceId === "string" ? value.brokerInstanceId : "unknown";
+  const handle = processHandleValue(value);
+  const brokerInstanceId = typeof handle.brokerInstanceId === "string"
+    ? handle.brokerInstanceId : "unknown";
   session.execution.processHandles ??= new Map();
   session.execution.processHandles.set(id, {
     id,
     brokerInstanceId,
-    ...(typeof value.systemProcessId === "number" ? { systemProcessId: value.systemProcessId } : {}),
-    lifecycle: value.lifecycle === "deliverable" ? "deliverable" : "session"
+    ...(typeof handle.systemProcessId === "number"
+      ? { systemProcessId: handle.systemProcessId } : {}),
+    lifecycle: handle.lifecycle === "deliverable" ? "deliverable" : "session"
   });
   await emit(session, "process.spawned", "runtime", {
     processId: id,
     executionId: call.id,
     mode: plan.processMode === "pty" ? "pty" : "background",
     brokerInstanceId,
-    lifecycle: value.lifecycle === "deliverable" ? "deliverable" : "session"
+    lifecycle: handle.lifecycle === "deliverable" ? "deliverable" : "session"
   });
 }
 
@@ -97,6 +109,42 @@ async function recordPolledProcess(
   });
 }
 
+function unifiedProcessSpawn(
+  call: ModelToolCall,
+  plan: ToolCallPlan
+): boolean {
+  return call.name === "shell"
+    && (plan.processMode === "background" || plan.processMode === "pty");
+}
+
+function processLifecycleCall(
+  call: ModelToolCall,
+  unifiedSpawn: boolean
+): boolean {
+  return unifiedSpawn || [
+    "process_spawn",
+    "environment_process_spawn",
+    "process_poll",
+    "process_terminate",
+    "process_handoff"
+  ].includes(call.name);
+}
+
+async function recordSpawnReceipt(
+  session: RuntimeSession,
+  call: ModelToolCall,
+  plan: ToolCallPlan,
+  value: Record<string, unknown>,
+  id: string,
+  unifiedSpawn: boolean,
+  emit: RuntimeEventEmitter
+): Promise<void> {
+  await recordSpawnedProcess(session, call, plan, value, id, emit);
+  if (unifiedSpawn && typeof value.state === "string") {
+    await recordPolledProcess(session, value, id, emit);
+  }
+}
+
 export async function recordProcessReceipt(
   session: RuntimeSession,
   call: ModelToolCall,
@@ -104,13 +152,15 @@ export async function recordProcessReceipt(
   receipt: ToolReceipt,
   emit: RuntimeEventEmitter
 ): Promise<void> {
-  if (call.name !== "process_spawn" && call.name !== "environment_process_spawn"
-    && call.name !== "process_poll"
-    && call.name !== "process_terminate" && call.name !== "process_handoff") return;
+  const unifiedSpawn = unifiedProcessSpawn(call, plan);
+  if (!processLifecycleCall(call, unifiedSpawn)) return;
   const value = receiptOutput(receipt);
   const id = processId(value);
-  if (call.name === "process_spawn" || call.name === "environment_process_spawn") {
-    await recordSpawnedProcess(session, call, plan, value, id, emit);
+  if (call.name === "process_spawn" || call.name === "environment_process_spawn"
+    || unifiedSpawn) {
+    await recordSpawnReceipt(
+      session, call, plan, value, id, unifiedSpawn, emit
+    );
     return;
   }
   if (call.name === "process_handoff") {

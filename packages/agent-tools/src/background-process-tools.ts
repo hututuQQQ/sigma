@@ -15,12 +15,18 @@ import {
 } from "./execution-tool-planning.js";
 import type { ExecutionToolOptions } from "./execution-tool-types.js";
 import {
+  availableShells,
   availableNetworkModes,
   executableCapabilitySchema,
   executionArgs,
   executionText,
   executionToolSchema
 } from "./execution-tool-values.js";
+import {
+  DEFAULT_PROCESS_POLL_YIELD_MS,
+  pollProcessUntilYield,
+  processYieldMs
+} from "./process-wait.js";
 import { simpleExecutionReceipt } from "./execution-tool-receipts.js";
 import { processHandoffTool } from "./process-handoff-tool.js";
 import type {
@@ -62,7 +68,7 @@ function environmentProcessArguments(
   value: JsonValue,
   workspacePath: string
 ): Record<string, JsonValue> {
-  const input = executionArgs(value);
+  const { target: _target, ...input } = executionArgs(value);
   const root = path.parse(path.resolve(workspacePath)).root;
   return {
     ...input,
@@ -70,6 +76,45 @@ function environmentProcessArguments(
     writeRoots: [root],
     expectedChanges: [root]
   };
+}
+
+function resolvedSpawnArguments(
+  value: JsonValue,
+  workspacePath: string,
+  environmentAvailable: boolean
+): { input: Record<string, JsonValue>; environment: boolean } {
+  const input = executionArgs(value);
+  if (input.target === "environment") {
+    if (!environmentAvailable) {
+      throw Object.assign(new Error(
+        "The broker-attested disposable outer environment is unavailable."
+      ), { code: "policy_denied" });
+    }
+    return {
+      input: environmentProcessArguments(input, workspacePath),
+      environment: true
+    };
+  }
+  if (input.target !== undefined && input.target !== "workspace") {
+    throw Object.assign(new Error(
+      "Process target must be 'workspace' or 'environment'."
+    ), { code: "tool_arguments_invalid" });
+  }
+  const { target: _target, ...workspaceInput } = input;
+  return { input: workspaceInput, environment: false };
+}
+
+function spawnTargetProperties(
+  environmentAvailable: boolean
+): Record<string, JsonValue> {
+  return environmentAvailable ? {
+    target: {
+      type: "string",
+      enum: ["workspace", "environment"],
+      description:
+        "Execution boundary. Defaults to workspace. Use environment only for system-level changes in the broker-attested disposable outer environment. Processes, sockets, and temporary files created there are visible only to later calls that also use target=environment."
+    }
+  } : {};
 }
 
 function environmentProcessTool(
@@ -85,6 +130,9 @@ function environmentProcessTool(
     }
   } : {};
   return {
+    // Keep the legacy name registered for durable recovery. New model turns
+    // use process_spawn(target=environment), so they see one spawn surface.
+    modelVisible: false,
     descriptor: {
       ...executionToolSchema(
         "environment_process_spawn",
@@ -137,6 +185,7 @@ function spawnTool(
   options: ExecutionToolOptions,
   executeBackground: BackgroundProcessExecutor
 ): RegisteredEffectTool {
+  const environmentAvailable = environmentProcessAvailable(options);
   const enclosing = options.writeScope === "enclosing-container"
     && options.enclosingContainerRoot === true;
   const effects: ToolDescriptor["possibleEffects"] = [
@@ -148,13 +197,20 @@ function spawnTool(
     "open_world"
   ];
   return {
+    // A verified shell exposes background=true on the primary shell tool.
+    // Keep this legacy direct-spawn name registered only for durable recovery
+    // and for execution targets that have no verified shell.
+    modelVisible: availableShells(options).length === 0 ? undefined : false,
     descriptor: {
       ...executionToolSchema(
         "process_spawn",
-        "Start a sandboxed background process and return an in-session handle.",
+        environmentAvailable
+          ? "Start a sandboxed background process and return an in-session handle. Set target=environment only for a service that needs system-level changes in the broker-attested disposable outer environment; use that same target for later inspection or control because workspace-target calls use a separate sandbox view."
+          : "Start a sandboxed background process and return an in-session handle.",
         {
           executable: executableCapabilitySchema(options),
           args: { type: "array", items: { type: "string" } },
+          ...spawnTargetProperties(environmentAvailable),
           cwd: { type: "string" },
           network: networkProperty(options),
           env: { type: "object", additionalProperties: { type: "string" } },
@@ -181,32 +237,61 @@ function spawnTool(
         ? { brokerMutationAuthority: "disposable_enclosing_container" as const }
         : {}),
       prepare(value, context) {
-        return prepareExecutionCallPlan(value, context, options, false, true);
+        const resolved = resolvedSpawnArguments(
+          value, context.workspacePath, environmentAvailable
+        );
+        return prepareExecutionCallPlan(
+          resolved.input,
+          context,
+          options,
+          false,
+          true,
+          resolved.environment
+        );
       }
     },
     async execute(request, context) {
-      return await executeBackground(options, request, context);
+      const resolved = resolvedSpawnArguments(
+        request.arguments, context.workspacePath, environmentAvailable
+      );
+      return await executeBackground(options, {
+        ...request,
+        arguments: resolved.input
+      }, context, resolved.environment);
     }
   };
 }
 
-function processControlTools(
+function processPollTool(
   options: ExecutionToolOptions,
   handleProperties: Record<string, JsonValue>
-): RegisteredEffectTool[] {
-  return [{
+): RegisteredEffectTool {
+  return {
     descriptor: executionToolSchema(
       "process_poll",
-      "Poll incremental output from an in-session background process.",
-      handleProperties,
+      "Wait briefly for incremental output or completion from an in-session background process. Returns immediately when output or terminal state is available.",
+      {
+        ...handleProperties,
+        yieldMs: {
+          type: "integer",
+          minimum: 0,
+          maximum: 30000,
+          description:
+            "Maximum wait for output or completion. Defaults to 5000 ms; set 0 for an immediate poll."
+        }
+      },
       ["handleId", "brokerInstanceId"],
       ["process.spawn.readonly"]
     ),
     async execute(request: ToolRequest, context: PlannedToolExecutionContext) {
       const startedAt = new Date().toISOString();
-      const result = await options.broker.poll(
-        handle(executionArgs(request.arguments)),
-        { signal: context.signal }
+      const input = executionArgs(request.arguments);
+      const result = await pollProcessUntilYield(
+        options.broker,
+        handle(input),
+        processYieldMs(input, DEFAULT_PROCESS_POLL_YIELD_MS),
+        context.signal,
+        true
       );
       return await processReceipt(
         request,
@@ -218,7 +303,14 @@ function processControlTools(
         "poll"
       );
     }
-  }, ...(options.stdin === false ? [] : [{
+  };
+}
+
+function processWriteTool(
+  options: ExecutionToolOptions,
+  handleProperties: Record<string, JsonValue>
+): RegisteredEffectTool {
+  return {
     descriptor: executionToolSchema("process_write", "Write UTF-8 input to an in-session background process.", {
       ...handleProperties,
       data: { type: "string" }
@@ -238,7 +330,14 @@ function processControlTools(
         ["process.spawn.readonly"]
       );
     }
-  }]), {
+  };
+}
+
+function processTerminateTool(
+  options: ExecutionToolOptions,
+  handleProperties: Record<string, JsonValue>
+): RegisteredEffectTool {
+  return {
     descriptor: executionToolSchema(
       "process_terminate",
       "Terminate an in-session background process tree.",
@@ -262,9 +361,22 @@ function processControlTools(
         "terminate"
       );
     }
-  }, ...(options.handoff === true
+  };
+}
+
+function processControlTools(
+  options: ExecutionToolOptions,
+  handleProperties: Record<string, JsonValue>
+): RegisteredEffectTool[] {
+  return [
+    processPollTool(options, handleProperties),
+    ...(options.stdin === false
+      ? [] : [processWriteTool(options, handleProperties)]),
+    processTerminateTool(options, handleProperties),
+    ...(options.handoff === true
     ? [processHandoffTool(options, handleProperties)]
-    : [])];
+    : [])
+  ];
 }
 
 export function backgroundProcessTools(

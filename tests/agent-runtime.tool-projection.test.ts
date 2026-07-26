@@ -29,31 +29,150 @@ describe("session model-tool capability projection", () => {
       executableSkillResourcesLoaded: false
     });
     expect(projected.some((item) => item.name === "load_skill")).toBe(false);
-    for (const name of ["exec", "validate", "process_spawn"]) {
-      const properties = projected.find((item) => item.name === name)?.inputSchema.properties;
-      expect(properties).not.toHaveProperty("skill");
-      expect(properties).not.toHaveProperty("skillScript");
-    }
+    expect(projected.some((item) => item.name === "exec")).toBe(false);
+    expect(projected.some((item) => item.name === "validate")).toBe(false);
+    expect(projected.some((item) => item.name === "process_spawn")).toBe(false);
+    const properties = projected.find((item) => item.name === "shell")?.inputSchema.properties;
+    expect(properties).not.toHaveProperty("skill");
+    expect(properties).not.toHaveProperty("skillScript");
   });
 
-  it("exposes only the skill capabilities that are actually usable in this session", () => {
+  it("keeps one stable foreground surface while skills are discovered and loaded", () => {
     const discoverable = projectModelToolDescriptors(descriptors, {
       skillsAvailable: true,
       executableSkillResourcesLoaded: false
     });
     expect(discoverable.some((item) => item.name === "load_skill")).toBe(true);
-    expect(discoverable.find((item) => item.name === "exec")?.inputSchema.properties)
-      .not.toHaveProperty("skill");
+    expect(discoverable.some((item) => item.name === "exec")).toBe(false);
+    expect(discoverable.find((item) => item.name === "shell")?.inputSchema.properties)
+      .toHaveProperty("skill");
 
     const loaded = projectModelToolDescriptors(descriptors, {
       skillsAvailable: true,
       executableSkillResourcesLoaded: true
     });
-    expect(loaded.find((item) => item.name === "exec")?.inputSchema.properties)
+    expect(loaded.some((item) => item.name === "exec")).toBe(false);
+    expect(loaded.find((item) => item.name === "shell")?.inputSchema.properties)
       .toHaveProperty("skill");
-    expect(loaded.find((item) => item.name === "exec")?.inputSchema.properties)
+    expect(loaded.find((item) => item.name === "shell")?.inputSchema.properties)
       .toHaveProperty("skillScript");
-    expect(loaded.find((item) => item.name === "process_spawn")?.inputSchema.properties)
+    expect(loaded.some((item) => item.name === "validate")).toBe(false);
+    expect(loaded.some((item) => item.name === "process_spawn")).toBe(false);
+    expect(loaded.find((item) => item.name === "shell")?.inputSchema.properties)
+      .toHaveProperty("background");
+    expect(loaded.find((item) => item.name === "shell")?.inputSchema.properties)
+      .toHaveProperty("validation");
+  });
+
+  it("presents one scoped workspace-write field while retaining the recovery contract", () => {
+    const tools = registerBuiltinTools(new EffectToolRegistry());
+    const runtimeProperties = tools.descriptor("shell")?.inputSchema.properties;
+    const modelShell = tools.modelDescriptors().find((item) => item.name === "shell");
+    const modelProperties = modelShell?.inputSchema.properties;
+
+    expect(runtimeProperties).toHaveProperty("access");
+    expect(runtimeProperties).toHaveProperty("writeRoots");
+    expect(runtimeProperties).toHaveProperty("expectedChanges");
+    expect(runtimeProperties).toHaveProperty("purpose");
+    expect(runtimeProperties).toHaveProperty("subjects");
+    expect(runtimeProperties).toHaveProperty("criterionIds");
+    expect(modelProperties).not.toHaveProperty("access");
+    expect(modelProperties).not.toHaveProperty("writeRoots");
+    expect(modelProperties).toHaveProperty("expectedChanges");
+    expect((modelProperties as Record<string, unknown>).expectedChanges)
+      .not.toHaveProperty("minItems");
+    expect(modelProperties).not.toHaveProperty("purpose");
+    expect(modelProperties).not.toHaveProperty("subjects");
+    expect(modelProperties).not.toHaveProperty("criterionIds");
+    expect(modelShell?.description).toContain("process temp directory");
+    expect(modelShell?.description).toContain("validation=true");
+
+    const analyzeShell = projectModelToolDescriptors(tools.modelDescriptors(), {
+      skillsAvailable: false,
+      executableSkillResourcesLoaded: false,
+      environmentMutationAvailable: false
+    }).find((item) => item.name === "shell");
+    expect(analyzeShell?.inputSchema.properties).not.toHaveProperty("expectedChanges");
+    expect(analyzeShell?.description).not.toContain("provide expectedChanges");
+  });
+
+  it("keeps environment state guidance only while that execution boundary is available", () => {
+    const environmentTools = registerBuiltinTools(new EffectToolRegistry(), {
+      readScope: "host",
+      writeScope: "enclosing-container",
+      enclosingContainerRoot: true,
+      enclosingContainerAttestationDigest: "attested-container"
+    }).modelDescriptors();
+    const availableShell = projectModelToolDescriptors(environmentTools, {
+      skillsAvailable: false,
+      executableSkillResourcesLoaded: false,
+      environmentMutationAvailable: true
+    }).find((item) => item.name === "shell");
+    expect(availableShell?.description)
+      .toContain("workspace-target calls use a separate sandbox view");
+
+    const unavailableShell = projectModelToolDescriptors(environmentTools, {
+      skillsAvailable: false,
+      executableSkillResourcesLoaded: false,
+      environmentMutationAvailable: false
+    }).find((item) => item.name === "shell");
+    expect(unavailableShell?.inputSchema.properties).not.toHaveProperty("target");
+    expect(unavailableShell?.description).not.toContain("target=environment");
+    expect(unavailableShell?.description).not.toContain("outer environment");
+  });
+
+  it("defers lifecycle controls until durable process or child state exists", () => {
+    const template = descriptors.find((item) => item.name === "read_plan")!;
+    const childNames = [
+      "spawn_agent", "message_agent", "join_agent", "list_agents", "integrate_agent"
+    ];
+    const lifecycleDescriptors = [
+      ...descriptors,
+      ...childNames.map((name) => ({ ...template, name }))
+    ];
+    const unavailable = projectModelToolDescriptors(lifecycleDescriptors, {
+      skillsAvailable: false,
+      executableSkillResourcesLoaded: false,
+      processControlsAvailable: false,
+      childControlsAvailable: false,
+      planReadRequired: false
+    });
+    for (const name of [
+      "process_poll", "process_write", "process_terminate", "process_handoff",
+      "message_agent", "join_agent", "list_agents", "integrate_agent", "read_plan"
+    ]) {
+      expect(unavailable.some((item) => item.name === name)).toBe(false);
+    }
+    expect(unavailable.some((item) => item.name === "process_spawn")).toBe(false);
+    expect(unavailable.find((item) => item.name === "shell")?.inputSchema.properties)
+      .toHaveProperty("background");
+    expect(unavailable.some((item) => item.name === "spawn_agent")).toBe(true);
+
+    const available = projectModelToolDescriptors(lifecycleDescriptors, {
+      skillsAvailable: false,
+      executableSkillResourcesLoaded: false,
+      processControlsAvailable: true,
+      childControlsAvailable: true,
+      planReadRequired: true
+    });
+    for (const name of [
+      "process_poll", "process_write", "process_terminate",
+      "message_agent", "join_agent", "list_agents", "integrate_agent", "read_plan"
+    ]) {
+      expect(available.some((item) => item.name === name)).toBe(true);
+    }
+  });
+
+  it("retains direct execution when no shell exists", () => {
+    const projected = projectModelToolDescriptors(
+      descriptors.filter((item) => item.name !== "shell"),
+      {
+        skillsAvailable: false,
+        executableSkillResourcesLoaded: false
+      }
+    );
+    expect(projected.some((item) => item.name === "exec")).toBe(true);
+    expect(projected.find((item) => item.name === "exec")?.inputSchema.properties)
       .not.toHaveProperty("skill");
   });
 

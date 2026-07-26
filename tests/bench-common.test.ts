@@ -220,18 +220,33 @@ describe("Terminal-Bench command construction", () => {
     })).toEqual(expect.arrayContaining([
       "network_mode:str=full",
       "execution_mode:str=sandboxed",
+      "write_scope:str=auto",
       "agent_profile:str=standard"
     ]));
     expect(buildHarborJobConfig(options, "jobs").agents[0].kwargs).toMatchObject({
       network_mode: "full",
       execution_mode: "sandboxed",
+      write_scope: "auto",
       agent_profile: "standard"
     });
+  });
+
+  it("freezes write-scope capability negotiation without assuming outer-container authority", () => {
+    const options = resolveRunOptions([
+      "--mode", "task", "--task-id", "generic-task", "--write-scope", "workspace"
+    ]);
+    expect(options.writeScope).toBe("workspace");
+    expect(buildHarborJobConfig(options, "jobs").agents[0].kwargs)
+      .toMatchObject({ write_scope: "workspace" });
+    expect(() => resolveRunOptions([
+      "--mode", "task", "--task-id", "generic-task", "--write-scope", "host"
+    ])).toThrow(/write scope/iu);
   });
 
   it("defaults every benchmark run to full network and records it in Harbor configuration", () => {
     const options = resolveRunOptions(["--mode", "task", "--task-id", "generic-task"], {});
     expect(options.networkMode).toBe("full");
+    expect(options.writeScope).toBe("auto");
     expect(buildHarborJobConfig(options, "jobs").agents[0].kwargs)
       .toMatchObject({ network_mode: "full" });
   });
@@ -745,9 +760,10 @@ describe("Terminal-Bench command construction", () => {
     expect(path.isAbsolute(config.agents[0].kwargs.agent_cli_tarball)).toBe(true);
     expect(config.agents[0].kwargs).toMatchObject({
       agent_cli_tarball: defaultAgentCliTarballForEnv(),
+      max_turns: 200,
+      command_timeout_sec: 180,
       max_wall_time_sec: 2700
     });
-    expect(config.agents[0].kwargs.max_turns).toBeUndefined();
     expect(config.agents[0].kwargs.validation_retry_limit).toBeUndefined();
     expect(config.agents[0].kwargs.precheck_command).toBeUndefined();
     expect(config.agents[0].kwargs.post_run_cleanup_globs).toBeUndefined();
@@ -780,6 +796,8 @@ describe("Terminal-Bench command construction", () => {
     });
     expect(config.agents[0].kwargs).toMatchObject({
       agent_cli_tarball: defaultAgentCliTarballForEnv(),
+      max_turns: 200,
+      command_timeout_sec: 180,
       max_wall_time_sec: 2700
     });
     expect(config.agents[0].kwargs.validation_mode).toBeUndefined();
@@ -805,7 +823,7 @@ describe("Terminal-Bench command construction", () => {
     expect(plan).toMatchObject({ agent_wall_time_sec: 2700, harness_timeout_sec: 2820 });
   });
 
-  it("does not expose fixed turn limits to the solver", () => {
+  it("forwards explicit generic turn and command timeout controls to the solver", () => {
     const timeoutProbe = {
       resolved_tasks: [{ name: "terminal-bench/long-runtime-task" }],
       tasks: [{ task_name: "terminal-bench/long-runtime-task", agent_timeout_sec: 1800 }],
@@ -827,7 +845,10 @@ describe("Terminal-Bench command construction", () => {
       timeoutProbe
     );
 
-    expect(config.agents[0].kwargs.max_turns).toBeUndefined();
+    expect(config.agents[0].kwargs).toMatchObject({
+      max_turns: 200,
+      command_timeout_sec: 180
+    });
   });
 
   it("rejects removed Harbor import paths", () => {
@@ -1266,6 +1287,56 @@ describe("benchmark report generation", () => {
     });
     expect(report.tasks[0].last_error).toContain("test_outputs.py::test_vm_execution");
     expect(await readFile(path.join(runDir, "report.md"), "utf8")).toContain("## Verifier Failures");
+  });
+
+  it("excludes Harbor environment failures that occur before agent startup", async () => {
+    const runDir = await mkdtemp(path.join(os.tmpdir(), "sigma-bench-environment-infra-"));
+    await writeFile(path.join(runDir, "config.json"), `${JSON.stringify({
+      run_id: "environment-infra-run",
+      provider: "deepseek",
+      model: "model",
+      dataset: terminalBenchDataset,
+      k: 1,
+      exit_code: 0,
+      status: "passed"
+    })}\n`, "utf8");
+    for (const name of ["harbor.stdout.log", "harbor.stderr.log", "result.raw.log"]) {
+      await writeFile(path.join(runDir, name), "", "utf8");
+    }
+    const trialDir = path.join(runDir, "harbor-jobs", "job-1", "trial-1");
+    await mkdir(trialDir, { recursive: true });
+    await writeFile(path.join(trialDir, "result.json"), `${JSON.stringify({
+      trial_name: "trial-1",
+      task_name: "registry/task-one",
+      exception_info: {
+        exception_type: "RuntimeError",
+        exception_message: "Environment orchestration failed before the agent started."
+      },
+      agent_result: null,
+      verifier_result: null,
+      environment_setup: {
+        started_at: "2026-07-06T00:00:00.000Z",
+        finished_at: "2026-07-06T00:00:01.000Z"
+      },
+      agent_setup: null,
+      agent_execution: null,
+      verifier: null
+    })}\n`, "utf8");
+    await writeHarborJobResult(path.dirname(trialDir), 1, 1);
+
+    const report = await generateBenchReport(runDir);
+
+    expect(report.tasks[0]).toMatchObject({
+      status: "infra_failed",
+      failure_category: "infrastructure_incomplete",
+      agent_outcome: "infrastructure_incomplete",
+      verifier_outcome: "not_run",
+      validity: "infra_failed",
+      suggested_owner: "environment"
+    });
+    expect(report.counts.infra_failed).toBe(1);
+    expect(report.validity).toEqual({ valid: 0, infra_failed: 1 });
+    expect(report.effective_correctness).toEqual({ passed: 0, total: 0, pass_rate: null });
   });
 
   it("excludes verifier setup failures from effective correctness", async () => {

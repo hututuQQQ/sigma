@@ -64,7 +64,7 @@ export interface PendingTool {
 
 export interface LengthRecoveryState {
   schemaVersion: 1;
-  mode: "none" | "action_required" | "bounded_answer" | "continue_after_tools";
+  mode: "none" | "retry_with_headroom" | "action_required" | "bounded_answer" | "continue_after_tools";
   attempts: number;
 }
 
@@ -233,7 +233,7 @@ function validLengthRecoveryState(value: unknown): value is LengthRecoveryState 
   const recovery = record(value);
   return Boolean(recovery
     && recovery.schemaVersion === 1
-    && ["none", "action_required", "bounded_answer", "continue_after_tools"]
+    && ["none", "retry_with_headroom", "action_required", "bounded_answer", "continue_after_tools"]
       .includes(String(recovery.mode))
     && Number.isSafeInteger(recovery.attempts)
     && Number(recovery.attempts) >= 0);

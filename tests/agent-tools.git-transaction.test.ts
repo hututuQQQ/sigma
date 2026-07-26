@@ -262,6 +262,9 @@ describe("controlled Git transactions", () => {
     const tools = registry();
     await expect(transact(tools, root, [{ op: "add", paths: ["seed.txt"], argv: ["status"] }]))
       .rejects.toThrow();
+    await expect(transact(tools, root, [{
+      op: "add", paths: ["seed.txt"], message: "known schema field, wrong operation"
+    }])).rejects.toThrow("add does not accept field: message");
     await expect(transact(tools, root, [{ op: "add", paths: ["../outside.txt"] }]))
       .rejects.toThrow("Unsafe Git pathspec");
 

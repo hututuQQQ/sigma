@@ -91,7 +91,7 @@ async function approveEvery(
 }
 
 function networkTurn(callId: string) {
-  return fakeToolTurn([fakeToolCall(callId, "exec", {
+  return fakeToolTurn([fakeToolCall(callId, "shell", {
     executable: "policy-fixture",
     args: [],
     network: "full"
@@ -476,7 +476,7 @@ describe("sensitive per-call approvals", () => {
     fixtures.push(root);
     const storeRootDir = path.join(root, "state");
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
-    const call = fakeToolCall("sensitive-resume", "exec", {
+    const call = fakeToolCall("sensitive-resume", "shell", {
       executable: "resume-fixture", args: [], network: "full"
     });
     const customization = await persistEmptyCustomization(

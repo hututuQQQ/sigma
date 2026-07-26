@@ -27,11 +27,22 @@ describe("agent-config single-source schema", () => {
   it("applies source precedence and rejects unknown TOML keys", () => {
     const values = resolveConfig({
       flags: { provider: "glm" },
-      env: { SIGMA_MODEL: "env-model", SIGMA_RUN_DEADLINE_SEC: "42" },
+      env: {
+        SIGMA_MODEL: "env-model",
+        SIGMA_RUN_DEADLINE_SEC: "42",
+        SIGMA_COMMAND_TIMEOUT_SEC: "90"
+      },
       workspace: { model: { provider: "deepseek", name: "workspace-model" }, tools: { max_parallel: 7 } },
       home: { model: { provider: "deepseek", name: "home-model" }, permissions: { mode: "deny" } }
     });
-    expect(values).toMatchObject({ provider: "glm", model: "env-model", runDeadlineSec: 42, maxParallelTools: 4, permissionMode: "deny" });
+    expect(values).toMatchObject({
+      provider: "glm",
+      model: "env-model",
+      runDeadlineSec: 42,
+      maxParallelTools: 4,
+      commandTimeoutSec: 90,
+      permissionMode: "deny"
+    });
     expect(() => resolveConfig({ workspace: { model: { unknown: true } } })).toThrow("Unknown workspace configuration key");
     expect(() => resolveConfig({ home: { surprise: {} } })).toThrow("Unknown home configuration key");
     expect(() => resolveConfig({ flags: { surprise: true } })).toThrow("Unknown option");
@@ -47,7 +58,9 @@ describe("agent-config single-source schema", () => {
           network: "none",
           process_handoff: "deny"
         },
-        budget: { max_input_tokens: 1_000, max_tool_calls: 20 }, checkpoint: { max_files: 100 }
+        budget: { max_input_tokens: 1_000, max_tool_calls: 20 },
+        tools: { command_timeout_sec: 120 },
+        checkpoint: { max_files: 100 }
       },
       workspace: {
         permissions: { mode: "auto" },
@@ -57,14 +70,17 @@ describe("agent-config single-source schema", () => {
           network: "full",
           process_handoff: "allow"
         },
-        budget: { max_input_tokens: 2_000, max_tool_calls: 10 }, checkpoint: { max_files: 200 },
+        budget: { max_input_tokens: 2_000, max_tool_calls: 10 },
+        tools: { command_timeout_sec: 240 },
+        checkpoint: { max_files: 200 },
         agents: { max_parallel: 2 }
       }
     });
     expect(values).toMatchObject({
       permissionMode: "deny", readScope: "workspace", writeScope: "workspace",
       networkMode: "none", processHandoff: "deny",
-      maxInputTokens: 1_000, maxToolCalls: 10, checkpointMaxFiles: 100, maxParallelAgents: 2
+      maxInputTokens: 1_000, maxToolCalls: 10, commandTimeoutSec: 120,
+      checkpointMaxFiles: 100, maxParallelAgents: 2
     });
 
     const narrowed = resolveConfig({
@@ -126,6 +142,9 @@ describe("agent-config single-source schema", () => {
     expect(() => field("streamJsonMaxLineBytes").parse(4_096.5)).toThrow("integer");
     expect(() => field("maxParallelTools").parse(0)).toThrow("number");
     expect(() => field("maxParallelTools").parse(33)).toThrow("number");
+    expect(field("commandTimeoutSec").parse(180)).toBe(180);
+    expect(() => field("commandTimeoutSec").parse(0)).toThrow("number");
+    expect(() => field("commandTimeoutSec").parse(601)).toThrow("number");
     expect(() => field("stdin").parse("maybe")).toThrow("true or false");
     expect(field("stdin").parse("1")).toBe(true);
     expect(field("stdin").parse("0")).toBe(false);

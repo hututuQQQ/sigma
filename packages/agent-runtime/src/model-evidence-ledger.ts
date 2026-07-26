@@ -116,7 +116,9 @@ export function evidenceLedger(session: RuntimeSession): ContextItem {
     ...reviewStatusLines(review),
     reviewMode === "required"
       ? "- Strict completion requires current-frontier reviewer approval backed by at least one reviewer-executed check."
-      : "- Standard completion requires current-frontier reviewer approval or an explicit user waiver; an unchanged incomplete basis gets one repair opportunity.",
+      : reviewMode === "advisory"
+        ? "- Standard completion uses plan and validation evidence. Independent review runs only when explicitly requested."
+        : "- Standard completion uses plan and validation evidence; independent review is disabled.",
     "When work is complete, stop naturally with the user-facing summary."
   ];
   const stateDigest = digest({

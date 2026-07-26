@@ -17,6 +17,7 @@ import {
 import { processMutationContract, writePlanError } from "./process-mutation-contract.js";
 import type { PlannedToolExecutionContext } from "./registry.js";
 import { validationWorkspacePolicy } from "./execution-validation-workspace.js";
+import { environmentWorkspaceMutation } from "./environment-workspace-mutation.js";
 import {
   assembledExecutionPlan,
   assertBackgroundExecutionAvailable,
@@ -158,7 +159,8 @@ async function plannedCall(
   skillResource: LoadedSkillResourceAccess | undefined,
   validation = false,
   background = false,
-  allowEnclosingContainerDeliverable = false
+  allowEnclosingContainerDeliverable = false,
+  environmentExpectedChanges?: JsonValue
 ): Promise<ToolCallPlan> {
   assertBackgroundExecutionAvailable(input, options, skillResource, background);
   const networkMode = network(input, options);
@@ -176,6 +178,14 @@ async function plannedCall(
     background,
     allowEnclosingContainerDeliverable
   );
+  const workspaceMutation = mutation.scope === "enclosing_container"
+    ? await environmentWorkspaceMutation(
+      environmentExpectedChanges,
+      context.workspacePath,
+      context.runMode,
+      background
+    )
+    : undefined;
   const readPaths = await plannedReadPaths(
     input,
     context.workspacePath,
@@ -189,6 +199,7 @@ async function plannedCall(
   return assembledExecutionPlan({
     invocation,
     mutation,
+    workspaceMutation,
     readPaths,
     networkMode,
     processMode: plannedProcessMode(input, background),
@@ -207,7 +218,8 @@ export async function approvedProcessPlan(
   skillResource: LoadedSkillResourceAccess | undefined,
   validation: boolean,
   background = false,
-  allowEnclosingContainerDeliverable = false
+  allowEnclosingContainerDeliverable = false,
+  environmentExpectedChanges?: JsonValue
 ): Promise<ToolCallPlan> {
   const approved = context.callPlan;
   const current = await plannedCall(
@@ -217,7 +229,8 @@ export async function approvedProcessPlan(
     skillResource,
     validation,
     background,
-    allowEnclosingContainerDeliverable
+    allowEnclosingContainerDeliverable,
+    environmentExpectedChanges
   )
     .catch((error) => {
       if (!approved) throw error;
@@ -243,7 +256,8 @@ export async function prepareExecutionCallPlan(
   options: ExecutionToolOptions,
   validation = false,
   background = false,
-  allowEnclosingContainerDeliverable = false
+  allowEnclosingContainerDeliverable = false,
+  environmentExpectedChanges?: JsonValue
 ): Promise<ToolCallPlan> {
   const input = executionArgs(argumentsValue);
   if (input.executable !== undefined) assertAvailableExecutable(input, options);
@@ -255,8 +269,34 @@ export async function prepareExecutionCallPlan(
     skillResource,
     validation,
     background,
-    allowEnclosingContainerDeliverable
+    allowEnclosingContainerDeliverable,
+    environmentExpectedChanges
   );
+}
+
+function executionProtectedPaths(
+  plan: ToolCallPlan,
+  workspaceRoot: string,
+  runtimeProtectedPaths: string[],
+  skillResource?: LoadedSkillResourceAccess
+): string[] {
+  const protectedPaths = skillResource
+    ? [path.resolve(skillResource.readRoot)] : [];
+  if (plan.mutationAuthority !== "disposable_enclosing_container") {
+    return protectedPaths;
+  }
+  const mutatesWorkspace =
+    plan.checkpointScope.some((item) => !path.isAbsolute(item));
+  return [
+    ...protectedPaths,
+    ...(mutatesWorkspace
+      ? [
+          path.join(workspaceRoot, ".git"),
+          path.join(workspaceRoot, ".agent")
+        ]
+      : [workspaceRoot]),
+    ...runtimeProtectedPaths
+  ];
 }
 
 export function executionPolicy(
@@ -296,13 +336,12 @@ export function executionPolicy(
     // The broker derives metadata guards from the minimal declared roots.
     // Adding workspace-root metadata here would make a narrow cwd/read scope
     // fail native root validation before the command can start.
-    protectedPaths: [
-      ...(skillResource ? [path.resolve(skillResource.readRoot)] : []),
-      ...(enclosingContainer ? [
-        workspaceRoot,
-        ...runtimeProtectedPaths
-      ] : [])
-    ],
+    protectedPaths: executionProtectedPaths(
+      plan,
+      workspaceRoot,
+      runtimeProtectedPaths,
+      skillResource
+    ),
     ...(enclosingContainer ? { enclosingContainerRoot: true } : {}),
     ...validationWorkspacePolicy(disposableValidation, workspaceRoot, options),
     ...(scratchLease && !enclosingContainer ? { scratchLease } : {})
@@ -315,12 +354,15 @@ export async function resolvedWriteRoots(
 ): Promise<string[]> {
   if (context.runMode !== "change") return [];
   if (plan.mutationAuthority === "disposable_enclosing_container") {
-    if (plan.checkpointScope.some((item) => !path.isAbsolute(item))) {
+    const enclosingRoots = plan.checkpointScope
+      .filter((item) => path.isAbsolute(item))
+      .map((item) => path.resolve(item));
+    if (enclosingRoots.length === 0) {
       throw Object.assign(new Error(
-        "Enclosing-container write roots must remain canonical absolute paths."
+        "Enclosing-container execution requires a canonical absolute write root."
       ), { code: "write_plan_stale" });
     }
-    return [...new Set(plan.checkpointScope.map((item) => path.resolve(item)))];
+    return [...new Set(enclosingRoots)];
   }
   const roots = await Promise.all(plan.checkpointScope.map(async (item) =>
     await resolveWorkspacePath(context.workspacePath, item)

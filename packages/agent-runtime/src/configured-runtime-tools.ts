@@ -24,6 +24,7 @@ export interface ConfiguredToolOptions {
   writeScope?: "workspace" | "enclosing-container";
   networkMode?: "none" | "loopback" | "full";
   processHandoff?: "allow" | "deny";
+  commandTimeoutSec?: number;
   checkpoint?: { maxFiles: number; maxBytes: number };
 }
 
@@ -39,6 +40,21 @@ function runtimeProtectedPaths(storeRootDir: string): string[] {
     path.resolve(installRoot),
     ...(process.argv[1] ? [path.dirname(path.resolve(process.argv[1]))] : [])
   ])].filter((item) => path.parse(item).root !== item);
+}
+
+function enclosingContainerProtectedPaths(report: BrokerDoctorReport): string[] {
+  const capability = report.capabilities.enclosingContainerRoot;
+  return capability?.available === true ? capability.protectedPaths : [];
+}
+
+export function configuredProtectedPaths(
+  report: BrokerDoctorReport,
+  storeRootDir: string
+): string[] {
+  return [...new Set([
+    ...runtimeProtectedPaths(storeRootDir),
+    ...enclosingContainerProtectedPaths(report)
+  ])];
 }
 
 function configuredToolPolicy(config: ConfiguredToolOptions) {
@@ -116,8 +132,11 @@ export function createConfiguredTools(
     sandboxMode: "required",
     readScope: policy.readScope,
     writeScope: policy.writeScope,
-    protectedPaths: runtimeProtectedPaths(storeRootDir),
+    protectedPaths: configuredProtectedPaths(executionReport, storeRootDir),
     processHandoff: policy.processHandoff,
+    commandTimeoutMs: config.commandTimeoutSec === undefined
+      ? undefined
+      : config.commandTimeoutSec * 1_000,
     networkMode: network.defaultMode,
     networkModes: network.modes,
     ...brokerToolCapabilities(config, execution, executionReport),

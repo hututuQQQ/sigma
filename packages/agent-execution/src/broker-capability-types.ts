@@ -10,6 +10,9 @@ export interface BrokerEnclosingContainerRootCapability {
   available: boolean;
   rootKind: "container_cow" | "unavailable";
   attestationDigest?: string;
+  /** Writable mounts backed outside the disposable root that every
+   * enclosing-container request must re-bind read-only. */
+  protectedPaths: string[];
   reason?: string;
 }
 

@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import type {
   BrokerDoctorReport,
   ExecutionBroker,
+  ExecutionRequest,
   ExecutionResult,
   ProcessOutputArtifact,
   ProcessPollResult
@@ -41,13 +42,17 @@ function outputArtifact(stream: "stdout" | "stderr", content: string): ProcessOu
 function broker(
   execution: ExecutionResult,
   poll: ProcessPollResult,
-  released: string[][] = []
+  released: string[][] = [],
+  requests: ExecutionRequest[] = []
 ): ExecutionBroker {
   return {
     lostProcessHandles: [],
     connect: async () => report,
     doctor: async () => report,
-    execute: async () => execution,
+    execute: async (input) => {
+      requests.push(input);
+      return execution;
+    },
     spawn: async () => poll.handle,
     poll: async () => poll,
     write: async () => undefined,
@@ -82,6 +87,49 @@ function request(callId: string, name: string, argumentsValue: ToolRequest["argu
 }
 
 describe("execution output artifact receipts", () => {
+  it("uses the configured command timeout by default while preserving per-call overrides", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-command-timeout-"));
+    const requests: ExecutionRequest[] = [];
+    const execution: ExecutionResult = {
+      state: "exited", exitCode: 0, signal: null, durationMs: 1,
+      timedOut: false, idleTimedOut: false, cancelled: false,
+      stdout: "", stderr: "", stdoutDroppedBytes: 0, stderrDroppedBytes: 0,
+      outputTruncated: false, outputArtifacts: []
+    };
+    const poll: ProcessPollResult = {
+      ...execution, state: "exited", handle: { id: "process", brokerInstanceId: "broker" }
+    };
+    const tools = executionTools({
+      broker: broker(execution, poll, [], requests),
+      sandboxMode: "required",
+      networkMode: "none",
+      commandTimeoutMs: 180_000
+    });
+    const exec = tools.find((tool) => tool.descriptor.name === "exec")!;
+    const { context } = await fixtureContext(workspace);
+
+    await exec.execute(request("configured-timeout", "exec", {
+      executable: process.execPath
+    }), context);
+    await exec.execute(request("explicit-timeout", "exec", {
+      executable: process.execPath,
+      timeoutMs: 300_000
+    }), context);
+
+    expect(requests.map((item) => ({
+      timeoutMs: item.timeoutMs,
+      idleTimeoutMs: item.idleTimeoutMs
+    }))).toEqual([
+      { timeoutMs: 180_000, idleTimeoutMs: 120_000 },
+      { timeoutMs: 300_000, idleTimeoutMs: 120_000 }
+    ]);
+    expect(exec.descriptor.inputSchema).toMatchObject({
+      properties: {
+        timeoutMs: { default: 180_000, maximum: 600_000 }
+      }
+    });
+  });
+
   it("projects each foreground stream to 16 KiB and preserves the complete output", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-model-output-limit-"));
     const stdout = `${"H".repeat(8_192)}${"M".repeat(5_000)}${"T".repeat(8_192)}`;
@@ -449,6 +497,69 @@ describe("execution output artifact receipts", () => {
     expect(receipt).toMatchObject({ ok: false });
     expect(receipt.diagnostics).toContain("command_dependency_missing");
     expect(receipt.diagnostics).not.toContain("dependency_missing");
+  });
+
+  it("turns a read-only filesystem failure into generic scoped-write guidance", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-readonly-command-"));
+    const execution: ExecutionResult = {
+      state: "exited", exitCode: 1, signal: null, durationMs: 8,
+      timedOut: false, idleTimedOut: false, cancelled: false,
+      stdout: "", stderr: "/usr/bin/ld: cannot open output file app: Read-only file system",
+      stdoutDroppedBytes: 0, stderrDroppedBytes: 0,
+      outputTruncated: false, outputArtifacts: []
+    };
+    const poll: ProcessPollResult = {
+      ...execution,
+      handle: { id: "process", brokerInstanceId: "broker" },
+      state: "exited"
+    };
+    const tools = executionTools({
+      broker: broker(execution, poll), sandboxMode: "required", networkMode: "none",
+      shells: ["bash"]
+    });
+    const { context } = await fixtureContext(workspace);
+    const shell = tools.find((tool) => tool.descriptor.name === "shell")!;
+    const receipt = await shell.execute(
+      request("readonly-command", "shell", { command: "compile project" }),
+      context
+    );
+
+    expect(receipt).toMatchObject({ ok: false });
+    expect(receipt.diagnostics).toContain("command_readonly_filesystem");
+    expect(receipt.output).toContain("re-run with expectedChanges");
+    expect(receipt.output).toContain("process temp directory");
+  });
+
+  it("does not mislabel a read-only external filesystem as missing workspace scope", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-scoped-command-"));
+    const execution: ExecutionResult = {
+      state: "exited", exitCode: 1, signal: null, durationMs: 8,
+      timedOut: false, idleTimedOut: false, cancelled: false,
+      stdout: "", stderr: "cannot update system mount: Read-only file system",
+      stdoutDroppedBytes: 0, stderrDroppedBytes: 0,
+      outputTruncated: false, outputArtifacts: []
+    };
+    const poll: ProcessPollResult = {
+      ...execution,
+      handle: { id: "process", brokerInstanceId: "broker" },
+      state: "exited"
+    };
+    const tools = executionTools({
+      broker: broker(execution, poll), sandboxMode: "required", networkMode: "none",
+      shells: ["bash"]
+    });
+    const { context } = await fixtureContext(workspace);
+    const shell = tools.find((tool) => tool.descriptor.name === "shell")!;
+    const call = request("scoped-command", "shell", {
+      command: "compile project",
+      expectedChanges: ["app"]
+    });
+    const callPlan = await shell.descriptor.prepare!(call.arguments, context);
+    const receipt = await shell.execute(call, { ...context, callPlan });
+
+    expect(receipt).toMatchObject({ ok: false });
+    expect(receipt.diagnostics).not.toContain("command_readonly_filesystem");
+    expect(receipt.output).not.toContain("re-run with expectedChanges");
   });
 
   it("preserves authenticated sandbox launch failures as stable diagnostics", async () => {

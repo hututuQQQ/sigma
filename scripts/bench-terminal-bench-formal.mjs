@@ -344,6 +344,7 @@ async function runBatch(manifest, batch, options, deps) {
     "--agent-timeout-grace-sec", String(manifest.solver_controls.cleanup_grace_sec),
     "--network", manifest.execution.network_mode,
     "--execution-mode", manifest.execution.execution_mode,
+    "--write-scope", manifest.execution.write_scope,
     "--managed-environment-mode", manifest.execution.managed_environment_mode,
     "--harbor-topology", manifest.execution.harbor_topology,
     "--concurrency", String(manifest.execution.concurrency),

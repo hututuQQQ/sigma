@@ -157,7 +157,7 @@ describe("agent-kernel protocol behavior", () => {
     assertKernelInvariants(state);
   });
 
-  it("proposes natural text directly and permits one bounded action recovery", () => {
+  it("proposes natural text directly and bounds clean length recovery", () => {
     const prepared = apply(initial(), "user.message", { text: "Answer." });
     const natural = complete(start(prepared, 1), {
       message: { role: "assistant", content: "Done." },
@@ -185,17 +185,18 @@ describe("agent-kernel protocol behavior", () => {
     expect(length).toMatchObject({
       phase: "ready_model",
       consecutiveLengthFinishes: 1,
-      consecutiveLengthNoAction: 1
+      consecutiveLengthNoAction: 1,
+      lengthRecovery: { mode: "retry_with_headroom", attempts: 1 }
     });
-    expect(length.messages.at(-1)?.content).toContain("action-oriented");
-    const strictStop = complete(start(length, 4), {
+    expect(length.messages.some((message) => message.content === "partial")).toBe(false);
+    const recoveredStop = complete(start(length, 4), {
       message: { role: "assistant", content: "I stopped instead." },
       toolCalls: [],
       finishReason: "stop"
     });
-    expect(strictStop.proposedOutcome).toMatchObject({
-      kind: "recoverable_failure",
-      code: "model_action_recovery_failed"
+    expect(recoveredStop.proposedOutcome).toMatchObject({
+      kind: "completed",
+      message: "I stopped instead."
     });
     length = complete(start(length, 5), {
       message: { role: "assistant", content: "still partial" },
@@ -204,15 +205,13 @@ describe("agent-kernel protocol behavior", () => {
     });
     expect(length.proposedOutcome).toMatchObject({
       kind: "recoverable_failure",
-      code: "model_action_recovery_failed"
+      code: "model_output_limit"
     });
 
-    let bounded = complete(start(prepared, 6), {
-      message: { role: "assistant", content: "partial" },
-      toolCalls: [],
-      finishReason: "length"
-    });
-    bounded = start(bounded, 7);
+    let bounded = start({
+      ...prepared,
+      lengthRecovery: { schemaVersion: 1, mode: "action_required", attempts: 1 }
+    }, 7);
     bounded = apply(bounded, "model.prompt_materialized", {
       ...bounded.activeModelTurn!,
       messages: [],
@@ -513,6 +512,10 @@ describe("agent-kernel protocol behavior", () => {
     expect(isKernelState({
       ...state,
       lengthRecovery: { schemaVersion: 1, mode: "action_required", attempts: 1 }
+    })).toBe(true);
+    expect(isKernelState({
+      ...state,
+      lengthRecovery: { schemaVersion: 1, mode: "retry_with_headroom", attempts: 1 }
     })).toBe(true);
     expect(isKernelState({ ...state, lengthRecovery: {} })).toBe(false);
     expect(isKernelState({

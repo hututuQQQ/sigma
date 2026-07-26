@@ -48,6 +48,7 @@ function draft(overrides: Record<string, unknown> = {}) {
     execution: {
       network_mode: "full",
       execution_mode: "sandboxed",
+      write_scope: "auto",
       managed_environment_mode: "disabled",
       harbor_topology: "main_only",
       concurrency: 2,
@@ -156,6 +157,9 @@ describe("formal benchmark preregistration", () => {
     const missingConcurrency = draft();
     delete (missingConcurrency.execution as Record<string, unknown>).concurrency;
     expect(() => sigmaFormalRunPreregistration(missingConcurrency)).toThrow(/field set/u);
+    const excessiveCommandTimeout = draft();
+    (excessiveCommandTimeout.solver_controls as Record<string, unknown>).command_timeout_sec = 601;
+    expect(() => sigmaFormalRunPreregistration(excessiveCommandTimeout)).toThrow(/at most 600/u);
   });
 
   it("rejects score thresholds, mutable task sources, and stale digests", () => {
@@ -228,6 +232,7 @@ describe("formal benchmark preregistration", () => {
       agentTimeoutGraceSec: 17,
       networkMode: "full",
       executionMode: "sandboxed",
+      writeScope: "auto",
       managedEnvironmentMode: "disabled",
       harborTopology: "main_only",
       nConcurrentTrials: 2,
@@ -239,6 +244,9 @@ describe("formal benchmark preregistration", () => {
       resolvedTask: task,
       taskProbe: { tasks: [{ network_mode: "public" }] },
       timeoutPlan: { agent_wall_time_sec: 900 },
+      jobConfig: {
+        agents: [{ kwargs: { max_turns: 73, command_timeout_sec: 41 } }]
+      },
       jobConfigSha256: "e".repeat(64)
     }));
     expect(() => assertFrozenBatchControls(value, batch, { options, slots })).not.toThrow();
@@ -258,6 +266,13 @@ describe("formal benchmark preregistration", () => {
       options,
       slots: [{ ...slots[0], jobConfigSha256: null }, slots[1]]
     })).toThrow(/JobConfig digest/u);
+    expect(() => assertFrozenBatchControls(value, batch, {
+      options,
+      slots: [{
+        ...slots[0],
+        jobConfig: { agents: [{ kwargs: { max_turns: 72, command_timeout_sec: 41 } }] }
+      }, slots[1]]
+    })).toThrow(/agent controls/u);
   });
 });
 

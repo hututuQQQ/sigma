@@ -1,3 +1,4 @@
+import path from "node:path";
 import type {
   CheckpointRef,
   ModelToolCall,
@@ -21,7 +22,8 @@ interface NoChangePreparedTool {
 }
 
 export function delegatesWorkspaceMutation(plan: ToolCallPlan): boolean {
-  return plan.mutationAuthority === "disposable_enclosing_container"
+  return (plan.mutationAuthority === "disposable_enclosing_container"
+      && !plan.checkpointScope.some((item) => !path.isAbsolute(item)))
     || (plan.exactEffects.includes("agent.spawn") && plan.processMode === "background");
 }
 
@@ -123,11 +125,13 @@ export async function createMutationCheckpoint(
   plan: ToolCallPlan
 ): Promise<CheckpointRef | undefined> {
   if (plan.checkpointAction
-    || plan.mutationAuthority === "broker_repository_transaction"
-    || plan.mutationAuthority === "disposable_enclosing_container") {
+    || plan.mutationAuthority === "broker_repository_transaction") {
     return undefined;
   }
   if (!mutatingPlan(plan) || delegatesWorkspaceMutation(plan)) return undefined;
-  const scope = plan.checkpointScope.length > 0 ? plan.checkpointScope : ["."];
+  const declaredScope = plan.mutationAuthority === "disposable_enclosing_container"
+    ? plan.checkpointScope.filter((item) => !path.isAbsolute(item))
+    : plan.checkpointScope;
+  const scope = declaredScope.length > 0 ? declaredScope : ["."];
   return await options.control.createCheckpoint(session, scope);
 }

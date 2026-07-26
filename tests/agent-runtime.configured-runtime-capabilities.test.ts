@@ -24,6 +24,7 @@ import {
   createConfiguredRuntime,
   type RuntimeCompositionConfig
 } from "../packages/agent-runtime/src/testing.js";
+import { configuredProtectedPaths } from "../packages/agent-runtime/src/configured-runtime-tools.js";
 import { verifiedNetworkPolicy } from "../packages/agent-runtime/src/execution-capabilities.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -186,7 +187,8 @@ function doctorReport(
         enclosingContainerRoot: {
           available: true,
           rootKind: "container_cow" as const,
-          attestationDigest: `sha256:${"a".repeat(64)}`
+          attestationDigest: `sha256:${"a".repeat(64)}`,
+          protectedPaths: []
         }
       } : {}),
       shells,
@@ -300,6 +302,27 @@ afterEach(async () => {
 });
 
 describe("configured runtime execution capabilities", () => {
+  it("carries broker-attested external mounts into every environment write policy", async () => {
+    const root = await workspace();
+    const report = doctorReport([], [], {
+      foreground: true,
+      background: false,
+      stdin: true,
+      pty: false,
+      networkModes: ["none"],
+      enclosingContainerRoot: true
+    });
+    report.capabilities.enclosingContainerRoot!.protectedPaths = [
+      "/external-state",
+      "/external-config"
+    ];
+
+    expect(configuredProtectedPaths(report, root)).toEqual(expect.arrayContaining([
+      "/external-state",
+      "/external-config"
+    ]));
+  });
+
   it("rejects a configured network mode the broker did not advertise", () => {
     expect(() => verifiedNetworkPolicy(doctorReport([], [], {
       foreground: true, background: true, stdin: true, pty: true,
@@ -359,7 +382,7 @@ describe("configured runtime execution capabilities", () => {
     await runtime.close();
   });
 
-  it("exposes one attested environment mutation action only in change mode", async () => {
+  it("projects attested foreground environment mutation through the primary shell", async () => {
     const root = await workspace();
     const stateRoot = await mkdtemp(path.join(os.tmpdir(), "sigma-runtime-environment-shell-state-"));
     fixtures.push(stateRoot);
@@ -398,22 +421,53 @@ describe("configured runtime execution capabilities", () => {
       await configuredRuntime.runtime.waitForOutcome(session.sessionId);
 
       const request = gateway.requests[0] as ModelRequest;
-      const environmentShell = request.tools?.find((tool) =>
-        tool.name === "environment_shell");
-      expect(environmentShell).toBeDefined();
-      const schema = JSON.stringify(environmentShell?.inputSchema);
-      expect(schema).not.toContain("writeRoots");
-      expect(schema).not.toContain("expectedChanges");
-      expect(schema).not.toContain("\"access\"");
+      expect(request.tools?.find((tool) =>
+        tool.name === "environment_shell")).toBeUndefined();
+      expect(request.tools?.find((tool) =>
+        tool.name === "exec")).toBeUndefined();
+      const shell = request.tools?.find((tool) => tool.name === "shell");
+      expect(shell?.inputSchema.properties).toMatchObject({
+        target: {
+          enum: ["workspace", "environment"]
+        }
+      });
       const runtimeContext = request.messages
         .filter((message) =>
           message.role === "system" || message.role === "developer")
         .map((message) => message.content)
         .join("\n");
       expect(runtimeContext).toContain(
-        "use environment_shell for foreground system-level changes"
+        "use shell with target=environment for commands that need system-level changes"
       );
-      expect(runtimeContext).toContain("environment_process_spawn for a background service");
+      expect(runtimeContext).toContain(
+        "inspect or control them with later target=environment calls because workspace-target calls use a separate sandbox view"
+      );
+      expect(runtimeContext).toContain(
+        "foreground environment command may also change explicitly declared workspace expectedChanges"
+      );
+      expect(runtimeContext).toContain(
+        "Add background=true only for a service"
+      );
+      expect(runtimeContext).toContain(
+        "background environment commands cannot write the workspace"
+      );
+
+      const analyzeSession = await configuredRuntime.runtime.createSession({
+        workspacePath: root,
+        mode: "analyze"
+      });
+      await configuredRuntime.runtime.command({
+        type: "submit",
+        sessionId: analyzeSession.sessionId,
+        text: "Inspect the available read-only environment capabilities.",
+        mode: "analyze"
+      });
+      await configuredRuntime.runtime.waitForOutcome(analyzeSession.sessionId);
+      const analyzeRequest = gateway.requests.at(-1) as ModelRequest;
+      expect(analyzeRequest.tools?.find((tool) =>
+        tool.name === "environment_shell")).toBeUndefined();
+      expect(analyzeRequest.tools?.find((tool) =>
+        tool.name === "shell")?.inputSchema.properties).not.toHaveProperty("target");
     } finally {
       await configuredRuntime.close();
     }
@@ -625,18 +679,19 @@ describe("configured runtime execution capabilities", () => {
       expect(request.tools?.find((tool) => tool.name === "repository_stats")).toBeDefined();
       expect(request.tools?.find((tool) => tool.name === "load_skill")).toBeUndefined();
       const exec = request.tools?.find((tool) => tool.name === "exec");
+      const shell = request.tools?.find((tool) => tool.name === "shell");
+      const validate = request.tools?.find((tool) => tool.name === "validate");
       const foregroundAvailable = processCapabilities.foreground && expectedNetworkModes.length > 0;
       const backgroundAvailable = processCapabilities.background && expectedNetworkModes.length > 0;
       if (foregroundAvailable) {
-        expect(exec?.inputSchema).not.toMatchObject({
-          properties: { skill: expect.anything() }
-        });
-        expect(exec?.inputSchema).toMatchObject({
+        expect(validate === undefined).toBe(expectedShells.length > 0);
+        expect((shell ?? exec)?.inputSchema).toMatchObject({
           properties: { network: { enum: expectedNetworkModes } }
         });
+        expect(exec === undefined).toBe(expectedShells.length > 0);
       } else {
         expect(exec).toBeUndefined();
-        expect(request.tools?.find((tool) => tool.name === "validate")).toBeUndefined();
+        expect(validate).toBeUndefined();
       }
       const spawn = request.tools?.find((tool) => tool.name === "process_spawn");
       if (!backgroundAvailable) {
@@ -645,26 +700,37 @@ describe("configured runtime execution capabilities", () => {
         expect(request.tools?.find((tool) => tool.name === "process_write")).toBeUndefined();
         expect(request.tools?.find((tool) => tool.name === "process_terminate")).toBeUndefined();
       } else {
-        expect(spawn?.inputSchema).toMatchObject({
+        const backgroundEntry = shell ?? spawn;
+        expect(backgroundEntry?.inputSchema).toMatchObject({
           properties: { network: { enum: expectedNetworkModes } }
         });
         if (processCapabilities.pty) {
-          expect(spawn?.inputSchema).toMatchObject({ properties: { pty: { type: "boolean" } } });
+          expect(backgroundEntry?.inputSchema).toMatchObject({
+            properties: { pty: { type: "boolean" } }
+          });
         } else {
-          expect(spawn?.inputSchema).not.toMatchObject({ properties: { pty: expect.anything() } });
+          expect(backgroundEntry?.inputSchema).not.toMatchObject({
+            properties: { pty: expect.anything() }
+          });
         }
-        if (processCapabilities.stdin) {
-          expect(request.tools?.find((tool) => tool.name === "process_write")).toBeDefined();
-        } else {
-          expect(request.tools?.find((tool) => tool.name === "process_write")).toBeUndefined();
+        expect(spawn === undefined).toBe(expectedShells.length > 0);
+        if (shell) {
+          expect(shell.inputSchema).toMatchObject({
+            properties: { background: { type: "boolean" } }
+          });
         }
+        // Lifecycle controls are offered only after a durable process handle
+        // exists, independently of whether stdin is supported.
+        expect(request.tools?.find((tool) => tool.name === "process_write")).toBeUndefined();
+        expect(request.tools?.find((tool) => tool.name === "process_poll")).toBeUndefined();
+        expect(request.tools?.find((tool) => tool.name === "process_terminate")).toBeUndefined();
       }
       const codeIntelAvailable = backgroundAvailable
         && processCapabilities.stdin
         && expectedNetworkModes.includes("none");
       expect(request.tools?.find((tool) => tool.name === "lsp") !== undefined).toBe(codeIntelAvailable);
       const executionSchema = JSON.stringify(
-        exec?.inputSchema
+        (shell ?? exec ?? validate)?.inputSchema
       );
       const directResolution = "directExecutableResolution" in processCapabilities
         && processCapabilities.directExecutableResolution === true;
@@ -679,7 +745,6 @@ describe("configured runtime execution capabilities", () => {
       } else {
         expect(executionSchema).toContain("No general bare runtime command alias is verified");
       }
-      const shell = request.tools?.find((tool) => tool.name === "shell");
       if (expectedShells.length === 0) {
         expect(shell).toBeUndefined();
       } else {

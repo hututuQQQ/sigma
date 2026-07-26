@@ -229,9 +229,35 @@ const builders: Readonly<Record<string, OperationBuilder>> = {
     ...(bool(operation, "aggressive") ? ["--aggressive"] : [])]
 };
 
+const operationKeys: Readonly<Record<string, ReadonlySet<string>>> = Object.fromEntries(
+  Object.entries({
+    add: ["paths"],
+    restore: ["paths", "source", "staged", "worktree"],
+    switch: ["target", "create", "detach"],
+    commit: ["message", "amend"],
+    branch: ["action", "name", "newName", "startPoint", "force"],
+    tag: ["action", "name", "target"],
+    reset: ["mode", "target"],
+    merge: ["target", "noCommit"],
+    rebase: ["upstream", "onto", "branch"],
+    cherry_pick: ["commits"],
+    revert: ["commits"],
+    update_ref: ["ref", "newValue", "oldValue", "delete"],
+    reflog_expire: ["expire", "all"],
+    gc: ["prune", "aggressive"]
+  }).map(([op, keys]) => [op, new Set(["op", ...keys])])
+);
+
 export function gitOperationArgs(operation: GitOperation): string[] {
   const builder = builders[operation.op];
   if (!builder) throw new Error(`Unsupported Git operation '${operation.op}'.`);
+  const allowed = operationKeys[operation.op];
+  const irrelevant = Object.keys(operation).filter((key) => !allowed.has(key));
+  if (irrelevant.length > 0) {
+    throw new Error(
+      `${operation.op} does not accept field${irrelevant.length === 1 ? "" : "s"}: ${irrelevant.join(", ")}.`
+    );
+  }
   return builder(operation);
 }
 
@@ -255,31 +281,44 @@ const stringListProperty = {
   type: "array", minItems: 1, uniqueItems: true, items: stringProperty
 } as const;
 
-function operationObject(op: string, properties: Record<string, JsonValue>, required: string[] = []): JsonValue {
-  return {
-    type: "object", required: ["op", ...required],
-    properties: { op: { const: op }, ...properties }, additionalProperties: false
-  };
-}
-
-export const gitOperationSchema: JsonValue = { oneOf: [
-  operationObject("add", { paths: stringListProperty }, ["paths"]),
-  operationObject("restore", { paths: stringListProperty, source: stringProperty,
-    staged: booleanProperty, worktree: booleanProperty }, ["paths"]),
-  operationObject("switch", { target: stringProperty, create: stringProperty, detach: booleanProperty }),
-  operationObject("commit", { message: stringProperty, amend: booleanProperty }, ["message"]),
-  operationObject("branch", { action: { type: "string", enum: ["create", "move", "delete"] },
-    name: stringProperty, newName: stringProperty, startPoint: stringProperty, force: booleanProperty }, ["action", "name"]),
-  operationObject("tag", { action: { type: "string", enum: ["create", "move", "delete"] },
-    name: stringProperty, target: stringProperty }, ["action", "name"]),
-  operationObject("reset", { mode: { type: "string", enum: ["soft", "mixed", "hard"] },
-    target: stringProperty }, ["mode", "target"]),
-  operationObject("merge", { target: stringProperty, noCommit: booleanProperty }, ["target"]),
-  operationObject("rebase", { upstream: stringProperty, onto: stringProperty, branch: stringProperty }, ["upstream"]),
-  operationObject("cherry_pick", { commits: stringListProperty }, ["commits"]),
-  operationObject("revert", { commits: stringListProperty }, ["commits"]),
-  operationObject("update_ref", { ref: stringProperty, newValue: stringProperty,
-    oldValue: stringProperty, delete: booleanProperty }, ["ref"]),
-  operationObject("reflog_expire", { expire: stringProperty, all: booleanProperty }),
-  operationObject("gc", { prune: stringProperty, aggressive: booleanProperty })
-] };
+export const gitOperationSchema: JsonValue = {
+  type: "object",
+  required: ["op"],
+  description:
+    "Fields by op: add(paths); restore(paths,source?,staged?,worktree?); switch(target?|create?,detach?); commit(message,amend?); branch(action,name,newName?,startPoint?,force?); tag(action,name,target?); reset(mode,target); merge(target,noCommit?); rebase(upstream,onto?,branch?); cherry_pick(commits); revert(commits); update_ref(ref,newValue?,oldValue?,delete?); reflog_expire(expire?,all?); gc(prune?,aggressive?). The runtime rejects fields that do not belong to the selected op and validates conditional requirements.",
+  properties: {
+    op: {
+      type: "string",
+      enum: Object.keys(builders)
+    },
+    paths: stringListProperty,
+    source: stringProperty,
+    staged: booleanProperty,
+    worktree: booleanProperty,
+    target: stringProperty,
+    create: stringProperty,
+    detach: booleanProperty,
+    message: stringProperty,
+    amend: booleanProperty,
+    action: { type: "string", enum: ["create", "move", "delete"] },
+    name: stringProperty,
+    newName: stringProperty,
+    startPoint: stringProperty,
+    force: booleanProperty,
+    mode: { type: "string", enum: ["soft", "mixed", "hard"] },
+    noCommit: booleanProperty,
+    upstream: stringProperty,
+    onto: stringProperty,
+    branch: stringProperty,
+    commits: stringListProperty,
+    ref: stringProperty,
+    newValue: stringProperty,
+    oldValue: stringProperty,
+    delete: booleanProperty,
+    expire: stringProperty,
+    all: booleanProperty,
+    prune: stringProperty,
+    aggressive: booleanProperty
+  },
+  additionalProperties: false
+};

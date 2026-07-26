@@ -45,6 +45,7 @@ function brokerFixture(): {
   broker: ExecutionBroker;
   execute: ReturnType<typeof vi.fn>;
   spawn: ReturnType<typeof vi.fn>;
+  poll: ReturnType<typeof vi.fn>;
   handoff: ReturnType<typeof vi.fn>;
 } {
   const exited: ExecutionResult = {
@@ -66,6 +67,19 @@ function brokerFixture(): {
   const spawn = vi.fn(async (input) => ({
     id: "process", brokerInstanceId: "broker", lifecycle: input.lifecycle ?? "session"
   }));
+  const poll = vi.fn(async (handle) => ({
+    handle,
+    state: "exited" as const,
+    exitCode: 0,
+    signal: null,
+    durationMs: 5,
+    stdout: "ready",
+    stderr: "",
+    stdoutDroppedBytes: 0,
+    stderrDroppedBytes: 0,
+    outputTruncated: false,
+    outputArtifacts: []
+  }));
   const handoff = vi.fn(async (handle) => ({
     handle, handoffId: `handoff:${handle.id}`, systemProcessId: 4321
   }));
@@ -73,6 +87,7 @@ function brokerFixture(): {
   return {
     execute,
     spawn,
+    poll,
     handoff,
     broker: {
       lostProcessHandles: [],
@@ -80,7 +95,7 @@ function brokerFixture(): {
       doctor: unavailable,
       execute,
       spawn,
-      poll: unavailable,
+      poll,
       write: unavailable,
       terminate: unavailable,
       handoff,
@@ -248,6 +263,19 @@ describe("execution tool capability closure", () => {
       protectedPaths: [path.join(root, ".runtime")]
     });
     const environment = tools.descriptor("environment_process_spawn");
+    expect(tools.modelDescriptors().find((descriptor) =>
+      descriptor.name === "environment_process_spawn")).toBeUndefined();
+    expect(tools.descriptor("process_spawn")?.inputSchema).toMatchObject({
+      properties: {
+        target: { enum: ["workspace", "environment"] }
+      }
+    });
+    expect(JSON.stringify(
+      tools.descriptor("process_spawn")?.inputSchema.properties?.target
+    )).toContain("only to later calls that also use target=environment");
+    expect(tools.modelDescriptors().find((descriptor) =>
+      descriptor.name === "shell")?.description
+    ).toContain("workspace-target calls use a separate sandbox view");
     expect(environment).toMatchObject({
       brokerMutationAuthority: "disposable_enclosing_container",
       inputSchema: {
@@ -298,6 +326,29 @@ describe("execution tool capability closure", () => {
       })
     }), expect.anything());
 
+    const unified = request("process_spawn", {
+      executable: "runtime",
+      target: "environment",
+      lifecycle: "deliverable"
+    });
+    const unifiedPlan = await tools.prepare(unified, preparation(root));
+    expect(unifiedPlan).toMatchObject({
+      mutationAuthority: "disposable_enclosing_container",
+      checkpointScope: [path.parse(path.resolve(root)).root]
+    });
+    await expect(tools.execute(unified, {
+      ...execution(root),
+      callPlan: unifiedPlan,
+      approval: {
+        callId: unified.callId,
+        authority: "runtime",
+        networkApproved: false,
+        externalReadApproved: true,
+        processHandoffApproved: false,
+        openWorldApproved: true
+      }
+    })).resolves.toMatchObject({ ok: true });
+
     const ordinary = request("process_spawn", {
       executable: "runtime",
       lifecycle: "deliverable",
@@ -347,6 +398,20 @@ describe("execution tool capability closure", () => {
         args: ["-lc", "printf ok"]
       })
     }), expect.anything());
+    const direct = request("shell", {
+      executable: process.execPath,
+      args: ["--version"]
+    });
+    const directPlan = await tools.prepare(direct, preparation(root));
+    await expect(tools.execute(direct, { ...execution(root), callPlan: directPlan }))
+      .resolves.toMatchObject({ ok: true });
+    expect(fixture.execute).toHaveBeenLastCalledWith(expect.objectContaining({
+      command: expect.objectContaining({ executable: process.execPath, args: ["--version"] })
+    }), expect.anything());
+    await expect(tools.prepare(
+      request("shell", { command: "printf ok", args: ["ignored"] }),
+      preparation(root)
+    )).rejects.toMatchObject({ code: "tool_arguments_invalid" });
     await expect(tools.prepare(
       request("shell", { shell: "bash", command: "printf ok", unsupported: true }),
       preparation(root)
@@ -355,5 +420,128 @@ describe("execution tool capability closure", () => {
       request("shell", { shell: "bash", command: "printf ok", timeoutMs: "fast" }),
       preparation(root)
     )).rejects.toMatchObject({ code: "tool_arguments_invalid" });
+  });
+
+  it("uses one model-visible shell for command, validation, and background execution", async () => {
+    const root = await workspace();
+    const fixture = brokerFixture();
+    const tools = registerBuiltinTools(new EffectToolRegistry(), {
+      broker: fixture.broker,
+      foreground: true,
+      background: true,
+      networkMode: "none",
+      networkModes: ["none"],
+      runtimeCommands: ["runtime"],
+      shells: ["bash"]
+    });
+    const modelNames = tools.modelDescriptors().map((item) => item.name);
+    expect(modelNames).toContain("shell");
+    expect(modelNames).not.toContain("exec");
+    expect(modelNames).not.toContain("validate");
+    expect(modelNames).not.toContain("process_spawn");
+
+    const inferredWriteCall = request("shell", {
+      executable: "runtime",
+      expectedChanges: ["generated.txt"]
+    });
+    const inferredWritePlan = await tools.prepare(inferredWriteCall, preparation(root));
+    expect(inferredWritePlan).toMatchObject({
+      writePaths: ["generated.txt"],
+      checkpointScope: ["."],
+      exactEffects: expect.arrayContaining(["filesystem.write"])
+    });
+
+    const legacyWriteCall = request("shell", {
+      executable: "runtime",
+      access: "write",
+      writeRoots: ["."],
+      expectedChanges: ["legacy-generated.txt"]
+    });
+    await expect(tools.prepare(legacyWriteCall, preparation(root))).resolves.toMatchObject({
+      writePaths: ["legacy-generated.txt"],
+      checkpointScope: ["."],
+      exactEffects: expect.arrayContaining(["filesystem.write"])
+    });
+
+    const descriptiveWriteCall = request("shell", {
+      executable: "runtime",
+      expectedChanges: ["described-output.txt"],
+      purpose: "Create the requested output"
+    });
+    await expect(tools.prepare(descriptiveWriteCall, preparation(root))).resolves.toMatchObject({
+      writePaths: ["described-output.txt"],
+      exactEffects: expect.not.arrayContaining(["validation"])
+    });
+
+    const validationCall = request("shell", {
+      executable: "runtime",
+      validation: true,
+      purpose: "Check the current result"
+    });
+    const validationPlan = await tools.prepare(validationCall, preparation(root));
+    expect(validationPlan).toMatchObject({
+      processMode: "pipe",
+      exactEffects: expect.arrayContaining(["validation"])
+    });
+    await expect(tools.execute(validationCall, {
+      ...execution(root),
+      callPlan: validationPlan
+    })).resolves.toMatchObject({
+      ok: true,
+      evidence: [expect.objectContaining({ kind: "validation" })]
+    });
+    await expect(tools.prepare(request("shell", {
+      executable: "runtime",
+      validation: false,
+      purpose: "A description does not imply validation"
+    }), preparation(root))).resolves.toMatchObject({
+      exactEffects: expect.not.arrayContaining(["validation"])
+    });
+    await expect(tools.prepare(request("shell", {
+      executable: "runtime",
+      background: true,
+      purpose: "Describe a background process"
+    }), preparation(root))).resolves.toMatchObject({
+      processMode: "background",
+      exactEffects: expect.not.arrayContaining(["validation"])
+    });
+
+    const legacyValidationPlan = await tools.prepare(request("shell", {
+      executable: "runtime",
+      validation: true,
+      purpose: "Legacy validation"
+    }), preparation(root));
+    const legacyValidationCall = request("shell", {
+      executable: "runtime",
+      purpose: "Legacy validation"
+    });
+    await expect(tools.execute(legacyValidationCall, {
+      ...execution(root),
+      callPlan: legacyValidationPlan
+    })).resolves.toMatchObject({
+      ok: true,
+      evidence: [expect.objectContaining({ kind: "validation" })]
+    });
+
+    const backgroundCall = request("shell", {
+      executable: "runtime",
+      background: true,
+      yieldMs: 0
+    });
+    const backgroundPlan = await tools.prepare(backgroundCall, preparation(root));
+    expect(backgroundPlan).toMatchObject({ processMode: "background" });
+    const receipt = await tools.execute(backgroundCall, {
+      ...execution(root),
+      callPlan: backgroundPlan
+    });
+    expect(receipt).toMatchObject({ ok: true });
+    expect(JSON.parse(receipt.output)).toMatchObject({
+      state: "exited",
+      exitCode: 0,
+      stdout: "ready",
+      handle: { id: "process", brokerInstanceId: "broker" }
+    });
+    expect(fixture.spawn).toHaveBeenCalledOnce();
+    expect(fixture.poll).toHaveBeenCalledOnce();
   });
 });

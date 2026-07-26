@@ -118,3 +118,61 @@ describe("spawn_agent budget and Plan transaction", () => {
     expect(reserve).toHaveBeenCalledOnce();
   });
 });
+
+describe("supervisor tool effect boundaries", () => {
+  it("treats child messaging, waiting, and listing as local runtime control", async () => {
+    const test = harness(
+      async () => allocation(),
+      async ({ childId }) => ({ id: childId! })
+    );
+    const cases = [
+      { name: "message_agent", arguments: { childId: "child", text: "continue" }, idempotent: false },
+      { name: "join_agent", arguments: { childId: "child" }, idempotent: true },
+      { name: "list_agents", arguments: {}, idempotent: true }
+    ] as const;
+
+    for (const [index, testCase] of cases.entries()) {
+      const descriptor = test.tools.descriptor(testCase.name);
+      expect(descriptor).toMatchObject({
+        possibleEffects: ["runtime.control"],
+        maximumEffects: ["runtime.control"],
+        approval: "auto",
+        idempotent: testCase.idempotent
+      });
+      const request = {
+        callId: `control-${index}`,
+        name: testCase.name,
+        arguments: testCase.arguments
+      };
+      const callPlan = await test.tools.prepare(request, test.context);
+      expect(callPlan).toMatchObject({
+        exactEffects: ["runtime.control"],
+        network: "none",
+        processMode: "none",
+        checkpointScope: [],
+        idempotence: testCase.idempotent ? "read_only" : "non_replayable"
+      });
+      await expect(test.tools.execute(request, {
+        ...test.context,
+        callPlan
+      })).resolves.toMatchObject({
+        ok: true,
+        observedEffects: ["runtime.control"],
+        actualEffects: ["runtime.control"]
+      });
+    }
+  });
+
+  it("reserves agent.spawn for spawning and not for integrating existing children", () => {
+    const test = harness(
+      async () => allocation(),
+      async ({ childId }) => ({ id: childId! })
+    );
+    expect(test.tools.descriptor("spawn_agent")?.possibleEffects).toContain("agent.spawn");
+    expect(test.tools.descriptor("integrate_agent")).toMatchObject({
+      possibleEffects: ["runtime.control", "filesystem.write", "process.spawn"],
+      approval: "prompt",
+      executionMode: "exclusive"
+    });
+  });
+});

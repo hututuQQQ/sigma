@@ -8,14 +8,10 @@ import {
 } from "./completion-gate-common.js";
 import { strictCompletionDecision } from "./completion-gate-strict.js";
 import {
-  authenticCurrentReviewApproval,
   currentFrontierReview,
-  currentFrontierValidationStatus,
-  sessionMutationEvidence,
-  unresolvedWorkspaceDeltas
+  currentFrontierValidationStatus
 } from "./mutation-evidence.js";
 import type { RuntimeSession } from "./types.js";
-import { reviewerWaivedDeltaIds } from "./review-waiver-policy.js";
 import { substantiveReview } from "./review-coordinator-support.js";
 
 export { completionCandidate } from "./completion-gate-common.js";
@@ -33,6 +29,10 @@ function record(value: unknown): Record<string, unknown> | null {
 
 function reviewMode(session: RuntimeSession): "off" | "advisory" | "required" {
   return session.services.profile?.profile.mutationPolicy.reviewMode ?? "advisory";
+}
+
+export function automaticCompletionReviewRequired(session: RuntimeSession): boolean {
+  return reviewMode(session) === "required";
 }
 
 function unresolvedRepositoryTransactions(session: RuntimeSession): string[] {
@@ -206,23 +206,6 @@ function standardUncheckedDecision(session: RuntimeSession): CompletionGateDecis
   };
 }
 
-function currentReviewWaiver(session: RuntimeSession): boolean {
-  const evidence = sessionMutationEvidence(session);
-  const waived = reviewerWaivedDeltaIds(evidence);
-  const unresolved = unresolvedWorkspaceDeltas(session);
-  const environmentChanged =
-    (session.durable.state.mutationFrontier.environmentChangedPaths?.length ?? 0) > 0;
-  const broadWaiver = evidence.some((item) =>
-    item.kind === "user_waiver"
-    && item.runId === session.durable.runId
-    && item.data.scope === "review"
-    && !item.data.checkpointId);
-  return (unresolved.length > 0 || environmentChanged)
-    && (broadWaiver
-      || (!environmentChanged
-        && unresolved.every((item) => waived.has(item.evidenceId))));
-}
-
 function reviewRepairDetails(
   review: NonNullable<ReturnType<typeof currentFrontierReview>>
 ): string {
@@ -239,36 +222,6 @@ function reviewRepairDetails(
     ...(criteria.length > 0 ? [`acceptance gaps: ${criteria.join("; ")}`] : []),
     ...(validations.length > 0 ? [`validation targets: ${validations.join("; ")}`] : [])
   ].join(" ");
-}
-
-function unavailableReviewDecision(
-  review: ReturnType<typeof currentFrontierReview>
-): CompletionGateDecision | undefined {
-  if (!review) {
-    return {
-      action: "fail",
-      authority: "verification_verdict",
-      code: "verification_unavailable",
-      message: "The run changed the workspace, but no independent completion review could be produced for the current frontier. The result is incomplete and is not reported as verified."
-    };
-  }
-  if (review.data.failureKind || review.data.verdict === "blocked") {
-    return {
-      action: "fail",
-      authority: "verification_verdict",
-      code: "verification_unavailable",
-      message: `Independent completion review was unavailable (${review.summary}). The result is incomplete and is not reported as verified.`
-    };
-  }
-  if (review.data.verdict === "approved") {
-    return {
-      action: "fail",
-      authority: "provider_protocol",
-      code: "verification_unavailable",
-      message: "Independent completion review claimed approval without valid durable evidence provenance. The result is incomplete and is not reported as verified."
-    };
-  }
-  return undefined;
 }
 
 function reviewRepairDecision(
@@ -324,44 +277,6 @@ export function explicitReviewGateDecision(
   return reviewRepairDecision(session, review);
 }
 
-function standardReviewedDecision(session: RuntimeSession): CompletionGateDecision {
-  const frontier = session.durable.state.mutationFrontier;
-  const validation = currentFrontierValidationStatus(session);
-  const validationKind = standardValidationKind(
-    mutationFrontierHasChanges(frontier) ? 1 : 0,
-    validation
-  );
-  if (!mutationFrontierHasChanges(frontier)) {
-    return standardUncheckedDecision(session);
-  }
-  if (currentReviewWaiver(session)) {
-    return {
-      action: "complete",
-      authority: "user_policy",
-      validationStatus: publicValidationStatus(validationKind),
-      statusNote: [
-        "Independent review was explicitly waived by the user for this Standard run.",
-        completionStatusNote(session, [], validationKind, validation)
-      ].filter(Boolean).join(" ")
-    };
-  }
-  const taskBasisReview = currentFrontierReview(session);
-  if (taskBasisReview?.status === "passed"
-    && authenticCurrentReviewApproval(session, taskBasisReview)) {
-    return {
-      action: "complete",
-      authority: "verification_verdict",
-      validationStatus: publicValidationStatus(validationKind),
-      statusNote: [
-        "Independent reviewer approved the current mutation frontier.",
-        completionStatusNote(session, [], validationKind, validation)
-      ].filter(Boolean).join(" ")
-    };
-  }
-  const unavailable = unavailableReviewDecision(taskBasisReview);
-  return unavailable ?? reviewRepairDecision(session, taskBasisReview!);
-}
-
 export function completionGateDecision(session: RuntimeSession): CompletionGateDecision {
   const invariant = completionReviewBlocker(session);
   if (invariant) {
@@ -378,9 +293,7 @@ export function completionGateDecision(session: RuntimeSession): CompletionGateD
       "safety_invariant"
     );
   }
-  return reviewMode(session) === "required"
+  return automaticCompletionReviewRequired(session)
     ? strictCompletionDecision(session)
-    : reviewMode(session) === "off"
-      ? standardUncheckedDecision(session)
-      : standardReviewedDecision(session);
+    : standardUncheckedDecision(session);
 }

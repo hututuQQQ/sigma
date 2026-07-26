@@ -12,6 +12,7 @@ import re
 import shlex
 import shutil
 import tempfile
+import threading
 import time
 import uuid
 from typing import Any
@@ -51,6 +52,8 @@ MAX_STREAM_LINE_CHARS = 65_536
 MAX_STREAM_RECORD_BYTES = 16 * 1_048_576
 PROCESS_CLEANUP_TIMEOUT_SEC = 8
 PROCESS_TERM_GRACE_SEC = 1
+PRIVATE_ENV_DIR = "/tmp/agent/.credentials"
+ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _failure_kind_for_code(code: Any, payload: dict[str, Any] | None = None) -> str | None:
@@ -190,11 +193,15 @@ def _write_utf8_artifact(path: pathlib.Path, value: str) -> None:
 
 
 class _BoundedJsonlWriter:
-    """Append-only JSONL writer with a stable prefix and a hard byte cap."""
+    """Append-only JSONL writer with bounded recovery from artifact I/O failures."""
 
     def __init__(self, path: pathlib.Path, maximum: int, *, reset: bool = False) -> None:
         self.path = path
         self.maximum = max(0, maximum)
+        self._lock = threading.Lock()
+        self._pending = bytearray()
+        self._write_failures = 0
+        self._last_write_error: str | None = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if reset:
             self.path.unlink(missing_ok=True)
@@ -203,25 +210,98 @@ class _BoundedJsonlWriter:
         self.size = len(existing)
         self.truncated = b'"type": "trace_truncated"' in existing
 
-    def append(self, record: dict[str, Any]) -> None:
-        if self.truncated or self.maximum <= 0:
+    def _record_failure(self, error: BaseException) -> None:
+        self._write_failures += 1
+        self._last_write_error = _bounded_text(
+            f"{type(error).__name__}: {error}",
+            2_048,
+        )
+
+    def _consume_written_prefix(self, count: int) -> None:
+        if count <= 0:
             return
-        line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+        del self._pending[:count]
+        self.size += count
+
+    def _write_pending_once(self) -> None:
+        if not self._pending:
+            return
+        payload = bytes(self._pending)
+        written = 0
+        try:
+            # Unbuffered append lets us account for a short write precisely and
+            # retain only the unwritten suffix for the next recovery attempt.
+            with self.path.open("ab", buffering=0) as handle:
+                while written < len(payload):
+                    count = handle.write(payload[written:])
+                    if not isinstance(count, int) or count <= 0:
+                        raise OSError("trace append made no forward progress")
+                    written += count
+        except OSError:
+            self._consume_written_prefix(written)
+            raise
+        self._consume_written_prefix(written)
+
+    def _flush_pending(self, attempts: int = 1) -> bool:
+        if not self._pending:
+            return True
+        for attempt in range(max(1, attempts)):
+            try:
+                self._write_pending_once()
+                return not self._pending
+            except OSError as error:
+                self._record_failure(error)
+                if attempt + 1 < attempts:
+                    # Windows scanners and concurrent artifact readers can hold
+                    # a file briefly. Keep this bounded so streaming callbacks
+                    # remain responsive while allowing the lock to clear.
+                    time.sleep(min(0.01 * (2**attempt), 0.05))
+        return False
+
+    def append(self, record: dict[str, Any]) -> bool:
+        try:
+            line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+        except (TypeError, ValueError) as error:
+            with self._lock:
+                self._record_failure(error)
+            return False
         marker = (json.dumps({
             "type": "trace_truncated",
             "omitted_record_sha256": hashlib.sha256(line).hexdigest(),
         }, ensure_ascii=False) + "\n").encode("utf-8")
-        reserve = min(len(marker), self.maximum)
-        if self.size + len(line) <= self.maximum - reserve:
-            with self.path.open("ab") as handle:
-                handle.write(line)
-            self.size += len(line)
-            return
-        if self.size + len(marker) <= self.maximum:
-            with self.path.open("ab") as handle:
-                handle.write(marker)
-            self.size += len(marker)
-        self.truncated = True
+        with self._lock:
+            if self.maximum <= 0:
+                return True
+            if self.truncated:
+                return self._flush_pending()
+            logical_size = self.size + len(self._pending)
+            reserve = min(len(marker), self.maximum)
+            if logical_size + len(line) <= self.maximum - reserve:
+                self._pending.extend(line)
+                return self._flush_pending()
+            if logical_size + len(marker) <= self.maximum:
+                self._pending.extend(marker)
+            self.truncated = True
+            return self._flush_pending()
+
+    def flush(self) -> bool:
+        """Retry buffered records without ever turning trace I/O into an agent failure."""
+        with self._lock:
+            return self._flush_pending(attempts=4)
+
+    def artifact_warning(self) -> str | None:
+        with self._lock:
+            if self._write_failures == 0:
+                return None
+            state = (
+                "recovered"
+                if not self._pending
+                else f"{len(self._pending)} buffered byte(s) remain unwritten"
+            )
+            return (
+                f"{self.path.name}: {self._write_failures} artifact write attempt(s) "
+                f"failed; {state}; last error: {self._last_write_error}"
+            )
 
 
 def _text_artifact_summary(value: str) -> dict[str, Any]:
@@ -410,6 +490,7 @@ class _OutputRecorder:
         self.stderr_path = logs_dir / "stderr.partial.log"
         self.trace_path = logs_dir / "trace.jsonl"
         self.state_path = logs_dir / "runtime.partial.json"
+        self._artifact_failures: dict[str, dict[str, Any]] = {}
         self._buffers = {"stdout": "", "stderr": ""}
         self._pending_stdout = ""
         self._stream_chunks: dict[str, dict[str, Any]] = {}
@@ -435,6 +516,12 @@ class _OutputRecorder:
         )
         self._write_state()
 
+    def _record_artifact_failure(self, path: pathlib.Path, error: OSError) -> None:
+        key = path.name
+        state = self._artifact_failures.setdefault(key, {"count": 0, "last_error": None})
+        state["count"] += 1
+        state["last_error"] = _bounded_text(f"{type(error).__name__}: {error}", 2_048)
+
     async def callback(self, text: str, stream: str) -> None:
         self.record(text, stream)
 
@@ -445,7 +532,13 @@ class _OutputRecorder:
             self._buffers[stream] + (text or ""), MAX_PARTIAL_ARTIFACT_CHARS
         )
         path = self.stdout_path if stream == "stdout" else self.stderr_path
-        _write_utf8_artifact(path, self._buffers[stream])
+        try:
+            _write_utf8_artifact(path, self._buffers[stream])
+        except OSError as error:
+            # Partial stdout/stderr are observational artifacts. The full
+            # bounded buffer remains in memory and the next callback rewrites
+            # it, so a transient host lock must not abort the agent process.
+            self._record_artifact_failure(path, error)
         if stream == "stdout" and text:
             lines = (self._pending_stdout + text).splitlines(keepends=True)
             self._pending_stdout = ""
@@ -531,6 +624,20 @@ class _OutputRecorder:
             self.events.append(event)
             self.append_trace(_trace_record(event))
 
+    def finish_artifacts(self) -> list[str]:
+        """Flush recoverable artifact state and return bounded diagnostics."""
+        self._trace_writer.flush()
+        warnings = []
+        trace_warning = self._trace_writer.artifact_warning()
+        if trace_warning is not None:
+            warnings.append(trace_warning)
+        for name, state in sorted(self._artifact_failures.items()):
+            warnings.append(
+                f"{name}: {state['count']} artifact write attempt(s) failed; "
+                f"last error: {state['last_error']}"
+            )
+        return warnings
+
     def snapshot(self) -> dict[str, Any]:
         return {
             "last_event": _bounded_event(self.last_event) if self.last_event else None,
@@ -560,7 +667,14 @@ class _OutputRecorder:
 
     def _write_state(self) -> None:
         state = self.snapshot()
-        self.state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        try:
+            self.state_path.write_text(
+                json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as error:
+            # The next event writes a complete replacement snapshot.
+            self._record_artifact_failure(self.state_path, error)
 
 
 class SigmaCliHarborAgent(BaseAgent):
@@ -579,9 +693,11 @@ class SigmaCliHarborAgent(BaseAgent):
         permission_mode: str = "auto",
         network_mode: str = "full",
         execution_mode: str = "sandboxed",
-        write_scope: str = "enclosing-container",
+        write_scope: str = "auto",
         managed_environment_mode: str = "disabled",
         harbor_topology: str = "main_only",
+        max_turns: int = 200,
+        command_timeout_sec: int = 180,
         max_wall_time_sec: int = 7200,
         agent_timeout_grace_sec: int = 120,
         outer_trial_deadline_sec: int | float | None = None,
@@ -623,9 +739,9 @@ class SigmaCliHarborAgent(BaseAgent):
                 "execution_mode must be one of: sandboxed, container"
             )
         self.execution_mode = execution_mode
-        if write_scope not in {"workspace", "enclosing-container"}:
+        if write_scope not in {"auto", "workspace", "enclosing-container"}:
             raise ValueError(
-                "write_scope must be one of: workspace, enclosing-container"
+                "write_scope must be one of: auto, workspace, enclosing-container"
             )
         self.write_scope = write_scope
         if managed_environment_mode not in {"disabled", "required"}:
@@ -653,8 +769,18 @@ class SigmaCliHarborAgent(BaseAgent):
         self.effective_network_mode: str | None = network_mode
         self.available_network_modes: list[str] = []
         self.effective_read_scope = "host"
-        self.effective_write_scope = write_scope
+        self.effective_write_scope = (
+            "workspace" if write_scope == "auto" else write_scope
+        )
         self.process_handoff_available = False
+        parsed_max_turns = _as_int(max_turns, 0)
+        if parsed_max_turns < 1:
+            raise ValueError("max_turns must be a positive integer")
+        self.max_turns = parsed_max_turns
+        parsed_command_timeout = _as_int(command_timeout_sec, 0)
+        if parsed_command_timeout < 1 or parsed_command_timeout > 600:
+            raise ValueError("command_timeout_sec must be an integer from 1 to 600")
+        self.command_timeout_sec = parsed_command_timeout
         self.agent_timeout_grace_sec = max(0, _as_int(agent_timeout_grace_sec, 120))
         env_outer_deadline = os.environ.get("SIGMA_HARBOR_OUTER_TRIAL_DEADLINE_SEC")
         parsed_outer_deadline = _as_int(
@@ -892,6 +1018,7 @@ class SigmaCliHarborAgent(BaseAgent):
                 summary_path = summary_path or self._latest_downloaded_artifact("summary.json")
                 recorder.reconcile_trace(events)
                 trace_path = recorder.trace_path if events else None
+            artifact_warnings.extend(recorder.finish_artifacts())
             self._managed_broker_cleanup = await self._cleanup_managed_broker(environment)
             if self._managed_broker_cleanup and self._managed_broker_cleanup.get("error"):
                 artifact_warnings.append(
@@ -949,7 +1076,10 @@ class SigmaCliHarborAgent(BaseAgent):
         summary["harbor_topology"] = self.harbor_topology
         summary["permission_mode_effective"] = self._permission_mode()
         summary["agent_profile"] = self.agent_profile
+        summary["max_model_turns"] = self.max_turns
+        summary["command_timeout_sec"] = self.command_timeout_sec
         summary["read_scope_effective"] = self.effective_read_scope
+        summary["write_scope_requested"] = self.write_scope
         summary["write_scope_effective"] = self.effective_write_scope
         summary["process_handoff_available"] = self.process_handoff_available
         if self._process_cleanup is not None:
@@ -958,12 +1088,18 @@ class SigmaCliHarborAgent(BaseAgent):
             summary["managed_broker_bootstrap"] = self._managed_broker_bootstrap
         if self._managed_broker_cleanup is not None:
             summary["managed_broker_cleanup"] = self._managed_broker_cleanup
+        if artifact_warnings:
+            summary["artifact_warnings"] = list(dict.fromkeys(artifact_warnings))
         self._populate_context(context, result, summary, error_message)
         if timed_out or protocol_failure is not None:
             self._set_context_value(context, "exit_code", 1)
         self._set_context_value(context, "failure_kind", failure_kind)
         self._set_context_value(context, "failure_code", failure_code)
-        self._set_context_value(context, "artifact_warnings", artifact_warnings)
+        self._set_context_value(
+            context,
+            "artifact_warnings",
+            list(dict.fromkeys(artifact_warnings)),
+        )
         if summary_path is not None:
             summary_path.write_text(
                 json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
@@ -1003,6 +1139,10 @@ class SigmaCliHarborAgent(BaseAgent):
             self.model,
             "--agent-profile",
             self.agent_profile,
+            "--max-model-turns",
+            str(self.max_turns),
+            "--command-timeout-sec",
+            str(self.command_timeout_sec),
             "--run-deadline-sec",
             str(self.max_wall_time_sec),
             "--network",
@@ -1158,15 +1298,13 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
     ) -> Any:
         command = self._agent_command(context)
         command_text = self._agent_command_with_process_record(command)
-        kwargs = {
-            "env": env_vars or None,
-            "timeout_sec": self.max_wall_time_sec + self.agent_timeout_grace_sec,
-        }
-        callback_scope = getattr(environment, "scoped_output_callback", None)
-        if recorder is not None and callable(callback_scope):
-            with callback_scope(recorder.callback):
-                return await environment.exec(command_text, **kwargs)
-        return await environment.exec(command_text, **kwargs)
+        return await self._exec_with_private_env(
+            environment,
+            command_text,
+            env_vars,
+            timeout_sec=self.max_wall_time_sec + self.agent_timeout_grace_sec,
+            recorder=recorder,
+        )
 
     def _parse_stream_output(self, result: Any | None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         events: list[dict[str, Any]] = []
@@ -1435,6 +1573,10 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             self.model,
             "--agent-profile",
             self.agent_profile,
+            "--max-model-turns",
+            str(self.max_turns),
+            "--command-timeout-sec",
+            str(self.command_timeout_sec),
             "--permission-mode",
             self._permission_mode(),
             "--execution-mode",
@@ -1459,9 +1601,10 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
         env_vars: dict[str, str],
     ) -> tuple[list[dict[str, Any]], str | None]:
         command = self._session_command("show", session_id) + ["--json"]
-        result = await environment.exec(
+        result = await self._exec_with_private_env(
+            environment,
             " ".join(shlex.quote(part) for part in command),
-            env=env_vars or None,
+            env_vars,
             timeout_sec=30,
         )
         if _return_code(result) != 0:
@@ -1499,18 +1642,20 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
                     checkpoint_id,
                     f"--{self.checkpoint_recovery}",
                 ]
-                recovery = await environment.exec(
+                recovery = await self._exec_with_private_env(
+                    environment,
                     " ".join(shlex.quote(part) for part in command),
-                    env=env_vars or None,
+                    env_vars,
                     timeout_sec=30,
                 )
                 if _return_code(recovery) != 0:
                     detail = _output_text(recovery).strip() or "session recover failed"
                     return merged, None, f"external checkpoint recovery failed: {detail}"
                 resume_command = self._session_command("resume", session_id)
-                resumed = await environment.exec(
+                resumed = await self._exec_with_private_env(
+                    environment,
                     " ".join(shlex.quote(part) for part in resume_command),
-                    env=env_vars or None,
+                    env_vars,
                     timeout_sec=30,
                 )
                 if _return_code(resumed) != 0:
@@ -1606,9 +1751,12 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "managed_environment_mode": self.managed_environment_mode,
             "harbor_topology": self.harbor_topology,
             "agent_profile": self.agent_profile,
+            "max_model_turns": self.max_turns,
+            "command_timeout_sec": self.command_timeout_sec,
             "harbor_deadline_sec": self.outer_trial_deadline_sec,
             "sigma_deadline_sec": self.max_wall_time_sec,
             "read_scope_effective": self.effective_read_scope,
+            "write_scope_requested": self.write_scope,
             "write_scope_effective": self.effective_write_scope,
             "process_handoff_available": self.process_handoff_available,
         }
@@ -1643,6 +1791,7 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "network_mode_requested": self.network_mode,
             "network_mode_effective": self.effective_network_mode,
             "read_scope_effective": self.effective_read_scope,
+            "write_scope_requested": self.write_scope,
             "write_scope_effective": self.effective_write_scope,
             "process_handoff_available": self.process_handoff_available,
             "last_event": last_event,
@@ -1662,6 +1811,8 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "termination_source": "adapter_timeout",
             "harbor_deadline_sec": self.outer_trial_deadline_sec,
             "sigma_deadline_sec": self.max_wall_time_sec,
+            "max_model_turns": self.max_turns,
+            "command_timeout_sec": self.command_timeout_sec,
             "stdout": _text_artifact_summary(stdout),
             "stderr": _text_artifact_summary(stderr),
             "process_cleanup": process_cleanup,
@@ -1693,10 +1844,13 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "termination_source": state["termination_source"],
             "harbor_deadline_sec": state["harbor_deadline_sec"],
             "sigma_deadline_sec": state["sigma_deadline_sec"],
+            "max_model_turns": state["max_model_turns"],
+            "command_timeout_sec": state["command_timeout_sec"],
             "process_cleanup": process_cleanup,
             "network_mode_requested": self.network_mode,
             "network_mode_effective": self.effective_network_mode,
             "read_scope_effective": self.effective_read_scope,
+            "write_scope_requested": self.write_scope,
             "write_scope_effective": self.effective_write_scope,
             "process_handoff_available": self.process_handoff_available,
         })
@@ -1884,7 +2038,14 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             self._write_setup_checks(checks, "agent_setup_failed")
             raise RuntimeError(self._setup_failure_message("help", help_check))
 
-        doctor_check = await environment.exec(
+        # Auto is capability negotiation, not a weaker doctor mode. Probe with
+        # the safe workspace boundary, then widen only when the returned native
+        # attestation proves a disposable container COW root.
+        doctor_write_scope = (
+            "workspace" if self.write_scope == "auto" else self.write_scope
+        )
+        doctor_check = await self._exec_with_private_env(
+            environment,
             " ".join([
                 "/usr/local/bin/agent doctor --workspace",
                 shlex.quote(self._workspace),
@@ -1896,12 +2057,16 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
                 "--read-scope",
                 shlex.quote(self.effective_read_scope),
                 "--write-scope",
-                shlex.quote(self.effective_write_scope),
+                shlex.quote(doctor_write_scope),
                 "--managed-environment-mode",
                 shlex.quote(self.managed_environment_mode),
+                "--max-model-turns",
+                str(self.max_turns),
+                "--command-timeout-sec",
+                str(self.command_timeout_sec),
                 *( ["--check-api"] if self.check_api else [] ),
             ]),
-            env=self._agent_env() or None,
+            self._agent_env(),
             timeout_sec=60,
         )
         doctor_record = self._setup_check_record("strict_doctor", doctor_check)
@@ -1911,6 +2076,29 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             self._write_setup_checks(checks, "agent_setup_failed")
             raise RuntimeError(self._setup_failure_message("strict_doctor", doctor_check, doctor_record["doctor_json"]))
         doctor_json = doctor_record["doctor_json"]
+        if self.write_scope == "auto":
+            capabilities = (
+                doctor_json.get("capabilities")
+                if isinstance(doctor_json, dict)
+                else None
+            )
+            enclosing = (
+                capabilities.get("enclosingContainerRoot")
+                if isinstance(capabilities, dict)
+                else None
+            )
+            self.effective_write_scope = (
+                "enclosing-container"
+                if self.execution_mode == "sandboxed"
+                and self._enclosing_container_attested(enclosing)
+                else "workspace"
+            )
+            doctor_record["write_scope_negotiation"] = {
+                "requested": self.write_scope,
+                "doctor": doctor_write_scope,
+                "effective": self.effective_write_scope,
+                "execution_mode": self.execution_mode,
+            }
         contract_error = self._doctor_contract_error(doctor_json)
         if contract_error is not None:
             doctor_record["doctor_contract_error"] = contract_error
@@ -1930,10 +2118,7 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
         self.process_handoff_available = capabilities["processHandoff"]
         enclosing = capabilities.get("enclosingContainerRoot")
         if self.effective_write_scope == "enclosing-container" and (
-            not isinstance(enclosing, dict)
-            or enclosing.get("available") is not True
-            or enclosing.get("rootKind") != "container_cow"
-            or not isinstance(enclosing.get("attestationDigest"), str)
+            not self._enclosing_container_attested(enclosing)
         ):
             self._write_setup_checks(checks, "agent_setup_failed")
             raise RuntimeError(
@@ -1942,6 +2127,16 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             )
         self._managed_environment_verified = self.managed_environment_mode == "required"
         self._write_setup_checks(checks, "passed")
+
+    @staticmethod
+    def _enclosing_container_attested(enclosing: Any) -> bool:
+        return (
+            isinstance(enclosing, dict)
+            and enclosing.get("available") is True
+            and enclosing.get("rootKind") == "container_cow"
+            and isinstance(enclosing.get("attestationDigest"), str)
+            and bool(enclosing.get("attestationDigest"))
+        )
 
     def _setup_check_record(self, stage: str, result: Any) -> dict[str, Any]:
         return {
@@ -1989,9 +2184,7 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             return "capabilities.processHandoff is missing or invalid"
         if self.effective_write_scope == "enclosing-container":
             enclosing = capabilities.get("enclosingContainerRoot")
-            if not isinstance(enclosing, dict) or enclosing.get("available") is not True \
-                    or enclosing.get("rootKind") != "container_cow" \
-                    or not isinstance(enclosing.get("attestationDigest"), str):
+            if not self._enclosing_container_attested(enclosing):
                 return "required enclosing-container write boundary is unavailable"
         if self.managed_environment_mode == "required":
             container = doctor_json.get("container")
@@ -2020,8 +2213,11 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             "permission_mode_effective": self._permission_mode(),
             "managed_broker_bootstrap": self._managed_broker_bootstrap,
             "agent_profile": self.agent_profile,
+            "max_model_turns": self.max_turns,
+            "command_timeout_sec": self.command_timeout_sec,
             "available_network_modes": list(self.available_network_modes),
             "read_scope_effective": self.effective_read_scope,
+            "write_scope_requested": self.write_scope,
             "write_scope_effective": self.effective_write_scope,
             "process_handoff_available": self.process_handoff_available,
             "checks": checks,
@@ -2054,6 +2250,111 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             instruction_path = pathlib.Path(tmp_dir) / "instruction.md"
             instruction_path.write_text(instruction, encoding="utf-8")
             await environment.upload_file(instruction_path, "/tmp/agent/instruction.md")
+
+    @staticmethod
+    def _private_env_script(env_vars: dict[str, str]) -> bytes:
+        lines = ["# Private process environment generated by the Sigma Harbor adapter."]
+        for name, value in sorted(env_vars.items()):
+            if ENVIRONMENT_NAME.fullmatch(name) is None:
+                raise ValueError(f"Invalid agent environment variable name: {name!r}")
+            if "\0" in value:
+                raise ValueError(f"Agent environment variable {name!r} contains a NUL byte")
+            lines.append(f"export {name}={shlex.quote(value)}")
+        return ("\n".join(lines) + "\n").encode("utf-8")
+
+    async def _upload_private_env(
+        self,
+        environment: BaseEnvironment,
+        env_vars: dict[str, str],
+    ) -> str:
+        remote_path = f"{PRIVATE_ENV_DIR}/{uuid.uuid4().hex}.sh"
+        prepared = await environment.exec(
+            f"umask 077; mkdir -p {shlex.quote(PRIVATE_ENV_DIR)}; "
+            f"chmod 700 {shlex.quote(PRIVATE_ENV_DIR)}",
+            timeout_sec=30,
+        )
+        if _return_code(prepared) != 0:
+            raise RuntimeError(
+                "agent_credential_transport_failed: could not prepare the private "
+                "credential directory"
+            )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            local_path = pathlib.Path(tmp_dir) / "environment.sh"
+            local_path.write_bytes(self._private_env_script(env_vars))
+            try:
+                os.chmod(local_path, 0o600)
+            except OSError:
+                pass
+            await environment.upload_file(local_path, remote_path)
+
+        protected = await environment.exec(
+            f"chmod 600 {shlex.quote(remote_path)}",
+            timeout_sec=30,
+        )
+        if _return_code(protected) != 0:
+            await self._remove_private_env(environment, remote_path)
+            raise RuntimeError(
+                "agent_credential_transport_failed: could not protect the uploaded "
+                "credential file"
+            )
+        return remote_path
+
+    @staticmethod
+    def _command_with_private_env(command: str, remote_path: str) -> str:
+        quoted_path = shlex.quote(remote_path)
+        return (
+            f"if . {quoted_path}; then "
+            f"/bin/rm -f {quoted_path}; "
+            "else sigma_private_env_status=$?; "
+            f"/bin/rm -f {quoted_path}; "
+            'exit "$sigma_private_env_status"; fi; '
+            f"{command}"
+        )
+
+    async def _remove_private_env(
+        self,
+        environment: BaseEnvironment,
+        remote_path: str,
+    ) -> None:
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(environment.exec(
+                    f"rm -f {shlex.quote(remote_path)}",
+                    timeout_sec=30,
+                )),
+                timeout=30,
+            )
+        except (Exception, asyncio.CancelledError):
+            # The command wrapper removes the file before starting the agent.
+            # This is only a best-effort fallback for upload/start failures.
+            pass
+
+    async def _exec_with_private_env(
+        self,
+        environment: BaseEnvironment,
+        command: str,
+        env_vars: dict[str, str],
+        *,
+        timeout_sec: int,
+        recorder: _OutputRecorder | None = None,
+    ) -> Any:
+        callback_scope = getattr(environment, "scoped_output_callback", None)
+
+        async def execute(command_text: str) -> Any:
+            if recorder is not None and callable(callback_scope):
+                with callback_scope(recorder.callback):
+                    return await environment.exec(command_text, timeout_sec=timeout_sec)
+            return await environment.exec(command_text, timeout_sec=timeout_sec)
+
+        if not env_vars:
+            return await execute(command)
+
+        remote_path = await self._upload_private_env(environment, env_vars)
+        try:
+            return await execute(self._command_with_private_env(command, remote_path))
+        finally:
+            await self._remove_private_env(environment, remote_path)
 
     def _agent_env(self) -> dict[str, str]:
         env_vars: dict[str, str] = {}
@@ -2187,9 +2488,14 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             ),
             "harbor_topology": summary.get("harbor_topology", self.harbor_topology),
             "agent_profile": summary.get("agent_profile", self.agent_profile),
+            "max_model_turns": summary.get("max_model_turns", self.max_turns),
+            "command_timeout_sec": summary.get(
+                "command_timeout_sec", self.command_timeout_sec
+            ),
             "network_mode_requested": summary.get("network_mode_requested", self.network_mode),
             "network_mode_effective": summary.get("network_mode_effective", self.effective_network_mode),
             "read_scope_effective": summary.get("read_scope_effective", self.effective_read_scope),
+            "write_scope_requested": summary.get("write_scope_requested", self.write_scope),
             "write_scope_effective": summary.get("write_scope_effective", self.effective_write_scope),
             "process_handoff_available": summary.get("process_handoff_available", self.process_handoff_available),
         }
@@ -2315,9 +2621,14 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             ),
             "harbor_topology": getattr(context, "harbor_topology", self.harbor_topology),
             "agent_profile": getattr(context, "agent_profile", self.agent_profile),
+            "max_model_turns": getattr(context, "max_model_turns", self.max_turns),
+            "command_timeout_sec": getattr(
+                context, "command_timeout_sec", self.command_timeout_sec
+            ),
             "network_mode_requested": getattr(context, "network_mode_requested", self.network_mode),
             "network_mode_effective": getattr(context, "network_mode_effective", self.effective_network_mode),
             "read_scope_effective": getattr(context, "read_scope_effective", self.effective_read_scope),
+            "write_scope_requested": getattr(context, "write_scope_requested", self.write_scope),
             "write_scope_effective": getattr(context, "write_scope_effective", self.effective_write_scope),
             "process_handoff_available": getattr(context, "process_handoff_available", self.process_handoff_available),
             "artifact_warnings": getattr(context, "artifact_warnings", []),

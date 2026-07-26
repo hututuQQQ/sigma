@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { lstat, readFile, stat } from "node:fs/promises";
+import path from "node:path";
 import {
   type JsonValue, type ModelGateway, type ModelToolCall, type ModelToolDefinition,
   type ToolCallPlan, type ToolDescriptor, type ToolReceipt, type WorkspaceDelta
@@ -13,6 +14,12 @@ export {
   completionFailure
 } from "./completion-evidence-gate.js";
 export { failed } from "./tool-receipt.js";
+export {
+  projectModelToolDescriptors,
+  sessionModelToolProjectionCapabilities,
+  sessionSkillProjectionCapabilities,
+  type ModelToolProjectionCapabilities
+} from "./model-tool-projection.js";
 
 function canonicalJsonValue(value: JsonValue): JsonValue {
   if (Array.isArray(value)) return value.map(canonicalJsonValue);
@@ -32,70 +39,6 @@ export function modelTools(descriptors: readonly ToolDescriptor[]): ModelToolDef
       description: item.description,
       inputSchema: canonicalJsonValue(item.inputSchema) as ModelToolDefinition["inputSchema"]
     }));
-}
-
-export interface ModelToolProjectionCapabilities {
-  skillsAvailable: boolean;
-  executableSkillResourcesLoaded: boolean;
-}
-
-/** Frozen sessions never acquire capabilities from changed live state. */
-export function sessionSkillProjectionCapabilities(input: {
-  frozenCustomization: { readonly skills: readonly { qualifiedName: string }[] };
-  loadedSkills: readonly {
-    qualifiedName: string;
-    executionManifestArtifactId?: string;
-    executionManifestDigest?: string;
-  }[];
-  profileSkillNames?: readonly string[];
-}): ModelToolProjectionCapabilities {
-  const allowed = input.profileSkillNames ? new Set(input.profileSkillNames) : undefined;
-  const candidates = input.frozenCustomization.skills.map((skill) => skill.qualifiedName);
-  const available = new Set(candidates.filter((name) => !allowed || allowed.has(name)));
-  return {
-    skillsAvailable: available.size > 0,
-    executableSkillResourcesLoaded: input.loadedSkills.some((skill) =>
-      available.has(skill.qualifiedName)
-      && Boolean(skill.executionManifestArtifactId && skill.executionManifestDigest)
-    )
-  };
-}
-
-/** Present only session-real capabilities to the model while leaving the
- * authoritative registry unchanged for durable recovery and stale-call denial. */
-export function projectModelToolDescriptors(
-  descriptors: readonly ToolDescriptor[],
-  capabilities: ModelToolProjectionCapabilities
-): ToolDescriptor[] {
-  const visible = capabilities.skillsAvailable
-    ? descriptors
-    : descriptors.filter((descriptor) => descriptor.name !== "load_skill");
-  return visible.map((descriptor) => {
-    const foregroundExecution = descriptor.name === "exec" || descriptor.name === "validate";
-    const unavailable = descriptor.name === "process_spawn"
-      || (foregroundExecution && !capabilities.executableSkillResourcesLoaded);
-    if (!unavailable) return descriptor;
-    const rawProperties = descriptor.inputSchema.properties;
-    if (!rawProperties || typeof rawProperties !== "object" || Array.isArray(rawProperties)) return descriptor;
-    const properties = { ...(rawProperties as Record<string, JsonValue>) };
-    delete properties.skill;
-    delete properties.skillScript;
-    const required = Array.isArray(descriptor.inputSchema.required)
-      ? descriptor.inputSchema.required.filter((item) => item !== "skill" && item !== "skillScript")
-      : undefined;
-    return {
-      ...descriptor,
-      description: descriptor.description.replace(
-        " With skill and skillScript, the frozen script is prepended to interpreter args.",
-        ""
-      ),
-      inputSchema: {
-        ...descriptor.inputSchema,
-        properties,
-        ...(required ? { required } : {})
-      }
-    };
-  });
 }
 
 export async function providerSizedPlan(
@@ -233,7 +176,20 @@ export async function writeScopeFailure(
   startedAt: string,
   plan?: ToolCallPlan
 ): Promise<ToolReceipt | null> {
-  if (plan?.mutationAuthority === "disposable_enclosing_container") return null;
+  if (plan?.mutationAuthority === "disposable_enclosing_container") {
+    const workspaceWritePaths =
+      plan.writePaths.filter((item) => !path.isAbsolute(item));
+    const workspaceCheckpointScope =
+      plan.checkpointScope.filter((item) => !path.isAbsolute(item));
+    if (workspaceWritePaths.length === 0
+      && workspaceCheckpointScope.length === 0) return null;
+    plan = {
+      ...plan,
+      writePaths: workspaceWritePaths,
+      checkpointScope: workspaceCheckpointScope,
+      mutationAuthority: undefined
+    };
+  }
   if (!session.identity.strictWriteScope || !needsWriteScope(plan, descriptor)) return null;
   const input = structuredArguments(call);
   if (!input) return failed(call, startedAt, "Scoped writer tools require structured path arguments.", "write_scope_denied");

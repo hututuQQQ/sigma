@@ -44,6 +44,7 @@ pub(crate) struct ScratchLease {
     root: PathBuf,
     home_source: PathBuf,
     temp_source: PathBuf,
+    var_temp_source: PathBuf,
     home_destination: PathBuf,
 }
 
@@ -154,6 +155,7 @@ impl ScratchLease {
             lease_id: format!("scratch-{instance_id}-{nonce}-{suffix}"),
             home_source: root.join("home"),
             temp_source: root.join("tmp"),
+            var_temp_source: root.join("var-tmp"),
             root,
             home_destination,
         }
@@ -171,6 +173,9 @@ impl ScratchLease {
             self.temp_source.clone(),
             self.temp_source.join(".git"),
             self.temp_source.join(".agent"),
+            self.var_temp_source.clone(),
+            self.var_temp_source.join(".git"),
+            self.var_temp_source.join(".agent"),
             self.root.join("disposable"),
         ] {
             std::fs::create_dir_all(&directory).map_err(|error| {
@@ -211,6 +216,10 @@ impl ScratchLease {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn temp_source(&self) -> &Path {
         &self.temp_source
+    }
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn var_temp_source(&self) -> &Path {
+        &self.var_temp_source
     }
 
     #[cfg(target_os = "linux")]
@@ -534,12 +543,19 @@ mod tests {
         #[cfg(not(target_os = "linux"))]
         assert_eq!(first.status("one").temp, first.temp_source);
         std::fs::write(first.temp_source.join("persisted"), b"yes").unwrap();
+        std::fs::write(first.var_temp_source.join("persisted"), b"var").unwrap();
         first.prepare().unwrap();
         assert_eq!(
             std::fs::read(first.temp_source.join("persisted")).unwrap(),
             b"yes"
         );
+        assert_eq!(
+            std::fs::read(first.var_temp_source.join("persisted")).unwrap(),
+            b"var"
+        );
         assert!(!second.temp_source.join("persisted").exists());
+        assert!(!second.var_temp_source.join("persisted").exists());
+        assert_ne!(first.temp_source, first.var_temp_source);
         let first_root = first.root.clone();
         drop(first);
         assert!(!first_root.exists());

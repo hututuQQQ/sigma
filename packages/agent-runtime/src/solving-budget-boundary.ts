@@ -5,7 +5,10 @@ import type { EffectRunnerOptions } from "./effect-runner.js";
 import type { LongHorizonCoordinator } from "./long-horizon-coordinator.js";
 import type { ReviewCoordinator } from "./review-coordinator.js";
 import type { RuntimeSession } from "./types.js";
-import { completionReviewBlocker } from "./completion-evidence-gate.js";
+import {
+  automaticCompletionReviewRequired,
+  completionReviewBlocker
+} from "./completion-evidence-gate.js";
 import { settleBudgetBoundaryProcesses } from "./process-budget-settlement.js";
 
 interface SolvingBudgetBoundaryOptions {
@@ -43,6 +46,9 @@ export async function finishSolvingBudgetBoundary(
   if (!isOrdinaryBudgetExhaustion(outcome)
     || deadlineForecast(session).stage !== "normal"
     || !mutationFrontierHasChanges(session.durable.state.mutationFrontier)) {
+    return await options.finish(session, outcome);
+  }
+  if (!automaticCompletionReviewRequired(session)) {
     return await options.finish(session, outcome);
   }
   await settleBudgetBoundaryProcesses(session, signal, {

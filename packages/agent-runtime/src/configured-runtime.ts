@@ -48,6 +48,7 @@ export interface RuntimeCompositionConfig {
   streamActiveSec?: number;
   maxModelRetries?: number;
   maxParallelTools: number;
+  commandTimeoutSec?: number;
   maxParallelAgents: number;
   mcpServers: McpServerConfigValue[];
   mcpSource: McpConfigSource;

@@ -4,10 +4,11 @@ import type { ModelToolCall } from "agent-protocol";
 import type { EffectRunnerOptions } from "./effect-runner.js";
 import type { RuntimeSession } from "./types.js";
 
-type DependencyProbeTool = "exec" | "validate" | "process_spawn";
+type DependencyProbeTool = "exec" | "shell" | "validate" | "process_spawn";
 
 function dependencyProbeTool(name: string): DependencyProbeTool | null {
-  return name === "exec" || name === "validate" || name === "process_spawn" ? name : null;
+  return name === "exec" || name === "shell"
+    || name === "validate" || name === "process_spawn" ? name : null;
 }
 
 function executableArgument(call: ModelToolCall): string {
