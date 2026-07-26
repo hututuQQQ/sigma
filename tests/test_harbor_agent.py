@@ -12,6 +12,17 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 
+PORTABLE_AGENT_ENV_KEYS = (
+    "DEEPSEEK_API_KEY",
+    "GLM_API_KEY",
+    "ZAI_API_KEY",
+    "BIGMODEL_API_KEY",
+    "DEEPSEEK_BASE_URL",
+    "GLM_BASE_URL",
+    "ZAI_BASE_URL",
+)
+
+
 def install_harbor_stubs() -> None:
     class BaseAgent:
         def __init__(self, logs_dir, model_name=None, extra_env=None, **_kwargs):
@@ -104,6 +115,75 @@ def managed_doctor_payload() -> str:
 
 
 class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._saved_agent_env = {
+            key: os.environ[key] for key in PORTABLE_AGENT_ENV_KEYS if key in os.environ
+        }
+        for key in PORTABLE_AGENT_ENV_KEYS:
+            os.environ.pop(key, None)
+
+    def tearDown(self):
+        for key in PORTABLE_AGENT_ENV_KEYS:
+            os.environ.pop(key, None)
+        os.environ.update(self._saved_agent_env)
+
+    async def test_agent_environment_uses_private_file_without_literal_exec_values(self):
+        module = import_portable_agent_module()
+
+        class RecordingEnvironment:
+            def __init__(self):
+                self.exec_calls = []
+                self.uploads = []
+
+            async def exec(self, command, **kwargs):
+                self.exec_calls.append((command, kwargs))
+                return SimpleNamespace(return_code=0, stdout="ok", stderr="")
+
+            async def upload_file(self, source, target):
+                source_path = Path(source)
+                self.uploads.append({
+                    "target": target,
+                    "content": source_path.read_text(encoding="utf-8"),
+                    "source": source_path,
+                })
+
+        env = RecordingEnvironment()
+        agent = module.SigmaCliHarborAgent(extra_env={})
+        credential = "fixture-secret-value-12345"
+
+        result = await agent._exec_with_private_env(
+            env,
+            "printf command-completed",
+            {"DEEPSEEK_API_KEY": credential, "SAFE_SETTING": "value with spaces"},
+            timeout_sec=30,
+        )
+
+        self.assertEqual(result.return_code, 0)
+        self.assertEqual(len(env.uploads), 1)
+        self.assertIn("export DEEPSEEK_API_KEY=", env.uploads[0]["content"])
+        self.assertIn(credential, env.uploads[0]["content"])
+        self.assertTrue(env.uploads[0]["target"].startswith(module.PRIVATE_ENV_DIR + "/"))
+        self.assertFalse(env.uploads[0]["source"].exists())
+
+        serialized_calls = json.dumps(env.exec_calls)
+        self.assertNotIn(credential, serialized_calls)
+        self.assertNotIn("DEEPSEEK_API_KEY=", serialized_calls)
+        self.assertTrue(all("env" not in kwargs for _, kwargs in env.exec_calls))
+        wrapped = next(command for command, _ in env.exec_calls if "printf command-completed" in command)
+        self.assertIn("/bin/rm -f", wrapped)
+        self.assertLess(
+            wrapped.index("/bin/rm -f"),
+            wrapped.index("printf command-completed"),
+        )
+
+    async def test_private_agent_environment_rejects_unsafe_shell_names_and_nul_values(self):
+        module = import_portable_agent_module()
+
+        with self.assertRaisesRegex(ValueError, "variable name"):
+            module.SigmaCliHarborAgent._private_env_script({"BAD-NAME": "value"})
+        with self.assertRaisesRegex(ValueError, "NUL"):
+            module.SigmaCliHarborAgent._private_env_script({"SAFE_NAME": "bad\0value"})
+
     async def test_model_name_is_used_unless_model_is_explicit(self):
         module = import_portable_agent_module()
 
