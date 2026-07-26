@@ -10,7 +10,6 @@ import {
 import { environmentShellAvailable } from "./environment-shell-tool.js";
 
 type ForegroundKind = "exec" | "shell" | "validate";
-const VALIDATION_INTENT_FIELDS = ["purpose", "subjects", "criterionIds"] as const;
 
 export interface ForegroundInvocation {
   shellCommand: boolean;
@@ -37,22 +36,8 @@ function assertShellModeTypes(input: Record<string, JsonValue>): void {
   }
 }
 
-function hasShellValidationIntent(input: Record<string, JsonValue>): boolean {
-  return VALIDATION_INTENT_FIELDS.some((field) => input[field] !== undefined);
-}
-
-function shellValidationRequested(input: Record<string, JsonValue>): boolean {
-  return input.validation === true || hasShellValidationIntent(input);
-}
-
 function assertShellValidationMode(input: Record<string, JsonValue>): void {
-  const validation = shellValidationRequested(input);
-  if (input.validation === false && hasShellValidationIntent(input)) {
-    invalidArguments(
-      "shell validation=false conflicts with purpose, subjects, or criterionIds; omit validation or set it to true."
-    );
-  }
-  if (input.background === true && validation) {
+  if (input.background === true && input.validation === true) {
     invalidArguments("shell background execution cannot be recorded as a completed validation.");
   }
 }
@@ -125,7 +110,7 @@ export function assertForegroundInvocation(
   else assertAvailableExecutable(input, options);
   return {
     shellCommand,
-    validation: kind === "validate" || (kind === "shell" && shellValidationRequested(input)),
+    validation: kind === "validate" || (kind === "shell" && input.validation === true),
     background: kind === "shell" && input.background === true
   };
 }
@@ -248,21 +233,21 @@ function validationIntentProperties(): Record<string, JsonValue> {
     purpose: {
       type: "string",
       description:
-        "Model-declared reason for a completed check. Providing this marks a foreground shell call as validation; the declaration is recorded as intent, not treated as proof."
+        "Optional reason recorded with an explicit completed validation. This is descriptive metadata and does not select validation mode."
     },
     subjects: {
       type: "array",
       items: { type: "string" },
       maxItems: 128,
       description:
-        "Paths or logical subjects a completed check intends to cover. Providing this marks a foreground shell call as validation."
+        "Paths or logical subjects an explicit completed validation intends to cover. This is descriptive metadata and does not select validation mode."
     },
     criterionIds: {
       type: "array",
       items: { type: "string" },
       maxItems: 64,
       description:
-        "Acceptance-criterion identifiers a completed check is intended to inform. Providing this marks a foreground shell call as validation."
+        "Acceptance-criterion identifiers an explicit completed validation is intended to inform. This is descriptive metadata and does not select validation mode."
     }
   };
 }
@@ -274,7 +259,7 @@ function unifiedExecutionProperties(
     validation: {
       type: "boolean",
       description:
-        "Optional explicit marker for a completed foreground check. Setting purpose, subjects, or criterionIds also marks the call as validation, so no second switch is required."
+        "Set true only for a completed foreground check. Validation runs in a disposable workspace view, so it must not create or update deliverables."
     },
     ...validationIntentProperties(),
     ...(options.background === false ? {} : {
@@ -337,7 +322,7 @@ function executionDescription(
     return `Run a sandboxed ${kind} command. With skill and skillScript, the frozen script is prepended to interpreter args.`;
   }
   return [
-    "Run one sandboxed command using exactly one form: {command,shell?} or {executable,args?,skill?,skillScript?}. Foreground is the default. Workspace commands are read-only by default; to create, modify, or delete workspace paths, provide expectedChanges with exact files or narrow directories. Put disposable outputs in the process temp directory ($TMPDIR on POSIX, %TEMP% or $env:TEMP on Windows). A completed check may be marked by validation=true or by supplying purpose, subjects, or criterionIds; background=true is only for a long-running service or interactive process. Background startup waits up to yieldMs and returns either terminal status or a live handle.",
+    "Run one sandboxed command using exactly one form: {command,shell?} or {executable,args?,skill?,skillScript?}. Foreground is the default. Workspace commands are read-only by default; to create, modify, or delete workspace paths, provide expectedChanges with exact files or narrow directories. Put disposable outputs in the process temp directory ($TMPDIR on POSIX, %TEMP% or $env:TEMP on Windows). Set validation=true only for a completed check; validation uses a disposable workspace view and cannot persist deliverables. background=true is only for a long-running service or interactive process. Background startup waits up to yieldMs and returns either terminal status or a live handle.",
     ...(environmentShellAvailable(options)
       ? ["Set target=environment only when the command needs system-level changes in the broker-attested disposable outer environment. If that same foreground command must also create or modify workspace deliverables, declare those workspace paths in expectedChanges so they remain checkpointed. Background environment commands cannot write the workspace."]
       : [])

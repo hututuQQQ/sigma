@@ -99,6 +99,11 @@ function modelForegroundInputSchema(
   // for durable recovery, but do not ask the model to coordinate all three.
   delete properties.access;
   delete properties.writeRoots;
+  // Validation intent metadata belongs to the hidden legacy validate contract.
+  // The unified shell uses one unambiguous validation boolean.
+  delete properties.purpose;
+  delete properties.subjects;
+  delete properties.criterionIds;
   if (properties.expectedChanges
     && typeof properties.expectedChanges === "object"
     && !Array.isArray(properties.expectedChanges)) {
@@ -211,7 +216,13 @@ export async function executeForegroundCommand(
   const startedAt = new Date().toISOString();
   const input = executionArgs(request.arguments);
   const invocationMode = assertForegroundInvocation(kind, input, options);
-  const { shellCommand, validation, background } = invocationMode;
+  const { shellCommand, background } = invocationMode;
+  // A durable plan is the authority for an already-approved call. Preserve
+  // recovery of older shell calls whose intent metadata used to imply
+  // validation, while new preparations require validation=true explicitly.
+  const validation = invocationMode.validation
+    || (kind === "shell"
+      && context.callPlan?.exactEffects.includes("validation") === true);
   if (background) {
     return await executeBackgroundProcess(
       options,

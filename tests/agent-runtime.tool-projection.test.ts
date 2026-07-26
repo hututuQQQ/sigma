@@ -73,10 +73,17 @@ describe("session model-tool capability projection", () => {
     expect(runtimeProperties).toHaveProperty("access");
     expect(runtimeProperties).toHaveProperty("writeRoots");
     expect(runtimeProperties).toHaveProperty("expectedChanges");
+    expect(runtimeProperties).toHaveProperty("purpose");
+    expect(runtimeProperties).toHaveProperty("subjects");
+    expect(runtimeProperties).toHaveProperty("criterionIds");
     expect(modelProperties).not.toHaveProperty("access");
     expect(modelProperties).not.toHaveProperty("writeRoots");
     expect(modelProperties).toHaveProperty("expectedChanges");
+    expect(modelProperties).not.toHaveProperty("purpose");
+    expect(modelProperties).not.toHaveProperty("subjects");
+    expect(modelProperties).not.toHaveProperty("criterionIds");
     expect(modelShell?.description).toContain("process temp directory");
+    expect(modelShell?.description).toContain("validation=true");
 
     const analyzeShell = projectModelToolDescriptors(tools.modelDescriptors(), {
       skillsAvailable: false,

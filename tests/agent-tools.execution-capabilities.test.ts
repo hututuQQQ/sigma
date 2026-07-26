@@ -457,8 +457,19 @@ describe("execution tool capability closure", () => {
       exactEffects: expect.arrayContaining(["filesystem.write"])
     });
 
+    const descriptiveWriteCall = request("shell", {
+      executable: "runtime",
+      expectedChanges: ["described-output.txt"],
+      purpose: "Create the requested output"
+    });
+    await expect(tools.prepare(descriptiveWriteCall, preparation(root))).resolves.toMatchObject({
+      writePaths: ["described-output.txt"],
+      exactEffects: expect.not.arrayContaining(["validation"])
+    });
+
     const validationCall = request("shell", {
       executable: "runtime",
+      validation: true,
       purpose: "Check the current result"
     });
     const validationPlan = await tools.prepare(validationCall, preparation(root));
@@ -476,13 +487,35 @@ describe("execution tool capability closure", () => {
     await expect(tools.prepare(request("shell", {
       executable: "runtime",
       validation: false,
-      purpose: "Conflicting validation intent"
-    }), preparation(root))).rejects.toMatchObject({ code: "tool_arguments_invalid" });
+      purpose: "A description does not imply validation"
+    }), preparation(root))).resolves.toMatchObject({
+      exactEffects: expect.not.arrayContaining(["validation"])
+    });
     await expect(tools.prepare(request("shell", {
       executable: "runtime",
       background: true,
-      purpose: "A background process is not a completed check"
-    }), preparation(root))).rejects.toMatchObject({ code: "tool_arguments_invalid" });
+      purpose: "Describe a background process"
+    }), preparation(root))).resolves.toMatchObject({
+      processMode: "background",
+      exactEffects: expect.not.arrayContaining(["validation"])
+    });
+
+    const legacyValidationPlan = await tools.prepare(request("shell", {
+      executable: "runtime",
+      validation: true,
+      purpose: "Legacy validation"
+    }), preparation(root));
+    const legacyValidationCall = request("shell", {
+      executable: "runtime",
+      purpose: "Legacy validation"
+    });
+    await expect(tools.execute(legacyValidationCall, {
+      ...execution(root),
+      callPlan: legacyValidationPlan
+    })).resolves.toMatchObject({
+      ok: true,
+      evidence: [expect.objectContaining({ kind: "validation" })]
+    });
 
     const backgroundCall = request("shell", {
       executable: "runtime",

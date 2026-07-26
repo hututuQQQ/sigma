@@ -118,9 +118,13 @@ function projectedInputSchema(
   if (presentation.environmentUnavailable) delete properties.target;
   if (presentation.unifiedShell) {
     // expectedChanges is sufficient for ordinary workspace writes. Runtime
-    // descriptors retain the legacy fields for durable-call compatibility.
+    // descriptors retain lower-level write and validation-intent fields for
+    // durable-call compatibility.
     delete properties.access;
     delete properties.writeRoots;
+    delete properties.purpose;
+    delete properties.subjects;
+    delete properties.criterionIds;
     if (capabilities.environmentMutationAvailable === false) {
       delete properties.expectedChanges;
     }
