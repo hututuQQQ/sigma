@@ -434,6 +434,29 @@ describe("execution tool capability closure", () => {
     expect(modelNames).not.toContain("validate");
     expect(modelNames).not.toContain("process_spawn");
 
+    const inferredWriteCall = request("shell", {
+      executable: "runtime",
+      expectedChanges: ["generated.txt"]
+    });
+    const inferredWritePlan = await tools.prepare(inferredWriteCall, preparation(root));
+    expect(inferredWritePlan).toMatchObject({
+      writePaths: ["generated.txt"],
+      checkpointScope: ["."],
+      exactEffects: expect.arrayContaining(["filesystem.write"])
+    });
+
+    const legacyWriteCall = request("shell", {
+      executable: "runtime",
+      access: "write",
+      writeRoots: ["."],
+      expectedChanges: ["legacy-generated.txt"]
+    });
+    await expect(tools.prepare(legacyWriteCall, preparation(root))).resolves.toMatchObject({
+      writePaths: ["legacy-generated.txt"],
+      checkpointScope: ["."],
+      exactEffects: expect.arrayContaining(["filesystem.write"])
+    });
+
     const validationCall = request("shell", {
       executable: "runtime",
       purpose: "Check the current result"

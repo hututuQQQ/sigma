@@ -110,6 +110,22 @@ function dependencyDiagnostics(result: ExecutionResult): string[] {
   return missing ? ["command_dependency_missing"] : [];
 }
 
+function readonlyFilesystemDiagnostic(
+  result: ExecutionResult,
+  actualEffects: ToolCallPlan["exactEffects"]
+): string[] {
+  if (commandSucceeded(result) || actualEffects.includes("filesystem.write")) return [];
+  const output = `${result.stdout}\n${result.stderr}`;
+  return /\bread-only file system\b/iu.test(output)
+    ? ["command_readonly_filesystem"]
+    : [];
+}
+
+function readonlyFilesystemHint(diagnostics: readonly string[]): string {
+  if (!diagnostics.includes("command_readonly_filesystem")) return "";
+  return "Sigma hint: this call had read-only workspace access. If the failed write belongs in the workspace, re-run with expectedChanges listing exact files or a narrow directory. Put disposable outputs in the process temp directory.";
+}
+
 async function importOutputArtifacts(
   artifacts: readonly ProcessOutputArtifact[] | undefined,
   context: ToolExecutionContext
@@ -228,11 +244,17 @@ export async function commandReceipt(
   await preserveProjectedStream("stderr", result.stderr, stderr, context, imported);
   await acknowledge(imported, broker);
   const evidence = commandEvidence(request, command, result, validation, completedAt, context, imported);
-  const output = [stdout.value, stderr.value].filter(Boolean).join("\n");
+  const readonlyDiagnostics = readonlyFilesystemDiagnostic(result, actualEffects);
+  const output = [
+    stdout.value,
+    stderr.value,
+    readonlyFilesystemHint(readonlyDiagnostics)
+  ].filter(Boolean).join("\n");
   const diagnostics = [
     `exit_code=${String(result.exitCode)}`,
     ...(result.failure ? [result.failure.code] : []),
     ...dependencyDiagnostics(result),
+    ...readonlyDiagnostics,
     ...(result.outputTruncated ? ["output_truncated"] : []), ...imported.diagnostics,
     ...decodingDiagnostics(result),
     ...(result.timedOut || result.idleTimedOut ? ["process_timed_out"] : [])

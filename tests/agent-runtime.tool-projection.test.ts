@@ -64,6 +64,29 @@ describe("session model-tool capability projection", () => {
       .toHaveProperty("validation");
   });
 
+  it("presents one scoped workspace-write field while retaining the recovery contract", () => {
+    const tools = registerBuiltinTools(new EffectToolRegistry());
+    const runtimeProperties = tools.descriptor("shell")?.inputSchema.properties;
+    const modelShell = tools.modelDescriptors().find((item) => item.name === "shell");
+    const modelProperties = modelShell?.inputSchema.properties;
+
+    expect(runtimeProperties).toHaveProperty("access");
+    expect(runtimeProperties).toHaveProperty("writeRoots");
+    expect(runtimeProperties).toHaveProperty("expectedChanges");
+    expect(modelProperties).not.toHaveProperty("access");
+    expect(modelProperties).not.toHaveProperty("writeRoots");
+    expect(modelProperties).toHaveProperty("expectedChanges");
+    expect(modelShell?.description).toContain("process temp directory");
+
+    const analyzeShell = projectModelToolDescriptors(tools.modelDescriptors(), {
+      skillsAvailable: false,
+      executableSkillResourcesLoaded: false,
+      environmentMutationAvailable: false
+    }).find((item) => item.name === "shell");
+    expect(analyzeShell?.inputSchema.properties).not.toHaveProperty("expectedChanges");
+    expect(analyzeShell?.description).not.toContain("provide expectedChanges");
+  });
+
   it("defers lifecycle controls until durable process or child state exists", () => {
     const template = descriptors.find((item) => item.name === "read_plan")!;
     const childNames = [

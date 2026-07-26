@@ -2,6 +2,7 @@ import type {
   JsonValue,
   LoadedSkillResourceAccess,
   ToolCallPlan,
+  ToolDescriptor,
   ToolReceipt,
   ToolRequest
 } from "agent-protocol";
@@ -81,6 +82,24 @@ function foregroundArguments(
   }
   const { target: _target, ...workspaceInput } = input;
   return workspaceInput;
+}
+
+function modelForegroundInputSchema(
+  kind: "exec" | "shell" | "validate",
+  schema: ToolDescriptor["inputSchema"]
+): ToolDescriptor["inputSchema"] | undefined {
+  if (kind !== "shell") return undefined;
+  const rawProperties = schema.properties;
+  if (!rawProperties || typeof rawProperties !== "object" || Array.isArray(rawProperties)) {
+    return schema;
+  }
+  const properties = { ...(rawProperties as Record<string, JsonValue>) };
+  // expectedChanges is the complete ordinary workspace-write declaration.
+  // Keep the lower-level access/writeRoots fields in the runtime descriptor
+  // for durable recovery, but do not ask the model to coordinate all three.
+  delete properties.access;
+  delete properties.writeRoots;
+  return { ...schema, properties };
 }
 
 interface ForegroundExecution {
@@ -196,12 +215,14 @@ export async function executeForegroundCommand(
 
 function foregroundTool(kind: "exec" | "shell" | "validate", options: ExecutionToolOptions): RegisteredEffectTool {
   const { schema, validation } = foregroundExecutionSchema(kind, options, networkProperty(options));
+  const modelInputSchema = modelForegroundInputSchema(kind, schema.inputSchema);
   return {
     // When a verified shell exists it is the single model-visible execution
     // surface. Legacy exec/validate names remain registered for durable
     // recovery and for direct-only environments without a verified shell.
     modelVisible: kind !== "shell" && availableShells(options).length > 0
       ? false : undefined,
+    ...(modelInputSchema ? { modelInputSchema } : {}),
     descriptor: {
       ...schema,
       ...(options.writeScope === "enclosing-container"

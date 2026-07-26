@@ -152,7 +152,7 @@ export function writeContractProperties(
       type: "array", items: { type: "string" }, minItems: 1, uniqueItems: true,
       description: enclosing
         ? "Exact files or narrow paths approved to change. Use canonical absolute paths for enclosing-container changes. External changes persist only for the disposable task container and are independently reviewed."
-        : "Exact files or narrow paths approved to change. New parent directories needed to create an approved path are implicit; other changes are rolled back."
+        : "Exact workspace files or narrow directories this command may create, modify, or delete. Supplying this field alone grants only that write scope; new parent directories are implicit and other changes are rolled back."
     }
   };
 }
@@ -337,7 +337,7 @@ function executionDescription(
     return `Run a sandboxed ${kind} command. With skill and skillScript, the frozen script is prepended to interpreter args.`;
   }
   return [
-    "Run one sandboxed command using exactly one form: {command,shell?} or {executable,args?,skill?,skillScript?}. Foreground is the default. A completed check may be marked by validation=true or by supplying purpose, subjects, or criterionIds; background=true is only for a long-running service or interactive process. Background startup waits up to yieldMs and returns either terminal status or a live handle.",
+    "Run one sandboxed command using exactly one form: {command,shell?} or {executable,args?,skill?,skillScript?}. Foreground is the default. Workspace commands are read-only by default; to create, modify, or delete workspace paths, provide expectedChanges with exact files or narrow directories. Put disposable outputs in the process temp directory ($TMPDIR on POSIX, %TEMP% or $env:TEMP on Windows). A completed check may be marked by validation=true or by supplying purpose, subjects, or criterionIds; background=true is only for a long-running service or interactive process. Background startup waits up to yieldMs and returns either terminal status or a live handle.",
     ...(environmentShellAvailable(options)
       ? ["Set target=environment only for system-level changes in the broker-attested disposable outer environment."]
       : [])

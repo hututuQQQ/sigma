@@ -451,6 +451,69 @@ describe("execution output artifact receipts", () => {
     expect(receipt.diagnostics).not.toContain("dependency_missing");
   });
 
+  it("turns a read-only filesystem failure into generic scoped-write guidance", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-readonly-command-"));
+    const execution: ExecutionResult = {
+      state: "exited", exitCode: 1, signal: null, durationMs: 8,
+      timedOut: false, idleTimedOut: false, cancelled: false,
+      stdout: "", stderr: "/usr/bin/ld: cannot open output file app: Read-only file system",
+      stdoutDroppedBytes: 0, stderrDroppedBytes: 0,
+      outputTruncated: false, outputArtifacts: []
+    };
+    const poll: ProcessPollResult = {
+      ...execution,
+      handle: { id: "process", brokerInstanceId: "broker" },
+      state: "exited"
+    };
+    const tools = executionTools({
+      broker: broker(execution, poll), sandboxMode: "required", networkMode: "none",
+      shells: ["bash"]
+    });
+    const { context } = await fixtureContext(workspace);
+    const shell = tools.find((tool) => tool.descriptor.name === "shell")!;
+    const receipt = await shell.execute(
+      request("readonly-command", "shell", { command: "compile project" }),
+      context
+    );
+
+    expect(receipt).toMatchObject({ ok: false });
+    expect(receipt.diagnostics).toContain("command_readonly_filesystem");
+    expect(receipt.output).toContain("re-run with expectedChanges");
+    expect(receipt.output).toContain("process temp directory");
+  });
+
+  it("does not mislabel a read-only external filesystem as missing workspace scope", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-scoped-command-"));
+    const execution: ExecutionResult = {
+      state: "exited", exitCode: 1, signal: null, durationMs: 8,
+      timedOut: false, idleTimedOut: false, cancelled: false,
+      stdout: "", stderr: "cannot update system mount: Read-only file system",
+      stdoutDroppedBytes: 0, stderrDroppedBytes: 0,
+      outputTruncated: false, outputArtifacts: []
+    };
+    const poll: ProcessPollResult = {
+      ...execution,
+      handle: { id: "process", brokerInstanceId: "broker" },
+      state: "exited"
+    };
+    const tools = executionTools({
+      broker: broker(execution, poll), sandboxMode: "required", networkMode: "none",
+      shells: ["bash"]
+    });
+    const { context } = await fixtureContext(workspace);
+    const shell = tools.find((tool) => tool.descriptor.name === "shell")!;
+    const call = request("scoped-command", "shell", {
+      command: "compile project",
+      expectedChanges: ["app"]
+    });
+    const callPlan = await shell.descriptor.prepare!(call.arguments, context);
+    const receipt = await shell.execute(call, { ...context, callPlan });
+
+    expect(receipt).toMatchObject({ ok: false });
+    expect(receipt.diagnostics).not.toContain("command_readonly_filesystem");
+    expect(receipt.output).not.toContain("re-run with expectedChanges");
+  });
+
   it("preserves authenticated sandbox launch failures as stable diagnostics", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-launch-failure-receipt-"));
     const failure = {
