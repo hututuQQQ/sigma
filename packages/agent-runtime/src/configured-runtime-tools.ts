@@ -23,6 +23,8 @@ export interface ConfiguredToolOptions {
   readScope?: "workspace" | "host";
   writeScope?: "workspace" | "enclosing-container";
   networkMode?: "none" | "loopback" | "full";
+  webMode?: "auto" | "disabled";
+  webSearchProvider?: "exa";
   processHandoff?: "allow" | "deny";
   commandTimeoutSec?: number;
   checkpoint?: { maxFiles: number; maxBytes: number };
@@ -141,7 +143,13 @@ export function createConfiguredTools(
     networkModes: network.modes,
     ...brokerToolCapabilities(config, execution, executionReport),
     ...repositoryRuntimeProviders,
-    ...configuredCodeIntel(executionReport, network.modes)
+    ...configuredCodeIntel(executionReport, network.modes),
+    ...(policy.networkMode === "full"
+      && (config.webMode ?? "auto") === "auto"
+      && (config.webSearchProvider ?? "exa") === "exa"
+      && executionReport.capabilities.webRequest === true
+      && typeof execution.webRequest === "function"
+      ? { web: { apiKey: process.env.EXA_API_KEY } } : {})
   });
   builtins.register(repositoryInspectTool(execution, recoverySelections));
   builtins.register(repositoryTransactionTool(execution, {

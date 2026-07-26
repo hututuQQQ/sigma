@@ -193,6 +193,13 @@ function parseDoctorSandbox(input: unknown): BrokerDoctorReport["sandbox"] {
   };
 }
 
+function webRequestCapability(
+  capabilities: Record<string, unknown>
+): Pick<BrokerDoctorReport["capabilities"], "webRequest"> {
+  return capabilities.webRequest === undefined
+    ? {} : { webRequest: booleanValue(capabilities.webRequest, "capabilities.webRequest") };
+}
+
 function parseDoctorCapabilities(input: unknown, platform: string): BrokerDoctorReport["capabilities"] {
   const capabilities = protocolRecord(input, "Broker capabilities");
   const networkModes = capabilities.networkModes;
@@ -230,6 +237,7 @@ function parseDoctorCapabilities(input: unknown, platform: string): BrokerDoctor
       processHandoff: booleanValue(capabilities.processHandoff, "capabilities.processHandoff")
     }),
     networkModes: networkModes as Array<"none" | "loopback" | "full">,
+    ...webRequestCapability(capabilities),
     ...(capabilities.executionRoots === undefined ? {} : {
       executionRoots: booleanValue(capabilities.executionRoots, "capabilities.executionRoots")
     }),

@@ -125,6 +125,14 @@ export class ToolApprovalCoordinator {
       }
       session.interaction.alwaysAllowedEffects.add(grant.alwaysAllowEffectGrant);
     }
+    if (grant.sessionApprovalGrant) {
+      if (grant.sessionApprovalGrant !== prepared.descriptor.sessionApprovalGrant) {
+        throw Object.assign(new Error("The tool-scoped session grant does not match the approved call."), {
+          code: "per_call_approval_required"
+        });
+      }
+      session.interaction.sessionApprovalGrants.add(grant.sessionApprovalGrant);
+    }
     return perCall ? grant : undefined;
   }
 
@@ -161,6 +169,8 @@ export class ToolApprovalCoordinator {
     const waiter: ApprovalWaiter = {
       effects,
       binding: createApprovalBinding(session.identity.sessionId, session.durable.runId, request, plan, effects),
+      ...(descriptor.sessionApprovalGrant
+        ? { sessionApprovalGrant: descriptor.sessionApprovalGrant } : {}),
       resolve
     };
     session.interaction.approvals.set(requestId, waiter);
@@ -177,7 +187,9 @@ export class ToolApprovalCoordinator {
           request,
           effects,
           plan,
-          this.options.runtime.runtimeEnvironment?.executionMode === "container" ? "oci" : "native"
+          this.options.runtime.runtimeEnvironment?.executionMode === "container" ? "oci" : "native",
+          false,
+          descriptor.sessionApprovalGrant
         ),
         ...turnPayload(modelTurn)
       });
@@ -218,7 +230,8 @@ export class ToolApprovalCoordinator {
         effects,
         plan,
         this.options.runtime.runtimeEnvironment?.executionMode === "container" ? "oci" : "native",
-        true
+        true,
+        descriptor.sessionApprovalGrant
       ),
       ...turnPayload(modelTurn)
     });
@@ -231,7 +244,9 @@ export class ToolApprovalCoordinator {
       networkApproved: plan.network === "full",
       externalReadApproved: plan.exactEffects.includes("filesystem.read.external"),
       processHandoffApproved: plan.exactEffects.includes("process.handoff"),
-      openWorldApproved: false
+      openWorldApproved: false,
+      ...(descriptor.sessionApprovalGrant
+        ? { sessionApprovalGrant: descriptor.sessionApprovalGrant } : {})
     });
     return "allow";
   }
@@ -254,7 +269,9 @@ export class ToolApprovalCoordinator {
           request,
           effects,
           plan,
-          this.options.runtime.runtimeEnvironment?.executionMode === "container" ? "oci" : "native"
+          this.options.runtime.runtimeEnvironment?.executionMode === "container" ? "oci" : "native",
+          false,
+          descriptor.sessionApprovalGrant
         ),
         ...turnPayload(modelTurn)
       });

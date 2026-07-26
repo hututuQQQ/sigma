@@ -86,6 +86,8 @@ export interface ArtifactRef {
   digest: string;
   mediaType?: string;
   sizeBytes?: number;
+  /** Provenance boundary for bytes that originated outside the trusted runtime. */
+  contentTrust?: "external_untrusted";
 }
 
 export type ModelExecutionRole = z.infer<typeof modelExecutionRoleSchema>;

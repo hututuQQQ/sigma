@@ -168,6 +168,8 @@ export const SIGMA_CONFIG_SCHEMA: readonly ConfigField[] = [
   { key: "readScope", flag: "read-scope", env: "SIGMA_READ_SCOPE", toml: "security.read_scope", description: "Filesystem read scope", defaultValue: "workspace", parse: (raw) => enumValue(raw, "readScope", ["workspace", "host"] as const) },
   { key: "writeScope", flag: "write-scope", env: "SIGMA_WRITE_SCOPE", toml: "security.write_scope", description: "Process write boundary (enclosing-container requires native attestation)", defaultValue: "workspace", parse: (raw) => enumValue(raw, "writeScope", ["workspace", "enclosing-container"] as const) },
   { key: "networkMode", flag: "network", env: "SIGMA_NETWORK", toml: "security.network", description: "Default process network policy", defaultValue: "full", parse: (raw) => enumValue(raw, "networkMode", ["none", "loopback", "full"] as const) },
+  { key: "webMode", flag: "web", env: "SIGMA_WEB_MODE", toml: "web.mode", description: "Read-only Web research mode", defaultValue: "auto", parse: (raw) => enumValue(raw, "webMode", ["auto", "disabled"] as const) },
+  { key: "webSearchProvider", flag: "web-search-provider", env: "SIGMA_WEB_SEARCH_PROVIDER", toml: "web.search_provider", description: "Web search provider", defaultValue: "exa", parse: (raw) => enumValue(raw, "webSearchProvider", ["exa"] as const) },
   { key: "processHandoff", flag: "process-handoff", env: "SIGMA_PROCESS_HANDOFF", toml: "security.process_handoff", description: "Persistent process handoff policy", defaultValue: "allow", parse: (raw) => enumValue(raw, "processHandoff", ["allow", "deny"] as const) },
   { key: "runDeadlineSec", flag: "run-deadline-sec", env: "SIGMA_RUN_DEADLINE_SEC", toml: "runtime.run_deadline_sec", description: "Whole-run hard deadline in seconds", defaultValue: 900, parse: (raw) => numberValue(raw, "runDeadlineSec", 1) },
   { key: "modelDeadlineSec", flag: "model-deadline-sec", env: "SIGMA_MODEL_DEADLINE_SEC", toml: "runtime.model_deadline_sec", description: "Model first-byte and non-stream request deadline in seconds", defaultValue: 120, parse: (raw) => numberValue(raw, "modelDeadlineSec", 1) },
@@ -260,10 +262,19 @@ const PERMISSION_STRICTNESS: Readonly<Record<string, number>> = {
   deny: 0, ask: 1, "workspace-auto": 2, auto: 3
 };
 const NETWORK_STRICTNESS: Readonly<Record<string, number>> = { none: 0, loopback: 1, full: 2 };
+const WEB_STRICTNESS: Readonly<Record<string, number>> = { disabled: 0, auto: 1 };
 const READ_SCOPE_STRICTNESS: Readonly<Record<string, number>> = { workspace: 0, host: 1 };
 const WRITE_SCOPE_STRICTNESS: Readonly<Record<string, number>> =
   { workspace: 0, "enclosing-container": 1 };
 const HANDOFF_STRICTNESS: Readonly<Record<string, number>> = { deny: 0, allow: 1 };
+const WORKSPACE_STRICTNESS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
+  permissionMode: PERMISSION_STRICTNESS,
+  networkMode: NETWORK_STRICTNESS,
+  webMode: WEB_STRICTNESS,
+  readScope: READ_SCOPE_STRICTNESS,
+  writeScope: WRITE_SCOPE_STRICTNESS,
+  processHandoff: HANDOFF_STRICTNESS
+};
 function restrictWorkspaceValue(field: ConfigField, baseline: ConfigValue, workspaceRaw: unknown): ConfigValue {
   const workspaceValue = field.parse(workspaceRaw);
   if (WORKSPACE_NUMERIC_CAPS.has(field.key)) {
@@ -274,24 +285,9 @@ function restrictWorkspaceValue(field: ConfigField, baseline: ConfigValue, works
     }
     return Math.min(baselineNumber, workspaceNumber);
   }
-  if (field.key === "permissionMode") {
-    return PERMISSION_STRICTNESS[String(workspaceValue)] < PERMISSION_STRICTNESS[String(baseline)]
-      ? workspaceValue : baseline;
-  }
-  if (field.key === "networkMode") {
-    return NETWORK_STRICTNESS[String(workspaceValue)] < NETWORK_STRICTNESS[String(baseline)]
-      ? workspaceValue : baseline;
-  }
-  if (field.key === "readScope") {
-    return READ_SCOPE_STRICTNESS[String(workspaceValue)] < READ_SCOPE_STRICTNESS[String(baseline)]
-      ? workspaceValue : baseline;
-  }
-  if (field.key === "writeScope") {
-    return WRITE_SCOPE_STRICTNESS[String(workspaceValue)] < WRITE_SCOPE_STRICTNESS[String(baseline)]
-      ? workspaceValue : baseline;
-  }
-  if (field.key === "processHandoff") {
-    return HANDOFF_STRICTNESS[String(workspaceValue)] < HANDOFF_STRICTNESS[String(baseline)]
+  const strictness = WORKSPACE_STRICTNESS[field.key];
+  if (strictness) {
+    return strictness[String(workspaceValue)] < strictness[String(baseline)]
       ? workspaceValue : baseline;
   }
   return workspaceValue;

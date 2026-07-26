@@ -53,6 +53,11 @@ impl RedactionConfig {
         values.dedup();
         Ok(Self { values })
     }
+
+    pub(crate) fn redact_bytes(&self, input: &[u8]) -> Vec<u8> {
+        let mut redactor = OutputRedactor::new(self.clone());
+        redactor.push(input, true)
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]

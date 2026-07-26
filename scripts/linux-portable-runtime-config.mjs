@@ -24,7 +24,7 @@ export const linuxMinimumGlibc = "2.28";
 export const linuxNodeRpath = "$ORIGIN/../lib";
 export const bubblewrapRelease = Object.freeze({
   version: "0.4.0-2.el8_10",
-  url: "https://dl.rockylinux.org/pub/rocky/8.10/BaseOS/x86_64/os/Packages/b/bubblewrap-0.4.0-2.el8_10.x86_64.rpm",
+  url: "https://download.rockylinux.org/pub/rocky/8.10/BaseOS/x86_64/os/Packages/b/bubblewrap-0.4.0-2.el8_10.x86_64.rpm",
   sha256: "2899b655f4be66eac7534acc35858209ac1a0be12117a95aa8294ad4f14bce75"
 });
 export const linuxRuntimeLibraryNames = Object.freeze([

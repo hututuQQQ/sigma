@@ -54,6 +54,8 @@ export function receipt(
     actualEffects: input.actualEffects ?? input.observedEffects ?? [],
     workspaceDelta: input.workspaceDelta,
     artifacts: input.artifacts ?? [],
+    ...(input.artifactRefs ? { artifactRefs: input.artifactRefs } : {}),
+    ...(input.contentTrust ? { contentTrust: input.contentTrust } : {}),
     diagnostics,
     evidence: input.evidence ?? [],
     startedAt,

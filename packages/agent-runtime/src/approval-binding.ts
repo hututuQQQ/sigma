@@ -42,6 +42,21 @@ function strings(value: unknown): string[] | null {
     : null;
 }
 
+function networkTargets(value: unknown): ToolCallPlan["networkTargets"] | null {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) return null;
+  const targets = value.flatMap((item) => {
+    const target = record(item);
+    if (!target || typeof target.origin !== "string"
+      || (target.method !== "GET" && target.method !== "POST")) return [];
+    return [{
+      origin: target.origin,
+      method: target.method as "GET" | "POST"
+    }];
+  });
+  return targets.length === value.length ? targets : null;
+}
+
 export function parseToolEffects(value: unknown): ToolEffect[] | null {
   const values = strings(value);
   if (!values || new Set(values).size !== values.length
@@ -74,14 +89,16 @@ export function parseToolCallPlan(value: unknown): ToolCallPlan | null {
   const readPaths = strings(plan.readPaths);
   const writePaths = strings(plan.writePaths);
   const checkpointScope = strings(plan.checkpointScope);
+  const targets = networkTargets(plan.networkTargets);
   const checkpoint = plan.checkpointAction === undefined ? undefined : record(plan.checkpointAction);
-  if (!exactEffects || !readPaths || !writePaths || !checkpointScope
+  if (!exactEffects || !readPaths || !writePaths || !checkpointScope || !targets
     || !validPlanScalars(plan, checkpoint)) return null;
   return {
     exactEffects,
     readPaths,
     writePaths,
     network: plan.network as ToolCallPlan["network"],
+    ...(targets.length > 0 ? { networkTargets: targets } : {}),
     processMode: plan.processMode as ToolCallPlan["processMode"],
     checkpointScope,
     ...(checkpoint ? {
@@ -195,6 +212,13 @@ function canonicalApprovalAuthority(
       readPaths: sorted(plan.readPaths),
       writePaths: sorted(plan.writePaths),
       network: plan.network,
+      networkTargets: [...(plan.networkTargets ?? [])]
+        .map((target) => ({
+          origin: target.origin.normalize("NFC"),
+          method: target.method
+        }))
+        .sort((left, right) =>
+          left.origin.localeCompare(right.origin) || left.method.localeCompare(right.method)),
       processMode: plan.processMode,
       checkpointScope: sorted(plan.checkpointScope),
       checkpointAction: plan.checkpointAction

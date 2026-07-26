@@ -19,7 +19,7 @@ import { BoundedByteRingBuffer } from "./ring-buffer.js";
 import type { BrokerRequestOptions, SigmaExecBrokerClientOptions } from "./types.js";
 
 type TransportState = "new" | "running" | "closing" | "closed" | "failed";
-const rawOutputMethods = new Set(["exec", "process.poll", "process.terminate"]);
+const rawOutputMethods = new Set(["exec", "process.poll", "process.terminate", "web.request"]);
 
 interface PendingRequest {
   id: number;
@@ -221,7 +221,7 @@ export class BrokerTransport {
       this.settle(pending, undefined, failure);
       return;
     }
-    if (pending.method === "exec") {
+    if (pending.method === "exec" || pending.method === "web.request") {
       if (pending.deferredError) return;
       pending.deferredError = error;
       clearTimeout(pending.timer);

@@ -133,6 +133,9 @@ export function withTrustedRuntimeCapabilities(
         await broker.releaseScratchLease!(sessionId, options)
     } : {}),
     ...repositoryBrokerCapabilities(broker),
+    ...(broker.webRequest ? {
+      webRequest: async (request, options) => await broker.webRequest!(request, options)
+    } : {}),
     execute: async (request: ExecutionRequest, options) => await broker.execute(request, options),
     spawn: async (request: ProcessSpawnRequest, options) => await broker.spawn(request, options),
     poll: async (handle, options): Promise<ProcessPollResult> => await broker.poll(handle, options),

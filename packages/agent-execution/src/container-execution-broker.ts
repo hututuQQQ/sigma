@@ -20,7 +20,7 @@ import type {
   ProcessPollResult,
   ProcessSpawnRequest,
   ScratchLeaseRequest, ScratchLease,
-  TrustedManagedContainerAttestation
+  TrustedManagedContainerAttestation, WebRequest, WebResponse
 } from "./types.js";
 import {
   assertContainerExecutionConfig,
@@ -257,7 +257,7 @@ export class AttestedContainerExecutionBroker extends RepositoryExecutionBrokerB
     await this.verify(options?.signal);
     return await this.broker.execute(request, options);
   }
-
+  async webRequest(request: WebRequest, options?: BrokerRequestOptions): Promise<WebResponse> { await this.verify(options?.signal); if (!this.broker.webRequest) throw new ContainerUnavailableError("OCI broker Web request capability is unavailable."); return await this.broker.webRequest(request, options); }
   async spawn(request: ProcessSpawnRequest, options?: BrokerRequestOptions): Promise<ProcessHandle> {
     await this.verify(options?.signal);
     return await this.broker.spawn(request, options);
@@ -320,9 +320,8 @@ export class AttestedContainerExecutionBroker extends RepositoryExecutionBrokerB
       ...report,
       capabilities: {
         ...report.capabilities,
-        runtimeClosure: containerRuntimeClosure(
-          report, observed
-        ),
+        webRequest: this.options.config.network === "full" && report.capabilities.webRequest === true,
+        runtimeClosure: containerRuntimeClosure(report, observed),
         managedEnvironment: {
           available: observed.target === "managed"
             && this.options.config.network === "full"

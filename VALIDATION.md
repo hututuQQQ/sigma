@@ -86,6 +86,20 @@ executed successfully.
 
 Live provider validation is intentionally separate because it costs money, depends on credentials/network/provider state, and is not a deterministic PR gate.
 
+After creating the current-platform portable bundle, run the live Web gate:
+
+```powershell
+pnpm smoke:web:live
+```
+
+This launches the packaged CLI with `permission-mode=auto` and full networking.
+The model must call `web_run.search_query`, open a returned public HTTPS
+reference, and run a literal find on the opened page. The report under
+`.artifacts/smoke-web-live/` records the tool calls, external-untrusted
+receipts, direct source URL, bundle digest, and a byte scan proving that
+`EXA_API_KEY` was not written to the event log, artifacts, or model state.
+The key is optional unless the hosted Exa MCP endpoint returns 429.
+
 ## Covered failure and recovery boundaries
 
 The automated suites cover:
@@ -100,6 +114,7 @@ The automated suites cover:
 - typed user-input suspension, bounded natural-stop repair, repeated tool-batch detection, run-wide tool-call ID uniqueness, child follow-up quiescence, and durable joined-child evidence recovery;
 - child scheduling, durable FIFO follow-ups, parent cancellation/join behavior, crash-visible unresolved children, clean-repository worktrees, dirty/non-Git single-writer leases, delegated approval capabilities, scoped integration, and integration conflicts;
 - MCP initialize/tools/call flows, repository trust/digest invalidation, cwd containment, environment-secret isolation, malicious-config preflight, progress, pagination, protocol errors, cancellation, idle/deadline distinction, stderr bounds, shutdown, and tool-policy bridging;
+- Web search JSON/SSE parsing, durable references, open/find/static-click flows, partial batches, binary/active-content rejection, broker origin/method/header/size policy, tool-scoped session approval, external-content trust propagation, and secret-byte redaction;
 - CLI strict config precedence, init/replay/session commands, active-owner routing, output formats, exit codes, interactive approval, and provider failure;
 - OpenTUI character/style frames at 20×5, 60×12, 80×24, and 120×40; streaming Markdown/code, CJK/emoji/combining input, bracketed paste, history, command completion, scroll/mouse routing, overlays, approvals, steering/follow-ups, double Ctrl+C, and terminal-control sanitization;
 - 10,000-event projection with keyed incremental updates under 100 ms, long streaming-message update/render stages under 150 ms, and heap growth under 150 MiB in the unit-test environment;

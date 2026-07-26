@@ -205,7 +205,7 @@ impl BrokerState {
         ) {
             return self.repository_transactions.begin_request(request_id);
         }
-        if method != "exec" {
+        if method != "exec" && method != "web.request" {
             return Ok(());
         }
         let mut active = self.exec_requests.lock().map_err(lock_error)?;
@@ -216,6 +216,20 @@ impl BrokerState {
             ));
         }
         Ok(())
+    }
+
+    pub(crate) fn request_cancelled(&self, request_id: u64) -> bool {
+        self.cancelled_requests
+            .lock()
+            .is_ok_and(|cancelled| cancelled.contains(&request_id))
+    }
+
+    pub(crate) fn redact_external_bytes(&self, input: &[u8]) -> Result<Vec<u8>, RpcError> {
+        Ok(self
+            .redaction
+            .lock()
+            .map_err(lock_error)?
+            .redact_bytes(input))
     }
 
     pub fn finish_request(&self, request_id: u64) {
@@ -534,7 +548,12 @@ impl BrokerState {
             }
             cancelled.insert(params.target_request_id);
         }
-        Ok(json!({ "cancelled": handle.is_some() || repository_cancelled }))
+        let active_request = self
+            .exec_requests
+            .lock()
+            .map_err(lock_error)?
+            .contains(&params.target_request_id);
+        Ok(json!({ "cancelled": handle.is_some() || repository_cancelled || active_request }))
     }
 
     pub fn shutdown(&self) -> Result<(), RpcError> {

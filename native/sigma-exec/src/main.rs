@@ -17,6 +17,7 @@ mod sandbox;
 mod scratch;
 #[cfg(target_os = "linux")]
 mod unix_pty;
+mod web;
 #[cfg(windows)]
 mod windows_sandbox;
 
@@ -41,6 +42,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use web::WebRequestParams;
 
 #[derive(Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -163,6 +165,11 @@ fn dispatch(state: &BrokerState, request: Request) -> Result<Value, RpcError> {
         "exec" => state.execute(
             request.request_id,
             decode::<ProcessParams>(request.params, "exec params")?,
+        ),
+        "web.request" => web::request(
+            state,
+            request.request_id,
+            decode::<WebRequestParams>(request.params, "web.request params")?,
         ),
         "process.spawn" => state.spawn(decode::<ProcessParams>(
             request.params,

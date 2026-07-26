@@ -19,6 +19,8 @@ export interface RuntimeAssemblyConfig {
   maxParallelTools: number;
   managedEnvironmentMode?: "disabled" | "required";
   networkMode?: "none" | "loopback" | "full";
+  webMode?: "auto" | "disabled";
+  webSearchProvider?: "exa";
   executionMode?: "sandboxed" | "container";
   writeScope?: "workspace" | "enclosing-container";
   checkpoint?: { maxFiles: number; maxBytes: number };

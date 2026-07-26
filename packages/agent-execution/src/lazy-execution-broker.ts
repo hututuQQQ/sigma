@@ -11,8 +11,7 @@ import type {
   BrokerDoctorReport, BrokerRequestOptions, BrokerSandboxLeaseStatus, BrokerSandboxRevokeResult,
   ExecutionBroker, ExecutionRequest, ExecutionResult,
   ProcessHandle, ProcessHandoffResult, ProcessPollResult, ProcessSpawnRequest,
-  ScratchLeaseRequest, ScratchLease,
-} from "./types.js";
+  ScratchLeaseRequest, ScratchLease, WebRequest, WebResponse } from "./types.js";
 import {
   invokeRepositoryOperation,
   RepositoryExecutionBrokerBase,
@@ -99,7 +98,7 @@ export class LazyExecutionBroker extends RepositoryExecutionBrokerBase implement
   async execute(request: ExecutionRequest, options?: BrokerRequestOptions): Promise<ExecutionResult> {
     return (await this.invokeFresh((client) => client.execute(request, options), options?.signal)).value;
   }
-
+  async webRequest(request: WebRequest, options?: BrokerRequestOptions): Promise<WebResponse> { return (await this.invokeFresh((client) => { if (!client.webRequest) throw new BrokerConnectionError("Broker Web request capability is unavailable."); return client.webRequest(request, options); }, options?.signal)).value; }
   async spawn(request: ProcessSpawnRequest, options?: BrokerRequestOptions): Promise<ProcessHandle> {
     const result = await this.invokeFresh((client) => client.spawn(request, options), options?.signal);
     const owner = this.processHandles.register(

@@ -12,7 +12,8 @@ export type RuntimeSessionSeed = RuntimeSessionIdentity
   & RuntimeSessionDurableState
   & Omit<RuntimeSessionExecutionState, "processHandles">
   & { processHandles?: RuntimeSessionExecutionState["processHandles"] }
-  & RuntimeSessionInteractionState
+  & Omit<RuntimeSessionInteractionState, "sessionApprovalGrants">
+  & { sessionApprovalGrants?: RuntimeSessionInteractionState["sessionApprovalGrants"] }
   & RuntimeSessionRecoveryState
   & RuntimeSessionServices;
 
@@ -50,6 +51,7 @@ export function createRuntimeSessionAggregate(seed: RuntimeSessionSeed): Runtime
     approvals: seed.approvals,
     callApprovals: seed.callApprovals,
     alwaysAllowedEffects: seed.alwaysAllowedEffects,
+    sessionApprovalGrants: seed.sessionApprovalGrants ?? new Set(),
     steeringPending: seed.steeringPending,
     followUps: seed.followUps,
     contextItems: seed.contextItems,

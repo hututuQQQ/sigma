@@ -33,6 +33,8 @@ export interface CliConfig {
   readScope: "workspace" | "host";
   writeScope: "workspace" | "enclosing-container";
   networkMode: "none" | "loopback" | "full";
+  webMode: "auto" | "disabled";
+  webSearchProvider: "exa";
   processHandoff: "allow" | "deny";
   reviewerWaiver: boolean;
   explicitSingleModelRoute: boolean;
@@ -212,6 +214,8 @@ function cliConfig(
     readScope: values.readScope as CliConfig["readScope"],
     writeScope: values.writeScope as CliConfig["writeScope"],
     networkMode: values.networkMode as CliConfig["networkMode"],
+    webMode: values.webMode as CliConfig["webMode"],
+    webSearchProvider: values.webSearchProvider as CliConfig["webSearchProvider"],
     processHandoff: values.processHandoff as CliConfig["processHandoff"],
     reviewerWaiver: values.reviewerWaiver === true,
     explicitSingleModelRoute,

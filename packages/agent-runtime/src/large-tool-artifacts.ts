@@ -53,7 +53,9 @@ export async function materializeLargeToolArtifacts(
       name: value.name,
       digest,
       mediaType: value.mediaType,
-      sizeBytes: Buffer.byteLength(value.content, "utf8")
+      sizeBytes: Buffer.byteLength(value.content, "utf8"),
+      ...(receipt.contentTrust === "external_untrusted"
+        ? { contentTrust: "external_untrusted" as const } : {})
     });
   }
   return refs.length === (receipt.artifactRefs?.length ?? 0)

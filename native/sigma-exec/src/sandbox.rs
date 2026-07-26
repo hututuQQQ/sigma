@@ -301,6 +301,7 @@ pub fn doctor_report() -> Value {
             "pty": cfg!(any(target_os = "linux", target_os = "windows")) && status.available,
             "processHandoff": cfg!(target_os = "linux") && status.available && status.self_test_passed,
             "networkModes": network_modes,
+            "webRequest": true,
             "executionRoots": true,
             "shells": shells,
             "runtimeCommands": runtime_commands.commands,
