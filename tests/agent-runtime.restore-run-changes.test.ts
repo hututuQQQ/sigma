@@ -277,7 +277,18 @@ describe("restore_run_changes transaction control", () => {
       doctor: unused,
       execute: unused,
       spawn: async () => ({ id: "active-process", brokerInstanceId: "fixture-broker" }),
-      poll: unused,
+      poll: async (handle) => ({
+        handle,
+        state: "running",
+        exitCode: null,
+        signal: null,
+        durationMs: 1,
+        stdout: "",
+        stderr: "",
+        stdoutDroppedBytes: 0,
+        stderrDroppedBytes: 0,
+        outputTruncated: false
+      }),
       write: unused,
       terminate: unused,
       close: async () => undefined
@@ -285,9 +296,11 @@ describe("restore_run_changes transaction control", () => {
     const runtime = createRuntime({
       gateway: new SmokeFakeGateway([
         fakeToolTurn([fakeToolCall("write", "write", { path: "retained.txt", content: "retained" })]),
-        fakeToolTurn([fakeToolCall("spawn", "process_spawn", {
+        fakeToolTurn([fakeToolCall("spawn", "shell", {
           executable: "fixture-process",
-          args: []
+          args: [],
+          background: true,
+          yieldMs: 0
         })]),
         fakeToolTurn([fakeToolCall("restore", "restore_run_changes", {})]),
         fakeToolTurn([fakeToolCall("done", "request_user_input", { message: "Restore was blocked." })])

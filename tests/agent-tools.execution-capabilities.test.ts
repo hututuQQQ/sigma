@@ -45,6 +45,7 @@ function brokerFixture(): {
   broker: ExecutionBroker;
   execute: ReturnType<typeof vi.fn>;
   spawn: ReturnType<typeof vi.fn>;
+  poll: ReturnType<typeof vi.fn>;
   handoff: ReturnType<typeof vi.fn>;
 } {
   const exited: ExecutionResult = {
@@ -66,6 +67,19 @@ function brokerFixture(): {
   const spawn = vi.fn(async (input) => ({
     id: "process", brokerInstanceId: "broker", lifecycle: input.lifecycle ?? "session"
   }));
+  const poll = vi.fn(async (handle) => ({
+    handle,
+    state: "exited" as const,
+    exitCode: 0,
+    signal: null,
+    durationMs: 5,
+    stdout: "ready",
+    stderr: "",
+    stdoutDroppedBytes: 0,
+    stderrDroppedBytes: 0,
+    outputTruncated: false,
+    outputArtifacts: []
+  }));
   const handoff = vi.fn(async (handle) => ({
     handle, handoffId: `handoff:${handle.id}`, systemProcessId: 4321
   }));
@@ -73,6 +87,7 @@ function brokerFixture(): {
   return {
     execute,
     spawn,
+    poll,
     handoff,
     broker: {
       lostProcessHandles: [],
@@ -80,7 +95,7 @@ function brokerFixture(): {
       doctor: unavailable,
       execute,
       spawn,
-      poll: unavailable,
+      poll,
       write: unavailable,
       terminate: unavailable,
       handoff,
@@ -399,5 +414,63 @@ describe("execution tool capability closure", () => {
       request("shell", { shell: "bash", command: "printf ok", timeoutMs: "fast" }),
       preparation(root)
     )).rejects.toMatchObject({ code: "tool_arguments_invalid" });
+  });
+
+  it("uses one model-visible shell for command, validation, and background execution", async () => {
+    const root = await workspace();
+    const fixture = brokerFixture();
+    const tools = registerBuiltinTools(new EffectToolRegistry(), {
+      broker: fixture.broker,
+      foreground: true,
+      background: true,
+      networkMode: "none",
+      networkModes: ["none"],
+      runtimeCommands: ["runtime"],
+      shells: ["bash"]
+    });
+    const modelNames = tools.modelDescriptors().map((item) => item.name);
+    expect(modelNames).toContain("shell");
+    expect(modelNames).not.toContain("exec");
+    expect(modelNames).not.toContain("validate");
+    expect(modelNames).not.toContain("process_spawn");
+
+    const validationCall = request("shell", {
+      executable: "runtime",
+      validation: true,
+      purpose: "Check the current result"
+    });
+    const validationPlan = await tools.prepare(validationCall, preparation(root));
+    expect(validationPlan).toMatchObject({
+      processMode: "pipe",
+      exactEffects: expect.arrayContaining(["validation"])
+    });
+    await expect(tools.execute(validationCall, {
+      ...execution(root),
+      callPlan: validationPlan
+    })).resolves.toMatchObject({
+      ok: true,
+      evidence: [expect.objectContaining({ kind: "validation" })]
+    });
+
+    const backgroundCall = request("shell", {
+      executable: "runtime",
+      background: true,
+      yieldMs: 0
+    });
+    const backgroundPlan = await tools.prepare(backgroundCall, preparation(root));
+    expect(backgroundPlan).toMatchObject({ processMode: "background" });
+    const receipt = await tools.execute(backgroundCall, {
+      ...execution(root),
+      callPlan: backgroundPlan
+    });
+    expect(receipt).toMatchObject({ ok: true });
+    expect(JSON.parse(receipt.output)).toMatchObject({
+      state: "exited",
+      exitCode: 0,
+      stdout: "ready",
+      handle: { id: "process", brokerInstanceId: "broker" }
+    });
+    expect(fixture.spawn).toHaveBeenCalledOnce();
+    expect(fixture.poll).toHaveBeenCalledOnce();
   });
 });

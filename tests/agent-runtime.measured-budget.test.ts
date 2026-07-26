@@ -323,8 +323,9 @@ describe("provider-measured model budget settlement", () => {
     expect(gateway.requests[0]).toMatchObject({ maxOutputTokens: 4_096 });
     expect(gateway.requests[0].toolChoice).toBeUndefined();
     expect(gateway.requests[0].tools.map((tool) => tool.name)).toEqual(
-      expect.arrayContaining(["read", "shell", "validate", "report_blocked", "request_user_input"])
+      expect.arrayContaining(["read", "shell", "report_blocked", "request_user_input"])
     );
+    expect(gateway.requests[0].tools.map((tool) => tool.name)).not.toContain("validate");
     expect(gateway.requests[0].messages.some((message) => message.content.includes("Budget stage is terminal")))
       .toBe(false);
   });
@@ -386,9 +387,10 @@ describe("provider-measured model budget settlement", () => {
     expect(gateway.requests[0].toolChoice).toBeUndefined();
     expect(gateway.requests[0].tools.map((tool) => tool.name)).toEqual(
       expect.arrayContaining([
-        "read", "shell", "validate", "report_blocked", "request_user_input"
+        "read", "shell", "report_blocked", "request_user_input"
       ])
     );
+    expect(gateway.requests[0].tools.map((tool) => tool.name)).not.toContain("validate");
     expect(gateway.requests[0].tools.map((tool) => tool.name)).not.toContain("runtime_finalize");
   });
 

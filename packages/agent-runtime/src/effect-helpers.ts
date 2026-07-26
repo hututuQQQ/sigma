@@ -101,23 +101,50 @@ const CHILD_CONTROL_TOOLS = new Set([
   "message_agent", "join_agent", "list_agents", "integrate_agent"
 ]);
 
+function hiddenByUnifiedShell(
+  toolName: string,
+  shellAvailable: boolean,
+  unifiedShell: Record<string, JsonValue> | undefined
+): boolean {
+  if (toolName === "exec") return shellAvailable;
+  if (toolName === "validate") return Boolean(unifiedShell?.validation);
+  return toolName === "process_spawn" && Boolean(unifiedShell?.background);
+}
+
+function projectedDescriptorVisible(
+  descriptor: ToolDescriptor,
+  capabilities: ModelToolProjectionCapabilities,
+  shellAvailable: boolean,
+  unifiedShell: Record<string, JsonValue> | undefined
+): boolean {
+  if (!capabilities.skillsAvailable && descriptor.name === "load_skill") return false;
+  if (hiddenByUnifiedShell(descriptor.name, shellAvailable, unifiedShell)) return false;
+  if (PROCESS_CONTROL_TOOLS.has(descriptor.name)
+    && capabilities.processControlsAvailable === false) return false;
+  if (CHILD_CONTROL_TOOLS.has(descriptor.name)
+    && capabilities.childControlsAvailable === false) return false;
+  return descriptor.name !== "read_plan" || capabilities.planReadRequired !== false;
+}
+
 /** Present only session-real capabilities to the model while leaving the
  * authoritative registry unchanged for durable recovery and stale-call denial. */
 export function projectModelToolDescriptors(
   descriptors: readonly ToolDescriptor[],
   capabilities: ModelToolProjectionCapabilities
 ): ToolDescriptor[] {
-  const shellAvailable = descriptors.some((descriptor) =>
+  const shellDescriptor = descriptors.find((descriptor) =>
     descriptor.name === "shell");
+  const shellProperties = shellDescriptor?.inputSchema.properties;
+  const unifiedShell = shellProperties
+    && typeof shellProperties === "object"
+    && !Array.isArray(shellProperties)
+    ? shellProperties as Record<string, JsonValue>
+    : undefined;
+  const shellAvailable = Boolean(shellDescriptor);
   const visible = descriptors.filter((descriptor) =>
-    (capabilities.skillsAvailable || descriptor.name !== "load_skill")
-    && !(descriptor.name === "exec" && shellAvailable)
-    && !(PROCESS_CONTROL_TOOLS.has(descriptor.name)
-      && capabilities.processControlsAvailable === false)
-    && !(CHILD_CONTROL_TOOLS.has(descriptor.name)
-      && capabilities.childControlsAvailable === false)
-    && !(descriptor.name === "read_plan"
-      && capabilities.planReadRequired === false));
+    projectedDescriptorVisible(
+      descriptor, capabilities, shellAvailable, unifiedShell
+    ));
   return visible.map((descriptor) => {
     const skillFieldsUnavailable = !capabilities.skillsAvailable
       && ["exec", "shell", "validate", "process_spawn"].includes(descriptor.name);

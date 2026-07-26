@@ -374,7 +374,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     expect(restored.state.evidence.length).toBeGreaterThan(0);
   }, 30_000);
 
-  it("keeps read, shell, edit, validate, and terminal tools visible after a failed exec", async () => {
+  it("keeps read, unified shell, edit, and terminal tools visible after a failed exec", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-failed-evidence-repair-"));
     const gateway = new ScriptedGateway([
       {
@@ -419,8 +419,10 @@ describe("runtime queues and non-blocking instruction steering", () => {
     expect(gateway.requests[1].toolChoice).toBeUndefined();
     const offered = gateway.requests[1].tools?.map((tool) => tool.name) ?? [];
     expect(offered).toEqual(expect.arrayContaining([
-      "read", "shell", "edit", "validate", "request_user_input", "report_blocked"
+      "read", "shell", "edit", "request_user_input", "report_blocked"
     ]));
+    expect(offered).not.toContain("validate");
+    expect(offered).not.toContain("process_spawn");
     expect(offered).not.toContain("runtime_finalize");
   }, 30_000);
 

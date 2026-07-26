@@ -11,6 +11,12 @@ import { environmentShellAvailable } from "./environment-shell-tool.js";
 
 type ForegroundKind = "exec" | "shell" | "validate";
 
+export interface ForegroundInvocation {
+  shellCommand: boolean;
+  validation: boolean;
+  background: boolean;
+}
+
 function hasDirectOnlyFields(input: Record<string, JsonValue>): boolean {
   return input.args !== undefined
     || input.skill !== undefined
@@ -21,17 +27,61 @@ function invalidArguments(message: string): never {
   throw Object.assign(new Error(message), { code: "tool_arguments_invalid" });
 }
 
+function assertShellModeTypes(input: Record<string, JsonValue>): void {
+  if (input.background !== undefined && typeof input.background !== "boolean") {
+    invalidArguments("shell background must be a boolean.");
+  }
+  if (input.validation !== undefined && typeof input.validation !== "boolean") {
+    invalidArguments("shell validation must be a boolean.");
+  }
+}
+
+function assertShellValidationMode(input: Record<string, JsonValue>): void {
+  const validationFields = ["purpose", "subjects", "criterionIds"] as const;
+  if (input.validation !== true
+    && validationFields.some((field) => input[field] !== undefined)) {
+    invalidArguments("shell purpose, subjects, and criterionIds require validation=true.");
+  }
+  if (input.background === true && input.validation === true) {
+    invalidArguments("shell background execution cannot be recorded as a completed validation.");
+  }
+}
+
+function assertShellBackgroundMode(
+  input: Record<string, JsonValue>,
+  options: ExecutionToolOptions
+): void {
+  const background = input.background === true;
+  const backgroundFields = ["yieldMs", "pty", "lifecycle"] as const;
+  if (!background && backgroundFields.some((field) => input[field] !== undefined)) {
+    invalidArguments("shell yieldMs, pty, and lifecycle require background=true.");
+  }
+  if (background && options.background === false) {
+    invalidArguments("shell background execution is unavailable for this execution broker.");
+  }
+  if (background && input.timeoutMs !== undefined) {
+    invalidArguments("shell timeoutMs is foreground-only; use yieldMs for background startup.");
+  }
+  if (input.lifecycle === "deliverable" && options.handoff !== true) {
+    invalidArguments("Deliverable process handoff is unavailable for this execution broker.");
+  }
+}
+
 function assertShellInvocationShape(
   input: Record<string, JsonValue>,
   hasExecutable: boolean,
-  hasCommand: boolean
+  hasCommand: boolean,
+  options: ExecutionToolOptions
 ): void {
   if (hasExecutable === hasCommand || (hasCommand && hasDirectOnlyFields(input))
-    || (hasExecutable && (input.shell !== undefined || input.target !== undefined))) {
+    || (hasExecutable && input.shell !== undefined)) {
     invalidArguments(
       "shell requires exactly one invocation form: {command,shell?} or {executable,args?,skill?,skillScript?}."
     );
   }
+  assertShellModeTypes(input);
+  assertShellValidationMode(input);
+  assertShellBackgroundMode(input, options);
 }
 
 function assertValidationInvocationShape(
@@ -53,15 +103,21 @@ export function assertForegroundInvocation(
   kind: ForegroundKind,
   input: Record<string, JsonValue>,
   options: ExecutionToolOptions
-): boolean {
+): ForegroundInvocation {
   const hasExecutable = input.executable !== undefined;
   const hasCommand = input.command !== undefined;
-  if (kind === "shell") assertShellInvocationShape(input, hasExecutable, hasCommand);
+  if (kind === "shell") {
+    assertShellInvocationShape(input, hasExecutable, hasCommand, options);
+  }
   if (kind === "validate") assertValidationInvocationShape(input, hasExecutable, hasCommand);
   const shellCommand = kind !== "exec" && hasCommand;
   if (shellCommand) assertAvailableShell(input, options);
   else assertAvailableExecutable(input, options);
-  return shellCommand;
+  return {
+    shellCommand,
+    validation: kind === "validate" || (kind === "shell" && input.validation === true),
+    background: kind === "shell" && input.background === true
+  };
 }
 
 export function writeContractProperties(
@@ -149,8 +205,7 @@ function invocationSchema(
           not: {
             anyOf: [
               { required: ["command"] },
-              { required: ["shell"] },
-              { required: ["target"] }
+              { required: ["shell"] }
             ]
           }
         }
@@ -178,12 +233,111 @@ function invocationSchema(
   };
 }
 
+function validationIntentProperties(): Record<string, JsonValue> {
+  return {
+    purpose: {
+      type: "string",
+      description: "Optional model-declared reason for this check. It is recorded as intent, not treated as proof."
+    },
+    subjects: {
+      type: "array",
+      items: { type: "string" },
+      maxItems: 128,
+      description: "Optional paths or logical subjects the model intends to check."
+    },
+    criterionIds: {
+      type: "array",
+      items: { type: "string" },
+      maxItems: 64,
+      description: "Optional acceptance-criterion identifiers this check is intended to inform."
+    }
+  };
+}
+
+function unifiedExecutionProperties(
+  options: ExecutionToolOptions
+): Record<string, JsonValue> {
+  return {
+    validation: {
+      type: "boolean",
+      description:
+        "Set true only when this completed foreground command is intended to validate the current result; optional purpose, subjects, and criterionIds then describe coverage."
+    },
+    ...validationIntentProperties(),
+    ...(options.background === false ? {} : {
+      background: {
+        type: "boolean",
+        description:
+          "Set true only for a long-running service or interactive process. The runtime waits up to yieldMs before returning a live handle."
+      },
+      yieldMs: {
+        type: "integer",
+        minimum: 0,
+        maximum: 30000,
+        description:
+          "For background execution, wait for early completion before yielding a live handle. Defaults to 10000 ms."
+      },
+      ...(options.pty === false ? {} : {
+        pty: {
+          type: "boolean",
+          description: "Allocate a PTY for background execution."
+        }
+      }),
+      ...(options.handoff === true ? {
+        lifecycle: {
+          type: "string",
+          enum: ["session", "deliverable"],
+          description:
+            "Defaults to session. Use deliverable only for a verified service that must survive successful completion, then call process_handoff."
+        }
+      } : {})
+    })
+  };
+}
+
+function executionEffects(
+  validation: boolean,
+  unified: boolean
+): ToolDescriptor["possibleEffects"] {
+  return validation
+    ? [
+        "process.spawn", "process.spawn.readonly", "filesystem.read",
+        "filesystem.read.external", "filesystem.write", "validation",
+        "network", "open_world"
+      ]
+    : [
+        "process.spawn", "process.spawn.readonly", "filesystem.read",
+        "filesystem.read.external", "filesystem.write",
+        ...(unified ? ["validation" as const] : []),
+        "network", "open_world"
+      ];
+}
+
+function executionDescription(
+  kind: ForegroundKind,
+  options: ExecutionToolOptions
+): string {
+  if (kind === "validate") {
+    return "Run a sandboxed validation using exactly one form: {executable,args} or {shell,command}. The runtime freezes the declared intent and objective command result; an independent reviewer decides semantic coverage.";
+  }
+  if (kind !== "shell") {
+    return `Run a sandboxed ${kind} command. With skill and skillScript, the frozen script is prepended to interpreter args.`;
+  }
+  return [
+    "Run one sandboxed command using exactly one form: {command,shell?} or {executable,args?,skill?,skillScript?}. Foreground is the default. Set validation=true for a completed check, or background=true only for a long-running service or interactive process; background startup waits up to yieldMs and returns either terminal status or a live handle.",
+    ...(environmentShellAvailable(options)
+      ? ["Set target=environment only for system-level changes in the broker-attested disposable outer environment."]
+      : [])
+  ].join(" ");
+}
+
 export function foregroundExecutionSchema(
   kind: ForegroundKind,
   options: ExecutionToolOptions,
   network: JsonValue
 ): { schema: ToolDescriptor; validation: boolean } {
   const validation = kind === "validate";
+  const unified = kind === "shell";
   const properties = {
     ...invocationProperties(kind, options),
     cwd: { type: "string" },
@@ -196,41 +350,18 @@ export function foregroundExecutionSchema(
     network,
     env: { type: "object", additionalProperties: { type: "string" } },
     timeoutMs: { type: "integer", minimum: 1, maximum: 600000 },
-    ...(validation ? {
-      purpose: {
-        type: "string",
-        description: "Optional model-declared reason for this check. It is recorded as intent, not treated as proof."
-      },
-      subjects: {
-        type: "array",
-        items: { type: "string" },
-        maxItems: 128,
-        description: "Optional paths or logical subjects the model intends to check."
-      },
-      criterionIds: {
-        type: "array",
-        items: { type: "string" },
-        maxItems: 64,
-        description: "Optional acceptance-criterion identifiers this check is intended to inform."
-      }
-    } : {}),
+    ...(validation ? validationIntentProperties() : {}),
+    ...(unified ? unifiedExecutionProperties(options) : {}),
     ...writeContractProperties(options)
   };
   const required = validation || kind === "shell" ? [] : ["executable"];
-  const effects: ToolDescriptor["possibleEffects"] = validation
-    ? ["process.spawn", "process.spawn.readonly", "filesystem.read", "filesystem.read.external", "filesystem.write", "validation", "network", "open_world"]
-    : ["process.spawn", "process.spawn.readonly", "filesystem.read", "filesystem.read.external", "filesystem.write", "network", "open_world"];
-  const description = validation
-    ? "Run a sandboxed validation using exactly one form: {executable,args} or {shell,command}. The runtime freezes the declared intent and objective command result; an independent reviewer decides semantic coverage."
-    : kind === "shell"
-      ? [
-          "Run one sandboxed foreground command using exactly one form: {command,shell?} or {executable,args?,skill?,skillScript?}. The runtime chooses a deterministic broker-verified shell when shell is omitted.",
-          ...(environmentShellAvailable(options)
-            ? ["Set target=environment only for system-level changes in the broker-attested disposable outer environment."]
-            : [])
-        ].join(" ")
-      : `Run a sandboxed ${kind} command. With skill and skillScript, the frozen script is prepended to interpreter args.`;
-  const base = executionToolSchema(kind, description, properties, required, effects);
+  const base = executionToolSchema(
+    kind,
+    executionDescription(kind, options),
+    properties,
+    required,
+    executionEffects(validation, unified)
+  );
   const schema = validation || kind === "shell"
     ? { ...base, inputSchema: invocationSchema(base, kind, availableShells(options).length > 0) }
     : base;

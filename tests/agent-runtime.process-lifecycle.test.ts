@@ -300,6 +300,58 @@ describe("durable process lifecycle events", () => {
     }]);
   });
 
+  it("records unified shell background startup and immediate terminal state", async () => {
+    const target = runtimeSessionFixture();
+    const recorded = recorder();
+    await recordProcessReceipt(
+      target,
+      call("shell", { background: true }),
+      plan("background"),
+      receipt({
+        handle: {
+          id: "unified-process",
+          brokerInstanceId: "broker-1",
+          lifecycle: "session"
+        },
+        state: "exited",
+        exitCode: 0,
+        signal: null,
+        stdout: "ready\n",
+        stderr: ""
+      }),
+      recorded.emit
+    );
+    expect(target.execution.processHandles.has("unified-process")).toBe(false);
+    expect(recorded.events).toEqual([
+      {
+        type: "process.spawned",
+        payload: {
+          processId: "unified-process",
+          executionId: "call-shell",
+          mode: "background",
+          lifecycle: "session",
+          brokerInstanceId: "broker-1"
+        }
+      },
+      {
+        type: "process.output",
+        payload: {
+          processId: "unified-process",
+          stream: "stdout",
+          chunk: "ready\n"
+        }
+      },
+      {
+        type: "process.exited",
+        payload: {
+          processId: "unified-process",
+          exitCode: 0,
+          state: "exited"
+        }
+      }
+    ]);
+  });
+
   it("records incremental output and terminal state", async () => {
     const recorded = recorder();
     await recordProcessReceipt(

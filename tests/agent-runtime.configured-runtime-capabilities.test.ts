@@ -414,10 +414,10 @@ describe("configured runtime execution capabilities", () => {
         .map((message) => message.content)
         .join("\n");
       expect(runtimeContext).toContain(
-        "use shell with target=environment for foreground system-level changes"
+        "use shell with target=environment for system-level changes"
       );
       expect(runtimeContext).toContain(
-        "process_spawn with target=environment for a background service"
+        "add background=true only for a service"
       );
 
       const analyzeSession = await configuredRuntime.runtime.createSession({
@@ -652,9 +652,7 @@ describe("configured runtime execution capabilities", () => {
       const foregroundAvailable = processCapabilities.foreground && expectedNetworkModes.length > 0;
       const backgroundAvailable = processCapabilities.background && expectedNetworkModes.length > 0;
       if (foregroundAvailable) {
-        expect(validate?.inputSchema).not.toMatchObject({
-          properties: { skill: expect.anything() }
-        });
+        expect(validate === undefined).toBe(expectedShells.length > 0);
         expect((shell ?? exec)?.inputSchema).toMatchObject({
           properties: { network: { enum: expectedNetworkModes } }
         });
@@ -670,13 +668,24 @@ describe("configured runtime execution capabilities", () => {
         expect(request.tools?.find((tool) => tool.name === "process_write")).toBeUndefined();
         expect(request.tools?.find((tool) => tool.name === "process_terminate")).toBeUndefined();
       } else {
-        expect(spawn?.inputSchema).toMatchObject({
+        const backgroundEntry = shell ?? spawn;
+        expect(backgroundEntry?.inputSchema).toMatchObject({
           properties: { network: { enum: expectedNetworkModes } }
         });
         if (processCapabilities.pty) {
-          expect(spawn?.inputSchema).toMatchObject({ properties: { pty: { type: "boolean" } } });
+          expect(backgroundEntry?.inputSchema).toMatchObject({
+            properties: { pty: { type: "boolean" } }
+          });
         } else {
-          expect(spawn?.inputSchema).not.toMatchObject({ properties: { pty: expect.anything() } });
+          expect(backgroundEntry?.inputSchema).not.toMatchObject({
+            properties: { pty: expect.anything() }
+          });
+        }
+        expect(spawn === undefined).toBe(expectedShells.length > 0);
+        if (shell) {
+          expect(shell.inputSchema).toMatchObject({
+            properties: { background: { type: "boolean" } }
+          });
         }
         // Lifecycle controls are offered only after a durable process handle
         // exists, independently of whether stdin is supported.
@@ -689,7 +698,7 @@ describe("configured runtime execution capabilities", () => {
         && expectedNetworkModes.includes("none");
       expect(request.tools?.find((tool) => tool.name === "lsp") !== undefined).toBe(codeIntelAvailable);
       const executionSchema = JSON.stringify(
-        (exec ?? validate)?.inputSchema
+        (shell ?? exec ?? validate)?.inputSchema
       );
       const directResolution = "directExecutableResolution" in processCapabilities
         && processCapabilities.directExecutableResolution === true;

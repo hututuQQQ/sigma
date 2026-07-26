@@ -30,11 +30,11 @@ describe("session model-tool capability projection", () => {
     });
     expect(projected.some((item) => item.name === "load_skill")).toBe(false);
     expect(projected.some((item) => item.name === "exec")).toBe(false);
-    for (const name of ["validate", "process_spawn"]) {
-      const properties = projected.find((item) => item.name === name)?.inputSchema.properties;
-      expect(properties).not.toHaveProperty("skill");
-      expect(properties).not.toHaveProperty("skillScript");
-    }
+    expect(projected.some((item) => item.name === "validate")).toBe(false);
+    expect(projected.some((item) => item.name === "process_spawn")).toBe(false);
+    const properties = projected.find((item) => item.name === "shell")?.inputSchema.properties;
+    expect(properties).not.toHaveProperty("skill");
+    expect(properties).not.toHaveProperty("skillScript");
   });
 
   it("keeps one stable foreground surface while skills are discovered and loaded", () => {
@@ -56,8 +56,12 @@ describe("session model-tool capability projection", () => {
       .toHaveProperty("skill");
     expect(loaded.find((item) => item.name === "shell")?.inputSchema.properties)
       .toHaveProperty("skillScript");
-    expect(loaded.find((item) => item.name === "process_spawn")?.inputSchema.properties)
-      .not.toHaveProperty("skill");
+    expect(loaded.some((item) => item.name === "validate")).toBe(false);
+    expect(loaded.some((item) => item.name === "process_spawn")).toBe(false);
+    expect(loaded.find((item) => item.name === "shell")?.inputSchema.properties)
+      .toHaveProperty("background");
+    expect(loaded.find((item) => item.name === "shell")?.inputSchema.properties)
+      .toHaveProperty("validation");
   });
 
   it("defers lifecycle controls until durable process or child state exists", () => {
@@ -82,7 +86,9 @@ describe("session model-tool capability projection", () => {
     ]) {
       expect(unavailable.some((item) => item.name === name)).toBe(false);
     }
-    expect(unavailable.some((item) => item.name === "process_spawn")).toBe(true);
+    expect(unavailable.some((item) => item.name === "process_spawn")).toBe(false);
+    expect(unavailable.find((item) => item.name === "shell")?.inputSchema.properties)
+      .toHaveProperty("background");
     expect(unavailable.some((item) => item.name === "spawn_agent")).toBe(true);
 
     const available = projectModelToolDescriptors(lifecycleDescriptors, {
