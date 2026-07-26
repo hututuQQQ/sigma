@@ -12,6 +12,7 @@ import re
 import shlex
 import shutil
 import tempfile
+import threading
 import time
 import uuid
 from typing import Any
@@ -192,11 +193,15 @@ def _write_utf8_artifact(path: pathlib.Path, value: str) -> None:
 
 
 class _BoundedJsonlWriter:
-    """Append-only JSONL writer with a stable prefix and a hard byte cap."""
+    """Append-only JSONL writer with bounded recovery from artifact I/O failures."""
 
     def __init__(self, path: pathlib.Path, maximum: int, *, reset: bool = False) -> None:
         self.path = path
         self.maximum = max(0, maximum)
+        self._lock = threading.Lock()
+        self._pending = bytearray()
+        self._write_failures = 0
+        self._last_write_error: str | None = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if reset:
             self.path.unlink(missing_ok=True)
@@ -205,25 +210,98 @@ class _BoundedJsonlWriter:
         self.size = len(existing)
         self.truncated = b'"type": "trace_truncated"' in existing
 
-    def append(self, record: dict[str, Any]) -> None:
-        if self.truncated or self.maximum <= 0:
+    def _record_failure(self, error: BaseException) -> None:
+        self._write_failures += 1
+        self._last_write_error = _bounded_text(
+            f"{type(error).__name__}: {error}",
+            2_048,
+        )
+
+    def _consume_written_prefix(self, count: int) -> None:
+        if count <= 0:
             return
-        line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+        del self._pending[:count]
+        self.size += count
+
+    def _write_pending_once(self) -> None:
+        if not self._pending:
+            return
+        payload = bytes(self._pending)
+        written = 0
+        try:
+            # Unbuffered append lets us account for a short write precisely and
+            # retain only the unwritten suffix for the next recovery attempt.
+            with self.path.open("ab", buffering=0) as handle:
+                while written < len(payload):
+                    count = handle.write(payload[written:])
+                    if not isinstance(count, int) or count <= 0:
+                        raise OSError("trace append made no forward progress")
+                    written += count
+        except OSError:
+            self._consume_written_prefix(written)
+            raise
+        self._consume_written_prefix(written)
+
+    def _flush_pending(self, attempts: int = 1) -> bool:
+        if not self._pending:
+            return True
+        for attempt in range(max(1, attempts)):
+            try:
+                self._write_pending_once()
+                return not self._pending
+            except OSError as error:
+                self._record_failure(error)
+                if attempt + 1 < attempts:
+                    # Windows scanners and concurrent artifact readers can hold
+                    # a file briefly. Keep this bounded so streaming callbacks
+                    # remain responsive while allowing the lock to clear.
+                    time.sleep(min(0.01 * (2**attempt), 0.05))
+        return False
+
+    def append(self, record: dict[str, Any]) -> bool:
+        try:
+            line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+        except (TypeError, ValueError) as error:
+            with self._lock:
+                self._record_failure(error)
+            return False
         marker = (json.dumps({
             "type": "trace_truncated",
             "omitted_record_sha256": hashlib.sha256(line).hexdigest(),
         }, ensure_ascii=False) + "\n").encode("utf-8")
-        reserve = min(len(marker), self.maximum)
-        if self.size + len(line) <= self.maximum - reserve:
-            with self.path.open("ab") as handle:
-                handle.write(line)
-            self.size += len(line)
-            return
-        if self.size + len(marker) <= self.maximum:
-            with self.path.open("ab") as handle:
-                handle.write(marker)
-            self.size += len(marker)
-        self.truncated = True
+        with self._lock:
+            if self.maximum <= 0:
+                return True
+            if self.truncated:
+                return self._flush_pending()
+            logical_size = self.size + len(self._pending)
+            reserve = min(len(marker), self.maximum)
+            if logical_size + len(line) <= self.maximum - reserve:
+                self._pending.extend(line)
+                return self._flush_pending()
+            if logical_size + len(marker) <= self.maximum:
+                self._pending.extend(marker)
+            self.truncated = True
+            return self._flush_pending()
+
+    def flush(self) -> bool:
+        """Retry buffered records without ever turning trace I/O into an agent failure."""
+        with self._lock:
+            return self._flush_pending(attempts=4)
+
+    def artifact_warning(self) -> str | None:
+        with self._lock:
+            if self._write_failures == 0:
+                return None
+            state = (
+                "recovered"
+                if not self._pending
+                else f"{len(self._pending)} buffered byte(s) remain unwritten"
+            )
+            return (
+                f"{self.path.name}: {self._write_failures} artifact write attempt(s) "
+                f"failed; {state}; last error: {self._last_write_error}"
+            )
 
 
 def _text_artifact_summary(value: str) -> dict[str, Any]:
@@ -412,6 +490,7 @@ class _OutputRecorder:
         self.stderr_path = logs_dir / "stderr.partial.log"
         self.trace_path = logs_dir / "trace.jsonl"
         self.state_path = logs_dir / "runtime.partial.json"
+        self._artifact_failures: dict[str, dict[str, Any]] = {}
         self._buffers = {"stdout": "", "stderr": ""}
         self._pending_stdout = ""
         self._stream_chunks: dict[str, dict[str, Any]] = {}
@@ -437,6 +516,12 @@ class _OutputRecorder:
         )
         self._write_state()
 
+    def _record_artifact_failure(self, path: pathlib.Path, error: OSError) -> None:
+        key = path.name
+        state = self._artifact_failures.setdefault(key, {"count": 0, "last_error": None})
+        state["count"] += 1
+        state["last_error"] = _bounded_text(f"{type(error).__name__}: {error}", 2_048)
+
     async def callback(self, text: str, stream: str) -> None:
         self.record(text, stream)
 
@@ -447,7 +532,13 @@ class _OutputRecorder:
             self._buffers[stream] + (text or ""), MAX_PARTIAL_ARTIFACT_CHARS
         )
         path = self.stdout_path if stream == "stdout" else self.stderr_path
-        _write_utf8_artifact(path, self._buffers[stream])
+        try:
+            _write_utf8_artifact(path, self._buffers[stream])
+        except OSError as error:
+            # Partial stdout/stderr are observational artifacts. The full
+            # bounded buffer remains in memory and the next callback rewrites
+            # it, so a transient host lock must not abort the agent process.
+            self._record_artifact_failure(path, error)
         if stream == "stdout" and text:
             lines = (self._pending_stdout + text).splitlines(keepends=True)
             self._pending_stdout = ""
@@ -533,6 +624,20 @@ class _OutputRecorder:
             self.events.append(event)
             self.append_trace(_trace_record(event))
 
+    def finish_artifacts(self) -> list[str]:
+        """Flush recoverable artifact state and return bounded diagnostics."""
+        self._trace_writer.flush()
+        warnings = []
+        trace_warning = self._trace_writer.artifact_warning()
+        if trace_warning is not None:
+            warnings.append(trace_warning)
+        for name, state in sorted(self._artifact_failures.items()):
+            warnings.append(
+                f"{name}: {state['count']} artifact write attempt(s) failed; "
+                f"last error: {state['last_error']}"
+            )
+        return warnings
+
     def snapshot(self) -> dict[str, Any]:
         return {
             "last_event": _bounded_event(self.last_event) if self.last_event else None,
@@ -562,7 +667,14 @@ class _OutputRecorder:
 
     def _write_state(self) -> None:
         state = self.snapshot()
-        self.state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        try:
+            self.state_path.write_text(
+                json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as error:
+            # The next event writes a complete replacement snapshot.
+            self._record_artifact_failure(self.state_path, error)
 
 
 class SigmaCliHarborAgent(BaseAgent):
@@ -896,6 +1008,7 @@ class SigmaCliHarborAgent(BaseAgent):
                 summary_path = summary_path or self._latest_downloaded_artifact("summary.json")
                 recorder.reconcile_trace(events)
                 trace_path = recorder.trace_path if events else None
+            artifact_warnings.extend(recorder.finish_artifacts())
             self._managed_broker_cleanup = await self._cleanup_managed_broker(environment)
             if self._managed_broker_cleanup and self._managed_broker_cleanup.get("error"):
                 artifact_warnings.append(
@@ -963,12 +1076,18 @@ class SigmaCliHarborAgent(BaseAgent):
             summary["managed_broker_bootstrap"] = self._managed_broker_bootstrap
         if self._managed_broker_cleanup is not None:
             summary["managed_broker_cleanup"] = self._managed_broker_cleanup
+        if artifact_warnings:
+            summary["artifact_warnings"] = list(dict.fromkeys(artifact_warnings))
         self._populate_context(context, result, summary, error_message)
         if timed_out or protocol_failure is not None:
             self._set_context_value(context, "exit_code", 1)
         self._set_context_value(context, "failure_kind", failure_kind)
         self._set_context_value(context, "failure_code", failure_code)
-        self._set_context_value(context, "artifact_warnings", artifact_warnings)
+        self._set_context_value(
+            context,
+            "artifact_warnings",
+            list(dict.fromkeys(artifact_warnings)),
+        )
         if summary_path is not None:
             summary_path.write_text(
                 json.dumps(summary, ensure_ascii=False, indent=2) + "\n",

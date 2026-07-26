@@ -1722,6 +1722,59 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(any(json.loads(line).get("type") == "trace_truncated" for line in trace_lines))
             self.assertEqual(json.loads(trace_lines[-1]).get("type"), "trace_truncated")
 
+    async def test_stream_trace_buffers_transient_host_lock_without_aborting_callback(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            recorder = module._OutputRecorder(Path(tmp) / "logs")
+            writer = recorder._trace_writer
+            write_pending_once = writer._write_pending_once
+            attempts = 0
+
+            def fail_twice_then_write():
+                nonlocal attempts
+                attempts += 1
+                if attempts <= 2:
+                    raise PermissionError(13, "fixture host artifact lock", str(writer.path))
+                write_pending_once()
+
+            writer._write_pending_once = fail_twice_then_write
+            first = {
+                "kind": "event",
+                "event": {
+                    "eventId": "locked-1",
+                    "sessionId": "session",
+                    "seq": 1,
+                    "type": "model.reasoning_delta",
+                    "payload": {"delta": "first"},
+                },
+            }
+            second = {
+                "kind": "event",
+                "event": {
+                    "eventId": "locked-2",
+                    "sessionId": "session",
+                    "seq": 2,
+                    "type": "model.reasoning_delta",
+                    "payload": {"delta": "second"},
+                },
+            }
+
+            recorder.record(json.dumps(first) + "\n", "stdout")
+            self.assertEqual(len(recorder.events), 1)
+            recorder.record(json.dumps(second) + "\n", "stdout")
+            warnings = recorder.finish_artifacts()
+
+            records = [
+                json.loads(line)
+                for line in recorder.trace_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(
+                [record["sigma_event"]["eventId"] for record in records],
+                ["locked-1", "locked-2"],
+            )
+            self.assertEqual(len(recorder.events), 2)
+            self.assertTrue(any("recovered" in warning for warning in warnings))
+
     async def test_accounting_trace_is_single_copy_and_strictly_bounded(self):
         module = import_portable_agent_module()
         with TemporaryDirectory() as tmp:
