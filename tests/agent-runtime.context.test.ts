@@ -10,5 +10,8 @@ describe("runtime behavior context", () => {
     expect(behavior).toContain("concrete missing decision");
     expect(behavior).toContain("request_user_input");
     expect(behavior).toContain("stop naturally");
+    expect(behavior).toContain("multiple tool calls are independent");
+    expect(behavior).toContain("Keep dependent calls sequential");
+    expect(behavior).toContain("never guess missing arguments or use placeholders");
   });
 });
