@@ -1318,7 +1318,12 @@ fn build_sandboxed_command(
         // those isolation layers with objects from the enclosing namespace.
         root.append_bind(&mut command, root_write.is_none());
     } else {
-        for parent in linux_system_mount_parents(&system_roots) {
+        let mount_parents = if params.policy.enclosing_container_root {
+            linux_system_mount_parents(&system_roots)
+        } else {
+            linux_ordinary_mount_parents(&system_roots)
+        };
+        for parent in mount_parents {
             command.arg("--dir").arg(parent);
         }
         for root in &system_roots {
@@ -1333,19 +1338,27 @@ fn build_sandboxed_command(
     let scratch_temp = scratch
         .map(|lease| PinnedMountSource::pin(lease.temp_source()))
         .transpose()?;
+    let scratch_var_temp = scratch
+        .map(|lease| PinnedMountSource::pin(lease.var_temp_source()))
+        .transpose()?;
     if params.policy.enclosing_container_root {
         // Preserve the task container's own /tmp. A declared /tmp or "/"
         // write root below determines whether it is writable.
         if root_mount.is_none() && Path::new("/tmp").exists() {
             command.args(["--ro-bind", "/tmp", "/tmp"]);
         }
-    } else if let (Some(lease), Some(home), Some(temp)) =
-        (scratch, scratch_home.as_ref(), scratch_temp.as_ref())
-    {
+    } else if let (Some(lease), Some(home), Some(temp), Some(var_temp)) = (
+        scratch,
+        scratch_home.as_ref(),
+        scratch_temp.as_ref(),
+        scratch_var_temp.as_ref(),
+    ) {
         home.append_bind_at(&mut command, false, lease.home_destination());
         temp.append_bind_at(&mut command, false, Path::new("/tmp"));
+        var_temp.append_bind_at(&mut command, false, Path::new("/var/tmp"));
     } else {
         command.args(["--tmpfs", "/tmp"]);
+        command.args(["--tmpfs", "/var/tmp"]);
     }
     bind_pinned_roots(&mut command, &read_roots, true, &system_roots, true);
     bind_pinned_roots(&mut command, &write_roots, false, &[], true);
@@ -1420,8 +1433,8 @@ fn build_sandboxed_command(
         .map(PathBuf::as_path)
         .chain(read_roots.iter().map(PinnedMountSource::destination))
         .chain(execution_roots.iter().map(PinnedMountSource::destination))
+        .chain(LINUX_PRIVATE_TEMP_ROOTS.iter().map(|root| Path::new(*root)))
         .chain([
-            Path::new("/tmp"),
             Path::new("/proc"),
             Path::new("/dev"),
             Path::new(INTERNAL_HELPER_MOUNT),
@@ -1432,7 +1445,8 @@ fn build_sandboxed_command(
     for root in write_roots
         .iter()
         .map(PinnedMountSource::destination)
-        .chain([Path::new("/tmp"), Path::new("/dev")])
+        .chain(LINUX_PRIVATE_TEMP_ROOTS.iter().map(|root| Path::new(*root)))
+        .chain([Path::new("/dev")])
     {
         command.arg("--write").arg(root);
     }
@@ -1478,6 +1492,7 @@ fn build_sandboxed_command(
         .chain(enclosing_bwrap_source.iter().map(PinnedMountSource::raw_fd))
         .chain(scratch_home.iter().map(PinnedMountSource::raw_fd))
         .chain(scratch_temp.iter().map(PinnedMountSource::raw_fd))
+        .chain(scratch_var_temp.iter().map(PinnedMountSource::raw_fd))
         .chain(disposable_source.iter().map(PinnedMountSource::raw_fd))
         .collect::<Vec<_>>();
     inherit_mount_sources(&mut command, &mount_source_fds)?;
@@ -1510,6 +1525,11 @@ fn build_sandboxed_command(
         )
         .chain(
             scratch_temp
+                .into_iter()
+                .map(PinnedMountSource::into_descriptor),
+        )
+        .chain(
+            scratch_var_temp
                 .into_iter()
                 .map(PinnedMountSource::into_descriptor),
         )
@@ -2000,6 +2020,9 @@ const LINUX_SYSTEM_ROOT_CANDIDATES: &[&str] = &[
     "/var/cache/fontconfig",
 ];
 
+#[cfg(any(target_os = "linux", test))]
+const LINUX_PRIVATE_TEMP_ROOTS: &[&str] = &["/tmp", "/var/tmp"];
+
 #[cfg(target_os = "linux")]
 fn linux_system_roots() -> Vec<PathBuf> {
     LINUX_SYSTEM_ROOT_CANDIDATES
@@ -2025,6 +2048,23 @@ fn linux_system_mount_parents(roots: &[PathBuf]) -> Vec<PathBuf> {
             ancestor = parent.parent();
         }
     }
+    parents.sort_by(|left, right| {
+        left.components()
+            .count()
+            .cmp(&right.components().count())
+            .then_with(|| left.cmp(right))
+    });
+    parents.dedup();
+    parents
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_ordinary_mount_parents(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut parents = linux_system_mount_parents(roots);
+    // Ordinary commands start from a synthetic root. `/var` may not otherwise
+    // be present when no selected system root lives below it, but the private
+    // POSIX `/var/tmp` mount always needs that parent.
+    parents.push(PathBuf::from("/var"));
     parents.sort_by(|left, right| {
         left.components()
             .count()
@@ -2301,8 +2341,10 @@ mod tests {
     fn selected_linux_toolchain_state_is_read_only_system_data() {
         assert!(!LINUX_SYSTEM_ROOT_CANDIDATES.contains(&"/var/lib"));
         assert!(!LINUX_SYSTEM_ROOT_CANDIDATES.contains(&"/var/cache"));
+        assert!(!LINUX_SYSTEM_ROOT_CANDIDATES.contains(&"/var/tmp"));
         assert!(LINUX_SYSTEM_ROOT_CANDIDATES.contains(&"/var/lib/texmf"));
         assert!(LINUX_SYSTEM_ROOT_CANDIDATES.contains(&"/var/cache/fontconfig"));
+        assert_eq!(LINUX_PRIVATE_TEMP_ROOTS, ["/tmp", "/var/tmp"]);
         assert_eq!(
             linux_system_mount_parents(&[
                 PathBuf::from("/usr"),
@@ -2314,6 +2356,10 @@ mod tests {
                 PathBuf::from("/var/cache"),
                 PathBuf::from("/var/lib"),
             ]
+        );
+        assert_eq!(
+            linux_ordinary_mount_parents(&[PathBuf::from("/usr")]),
+            vec![PathBuf::from("/var")]
         );
     }
 

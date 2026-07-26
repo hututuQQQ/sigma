@@ -166,7 +166,7 @@ function invocationProperties(
           type: "string",
           enum: ["workspace", "environment"],
           description:
-            "Execution boundary. Defaults to workspace. Use environment only for system-level changes in the broker-attested disposable outer environment."
+            "Execution boundary. Defaults to workspace. Use environment only for system-level changes in the broker-attested disposable outer environment. Processes, sockets, and temporary files created there are visible only to later calls that also use target=environment."
         }
       } : {})
     };
@@ -324,7 +324,7 @@ function executionDescription(
   return [
     "Run one sandboxed command using exactly one form: {command,shell?} or {executable,args?,skill?,skillScript?}. Foreground is the default. Workspace commands are read-only by default; to create, modify, or delete workspace paths, provide expectedChanges with exact files or narrow directories. Put disposable outputs in the process temp directory ($TMPDIR on POSIX, %TEMP% or $env:TEMP on Windows). Set validation=true only for a completed check; validation uses a disposable workspace view and cannot persist deliverables. background=true is only for a long-running service or interactive process. Background startup waits up to yieldMs and returns either terminal status or a live handle.",
     ...(environmentShellAvailable(options)
-      ? ["Set target=environment only when the command needs system-level changes in the broker-attested disposable outer environment. If that same foreground command must also create or modify workspace deliverables, declare those workspace paths in expectedChanges so they remain checkpointed. Background environment commands cannot write the workspace."]
+      ? ["Set target=environment only when the command needs system-level changes in the broker-attested disposable outer environment. Use target=environment again to inspect or control processes, sockets, and temporary files created there; workspace-target calls use a separate sandbox view. If that same foreground command must also create or modify workspace deliverables, declare those workspace paths in expectedChanges so they remain checkpointed. Background environment commands cannot write the workspace."]
       : [])
   ].join(" ");
 }

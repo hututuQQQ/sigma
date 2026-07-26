@@ -112,7 +112,7 @@ function spawnTargetProperties(
       type: "string",
       enum: ["workspace", "environment"],
       description:
-        "Execution boundary. Defaults to workspace. Use environment only for system-level changes in the broker-attested disposable outer environment."
+        "Execution boundary. Defaults to workspace. Use environment only for system-level changes in the broker-attested disposable outer environment. Processes, sockets, and temporary files created there are visible only to later calls that also use target=environment."
     }
   } : {};
 }
@@ -205,7 +205,7 @@ function spawnTool(
       ...executionToolSchema(
         "process_spawn",
         environmentAvailable
-          ? "Start a sandboxed background process and return an in-session handle. Set target=environment only for a service that needs system-level changes in the broker-attested disposable outer environment."
+          ? "Start a sandboxed background process and return an in-session handle. Set target=environment only for a service that needs system-level changes in the broker-attested disposable outer environment; use that same target for later inspection or control because workspace-target calls use a separate sandbox view."
           : "Start a sandboxed background process and return an in-session handle.",
         {
           executable: executableCapabilitySchema(options),

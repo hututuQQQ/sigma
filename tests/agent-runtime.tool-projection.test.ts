@@ -94,6 +94,31 @@ describe("session model-tool capability projection", () => {
     expect(analyzeShell?.description).not.toContain("provide expectedChanges");
   });
 
+  it("keeps environment state guidance only while that execution boundary is available", () => {
+    const environmentTools = registerBuiltinTools(new EffectToolRegistry(), {
+      readScope: "host",
+      writeScope: "enclosing-container",
+      enclosingContainerRoot: true,
+      enclosingContainerAttestationDigest: "attested-container"
+    }).modelDescriptors();
+    const availableShell = projectModelToolDescriptors(environmentTools, {
+      skillsAvailable: false,
+      executableSkillResourcesLoaded: false,
+      environmentMutationAvailable: true
+    }).find((item) => item.name === "shell");
+    expect(availableShell?.description)
+      .toContain("workspace-target calls use a separate sandbox view");
+
+    const unavailableShell = projectModelToolDescriptors(environmentTools, {
+      skillsAvailable: false,
+      executableSkillResourcesLoaded: false,
+      environmentMutationAvailable: false
+    }).find((item) => item.name === "shell");
+    expect(unavailableShell?.inputSchema.properties).not.toHaveProperty("target");
+    expect(unavailableShell?.description).not.toContain("target=environment");
+    expect(unavailableShell?.description).not.toContain("outer environment");
+  });
+
   it("defers lifecycle controls until durable process or child state exists", () => {
     const template = descriptors.find((item) => item.name === "read_plan")!;
     const childNames = [

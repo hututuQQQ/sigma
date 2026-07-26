@@ -147,18 +147,11 @@ function projectedDescription(
   let description = descriptor.description;
   if (capabilities.environmentMutationAvailable === false) {
     description = description.replace(WORKSPACE_WRITE_GUIDANCE, "");
+    description = description.replace(/ Set target=environment\b.*$/s, "");
   }
   return description
     .replace(
       " With skill and skillScript, the frozen script is prepended to interpreter args.",
-      ""
-    )
-    .replace(
-      " Set target=environment only for system-level changes in the broker-attested disposable outer environment.",
-      ""
-    )
-    .replace(
-      " Set target=environment only for a service that needs system-level changes in the broker-attested disposable outer environment.",
       ""
     );
 }

@@ -270,6 +270,12 @@ describe("execution tool capability closure", () => {
         target: { enum: ["workspace", "environment"] }
       }
     });
+    expect(JSON.stringify(
+      tools.descriptor("process_spawn")?.inputSchema.properties?.target
+    )).toContain("only to later calls that also use target=environment");
+    expect(tools.modelDescriptors().find((descriptor) =>
+      descriptor.name === "shell")?.description
+    ).toContain("workspace-target calls use a separate sandbox view");
     expect(environment).toMatchObject({
       brokerMutationAuthority: "disposable_enclosing_container",
       inputSchema: {

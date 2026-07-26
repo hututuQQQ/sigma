@@ -440,6 +440,9 @@ describe("configured runtime execution capabilities", () => {
         "use shell with target=environment for commands that need system-level changes"
       );
       expect(runtimeContext).toContain(
+        "inspect or control them with later target=environment calls because workspace-target calls use a separate sandbox view"
+      );
+      expect(runtimeContext).toContain(
         "foreground environment command may also change explicitly declared workspace expectedChanges"
       );
       expect(runtimeContext).toContain(
