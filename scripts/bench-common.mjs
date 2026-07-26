@@ -687,7 +687,9 @@ function benchmarkAgentKwargs(options, timeoutPlan = null) {
     execution_mode: options.executionMode ?? "sandboxed",
     write_scope: options.writeScope ?? "auto",
     managed_environment_mode: options.managedEnvironmentMode ?? "disabled",
-    harbor_topology: options.harborTopology ?? "main_only"
+    harbor_topology: options.harborTopology ?? "main_only",
+    max_turns: options.maxTurns,
+    command_timeout_sec: options.commandTimeoutSec
   };
   if (options.model) {
     agentKwargs.model = options.model;

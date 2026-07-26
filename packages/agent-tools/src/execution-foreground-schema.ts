@@ -347,7 +347,13 @@ export function foregroundExecutionSchema(
     },
     network,
     env: { type: "object", additionalProperties: { type: "string" } },
-    timeoutMs: { type: "integer", minimum: 1, maximum: 600000 },
+    timeoutMs: {
+      type: "integer",
+      minimum: 1,
+      maximum: 600000,
+      default: Math.max(1, Math.min(600_000, Math.floor(options.commandTimeoutMs ?? 600_000))),
+      description: "Foreground command deadline in milliseconds. Defaults to the configured command timeout."
+    },
     ...(validation ? validationIntentProperties() : {}),
     ...(unified ? unifiedExecutionProperties(options) : {}),
     ...writeContractProperties(options)

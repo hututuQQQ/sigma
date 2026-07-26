@@ -59,6 +59,14 @@ function positiveInteger(value, label) {
   return value;
 }
 
+function positiveIntegerAtMost(value, maximum, label) {
+  const parsed = positiveInteger(value, label);
+  if (parsed > maximum) {
+    throw new Error(`${label} must be at most ${maximum}.`);
+  }
+  return parsed;
+}
+
 function enumValue(value, allowed, label) {
   const text = requiredString(value, label);
   if (!allowed.includes(text)) throw new Error(`${label} must be one of: ${allowed.join(", ")}.`);
@@ -124,8 +132,8 @@ function normalizedSolverControls(value) {
     ),
     agent_profile: requiredString(controls.agent_profile, "solver_controls.agent_profile"),
     max_turns: positiveInteger(controls.max_turns, "solver_controls.max_turns"),
-    command_timeout_sec: positiveInteger(
-      controls.command_timeout_sec, "solver_controls.command_timeout_sec"
+    command_timeout_sec: positiveIntegerAtMost(
+      controls.command_timeout_sec, 600, "solver_controls.command_timeout_sec"
     ),
     cleanup_grace_sec: positiveInteger(
       controls.cleanup_grace_sec, "solver_controls.cleanup_grace_sec"
@@ -506,6 +514,13 @@ export function assertFrozenBatchControls(manifest, batch, context) {
   for (const slot of context.slots) {
     if (!SHA256.test(String(slot.jobConfigSha256 ?? ""))) {
       throw new Error("A formal Harbor slot lacks its frozen JobConfig digest.");
+    }
+    const agentKwargs = slot.jobConfig?.agents?.[0]?.kwargs;
+    if (!agentKwargs || agentKwargs.max_turns !== solver.max_turns
+      || agentKwargs.command_timeout_sec !== solver.command_timeout_sec) {
+      throw new Error(
+        "Resolved Harbor agent controls drifted from the formal preregistration."
+      );
     }
     const selectionDigest = taskSelectionIdentitySha256(slot.task);
     if (observed.has(selectionDigest) || !expectedBySelection.has(selectionDigest)) {

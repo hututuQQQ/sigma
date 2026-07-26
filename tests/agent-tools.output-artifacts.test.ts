@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import type {
   BrokerDoctorReport,
   ExecutionBroker,
+  ExecutionRequest,
   ExecutionResult,
   ProcessOutputArtifact,
   ProcessPollResult
@@ -41,13 +42,17 @@ function outputArtifact(stream: "stdout" | "stderr", content: string): ProcessOu
 function broker(
   execution: ExecutionResult,
   poll: ProcessPollResult,
-  released: string[][] = []
+  released: string[][] = [],
+  requests: ExecutionRequest[] = []
 ): ExecutionBroker {
   return {
     lostProcessHandles: [],
     connect: async () => report,
     doctor: async () => report,
-    execute: async () => execution,
+    execute: async (input) => {
+      requests.push(input);
+      return execution;
+    },
     spawn: async () => poll.handle,
     poll: async () => poll,
     write: async () => undefined,
@@ -82,6 +87,49 @@ function request(callId: string, name: string, argumentsValue: ToolRequest["argu
 }
 
 describe("execution output artifact receipts", () => {
+  it("uses the configured command timeout by default while preserving per-call overrides", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-command-timeout-"));
+    const requests: ExecutionRequest[] = [];
+    const execution: ExecutionResult = {
+      state: "exited", exitCode: 0, signal: null, durationMs: 1,
+      timedOut: false, idleTimedOut: false, cancelled: false,
+      stdout: "", stderr: "", stdoutDroppedBytes: 0, stderrDroppedBytes: 0,
+      outputTruncated: false, outputArtifacts: []
+    };
+    const poll: ProcessPollResult = {
+      ...execution, state: "exited", handle: { id: "process", brokerInstanceId: "broker" }
+    };
+    const tools = executionTools({
+      broker: broker(execution, poll, [], requests),
+      sandboxMode: "required",
+      networkMode: "none",
+      commandTimeoutMs: 180_000
+    });
+    const exec = tools.find((tool) => tool.descriptor.name === "exec")!;
+    const { context } = await fixtureContext(workspace);
+
+    await exec.execute(request("configured-timeout", "exec", {
+      executable: process.execPath
+    }), context);
+    await exec.execute(request("explicit-timeout", "exec", {
+      executable: process.execPath,
+      timeoutMs: 300_000
+    }), context);
+
+    expect(requests.map((item) => ({
+      timeoutMs: item.timeoutMs,
+      idleTimeoutMs: item.idleTimeoutMs
+    }))).toEqual([
+      { timeoutMs: 180_000, idleTimeoutMs: 120_000 },
+      { timeoutMs: 300_000, idleTimeoutMs: 120_000 }
+    ]);
+    expect(exec.descriptor.inputSchema).toMatchObject({
+      properties: {
+        timeoutMs: { default: 180_000, maximum: 600_000 }
+      }
+    });
+  });
+
   it("projects each foreground stream to 16 KiB and preserves the complete output", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-model-output-limit-"));
     const stdout = `${"H".repeat(8_192)}${"M".repeat(5_000)}${"T".repeat(8_192)}`;

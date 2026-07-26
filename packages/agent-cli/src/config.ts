@@ -44,6 +44,7 @@ export interface CliConfig {
   streamActiveSec: number;
   maxModelRetries: number;
   maxParallelTools: number;
+  commandTimeoutSec: number;
   maxParallelAgents: number;
   budget: {
     maxInputTokens: number;
@@ -222,6 +223,7 @@ function cliConfig(
     streamActiveSec: Number(values.streamActiveSec),
     maxModelRetries: Number(values.maxModelRetries),
     maxParallelTools: Number(values.maxParallelTools),
+    commandTimeoutSec: Number(values.commandTimeoutSec),
     maxParallelAgents: Number(values.maxParallelAgents),
     budget: {
       maxInputTokens: Number(values.maxInputTokens), maxOutputTokens: Number(values.maxOutputTokens),

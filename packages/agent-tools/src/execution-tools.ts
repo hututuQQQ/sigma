@@ -174,8 +174,12 @@ async function executePinnedForeground(
     await readLock.verify();
     const scratchLease = await acquireScratchLease(options, context, approvedPlan);
     const invocation = processInvocation(input, options, skillResource, shellCommand);
+    const defaultTimeoutMs = Math.max(
+      1,
+      Math.min(600_000, Math.floor(options.commandTimeoutMs ?? 600_000))
+    );
     const timeoutMs = typeof input.timeoutMs === "number"
-      ? Math.max(1, Math.min(600_000, input.timeoutMs)) : 600_000;
+      ? Math.max(1, Math.min(600_000, input.timeoutMs)) : defaultTimeoutMs;
     const result = await options.broker.execute({
       command: { ...invocation, cwd, environment: executionEnvironment(input) },
       policy: executionPolicy(

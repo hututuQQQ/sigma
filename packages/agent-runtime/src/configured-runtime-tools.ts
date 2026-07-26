@@ -24,6 +24,7 @@ export interface ConfiguredToolOptions {
   writeScope?: "workspace" | "enclosing-container";
   networkMode?: "none" | "loopback" | "full";
   processHandoff?: "allow" | "deny";
+  commandTimeoutSec?: number;
   checkpoint?: { maxFiles: number; maxBytes: number };
 }
 
@@ -133,6 +134,9 @@ export function createConfiguredTools(
     writeScope: policy.writeScope,
     protectedPaths: configuredProtectedPaths(executionReport, storeRootDir),
     processHandoff: policy.processHandoff,
+    commandTimeoutMs: config.commandTimeoutSec === undefined
+      ? undefined
+      : config.commandTimeoutSec * 1_000,
     networkMode: network.defaultMode,
     networkModes: network.modes,
     ...brokerToolCapabilities(config, execution, executionReport),

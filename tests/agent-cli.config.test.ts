@@ -20,6 +20,7 @@ describe("Sigma config", () => {
       readScope: "workspace",
       networkMode: "full",
       processHandoff: "allow",
+      commandTimeoutSec: 600,
       explicitSingleModelRoute: false,
       budget: { maxInputTokens: 8_000_000, maxOutputTokens: 1_000_000, maxCostMicroUsd: 50_000_000 }
     });

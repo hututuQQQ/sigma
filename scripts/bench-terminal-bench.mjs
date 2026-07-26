@@ -560,6 +560,7 @@ async function runTerminalBenchCliImpl(argv, deps, signal) {
       resolvedTask: spec.resolvedTask,
       attestation,
       attestationPath,
+      jobConfig,
       jobConfigSha256
     });
   }
@@ -572,6 +573,7 @@ async function runTerminalBenchCliImpl(argv, deps, signal) {
         resolvedTask: slot.resolvedTask,
         taskProbe: slot.taskProbe,
         timeoutPlan: slot.timeoutPlan,
+        jobConfig: slot.jobConfig,
         jobConfigSha256: slot.jobConfigSha256
       }))
     });

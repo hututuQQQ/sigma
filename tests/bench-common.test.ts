@@ -760,9 +760,10 @@ describe("Terminal-Bench command construction", () => {
     expect(path.isAbsolute(config.agents[0].kwargs.agent_cli_tarball)).toBe(true);
     expect(config.agents[0].kwargs).toMatchObject({
       agent_cli_tarball: defaultAgentCliTarballForEnv(),
+      max_turns: 200,
+      command_timeout_sec: 180,
       max_wall_time_sec: 2700
     });
-    expect(config.agents[0].kwargs.max_turns).toBeUndefined();
     expect(config.agents[0].kwargs.validation_retry_limit).toBeUndefined();
     expect(config.agents[0].kwargs.precheck_command).toBeUndefined();
     expect(config.agents[0].kwargs.post_run_cleanup_globs).toBeUndefined();
@@ -795,6 +796,8 @@ describe("Terminal-Bench command construction", () => {
     });
     expect(config.agents[0].kwargs).toMatchObject({
       agent_cli_tarball: defaultAgentCliTarballForEnv(),
+      max_turns: 200,
+      command_timeout_sec: 180,
       max_wall_time_sec: 2700
     });
     expect(config.agents[0].kwargs.validation_mode).toBeUndefined();
@@ -820,7 +823,7 @@ describe("Terminal-Bench command construction", () => {
     expect(plan).toMatchObject({ agent_wall_time_sec: 2700, harness_timeout_sec: 2820 });
   });
 
-  it("does not expose fixed turn limits to the solver", () => {
+  it("forwards explicit generic turn and command timeout controls to the solver", () => {
     const timeoutProbe = {
       resolved_tasks: [{ name: "terminal-bench/long-runtime-task" }],
       tasks: [{ task_name: "terminal-bench/long-runtime-task", agent_timeout_sec: 1800 }],
@@ -842,7 +845,10 @@ describe("Terminal-Bench command construction", () => {
       timeoutProbe
     );
 
-    expect(config.agents[0].kwargs.max_turns).toBeUndefined();
+    expect(config.agents[0].kwargs).toMatchObject({
+      max_turns: 200,
+      command_timeout_sec: 180
+    });
   });
 
   it("rejects removed Harbor import paths", () => {

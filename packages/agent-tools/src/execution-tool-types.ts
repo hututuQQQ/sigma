@@ -18,6 +18,9 @@ export interface ExecutionToolOptions {
   protectedPaths?: readonly string[];
   processHandoff: "allow" | "deny";
   networkMode: "none" | "loopback" | "full";
+  /** Product-configured default for foreground commands. Per-call timeouts can
+   * still narrow or extend it within the tool's fixed 600 second safety cap. */
+  commandTimeoutMs?: number;
   shells?: readonly ShellKind[];
   runtimeCommands?: readonly string[];
   directExecutableResolution?: boolean;

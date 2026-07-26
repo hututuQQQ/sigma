@@ -696,6 +696,8 @@ class SigmaCliHarborAgent(BaseAgent):
         write_scope: str = "auto",
         managed_environment_mode: str = "disabled",
         harbor_topology: str = "main_only",
+        max_turns: int = 200,
+        command_timeout_sec: int = 180,
         max_wall_time_sec: int = 7200,
         agent_timeout_grace_sec: int = 120,
         outer_trial_deadline_sec: int | float | None = None,
@@ -771,6 +773,14 @@ class SigmaCliHarborAgent(BaseAgent):
             "workspace" if write_scope == "auto" else write_scope
         )
         self.process_handoff_available = False
+        parsed_max_turns = _as_int(max_turns, 0)
+        if parsed_max_turns < 1:
+            raise ValueError("max_turns must be a positive integer")
+        self.max_turns = parsed_max_turns
+        parsed_command_timeout = _as_int(command_timeout_sec, 0)
+        if parsed_command_timeout < 1 or parsed_command_timeout > 600:
+            raise ValueError("command_timeout_sec must be an integer from 1 to 600")
+        self.command_timeout_sec = parsed_command_timeout
         self.agent_timeout_grace_sec = max(0, _as_int(agent_timeout_grace_sec, 120))
         env_outer_deadline = os.environ.get("SIGMA_HARBOR_OUTER_TRIAL_DEADLINE_SEC")
         parsed_outer_deadline = _as_int(
@@ -1066,6 +1076,8 @@ class SigmaCliHarborAgent(BaseAgent):
         summary["harbor_topology"] = self.harbor_topology
         summary["permission_mode_effective"] = self._permission_mode()
         summary["agent_profile"] = self.agent_profile
+        summary["max_model_turns"] = self.max_turns
+        summary["command_timeout_sec"] = self.command_timeout_sec
         summary["read_scope_effective"] = self.effective_read_scope
         summary["write_scope_requested"] = self.write_scope
         summary["write_scope_effective"] = self.effective_write_scope
@@ -1127,6 +1139,10 @@ class SigmaCliHarborAgent(BaseAgent):
             self.model,
             "--agent-profile",
             self.agent_profile,
+            "--max-model-turns",
+            str(self.max_turns),
+            "--command-timeout-sec",
+            str(self.command_timeout_sec),
             "--run-deadline-sec",
             str(self.max_wall_time_sec),
             "--network",
@@ -1557,6 +1573,10 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             self.model,
             "--agent-profile",
             self.agent_profile,
+            "--max-model-turns",
+            str(self.max_turns),
+            "--command-timeout-sec",
+            str(self.command_timeout_sec),
             "--permission-mode",
             self._permission_mode(),
             "--execution-mode",
@@ -1731,6 +1751,8 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "managed_environment_mode": self.managed_environment_mode,
             "harbor_topology": self.harbor_topology,
             "agent_profile": self.agent_profile,
+            "max_model_turns": self.max_turns,
+            "command_timeout_sec": self.command_timeout_sec,
             "harbor_deadline_sec": self.outer_trial_deadline_sec,
             "sigma_deadline_sec": self.max_wall_time_sec,
             "read_scope_effective": self.effective_read_scope,
@@ -1789,6 +1811,8 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "termination_source": "adapter_timeout",
             "harbor_deadline_sec": self.outer_trial_deadline_sec,
             "sigma_deadline_sec": self.max_wall_time_sec,
+            "max_model_turns": self.max_turns,
+            "command_timeout_sec": self.command_timeout_sec,
             "stdout": _text_artifact_summary(stdout),
             "stderr": _text_artifact_summary(stderr),
             "process_cleanup": process_cleanup,
@@ -1820,6 +1844,8 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "termination_source": state["termination_source"],
             "harbor_deadline_sec": state["harbor_deadline_sec"],
             "sigma_deadline_sec": state["sigma_deadline_sec"],
+            "max_model_turns": state["max_model_turns"],
+            "command_timeout_sec": state["command_timeout_sec"],
             "process_cleanup": process_cleanup,
             "network_mode_requested": self.network_mode,
             "network_mode_effective": self.effective_network_mode,
@@ -2034,6 +2060,10 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
                 shlex.quote(doctor_write_scope),
                 "--managed-environment-mode",
                 shlex.quote(self.managed_environment_mode),
+                "--max-model-turns",
+                str(self.max_turns),
+                "--command-timeout-sec",
+                str(self.command_timeout_sec),
                 *( ["--check-api"] if self.check_api else [] ),
             ]),
             self._agent_env(),
@@ -2183,6 +2213,8 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             "permission_mode_effective": self._permission_mode(),
             "managed_broker_bootstrap": self._managed_broker_bootstrap,
             "agent_profile": self.agent_profile,
+            "max_model_turns": self.max_turns,
+            "command_timeout_sec": self.command_timeout_sec,
             "available_network_modes": list(self.available_network_modes),
             "read_scope_effective": self.effective_read_scope,
             "write_scope_requested": self.write_scope,
@@ -2456,6 +2488,10 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             ),
             "harbor_topology": summary.get("harbor_topology", self.harbor_topology),
             "agent_profile": summary.get("agent_profile", self.agent_profile),
+            "max_model_turns": summary.get("max_model_turns", self.max_turns),
+            "command_timeout_sec": summary.get(
+                "command_timeout_sec", self.command_timeout_sec
+            ),
             "network_mode_requested": summary.get("network_mode_requested", self.network_mode),
             "network_mode_effective": summary.get("network_mode_effective", self.effective_network_mode),
             "read_scope_effective": summary.get("read_scope_effective", self.effective_read_scope),
@@ -2585,6 +2621,10 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             ),
             "harbor_topology": getattr(context, "harbor_topology", self.harbor_topology),
             "agent_profile": getattr(context, "agent_profile", self.agent_profile),
+            "max_model_turns": getattr(context, "max_model_turns", self.max_turns),
+            "command_timeout_sec": getattr(
+                context, "command_timeout_sec", self.command_timeout_sec
+            ),
             "network_mode_requested": getattr(context, "network_mode_requested", self.network_mode),
             "network_mode_effective": getattr(context, "network_mode_effective", self.effective_network_mode),
             "read_scope_effective": getattr(context, "read_scope_effective", self.effective_read_scope),

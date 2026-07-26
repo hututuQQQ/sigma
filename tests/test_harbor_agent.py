@@ -228,6 +228,10 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                 network_mode="full",
                 managed_environment_mode="unknown",
             )
+        with self.assertRaisesRegex(ValueError, "max_turns"):
+            module.SigmaCliHarborAgent(max_turns=0)
+        with self.assertRaisesRegex(ValueError, "command_timeout_sec"):
+            module.SigmaCliHarborAgent(command_timeout_sec=601)
 
     async def test_container_execution_mode_is_forwarded_without_host_opt_in(self):
         module = import_portable_agent_module()
@@ -238,6 +242,8 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                 network_mode="full",
                 managed_environment_mode="required",
                 harbor_topology="managed_three_role",
+                max_turns=73,
+                command_timeout_sec=41,
             )
             agent._workspace = "/app"
 
@@ -251,6 +257,8 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("required", command)
             self.assertIn("--agent-profile", command)
             self.assertIn("standard", command)
+            self.assertEqual(command[command.index("--max-model-turns") + 1], "73")
+            self.assertEqual(command[command.index("--command-timeout-sec") + 1], "41")
             self.assertEqual(session_command[0], "/usr/local/bin/agent")
             self.assertIn("--execution-mode", session_command)
             self.assertIn("container", session_command)
@@ -258,6 +266,14 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("required", session_command)
             self.assertIn("--agent-profile", session_command)
             self.assertIn("standard", session_command)
+            self.assertEqual(
+                session_command[session_command.index("--max-model-turns") + 1],
+                "73",
+            )
+            self.assertEqual(
+                session_command[session_command.index("--command-timeout-sec") + 1],
+                "41",
+            )
             self.assertIn("auto", command)
             self.assertIn("auto", session_command)
             self.assertNotIn("HOME=/tmp/agent/disposable-home", command)
@@ -495,7 +511,8 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                     "/usr/local/bin/agent doctor --workspace /app --json --strict "
                     "--execution-mode sandboxed --network full --read-scope host "
                     "--write-scope workspace "
-                    "--managed-environment-mode disabled --check-api",
+                    "--managed-environment-mode disabled --max-model-turns 200 "
+                    "--command-timeout-sec 180 --check-api",
                 ],
             )
 
@@ -705,6 +722,8 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("--run-deadline-sec 600", command)
             self.assertIn("--permission-mode auto", command)
             self.assertIn("--agent-profile standard", command)
+            self.assertIn("--max-model-turns 200", command)
+            self.assertIn("--command-timeout-sec 180", command)
             self.assertIn("--output-format stream-json", command)
             self.assertNotIn("--output-schema", command)
             self.assertIn("--stream-json-max-line-bytes 49152", command)

@@ -175,6 +175,7 @@ export const SIGMA_CONFIG_SCHEMA: readonly ConfigField[] = [
   { key: "streamActiveSec", flag: "stream-active-sec", env: "SIGMA_STREAM_ACTIVE_SEC", toml: "runtime.stream_active_sec", description: "Optional active model stream deadline in seconds (0 uses only the Agent/session deadline)", defaultValue: 0, parse: (raw) => numberValue(raw, "streamActiveSec", 0) },
   { key: "maxModelRetries", flag: "max-model-retries", env: "SIGMA_MAX_MODEL_RETRIES", toml: "runtime.max_model_retries", description: "Maximum model request retries", defaultValue: 2, parse: (raw) => numberValue(raw, "maxModelRetries", 0, 10) },
   { key: "maxParallelTools", flag: "max-parallel-tools", env: "SIGMA_MAX_PARALLEL_TOOLS", toml: "tools.max_parallel", description: "Maximum parallel tool calls", defaultValue: 4, parse: (raw) => numberValue(raw, "maxParallelTools", 1, 32) },
+  { key: "commandTimeoutSec", flag: "command-timeout-sec", env: "SIGMA_COMMAND_TIMEOUT_SEC", toml: "tools.command_timeout_sec", description: "Default foreground command timeout in seconds", defaultValue: 600, parse: (raw) => numberValue(raw, "commandTimeoutSec", 1, 600) },
   { key: "maxParallelAgents", flag: "max-parallel-agents", env: "SIGMA_MAX_PARALLEL_AGENTS", toml: "agents.max_parallel", description: "Maximum parallel child agents", defaultValue: 4, parse: (raw) => numberValue(raw, "maxParallelAgents", 1, 32) },
   { key: "maxInputTokens", flag: "max-input-tokens", env: "SIGMA_MAX_INPUT_TOKENS", toml: "budget.max_input_tokens", description: "Session-tree input token budget", defaultValue: 8_000_000, parse: (raw) => numberValue(raw, "maxInputTokens", 1) },
   { key: "maxOutputTokens", flag: "max-output-tokens", env: "SIGMA_MAX_OUTPUT_TOKENS", toml: "budget.max_output_tokens", description: "Session-tree output token budget", defaultValue: 1_000_000, parse: (raw) => numberValue(raw, "maxOutputTokens", 1) },
@@ -236,7 +237,6 @@ function nestedValue(source: Record<string, unknown> | undefined, dottedKey: str
   }
   return current;
 }
-
 function validateTomlKeys(source: Record<string, unknown> | undefined, schema: readonly ConfigField[], label: string): void {
   if (!source) return;
   const known = new Set(schema.flatMap((field) => field.toml ? [field.toml, ...field.toml.split(".").slice(0, -1).map((_, index, parts) => parts.slice(0, index + 1).join("."))] : []));
@@ -251,7 +251,7 @@ function validateTomlKeys(source: Record<string, unknown> | undefined, schema: r
 }
 
 const WORKSPACE_NUMERIC_CAPS = new Set([
-  "runDeadlineSec", "modelDeadlineSec", "streamIdleSec", "streamActiveSec", "maxModelRetries", "maxParallelTools", "maxParallelAgents",
+  "runDeadlineSec", "modelDeadlineSec", "streamIdleSec", "streamActiveSec", "maxModelRetries", "maxParallelTools", "commandTimeoutSec", "maxParallelAgents",
   "maxInputTokens", "maxOutputTokens", "maxCostMicroUsd", "maxModelTurns", "maxToolCalls",
   "maxChildren", "maxDepth", "checkpointMaxFiles", "checkpointMaxBytes"
 ]);
