@@ -436,7 +436,6 @@ describe("execution tool capability closure", () => {
 
     const validationCall = request("shell", {
       executable: "runtime",
-      validation: true,
       purpose: "Check the current result"
     });
     const validationPlan = await tools.prepare(validationCall, preparation(root));
@@ -451,6 +450,16 @@ describe("execution tool capability closure", () => {
       ok: true,
       evidence: [expect.objectContaining({ kind: "validation" })]
     });
+    await expect(tools.prepare(request("shell", {
+      executable: "runtime",
+      validation: false,
+      purpose: "Conflicting validation intent"
+    }), preparation(root))).rejects.toMatchObject({ code: "tool_arguments_invalid" });
+    await expect(tools.prepare(request("shell", {
+      executable: "runtime",
+      background: true,
+      purpose: "A background process is not a completed check"
+    }), preparation(root))).rejects.toMatchObject({ code: "tool_arguments_invalid" });
 
     const backgroundCall = request("shell", {
       executable: "runtime",

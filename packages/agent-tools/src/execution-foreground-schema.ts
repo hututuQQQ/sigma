@@ -10,6 +10,7 @@ import {
 import { environmentShellAvailable } from "./environment-shell-tool.js";
 
 type ForegroundKind = "exec" | "shell" | "validate";
+const VALIDATION_INTENT_FIELDS = ["purpose", "subjects", "criterionIds"] as const;
 
 export interface ForegroundInvocation {
   shellCommand: boolean;
@@ -36,13 +37,22 @@ function assertShellModeTypes(input: Record<string, JsonValue>): void {
   }
 }
 
+function hasShellValidationIntent(input: Record<string, JsonValue>): boolean {
+  return VALIDATION_INTENT_FIELDS.some((field) => input[field] !== undefined);
+}
+
+function shellValidationRequested(input: Record<string, JsonValue>): boolean {
+  return input.validation === true || hasShellValidationIntent(input);
+}
+
 function assertShellValidationMode(input: Record<string, JsonValue>): void {
-  const validationFields = ["purpose", "subjects", "criterionIds"] as const;
-  if (input.validation !== true
-    && validationFields.some((field) => input[field] !== undefined)) {
-    invalidArguments("shell purpose, subjects, and criterionIds require validation=true.");
+  const validation = shellValidationRequested(input);
+  if (input.validation === false && hasShellValidationIntent(input)) {
+    invalidArguments(
+      "shell validation=false conflicts with purpose, subjects, or criterionIds; omit validation or set it to true."
+    );
   }
-  if (input.background === true && input.validation === true) {
+  if (input.background === true && validation) {
     invalidArguments("shell background execution cannot be recorded as a completed validation.");
   }
 }
@@ -115,7 +125,7 @@ export function assertForegroundInvocation(
   else assertAvailableExecutable(input, options);
   return {
     shellCommand,
-    validation: kind === "validate" || (kind === "shell" && input.validation === true),
+    validation: kind === "validate" || (kind === "shell" && shellValidationRequested(input)),
     background: kind === "shell" && input.background === true
   };
 }
@@ -237,19 +247,22 @@ function validationIntentProperties(): Record<string, JsonValue> {
   return {
     purpose: {
       type: "string",
-      description: "Optional model-declared reason for this check. It is recorded as intent, not treated as proof."
+      description:
+        "Model-declared reason for a completed check. Providing this marks a foreground shell call as validation; the declaration is recorded as intent, not treated as proof."
     },
     subjects: {
       type: "array",
       items: { type: "string" },
       maxItems: 128,
-      description: "Optional paths or logical subjects the model intends to check."
+      description:
+        "Paths or logical subjects a completed check intends to cover. Providing this marks a foreground shell call as validation."
     },
     criterionIds: {
       type: "array",
       items: { type: "string" },
       maxItems: 64,
-      description: "Optional acceptance-criterion identifiers this check is intended to inform."
+      description:
+        "Acceptance-criterion identifiers a completed check is intended to inform. Providing this marks a foreground shell call as validation."
     }
   };
 }
@@ -261,7 +274,7 @@ function unifiedExecutionProperties(
     validation: {
       type: "boolean",
       description:
-        "Set true only when this completed foreground command is intended to validate the current result; optional purpose, subjects, and criterionIds then describe coverage."
+        "Optional explicit marker for a completed foreground check. Setting purpose, subjects, or criterionIds also marks the call as validation, so no second switch is required."
     },
     ...validationIntentProperties(),
     ...(options.background === false ? {} : {
@@ -324,7 +337,7 @@ function executionDescription(
     return `Run a sandboxed ${kind} command. With skill and skillScript, the frozen script is prepended to interpreter args.`;
   }
   return [
-    "Run one sandboxed command using exactly one form: {command,shell?} or {executable,args?,skill?,skillScript?}. Foreground is the default. Set validation=true for a completed check, or background=true only for a long-running service or interactive process; background startup waits up to yieldMs and returns either terminal status or a live handle.",
+    "Run one sandboxed command using exactly one form: {command,shell?} or {executable,args?,skill?,skillScript?}. Foreground is the default. A completed check may be marked by validation=true or by supplying purpose, subjects, or criterionIds; background=true is only for a long-running service or interactive process. Background startup waits up to yieldMs and returns either terminal status or a live handle.",
     ...(environmentShellAvailable(options)
       ? ["Set target=environment only for system-level changes in the broker-attested disposable outer environment."]
       : [])
