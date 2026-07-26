@@ -117,26 +117,36 @@ function descriptor(
   name: string,
   description: string,
   properties: Record<string, JsonValue>,
-  required: string[] = [],
-  approval: ToolDescriptor["approval"] = "auto",
-  possibleEffects: ToolEffect[] = ["agent.spawn", "open_world"],
-  executionMode: ToolDescriptor["executionMode"] = "parallel",
-  resourceKeys: string[] = []
+  required: string[],
+  policy: {
+    effects: ToolEffect[];
+    approval: ToolDescriptor["approval"];
+    idempotent: boolean;
+    executionMode?: ToolDescriptor["executionMode"];
+    resourceKeys?: string[];
+    timeoutMs?: number;
+  }
 ): ToolDescriptor {
   return {
     name,
     description,
     inputSchema: { type: "object", properties, required, additionalProperties: false },
-    possibleEffects,
-    executionMode,
-    resourceKeys,
-    approval,
-    idempotent: false,
-    timeoutMs: 900_000
+    possibleEffects: policy.effects,
+    maximumEffects: policy.effects,
+    executionMode: policy.executionMode ?? "parallel",
+    resourceKeys: policy.resourceKeys ?? [],
+    approval: policy.approval,
+    idempotent: policy.idempotent,
+    timeoutMs: policy.timeoutMs ?? 30_000
   };
 }
 
-function receipt(request: ToolRequest, startedAt: string, value: unknown, observedEffects: ToolEffect[] = ["agent.spawn"]): ToolReceipt {
+function receipt(
+  request: ToolRequest,
+  startedAt: string,
+  value: unknown,
+  observedEffects: ToolEffect[]
+): ToolReceipt {
   const output = JSON.stringify(value);
   return {
     callId: request.callId,
@@ -210,7 +220,12 @@ function spawnTool(supervisor: SupervisorPort): RegisteredEffectTool {
     allowDestructive: { type: "boolean" },
     budget: { type: "object", additionalProperties: { type: "integer", minimum: 0 } },
     detached: { type: "boolean" }
-  }, ["instruction", "planNodeIds"], "prompt", DELEGATED_CHILD_EFFECTS);
+  }, ["instruction", "planNodeIds"], {
+    effects: DELEGATED_CHILD_EFFECTS,
+    approval: "prompt",
+    idempotent: false,
+    timeoutMs: 900_000
+  });
   return {
     descriptor: {
       ...spawnDescriptor,
@@ -240,34 +255,77 @@ function spawnTool(supervisor: SupervisorPort): RegisteredEffectTool {
 }
 
 function followUpTool(supervisor: SupervisorPort): RegisteredEffectTool {
+  const followUpDescriptor = descriptor("message_agent", "Send a follow-up message to a running child agent's durable mailbox.", {
+    childId: { type: "string" }, text: { type: "string" }
+  }, ["childId", "text"], {
+    effects: ["runtime.control"],
+    approval: "auto",
+    idempotent: false
+  });
   return {
-    descriptor: descriptor("message_agent", "Send a follow-up message to a running child agent's durable mailbox.", {
-      childId: { type: "string" }, text: { type: "string" }
-    }, ["childId", "text"]),
+    descriptor: {
+      ...followUpDescriptor,
+      prepare() {
+        return {
+          exactEffects: ["runtime.control"],
+          readPaths: [],
+          writePaths: [],
+          network: "none",
+          processMode: "none",
+          checkpointScope: [],
+          idempotence: "non_replayable"
+        };
+      }
+    },
     async execute(request) {
       const startedAt = new Date().toISOString();
       const value = input(request);
       supervisor.followUp(requiredText(value, "childId"), requiredText(value, "text"));
-      return receipt(request, startedAt, { delivered: true });
+      return receipt(request, startedAt, { delivered: true }, ["runtime.control"]);
     }
   };
 }
 
 function joinTool(supervisor: SupervisorPort): RegisteredEffectTool {
   return {
-    descriptor: descriptor("join_agent", "Wait for a child agent and return its typed outcome and report.", { childId: { type: "string" } }, ["childId"]),
+    descriptor: descriptor(
+      "join_agent",
+      "Wait for a child agent and return its typed outcome and report.",
+      { childId: { type: "string" } },
+      ["childId"],
+      {
+        effects: ["runtime.control"],
+        approval: "auto",
+        idempotent: true,
+        timeoutMs: 900_000
+      }
+    ),
     async execute(request) {
       const startedAt = new Date().toISOString();
-      return receipt(request, startedAt, await supervisor.join(requiredText(input(request), "childId")));
+      return receipt(
+        request,
+        startedAt,
+        await supervisor.join(requiredText(input(request), "childId")),
+        ["runtime.control"]
+      );
     }
   };
 }
 
 function listTool(supervisor: SupervisorPort): RegisteredEffectTool {
   return {
-    descriptor: descriptor("list_agents", "List child agents owned by this session.", {}),
+    descriptor: descriptor("list_agents", "List child agents owned by this session.", {}, [], {
+      effects: ["runtime.control"],
+      approval: "auto",
+      idempotent: true
+    }),
     async execute(request, context) {
-      return receipt(request, new Date().toISOString(), supervisor.list(context.sessionId));
+      return receipt(
+        request,
+        new Date().toISOString(),
+        supervisor.list(context.sessionId),
+        ["runtime.control"]
+      );
     }
   };
 }
@@ -278,17 +336,21 @@ function integrateTool(supervisor: SupervisorPort): RegisteredEffectTool {
       "Safely integrate a completed writer child's retained worktree after checking the source HEAD and declared write scope.",
       { childId: { type: "string" } },
       ["childId"],
-      "prompt",
-      ["agent.spawn", "filesystem.write", "process.spawn"],
-      "exclusive",
-      ["workspace:write"]
+      {
+        effects: ["runtime.control", "filesystem.write", "process.spawn"],
+        approval: "prompt",
+        idempotent: false,
+        executionMode: "exclusive",
+        resourceKeys: ["workspace:write"],
+        timeoutMs: 900_000
+      }
     );
   return {
     descriptor: { ...integrateDescriptor, availableModes: ["change"] },
     async execute(request, context) {
       const startedAt = new Date().toISOString();
       const integrated = await supervisor.integrate(requiredText(input(request), "childId"), context.signal);
-      return receipt(request, startedAt, integrated, ["agent.spawn", "filesystem.write", "process.spawn"]);
+      return receipt(request, startedAt, integrated, ["runtime.control", "filesystem.write", "process.spawn"]);
     }
   };
 }
