@@ -307,3 +307,60 @@ export async function settleBudgetBoundaryProcesses(
     unavailable: false
   };
 }
+
+/**
+ * A deliverable process remains runtime-owned until an explicit handoff. Once
+ * the ordinary solving budget is exhausted, no model turn remains to perform
+ * that handoff, and every terminal outcome would terminate the process anyway.
+ * Terminate these unhanded processes before the completion gate so a normal
+ * resource boundary cannot be misreported as an agent crash.
+ */
+export async function terminateUnhandedBudgetBoundaryProcesses(
+  session: RuntimeSession,
+  signal: AbortSignal,
+  options: BudgetBoundaryProcessSettlementOptions
+): Promise<BudgetBoundaryProcessSettlement> {
+  const pending = [...session.execution.processHandles.values()]
+    .filter((handle) => handle.lifecycle === "deliverable");
+  if (pending.length === 0) {
+    return { attempted: 0, settled: 0, unavailable: false };
+  }
+  if (!options.execution?.terminate) {
+    return { attempted: pending.length, settled: 0, unavailable: true };
+  }
+  let settled = 0;
+  for (const handle of pending) {
+    signal.throwIfAborted();
+    const summary = emptyProcessSummary();
+    try {
+      const result = await options.execution.terminate(handle, {
+        signal,
+        timeoutMs: 10_000
+      });
+      await recordOutput(session, handle.id, result, summary, options);
+      session.execution.processHandles.delete(handle.id);
+      await options.emit(session, "process.exited", "runtime", {
+        processId: handle.id,
+        exitCode: result.exitCode,
+        ...(result.signal ? { signal: result.signal } : {}),
+        state: result.state,
+        reason: "budget_boundary_unhanded_deliverable"
+      });
+      await options.emit(
+        session,
+        "evidence.recorded",
+        "runtime",
+        settlementEvidence(session, handle, result, summary)
+      );
+    } catch (error) {
+      if (signal.aborted) throw error;
+      await recordLost(session, handle, error, summary, options);
+    }
+    settled += 1;
+  }
+  return {
+    attempted: pending.length,
+    settled,
+    unavailable: false
+  };
+}

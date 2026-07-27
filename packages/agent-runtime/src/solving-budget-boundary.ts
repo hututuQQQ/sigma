@@ -9,7 +9,10 @@ import {
   automaticCompletionReviewRequired,
   completionReviewBlocker
 } from "./completion-evidence-gate.js";
-import { settleBudgetBoundaryProcesses } from "./process-budget-settlement.js";
+import {
+  settleBudgetBoundaryProcesses,
+  terminateUnhandedBudgetBoundaryProcesses
+} from "./process-budget-settlement.js";
 
 interface SolvingBudgetBoundaryOptions {
   reviews: ReviewCoordinator;
@@ -50,6 +53,11 @@ export async function finishSolvingBudgetBoundary(
     return await options.finish(session, outcome);
   }
   await settleBudgetBoundaryProcesses(session, signal, {
+    execution: options.runtime.execution,
+    emit: options.emit,
+    createArtifact: options.createArtifact
+  });
+  await terminateUnhandedBudgetBoundaryProcesses(session, signal, {
     execution: options.runtime.execution,
     emit: options.emit,
     createArtifact: options.createArtifact
