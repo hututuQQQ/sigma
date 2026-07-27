@@ -1054,6 +1054,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             ("convergence_no_progress", {}, "convergence_no_progress"),
             ("validation_failed", {}, "validation_blocked"),
             ("runtime_terminal_missing", {}, "runtime_invariant_failure"),
+            ("run_deadline", {}, "timeout"),
             ("model_stream_protocol_error", {"diagnostics": {"category": "protocol"}}, "agent_failure"),
             ("model_route_failed", {"diagnostics": {"category": "rate_limit"}}, "api_error"),
         )
@@ -1065,6 +1066,52 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                     {"status": "failed"},
                 )
                 self.assertEqual(actual, expected)
+
+    async def test_budget_exhaustion_is_timeout_only_with_run_deadline_evidence(self):
+        module = import_portable_agent_module()
+        agent = module.SigmaCliHarborAgent(logs_dir=Path("unused"))
+
+        terminal = {
+            "type": "run.failed",
+            "payload": {
+                "code": "budget_exhausted",
+                "message": "Run exceeded its durable active-time deadline.",
+                "decisionAuthority": "resource_boundary",
+            },
+        }
+        self.assertEqual(
+            agent._failure_kind_from_events([terminal], {"status": "error"}),
+            "timeout",
+        )
+        self.assertEqual(
+            agent._failure_kind_from_events(
+                [
+                    {"type": "model.failed", "payload": {"code": "run_deadline"}},
+                    {
+                        "type": "run.failed",
+                        "payload": {
+                            "code": "budget_exhausted",
+                            "message": "Resource budget exhausted.",
+                        },
+                    },
+                ],
+                {"status": "error"},
+            ),
+            "timeout",
+        )
+        self.assertEqual(
+            agent._failure_kind_from_events(
+                [{
+                    "type": "run.failed",
+                    "payload": {
+                        "code": "budget_exhausted",
+                        "message": "Model-turn budget exhausted.",
+                    },
+                }],
+                {"status": "error"},
+            ),
+            "agent_failure",
+        )
 
     async def test_timeout_persists_bounded_partial_outputs_and_trace_state(self):
         module = import_portable_agent_module()

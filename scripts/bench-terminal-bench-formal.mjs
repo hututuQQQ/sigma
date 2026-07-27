@@ -150,13 +150,15 @@ function assertBatchMarker(marker, kind, batch, manifest, preregistrationSha256)
 function batchOperationallyComplete(record, batch) {
   const report = record?.report;
   const accounting = report?.trial_accounting;
+  const tasks = Array.isArray(report?.tasks) ? report.tasks : [];
   const expected = batch.task_indexes.length;
   return Boolean(report && report.incomplete_reason === null
     && record.docker_cleanup?.clean === true
     && Number(accounting?.expected) === expected
     && Number(accounting?.observed) === expected
     && Number(accounting?.missing) === 0
-    && Number(accounting?.errored) === 0);
+    && tasks.length === expected
+    && tasks.every((task) => task?.validity === "valid"));
 }
 
 async function completedBatchRecords(outputDir, manifest, preregistrationSha256) {
@@ -255,7 +257,6 @@ export function aggregateFormalReports(manifest, batchRecords) {
   const executionComplete = allBatchesRecorded
     && reports.length === manifest.execution.batches.length
     && accounting.observed === expected
-    && accounting.errored === 0
     && accounting.missing === 0
     && reports.every((report) => report.incomplete_reason === null)
     && batchRecords.every((record) => {

@@ -62,6 +62,8 @@ def _failure_kind_for_code(code: Any, payload: dict[str, Any] | None = None) -> 
     normalized = code.lower() if isinstance(code, str) else ""
     if not normalized:
         return None
+    if normalized == "run_deadline":
+        return "timeout"
     diagnostics = (payload or {}).get("diagnostics")
     category = diagnostics.get("category") if isinstance(diagnostics, dict) else None
     if normalized == "convergence_no_progress":
@@ -1364,11 +1366,29 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             explicit = payload.get("failureKind") or payload.get("failure_kind")
             if explicit in DECLARED_FAILURE_KINDS:
                 return explicit
+            code = payload.get("code") or payload.get("diagnosticCode") or payload.get("failureCode")
             classified = _failure_kind_for_code(
-                payload.get("code") or payload.get("diagnosticCode") or payload.get("failureCode"),
+                code,
                 payload,
             )
-            return classified or "agent_failure"
+            if classified:
+                return classified
+            if isinstance(code, str) and code.lower() == "budget_exhausted":
+                message = str(payload.get("message") or payload.get("reason") or "")
+                if re.search(r"(?:\brun\b.*\bdeadline\b|\bactive-time deadline\b)", message, re.IGNORECASE):
+                    return "timeout"
+                for event in reversed(events):
+                    if event is terminal:
+                        continue
+                    event_payload = _event_payload(event)
+                    event_code = (
+                        event_payload.get("code")
+                        or event_payload.get("diagnosticCode")
+                        or event_payload.get("failureCode")
+                    )
+                    if isinstance(event_code, str) and event_code.lower() == "run_deadline":
+                        return "timeout"
+            return "agent_failure"
         finish_reason = output_result.get("finishReason") or output_result.get("finish_reason")
         if finish_reason in {"timeout", "timed_out", "max_wall_time"}:
             return "timeout"

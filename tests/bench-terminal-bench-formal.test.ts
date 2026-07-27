@@ -124,6 +124,24 @@ function report(taskCount: number, passed: number, blocker = false) {
   };
 }
 
+function reportWithValidAgentTimeout(taskCount: number, passed: number) {
+  const value = report(taskCount, passed);
+  const timedOut = taskCount - passed;
+  for (let index = passed; index < taskCount; index += 1) {
+    value.tasks[index] = {
+      ...value.tasks[index],
+      verifier_outcome: "not_run",
+      failure_category: "agent_timeout"
+    };
+  }
+  value.trial_accounting.scored = passed;
+  value.trial_accounting.errored = timedOut;
+  value.trial_accounting.meanReward = passed > 0 ? 1 : null;
+  value.counts.failed = 0;
+  (value.counts as Record<string, number>).timeout = timedOut;
+  return value;
+}
+
 async function frozenManifest(directory: string, value = manifest()) {
   const file = path.join(directory, "preregistration.json");
   const bytes = `${JSON.stringify(value, null, 2)}\n`;
@@ -302,6 +320,28 @@ describe("formal benchmark controller", () => {
     expect(aggregate).not.toHaveProperty("minimum_passes");
   });
 
+  it("treats fully observed valid agent timeouts as completed outcomes", () => {
+    const value = manifest();
+    const aggregate = aggregateFormalReports(value, [
+      {
+        batch: "001",
+        report: reportWithValidAgentTimeout(2, 1),
+        docker_cleanup: { clean: true }
+      },
+      {
+        batch: "002",
+        report: report(1, 1),
+        docker_cleanup: { clean: true }
+      }
+    ]);
+    expect(aggregate).toMatchObject({
+      status: "complete",
+      trial_accounting: { expected: 3, observed: 3, scored: 2, errored: 1, missing: 0 },
+      counts: { passed: 2, timeout: 1 },
+      failure_categories: { agent_timeout: 1 }
+    });
+  });
+
   it("runs each frozen batch once and derives every CLI control from the manifest", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "sigma-formal-controller-"));
     const output = path.join(directory, "output");
@@ -444,6 +484,23 @@ describe("formal benchmark controller", () => {
     expect(aggregate.status).toBe("incomplete");
   });
 
+  it("does not accept an infrastructure-invalid task even when accounting has no errors", () => {
+    const value = manifest();
+    const invalid = report(2, 1);
+    invalid.tasks[1] = {
+      ...invalid.tasks[1],
+      status: "infra_failed",
+      validity: "infra_failed",
+      verifier_outcome: "infra_failed",
+      failure_category: "verifier_setup_failed"
+    };
+    const aggregate = aggregateFormalReports(value, [
+      { batch: "001", report: invalid, docker_cleanup: { clean: true } },
+      { batch: "002", report: report(1, 1), docker_cleanup: { clean: true } }
+    ]);
+    expect(aggregate.status).toBe("incomplete");
+  });
+
   it("does not continue after a completed batch has infrastructure gaps", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "sigma-formal-incomplete-prefix-"));
     const output = path.join(directory, "output");
@@ -479,6 +536,57 @@ describe("formal benchmark controller", () => {
         ...verificationDeps,
         runBatch: async () => { throw new Error("must not dispatch"); }
       })).rejects.toThrow(/infrastructure gaps/u);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("continues after a completed batch contains a valid agent timeout", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "sigma-formal-valid-timeout-"));
+    const output = path.join(directory, "output");
+    try {
+      const frozen = await frozenManifest(directory);
+      const first = await runFormalBenchmark([
+        "--preregistration-file", frozen.file,
+        "--expected-preregistration-sha256", frozen.sha256,
+        "--output", output,
+        "--batch", "001"
+      ], {
+        ...verificationDeps,
+        runBatch: async (_manifest, _batch, _options, deps) => {
+          await deps.beforeHarborDispatch();
+          return {
+            exitCode: 1,
+            runDir: "valid-timeout-run",
+            dockerCleanup: { clean: true },
+            report: reportWithValidAgentTimeout(2, 1)
+          };
+        }
+      });
+      expect(first.report.status).toBe("running");
+
+      const second = await runFormalBenchmark([
+        "--preregistration-file", frozen.file,
+        "--expected-preregistration-sha256", frozen.sha256,
+        "--output", output,
+        "--batch", "002",
+        "--resume"
+      ], {
+        ...verificationDeps,
+        runBatch: async (_manifest, _batch, _options, deps) => {
+          await deps.beforeHarborDispatch();
+          return {
+            exitCode: 0,
+            runDir: "following-run",
+            dockerCleanup: { clean: true },
+            report: report(1, 1)
+          };
+        }
+      });
+      expect(second.report).toMatchObject({
+        status: "complete",
+        trial_accounting: { expected: 3, observed: 3, errored: 1, missing: 0 }
+      });
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
