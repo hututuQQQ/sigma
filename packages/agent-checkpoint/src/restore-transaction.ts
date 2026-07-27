@@ -248,7 +248,7 @@ async function closeRestoreResources(
 async function performRestore(options: RestoreTransactionOptions): Promise<void> {
   validateManifest(options.desired);
   validateManifest(options.current);
-  await validateRestoreCas(options.desired, options.readCas);
+  await validateRestoreCas(options.desired, options.readCas, options.inspectCas);
   if (!manifestEqual(await options.capture(), options.current)) {
     throw new CheckpointConflictError("Workspace changed before checkpoint restore staging.");
   }

@@ -1375,9 +1375,11 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                 ]
             }
             commands = []
+            command_timeouts = []
 
             async def exec_side_effect(command, **kwargs):
                 commands.append(command)
+                command_timeouts.append((command, kwargs.get("timeout_sec")))
                 if "/usr/local/bin/agent run" in command:
                     return SimpleNamespace(return_code=0, stdout=initial_stdout, stderr="")
                 if "/usr/local/bin/agent session show" in command:
@@ -1401,8 +1403,79 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             recover_commands = [command for command in commands if " session recover " in command]
             self.assertEqual(len(recover_commands), 1)
             self.assertIn("--restore", recover_commands[0])
+            recover_timeout = next(
+                timeout for command, timeout in command_timeouts
+                if " session recover " in command
+            )
+            resume_timeout = next(
+                timeout for command, timeout in command_timeouts
+                if " session resume " in command
+            )
+            self.assertGreaterEqual(recover_timeout, 600)
+            self.assertGreater(resume_timeout, 30)
             self.assertEqual(context.exit_code, 0)
             self.assertIsNone(context.failure_kind)
+
+    async def test_checkpoint_recovery_failure_is_not_overwritten_by_needs_input(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            suspended = {
+                "kind": "event",
+                "event": {
+                    "eventId": "suspend",
+                    "sessionId": "recover-session",
+                    "seq": 1,
+                    "type": "run.suspended",
+                    "payload": {
+                        "checkpointId": "checkpoint-1",
+                        "choices": ["restore", "keep"],
+                    },
+                },
+            }
+            initial_stdout = "\n".join([
+                json.dumps(suspended),
+                json.dumps({
+                    "kind": "result",
+                    "result": {
+                        "status": "needs_input",
+                        "finishReason": "checkpoint_recovery",
+                        "sessionId": "recover-session",
+                        "finalMessage": "choose restore or keep",
+                    },
+                }),
+            ])
+
+            async def exec_side_effect(command, **kwargs):
+                if "/usr/local/bin/agent run" in command:
+                    return SimpleNamespace(return_code=2, stdout=initial_stdout, stderr="")
+                if " session recover " in command:
+                    return SimpleNamespace(
+                        return_code=1,
+                        stdout="checkpoint restore could not be completed",
+                        stderr="",
+                    )
+                if command.startswith("test -f ") or command.startswith("test -d "):
+                    return SimpleNamespace(return_code=1, stdout="", stderr="")
+                return SimpleNamespace(return_code=0, stdout="", stderr="")
+
+            env = SimpleNamespace(
+                exec=AsyncMock(side_effect=exec_side_effect),
+                upload_file=AsyncMock(),
+                upload_dir=AsyncMock(),
+                download_file=AsyncMock(),
+            )
+            context = SimpleNamespace(task_id="recover-failure")
+            agent = module.SigmaCliHarborAgent(logs_dir=Path(tmp) / "logs")
+            agent._workspace = "/app"
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "checkpoint_recovery_required: external checkpoint recovery failed",
+            ):
+                await agent.run("run", env, context)
+
+            self.assertEqual(context.failure_kind, "checkpoint_recovery_required")
+            self.assertIn("checkpoint restore could not be completed", context.error_message)
 
     async def test_reviewer_waiver_is_explicit(self):
         module = import_portable_agent_module()

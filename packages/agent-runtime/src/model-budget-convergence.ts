@@ -10,7 +10,7 @@ import type {
   RuntimePromptState,
   ToolDescriptor
 } from "agent-protocol";
-import type { ContextPlan } from "agent-context";
+import { approximateTokens, type ContextPlan } from "agent-context";
 import { APPROXIMATE_TOKEN_RESERVATION_MARGIN } from "agent-model";
 import {
   modelTools,
@@ -62,7 +62,10 @@ export interface TurnPreparationInput {
   defaultOutputReserveTokens: number;
   history?: readonly ModelMessage[];
   archive?: ContextItem;
+  modelTurnBoundaryStage?: ModelTurnBoundaryStage;
 }
+
+export type ModelTurnBoundaryStage = "tool_closure" | "final";
 
 export function availableModelBudget(session: RuntimeSession): BudgetAmounts {
   return availableOrchestratorBudget(session);
@@ -85,6 +88,15 @@ export function requestCapacity(available: BudgetAmounts, prepared: PreparedMode
     const required = unit[dimension] ?? 0;
     return required <= 0 ? Number.POSITIVE_INFINITY : Math.floor(available[dimension] / required);
   }));
+}
+
+export function projectedModelTurnBoundary(
+  available: BudgetAmounts,
+  prepared: PreparedModelBudget
+): ModelTurnBoundaryStage | undefined {
+  const capacity = requestCapacity(available, prepared);
+  if (capacity <= 1) return "final";
+  return capacity === 2 ? "tool_closure" : undefined;
 }
 
 export function fitPreparedBudget(
@@ -196,6 +208,35 @@ function recoveryNotice(input: TurnPreparationInput): ContextItem | undefined {
   };
 }
 
+function modelTurnBoundaryNotice(
+  stage: ModelTurnBoundaryStage | undefined
+): ContextItem | undefined {
+  if (!stage) return undefined;
+  const finalTurn = stage === "final";
+  const content = finalTurn
+    ? [
+        "Hard model-turn boundary:",
+        "This is the final model turn allowed by the durable resource ledger.",
+        "Tools are unavailable on this turn. Return a concise, honest status response that summarizes completed work, validation performed, and any remaining gaps.",
+        "Respond only with ordinary user-facing text; do not emit or simulate tool calls or provider protocol markup.",
+        "Do not claim unfinished work is complete and do not defer the response to another tool call."
+      ].join("\n")
+    : [
+        "Hard model-turn boundary approaching:",
+        "This is the final tool-capable model turn; the next and final model turn will be text-only.",
+        "Use this turn for the highest-value remaining action and settle completion invariants now: finish or update the plan, run essential validation, and terminate or hand off background processes as appropriate.",
+        "Do not start work that cannot be closed before the final response."
+      ].join("\n");
+  return {
+    id: `runtime:model-turn-boundary:${finalTurn ? "final" : "tool-closure"}`,
+    authority: "runtime",
+    provenance: "hard_resource_boundary",
+    content,
+    tokenCount: approximateTokens(content),
+    priority: 10_200
+  };
+}
+
 function committedPromptState(
   input: TurnPreparationInput,
   frame: RuntimePromptFrame,
@@ -219,8 +260,12 @@ function committedPromptState(
 
 function recoveryRequestPolicy(
   session: RuntimeSession,
-  projectedTools: ModelToolDefinition[]
+  projectedTools: ModelToolDefinition[],
+  boundaryStage: ModelTurnBoundaryStage | undefined
 ): { tools: ModelToolDefinition[]; toolChoice?: ModelRequest["toolChoice"] } {
+  if (boundaryStage === "final") {
+    return { tools: [], toolChoice: "none" };
+  }
   if (repairEpisodeWindow(session).closureRequired) {
     return { tools: [], toolChoice: "none" };
   }
@@ -248,11 +293,20 @@ export async function prepareBudgetedModelTurn(
   input: TurnPreparationInput
 ): Promise<{ turn: PreparedModelTurn; plan: ContextPlan }> {
   const { session, descriptors, capabilities, dynamic, hookContext, ledger, available } = input;
+  const boundaryStage = input.modelTurnBoundaryStage
+    ?? (available.modelTurns <= 1
+      ? "final"
+      : available.modelTurns === 2 ? "tool_closure" : undefined);
   const projectedTools = modelTools(projectModelToolDescriptors(descriptors, capabilities));
-  const { tools, toolChoice } = recoveryRequestPolicy(session, projectedTools);
+  const { tools, toolChoice } = recoveryRequestPolicy(
+    session,
+    projectedTools,
+    boundaryStage
+  );
   const outputReserveTokens = requestOutputTokens(input);
   const recovery = recoveryNotice(input);
   const repair = repairEpisodeNotice(session);
+  const modelTurnBoundary = modelTurnBoundaryNotice(boundaryStage);
   const frame = materializeRuntimePromptFrame(session, available, {
     repository: dynamic,
     completion: ledger,
@@ -262,7 +316,8 @@ export async function prepareBudgetedModelTurn(
       ...hookContext,
       ...(input.turnOnly ?? []),
       ...(recovery ? [recovery] : []),
-      ...(repair ? [repair] : [])
+      ...(repair ? [repair] : []),
+      ...(modelTurnBoundary ? [modelTurnBoundary] : [])
     ]
   });
   const plan = await providerSizedPlan(session.services.gateway, {

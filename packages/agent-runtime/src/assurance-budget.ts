@@ -67,6 +67,11 @@ function substantiveReviewRoundsUsed(session: RuntimeSession): number {
       .includes(evidence.data.failureCode ?? "")).length;
 }
 
+function bindingAssuranceRequired(session: RuntimeSession): boolean {
+  return (session.services.profile?.profile.mutationPolicy.reviewMode ?? "advisory")
+    === "required";
+}
+
 /**
  * Bound the reserve by assurance work that can still legally run. The global
  * auxiliary turn ceiling is intentionally conservative, but unused turns from
@@ -136,13 +141,13 @@ export function availableAuxiliaryBudget(session: RuntimeSession): BudgetAmounts
 }
 
 function futureRepairReserveRequired(session: RuntimeSession): boolean {
+  if (!bindingAssuranceRequired(session)) return false;
   const assurance = session.durable.state.longHorizon.assurance;
   if (assurance.repairRounds <= 0) return false;
   if (reviewRepairActive(session)) return true;
   const reviews = substantiveReviewRoundsUsed(session);
   if (reviews > 0 || reviews >= assurance.reviewRounds) return false;
-  return (session.services.profile?.profile.mutationPolicy.reviewMode ?? "advisory")
-    !== "off";
+  return true;
 }
 
 export interface MainBudgetWindow {
@@ -159,6 +164,19 @@ export interface MainBudgetWindow {
 export function mainBudgetWindow(session: RuntimeSession): MainBudgetWindow {
   const raw = rawAvailableBudget(session);
   const limits = session.durable.state.budget.limits;
+  if (!bindingAssuranceRequired(session)) {
+    return {
+      available: raw,
+      capacity: {
+        inputTokens: limits.inputTokens,
+        outputTokens: limits.outputTokens,
+        costMicroUsd: limits.costMicroUsd,
+        modelTurns: limits.modelTurns,
+        toolCalls: limits.toolCalls,
+        children: limits.children
+      }
+    };
+  }
   const assurance = session.durable.state.longHorizon.assurance;
   const auxiliary = availableAuxiliaryBudget(session);
   const protectRepair = futureRepairReserveRequired(session);
@@ -233,15 +251,18 @@ function proportionalShare(
 }
 
 /**
- * Ordinary orchestration cannot consume the capacity reserved for auxiliary
- * assurance calls or a future repair once a mutation frontier exists.
+ * Required-review profiles keep binding reviewer and repair capacity isolated
+ * once a mutation frontier exists. Advisory/off profiles may still invoke
+ * capped auxiliary work, but optional assurance cannot reduce the advertised
+ * main-loop hard limits or turn a normal solve into an early resource failure.
  * During an actual review repair, the protected values become guaranteed
  * reserve floors, not an episode ceiling: the repair may continue through the
  * ordinary main-loop budget while the remaining reviewer pool stays isolated.
  */
 export function availableOrchestratorBudget(session: RuntimeSession): BudgetAmounts {
   const raw = rawAvailableBudget(session);
-  if (!mutationFrontierHasChanges(session.durable.state.mutationFrontier)) return raw;
+  if (!mutationFrontierHasChanges(session.durable.state.mutationFrontier)
+    || !bindingAssuranceRequired(session)) return raw;
   const auxiliary = availableAuxiliaryBudget(session);
   const assurance = session.durable.state.longHorizon.assurance;
   const repair = reviewRepairActive(session);

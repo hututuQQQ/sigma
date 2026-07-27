@@ -205,7 +205,7 @@ export async function finishRuntimeSession(
         }
       : {
           ...outcome,
-          decisionAuthority: decision.authority,
+          decisionAuthority: outcome.decisionAuthority ?? decision.authority,
           ...(decision.statusNote
             ? { message: `${outcome.message}\n\n${decision.statusNote}` }
             : {})

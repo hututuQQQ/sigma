@@ -206,6 +206,52 @@ describe("incremental runtime prompt state", () => {
       message.content.includes("smallest complete user-facing answer"))).toBe(true);
   });
 
+  it("uses the last tool-capable turn for closure and makes the final model turn text-only", async () => {
+    const session = runtimeSessionFixture();
+    const descriptor: ToolDescriptor = {
+      name: "read",
+      description: "read",
+      inputSchema: { type: "object", properties: {} },
+      possibleEffects: ["filesystem.read"],
+      executionMode: "sequential",
+      resourceKeys: [],
+      approval: "auto",
+      idempotent: true,
+      timeoutMs: 1_000
+    };
+    const prepare = async (modelTurns: number) => await prepareBudgetedModelTurn({
+      session,
+      turnId: 2,
+      descriptors: [descriptor],
+      capabilities: { skillsAvailable: false, executableSkillResourcesLoaded: false },
+      dynamic: [item("repo", "repository", "same repository")],
+      hookContext: [],
+      ledger: evidenceLedger(session),
+      available: { ...available, modelTurns },
+      defaultOutputReserveTokens: 8_192
+    });
+
+    const toolClosure = await prepare(2);
+    expect(toolClosure.turn.tools).toEqual([
+      expect.objectContaining({ name: "read" })
+    ]);
+    expect(toolClosure.turn.toolChoice).toBeUndefined();
+    expect(toolClosure.turn.messages.some((message) =>
+      message.content.includes("final tool-capable model turn"))).toBe(true);
+
+    const final = await prepare(1);
+    expect(final.turn).toMatchObject({
+      toolChoice: "none",
+      tools: []
+    });
+    expect(final.turn.messages.some((message) =>
+      message.content.includes("final model turn allowed"))).toBe(true);
+    expect(final.turn.messages.some((message) =>
+      message.content.includes("Do not claim unfinished work is complete"))).toBe(true);
+    expect(final.turn.messages.some((message) =>
+      message.content.includes("do not emit or simulate tool calls"))).toBe(true);
+  });
+
   it("uses remaining repair tools before one bounded no-tool synthesis turn", async () => {
     const session = runtimeSessionFixture();
     session.durable.state.mutationFrontier = {

@@ -1,4 +1,9 @@
 import { describe, expect, it } from "vitest";
+import {
+  DEFAULT_PROFILE_ASSURANCE,
+  DEFAULT_PROFILE_BUDGET,
+  freezeAgentProfile
+} from "../packages/agent-extensions/src/index.js";
 import type { ReviewEvidence, UsageRecord } from "../packages/agent-protocol/src/index.js";
 import {
   availableAuxiliaryBudget,
@@ -13,8 +18,28 @@ import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
 
 const NOW = "2026-07-24T00:00:00.000Z";
 
-function mutatedSession() {
-  const session = runtimeSessionFixture();
+function mutatedSession(reviewMode: "off" | "advisory" | "required" = "required") {
+  const session = runtimeSessionFixture({
+    services: {
+      profile: freezeAgentProfile({
+        id: `fixture-${reviewMode}`,
+        roleRoutes: {},
+        toolAllow: null,
+        toolDeny: [],
+        skills: [],
+        hooks: [],
+        permissionMode: "auto",
+        budget: { ...DEFAULT_PROFILE_BUDGET },
+        mutationPolicy: {
+          requirePlanBeforeMutation: false,
+          checkpointBeforeMutation: true,
+          reviewMode
+        },
+        assurancePolicy: { ...DEFAULT_PROFILE_ASSURANCE },
+        allowedChildProfiles: []
+      })
+    }
+  });
   session.durable.state.budget.limits = {
     inputTokens: 100_000,
     outputTokens: 30_000,
@@ -127,7 +152,7 @@ function consumeModelTurns(
 }
 
 describe("assurance resource reserve", () => {
-  it("caps auxiliary usage at 20% and protects review plus repair turns from ordinary work", () => {
+  it("caps auxiliary usage at 20% and protects required review plus repair turns from ordinary work", () => {
     const session = mutatedSession();
 
     expect(availableAuxiliaryBudget(session)).toEqual({
@@ -149,6 +174,31 @@ describe("assurance resource reserve", () => {
     expect(rawAvailableBudget(session).modelTurns).toBe(10);
     expect(availableOrchestratorBudget(session).modelTurns).toBe(0);
   });
+
+  it.each(["advisory", "off"] as const)(
+    "does not strand the advertised main-loop budget for %s assurance",
+    (reviewMode) => {
+      const session = mutatedSession(reviewMode);
+
+      expect(availableAuxiliaryBudget(session).modelTurns).toBe(9);
+      expect(availableOrchestratorBudget(session)).toEqual(rawAvailableBudget(session));
+      expect(mainBudgetWindow(session)).toEqual({
+        available: rawAvailableBudget(session),
+        capacity: {
+          inputTokens: 100_000,
+          outputTokens: 30_000,
+          costMicroUsd: 10_000,
+          modelTurns: 20,
+          toolCalls: 10,
+          children: 1
+        }
+      });
+
+      consumeModelTurns(session, 19);
+      expect(rawAvailableBudget(session).modelTurns).toBe(1);
+      expect(availableOrchestratorBudget(session).modelTurns).toBe(1);
+    }
+  );
 
   it("derives auxiliary enforcement from durable usage without a refresh window", () => {
     const session = mutatedSession();

@@ -36,6 +36,7 @@ ENV_KEYS = [
 CHECKPOINT_RECOVERY_POLICIES = {"restore", "keep", "ask"}
 MAX_EXTERNAL_RECOVERIES = 8
 RECOVERY_POLL_INTERVAL_SEC = 0.25
+MIN_CHECKPOINT_RECOVERY_TIMEOUT_SEC = 600
 TERMINAL_EVENT_TYPES = {"run.completed", "run.cancelled", "run.failed"}
 FAILURE_KINDS = {
     "needs_input", "timeout", "tool_error", "api_error", "agent_failure", "verifier_failure",
@@ -868,6 +869,10 @@ class SigmaCliHarborAgent(BaseAgent):
         summary_path: pathlib.Path | None = None
         trace_path: pathlib.Path | None = None
         protocol_failure: dict[str, Any] | None = None
+        checkpoint_recovery_error: str | None = None
+        recovery_deadline = (
+            time.monotonic() + self.max_wall_time_sec + self.agent_timeout_grace_sec
+        )
         try:
             await environment.exec("mkdir -p /tmp/agent", timeout_sec=30)
             await self._upload_instruction(environment, instruction)
@@ -876,7 +881,7 @@ class SigmaCliHarborAgent(BaseAgent):
             session_id = self._session_id(events, output_result)
             if session_id:
                 recovery = await self._recover_external_checkpoint(
-                    environment, session_id, events, env_vars
+                    environment, session_id, events, env_vars, recovery_deadline
                 )
                 events = recovery[0]
                 if recovery[1] is not None:
@@ -885,8 +890,7 @@ class SigmaCliHarborAgent(BaseAgent):
                     error_message = None
                     failure_kind = None
                 if recovery[2]:
-                    error_message = recovery[2]
-                    failure_kind = "checkpoint_recovery_required"
+                    checkpoint_recovery_error = recovery[2]
             reported_failure = output_result.get("failureKind") or output_result.get("failure_kind")
             if reported_failure not in DECLARED_FAILURE_KINDS:
                 reported_failure = None
@@ -898,7 +902,10 @@ class SigmaCliHarborAgent(BaseAgent):
             protocol_failure = self._incomplete_terminal_protocol(result, events, output_result)
             # needs_input is a terminal protocol state, even when the CLI uses
             # a non-zero status to make Harbor stop waiting for user input.
-            if protocol_failure is not None:
+            if checkpoint_recovery_error is not None:
+                error_message = checkpoint_recovery_error
+                failure_kind = "checkpoint_recovery_required"
+            elif protocol_failure is not None:
                 error_message = self._protocol_failure_message(protocol_failure)
                 failure_kind = "agent_failure"
             elif output_result.get("status") == "needs_input":
@@ -1626,6 +1633,7 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
         session_id: str,
         events: list[dict[str, Any]],
         env_vars: dict[str, str],
+        deadline: float,
     ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str | None]:
         if self._pending_checkpoint(events) is None:
             return events, None, None
@@ -1634,8 +1642,9 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             return events, None, f"checkpoint recovery required for {checkpoint_id}"
 
         merged = list(events)
-        deadline = time.monotonic() + self.max_wall_time_sec + self.agent_timeout_grace_sec
         for _ in range(MAX_EXTERNAL_RECOVERIES):
+            if time.monotonic() >= deadline:
+                return merged, None, "external checkpoint recovery timed out before recovery could start"
             pending = self._pending_checkpoint(merged)
             if pending is not None:
                 checkpoint_id, _payload = pending
@@ -1643,22 +1652,34 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
                     checkpoint_id,
                     f"--{self.checkpoint_recovery}",
                 ]
-                recovery = await self._exec_with_private_env(
-                    environment,
-                    " ".join(shlex.quote(part) for part in command),
-                    env_vars,
-                    timeout_sec=30,
+                remaining = max(1, int(deadline - time.monotonic()) + 1)
+                recovery_timeout = min(
+                    remaining,
+                    max(MIN_CHECKPOINT_RECOVERY_TIMEOUT_SEC, self.command_timeout_sec),
                 )
+                try:
+                    recovery = await self._exec_with_private_env(
+                        environment,
+                        " ".join(shlex.quote(part) for part in command),
+                        env_vars,
+                        timeout_sec=recovery_timeout,
+                    )
+                except Exception as exc:
+                    return merged, None, f"external checkpoint recovery failed: {exc}"
                 if _return_code(recovery) != 0:
                     detail = _output_text(recovery).strip() or "session recover failed"
                     return merged, None, f"external checkpoint recovery failed: {detail}"
                 resume_command = self._session_command("resume", session_id)
-                resumed = await self._exec_with_private_env(
-                    environment,
-                    " ".join(shlex.quote(part) for part in resume_command),
-                    env_vars,
-                    timeout_sec=30,
-                )
+                remaining = max(1, int(deadline - time.monotonic()) + 1)
+                try:
+                    resumed = await self._exec_with_private_env(
+                        environment,
+                        " ".join(shlex.quote(part) for part in resume_command),
+                        env_vars,
+                        timeout_sec=remaining,
+                    )
+                except Exception as exc:
+                    return merged, None, f"external checkpoint resume failed: {exc}"
                 if _return_code(resumed) != 0:
                     detail = _output_text(resumed).strip() or "session resume failed"
                     return merged, None, f"external checkpoint resume failed: {detail}"

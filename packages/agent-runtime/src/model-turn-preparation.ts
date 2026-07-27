@@ -1,4 +1,9 @@
-import type { ContextItem, ModelMessage, RunOutcome } from "agent-protocol";
+import type {
+  BudgetAmounts,
+  ContextItem,
+  ModelMessage,
+  RunOutcome
+} from "agent-protocol";
 import {
   historyAfterArchive,
   projectReasoningSafeHistory,
@@ -17,6 +22,8 @@ import {
   budgetFailure,
   fitPreparedBudget,
   prepareBudgetedModelTurn,
+  projectedModelTurnBoundary,
+  type ModelTurnBoundaryStage,
   type PreparedModelTurn,
   type TurnPreparationInput
 } from "./model-budget-convergence.js";
@@ -38,6 +45,8 @@ interface ProjectedModelHistory {
   history: ModelMessage[];
   archiveProjection: ReturnType<typeof historyAfterArchive>;
 }
+
+type BudgetedModelTurn = Awaited<ReturnType<typeof prepareBudgetedModelTurn>>;
 
 async function projectedToolHistory(
   options: EffectRunnerOptions,
@@ -110,6 +119,37 @@ async function projectedModelHistory(
   return { history, archiveProjection };
 }
 
+async function applyProjectedResourceBoundary(
+  options: EffectRunnerOptions,
+  session: RuntimeSession,
+  preparation: TurnPreparationInput,
+  available: BudgetAmounts,
+  initial: BudgetedModelTurn
+): Promise<BudgetedModelTurn> {
+  const prepareBoundaryTurn = async (
+    stage: ModelTurnBoundaryStage
+  ): Promise<BudgetedModelTurn> => {
+    const projection = await projectedModelHistory(options, session);
+    return await prepareBudgetedModelTurn({
+      ...preparation,
+      available,
+      history: projection.history,
+      archive: projection.archiveProjection.archive?.item,
+      modelTurnBoundaryStage: stage
+    });
+  };
+  let prepared = initial;
+  let stage = projectedModelTurnBoundary(available, prepared.turn.budget);
+  if (!stage) return prepared;
+  prepared = await prepareBoundaryTurn(stage);
+  if (stage === "tool_closure"
+    && projectedModelTurnBoundary(available, prepared.turn.budget) === "final") {
+    stage = "final";
+    prepared = await prepareBoundaryTurn(stage);
+  }
+  return prepared;
+}
+
 export async function prepareModelAttempt(
   options: EffectRunnerOptions,
   repositoryContext: RepositoryContextProvider,
@@ -162,6 +202,9 @@ export async function prepareModelAttempt(
     summarizer,
     emit: options.emit
   }));
+  prepared = await applyProjectedResourceBoundary(
+    options, session, preparation, available, prepared
+  );
   const fittedBudget = fitPreparedBudget(
     prepared.turn.budget,
     available,

@@ -1,10 +1,10 @@
-import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import spawn from "cross-spawn";
 import {
   assertUniqueHarborTaskExecutionIdentities,
   buildResolvedTaskAttestation,
@@ -1035,7 +1035,7 @@ export async function runProcess(command, args, options = {}) {
       child = spawn(command, args, {
         cwd,
         env,
-        shell: process.platform === "win32" && /\.(cmd|bat)$/i.test(command),
+        shell: false,
         windowsHide: true
       });
     } catch (error) {

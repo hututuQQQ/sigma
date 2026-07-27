@@ -13,6 +13,7 @@ import {
 } from "./mutation-evidence.js";
 import type { RuntimeSession } from "./types.js";
 import { substantiveReview } from "./review-coordinator-support.js";
+import { rawAvailableBudget } from "./assurance-budget.js";
 
 export { completionCandidate } from "./completion-gate-common.js";
 export { completionFailure } from "./completion-terminal-gate.js";
@@ -165,7 +166,11 @@ function completionStatusNote(
   } else if (validationKind === "unverified") {
     validationNote = "Validation status: not run for the current mutation frontier.";
   }
-  const note = [planNote, validationNote].filter(Boolean).join(" ");
+  const review = currentFrontierReview(session);
+  const reviewNote = review && substantiveReview(review) && review.data.verdict !== "approved"
+    ? `Independent advisory review status: ${review.data.verdict}; unresolved findings remain.`
+    : undefined;
+  const note = [planNote, validationNote, reviewNote].filter(Boolean).join(" ");
   return note || undefined;
 }
 
@@ -188,7 +193,11 @@ function standardUncheckedDecision(session: RuntimeSession): CompletionGateDecis
   const needsRepair = incompleteNodes.length > 0
     || !["not_needed", "passed"].includes(validationKind);
   const basisDigest = standardBasisDigest(session, incompleteNodes, validationKind, validation);
-  if (needsRepair && !hasAdvisory(session, basisDigest)) {
+  const available = rawAvailableBudget(session);
+  const repairTurnAvailable = available.inputTokens > 0
+    && available.outputTokens > 0
+    && available.modelTurns > 0;
+  if (needsRepair && repairTurnAvailable && !hasAdvisory(session, basisDigest)) {
     const issues = repairIssues(incompleteNodes, validationKind, validation);
     return advisory(
       basisDigest,
@@ -197,7 +206,16 @@ function standardUncheckedDecision(session: RuntimeSession): CompletionGateDecis
         + "All permitted tools remain available; stopping again without a state change is allowed and will be reported explicitly."
     );
   }
-  const statusNote = completionStatusNote(session, incompleteNodes, validationKind, validation);
+  const ordinaryStatus = completionStatusNote(
+    session,
+    incompleteNodes,
+    validationKind,
+    validation
+  );
+  const boundaryStatus = needsRepair && !repairTurnAvailable
+    ? "Model-turn budget exhausted; unresolved Standard advisory items are reported without an impossible repair turn."
+    : undefined;
+  const statusNote = [ordinaryStatus, boundaryStatus].filter(Boolean).join(" ") || undefined;
   return {
     action: "complete",
     authority: "user_policy",
@@ -227,7 +245,7 @@ function reviewRepairDetails(
 function reviewRepairDecision(
   session: RuntimeSession,
   review: NonNullable<ReturnType<typeof currentFrontierReview>>
-): Extract<CompletionGateDecision, { action: "continue" | "fail" }> {
+): Extract<CompletionGateDecision, { action: "continue" | "fail" }> | undefined {
   const frontier = session.durable.state.mutationFrontier;
   const reviewAttempts = session.durable.state.evidence.filter((item) =>
     item.kind === "review" && item.runId === session.durable.runId
@@ -252,6 +270,25 @@ function reviewRepairDecision(
       "verification_verdict"
     );
   }
+  if (reviewMode(session) !== "required") {
+    const unresolvedBasisDigest = digest({
+      kind: "advisory_review_unresolved",
+      frontierRevision: frontier.revision,
+      stateDigest: frontier.currentStateDigest,
+      planRevision: session.durable.state.plan.revision,
+      reviewEvidenceId: review.evidenceId,
+      reviewVerdict: review.data.verdict
+    });
+    if (hasAdvisory(session, unresolvedBasisDigest)) return undefined;
+    return advisory(
+      unresolvedBasisDigest,
+      `Independent advisory review remains unresolved (${review.data.verdict}). `
+        + `${details || review.summary} Standard mode does not convert an advisory review into a runtime failure. `
+        + "Address the findings if useful, or stop naturally and report the unresolved review status. "
+        + "Request another review only after adding materially new evidence.",
+      "verification_verdict"
+    );
+  }
   return {
     action: "fail",
     authority: "verification_verdict",
@@ -263,9 +300,9 @@ function reviewRepairDecision(
 }
 
 /**
- * Explicit review is a protocol barrier. Once it yields the same unresolved
- * verdict after the one repair opportunity, or consumes the final substantive
- * review round, the runtime must not silently reopen ordinary solving.
+ * Explicit review is binding only for profiles whose review mode is required.
+ * Advisory profiles preserve the findings and one repair opportunity, then
+ * return control to ordinary solving so a natural stop can report them.
  */
 export function explicitReviewGateDecision(
   session: RuntimeSession

@@ -204,6 +204,22 @@ export class CheckpointCasStore {
     }
   }
 
+  async assertIdentity(
+    digest: string,
+    expectedIdentity: CheckpointCasIdentity,
+    expectedSize: number
+  ): Promise<void> {
+    let inspected: { identity: CheckpointCasIdentity; size: number };
+    try {
+      inspected = await this.inspect(digest);
+    } catch (error) {
+      throw new CheckpointConflictError(`Checkpoint CAS object is unavailable: ${digest}`, { cause: error });
+    }
+    if (inspected.size !== expectedSize || !sameIdentity(inspected.identity, expectedIdentity)) {
+      throw new CheckpointConflictError(`Checkpoint CAS identity no longer matches its manifest: ${digest}`);
+    }
+  }
+
   private async verify(
     digest: string,
     expectedSize?: number,

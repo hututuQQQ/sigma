@@ -33,9 +33,10 @@ function lastAssistantText(session: RuntimeSession): string | undefined {
 }
 
 /**
- * The ordinary solver and the assurance pool are separate resource domains.
- * Exhausting the former after a mutation transfers control to independent
- * verification; only an actual outer deadline bypasses that transfer.
+ * A normal hard-ledger boundary is an intentional stop, not a runtime crash.
+ * Settle owned work, preserve hard lifecycle invariants, run binding assurance
+ * when configured, and submit the current state for external evaluation.
+ * Only an actual outer deadline bypasses this boundary handoff.
  */
 export async function finishSolvingBudgetBoundary(
   session: RuntimeSession,
@@ -44,11 +45,7 @@ export async function finishSolvingBudgetBoundary(
   options: SolvingBudgetBoundaryOptions
 ): Promise<boolean> {
   if (!isOrdinaryBudgetExhaustion(outcome)
-    || deadlineForecast(session).stage !== "normal"
-    || !mutationFrontierHasChanges(session.durable.state.mutationFrontier)) {
-    return await options.finish(session, outcome);
-  }
-  if (!automaticCompletionReviewRequired(session)) {
+    || deadlineForecast(session).stage !== "normal") {
     return await options.finish(session, outcome);
   }
   await settleBudgetBoundaryProcesses(session, signal, {
@@ -59,12 +56,23 @@ export async function finishSolvingBudgetBoundary(
   if (completionReviewBlocker(session)) {
     return await options.finish(session, outcome);
   }
-  await options.reviews.maybeReview(session, signal, true, "completion");
-  await options.longHorizon.accountReview(session);
-  const message = lastAssistantText(session)
-    ?? "The ordinary solving budget ended after workspace changes; the current result was submitted to independent verification.";
+  const existingMessage = lastAssistantText(session);
+  if (!existingMessage
+    && !mutationFrontierHasChanges(session.durable.state.mutationFrontier)) {
+    return await options.finish(session, outcome);
+  }
+  const bindingReview = automaticCompletionReviewRequired(session)
+    && mutationFrontierHasChanges(session.durable.state.mutationFrontier);
+  if (bindingReview) {
+    await options.reviews.maybeReview(session, signal, true, "completion");
+    await options.longHorizon.accountReview(session);
+  }
+  const message = existingMessage
+    ?? "The ordinary solving budget ended; the current workspace state was submitted for external evaluation.";
   await options.emit(session, "diagnostic", "runtime", {
-    kind: "assurance.review_transfer",
+    kind: bindingReview
+      ? "assurance.review_transfer"
+      : "resource_boundary.submission",
     sourceOutcomeCode: "budget_exhausted",
     message,
     decisionAuthority: "resource_boundary"
@@ -72,6 +80,7 @@ export async function finishSolvingBudgetBoundary(
   return await options.finish(session, {
     kind: "completed",
     message,
-    evidence: [...session.durable.state.evidence]
+    evidence: [...session.durable.state.evidence],
+    decisionAuthority: "resource_boundary"
   }, session.durable.state.revision);
 }

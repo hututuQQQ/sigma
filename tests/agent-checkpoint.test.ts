@@ -23,6 +23,7 @@ import {
 import {
   acquireCheckpointMutationLease
 } from "../packages/agent-checkpoint/src/restore-transaction.js";
+import { validateRestoreCas } from "../packages/agent-checkpoint/src/restore-cas.js";
 import { recoverCheckpointTransactions } from "../packages/agent-checkpoint/src/restore-recovery.js";
 import {
   cleanupWorkspaceTransactionRoot,
@@ -196,6 +197,80 @@ describe("CheckpointManager", () => {
     await expect(readFile(path.join(workspace, "existing.txt"), "utf8")).resolves.toBe("after existing");
     await expect(readFile(path.join(workspace, "deleted.txt"), "utf8")).resolves.toBe("after deleted");
     await expect(lstat(path.join(workspace, ".agent"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("uses captured CAS identity for pre-restore validation without rereading file content", async () => {
+    const entry = {
+      path: "stable.bin",
+      kind: "file" as const,
+      mode: 0o100600,
+      size: 4,
+      digest: "a".repeat(64),
+      casIdentity: {
+        dev: "1", ino: "2", mode: "33152", size: "4", mtimeNs: "3", ctimeNs: "4"
+      }
+    };
+    let reads = 0;
+    let inspections = 0;
+    await validateRestoreCas(
+      { entries: [entry], fileCount: 1, totalBytes: 4 },
+      () => {
+        reads += 1;
+        return (async function* () { yield Buffer.from("data"); })();
+      },
+      async (candidate) => {
+        inspections += 1;
+        expect(candidate).toBe(entry);
+      }
+    );
+    expect(inspections).toBe(1);
+    expect(reads).toBe(0);
+  });
+
+  it("reuses identity-stable files across captures without copying their content again", async () => {
+    const root = await checkpointTemporaryRoot("sigma-checkpoint-capture-cache-");
+    const workspace = path.join(root, "workspace");
+    await mkdir(workspace, { recursive: true });
+    const target = path.join(workspace, "stable.bin");
+    await writeFile(target, "stable-content", "utf8");
+    const cache = { files: new Map() };
+    let puts = 0;
+    let reuses = 0;
+    const putCas = async (content: AsyncIterable<Uint8Array>) => {
+      puts += 1;
+      const chunks: Buffer[] = [];
+      for await (const chunk of content) chunks.push(Buffer.from(chunk));
+      const value = Buffer.concat(chunks);
+      return {
+        digest: createHash("sha256").update(value).digest("hex"),
+        size: value.byteLength,
+        identity: {
+          dev: "1", ino: "2", mode: "33152", size: value.byteLength.toString(),
+          mtimeNs: "3", ctimeNs: "4"
+        }
+      };
+    };
+    const options = {
+      workspacePath: workspace,
+      scopePaths: ["."],
+      maxFiles: 100,
+      maxBytes: 1024,
+      excludedNames: new Set<string>(),
+      cache,
+      assertReusableCas: async () => { reuses += 1; },
+      putCas
+    };
+
+    const first = await captureCheckpointManifest(options);
+    const second = await captureCheckpointManifest(options);
+    expect(second).toEqual(first);
+    expect(puts).toBe(1);
+    expect(reuses).toBe(1);
+
+    await writeFile(target, "changed-content", "utf8");
+    await captureCheckpointManifest(options);
+    expect(puts).toBe(2);
+    expect(reuses).toBe(1);
   });
 
   it("reports changed open checkpoints and enforces preimage limits", async () => {
