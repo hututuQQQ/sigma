@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { artifactSecretValues, evalRootDir, loadEvalSecrets, subjectEnvironment } from "../scripts/eval/common.mjs";
 import {
   evaluatorDigestFromSnapshot, measureEvaluationToolchain, packageManagerInvocation,
-  resolveEvaluatorHost, runEvaluation, verifierSourceDigest
+  resolveEvaluatorHost, runEvaluation, verifierSourceDigest, verifierWitnessPaths
 } from "../scripts/eval/runner.mjs";
 import { breachedBudget, terminalBudgetCancellation } from "../scripts/eval/subject-cli.mjs";
 
@@ -102,6 +102,19 @@ async function manifest(options: {
 }
 
 describe("agent experience evaluation runner", () => {
+  it("stages verifier evidence in a host path appropriate to each scratch implementation", () => {
+    expect(verifierWitnessPaths("/tmp/controller", { home: "/home/runner" }, "linux")).toEqual({
+      verifierWorkspace: path.posix.join("/tmp/controller", "verifier-workspace"),
+      verifierManifestDir: path.posix.join("/tmp/controller", "verifier-manifest"),
+      verifierHome: "/home/runner"
+    });
+    expect(verifierWitnessPaths("C:\\controller", { home: "C:\\scratch\\home" }, "win32")).toEqual({
+      verifierWorkspace: path.win32.join("C:\\scratch\\home", "verifier-workspace"),
+      verifierManifestDir: path.win32.join("C:\\scratch\\home", "verifier-manifest"),
+      verifierHome: "C:\\scratch\\home"
+    });
+  });
+
   it("measures the pinned Node, pnpm, Rust, provider, and model environment", async () => {
     const measurement = await measureEvaluationToolchain();
     expect(measurement).toMatchObject({

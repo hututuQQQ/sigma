@@ -52,6 +52,10 @@ export function verifierNodeToolchain(nodePath, api, platform = process.platform
 
 async function execute(broker, executable, args, options) {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  // A scratch lease's home is a broker-projected sandbox destination on
+  // Linux, not a host filesystem root. The capability mounts and authorizes
+  // it separately; only non-lease verifier homes belong in ordinary roots.
+  const homeRoots = options.scratchLease ? [] : [options.home];
   const result = await broker.execute({
     command: {
       executable,
@@ -71,8 +75,8 @@ async function execute(broker, executable, args, options) {
     policy: {
       sandbox: "required",
       network: "none",
-      readRoots: [...new Set([options.workspace, options.manifestDir, path.dirname(executable), options.home])],
-      writeRoots: [options.workspace, options.home],
+      readRoots: [...new Set([options.workspace, options.manifestDir, path.dirname(executable), ...homeRoots])],
+      writeRoots: [...new Set([options.workspace, ...homeRoots])],
       ...(options.scratchLease ? { scratchLease: options.scratchLease } : {})
     },
     timeoutMs,
