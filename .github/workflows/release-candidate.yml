@@ -22,6 +22,7 @@ jobs:
     outputs:
       version: ${{ steps.release.outputs.version }}
       prerelease: ${{ steps.release.outputs.prerelease }}
+      live_eval_override: ${{ steps.release.outputs.live_eval_override }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -29,6 +30,9 @@ jobs:
       - name: Require main or an exact version tag
         id: release
         shell: bash
+        env:
+          RELEASE_LIVE_EVAL_OVERRIDE_TAG: ${{ vars.RELEASE_LIVE_EVAL_OVERRIDE_TAG }}
+          RELEASE_LIVE_EVAL_OVERRIDE_REASON: ${{ vars.RELEASE_LIVE_EVAL_OVERRIDE_REASON }}
         run: |
           node --input-type=module <<'NODE'
           import { appendFileSync, readFileSync } from "node:fs";
@@ -43,7 +47,20 @@ jobs:
           if (process.env.GITHUB_EVENT_NAME === "workflow_dispatch" && process.env.GITHUB_REF !== "refs/heads/main") {
             throw new Error("Manual release verification must run from main.");
           }
-          appendFileSync(process.env.GITHUB_OUTPUT, `version=${version}\nprerelease=${version.includes("-")}\n`);
+          const overrideTag = (process.env.RELEASE_LIVE_EVAL_OVERRIDE_TAG ?? "").trim();
+          const overrideReason = (process.env.RELEASE_LIVE_EVAL_OVERRIDE_REASON ?? "").trim();
+          if (overrideTag && overrideTag !== expectedTag) {
+            throw new Error(`Live-evaluation override tag ${overrideTag} must equal ${expectedTag}.`);
+          }
+          if (overrideTag && !overrideReason) {
+            throw new Error("RELEASE_LIVE_EVAL_OVERRIDE_REASON is required when an override tag is configured.");
+          }
+          const liveEvalOverride = process.env.GITHUB_EVENT_NAME === "push"
+            && process.env.GITHUB_REF_NAME === overrideTag;
+          appendFileSync(
+            process.env.GITHUB_OUTPUT,
+            `version=${version}\nprerelease=${version.includes("-")}\nlive_eval_override=${liveEvalOverride}\n`
+          );
           NODE
           if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
             git fetch origin main --no-tags
@@ -54,7 +71,7 @@ jobs:
           fi
 
   verify:
-    name: ${{ matrix.label }} ${{ matrix.channel }} and quick five
+    name: ${{ matrix.label }} ${{ matrix.channel }} verification
     needs: metadata
     strategy:
       fail-fast: false
@@ -187,7 +204,36 @@ jobs:
             Remove-Item -LiteralPath $env:AGENT_RELEASE_TRUSTED_PUBLIC_KEY_FILES -Force -ErrorAction SilentlyContinue
           }
       - name: Require all five live scenarios and zero safety failures
+        if: needs.metadata.outputs.live_eval_override != 'true'
         run: pnpm eval:agent -- --suite quick --repeat 1 --skip-package --eval-root .artifacts/eval-rc
+      - name: Record authorized live-evaluation override
+        if: needs.metadata.outputs.live_eval_override == 'true' && runner.os == 'Linux'
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+          RELEASE_LIVE_EVAL_OVERRIDE_REASON: ${{ vars.RELEASE_LIVE_EVAL_OVERRIDE_REASON }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { mkdirSync, writeFileSync } from "node:fs";
+
+          const reason = (process.env.RELEASE_LIVE_EVAL_OVERRIDE_REASON ?? "").trim();
+          if (!reason) throw new Error("Live-evaluation override reason is missing.");
+          mkdirSync(".artifacts", { recursive: true });
+          const record = {
+            schemaVersion: 1,
+            kind: "sigma.release-live-evaluation-override",
+            tag: process.env.GITHUB_REF_NAME,
+            version: process.env.RELEASE_VERSION,
+            commit: process.env.GITHUB_SHA,
+            reason,
+            authorizedBy: process.env.GITHUB_ACTOR,
+            recordedAt: new Date().toISOString()
+          };
+          writeFileSync(
+            ".artifacts/release-live-evaluation-override.json",
+            `${JSON.stringify(record, null, 2)}\n`
+          );
+          NODE
       - name: Upload verified release assets
         uses: actions/upload-artifact@v4
         with:
@@ -205,6 +251,13 @@ jobs:
           name: release-public-key-${{ github.run_id }}
           if-no-files-found: error
           path: .artifacts/release-provenance-public.pem
+      - name: Upload live-evaluation override record
+        if: needs.metadata.outputs.live_eval_override == 'true' && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-live-eval-override-${{ github.run_id }}
+          if-no-files-found: error
+          path: .artifacts/release-live-evaluation-override.json
       - name: Upload candidate evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -230,6 +283,8 @@ jobs:
           merge-multiple: true
       - name: Require the complete release asset set
         shell: bash
+        env:
+          RELEASE_LIVE_EVAL_OVERRIDE: ${{ needs.metadata.outputs.live_eval_override }}
         run: |
           node --input-type=module <<'NODE'
           import { readdirSync } from "node:fs";
@@ -245,6 +300,9 @@ jobs:
             "agent-cli-win32-x64.provenance.json",
             "release-provenance-public.pem"
           ];
+          if (process.env.RELEASE_LIVE_EVAL_OVERRIDE === "true") {
+            expected.push("release-live-evaluation-override.json");
+          }
           const actual = new Set(readdirSync("release-assets"));
           const missing = expected.filter((name) => !actual.has(name));
           if (missing.length > 0) throw new Error(`Missing release assets: ${missing.join(", ")}`);
@@ -255,6 +313,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
           RELEASE_PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
+          RELEASE_LIVE_EVAL_OVERRIDE: ${{ needs.metadata.outputs.live_eval_override }}
+          RELEASE_LIVE_EVAL_OVERRIDE_REASON: ${{ vars.RELEASE_LIVE_EVAL_OVERRIDE_REASON }}
         run: |
           options=(--verify-tag --generate-notes --title "Sigma Code ${GITHUB_REF_NAME}")
           if [[ "${RELEASE_PRERELEASE}" == "true" ]]; then
@@ -271,6 +331,15 @@ jobs:
           Verify the matching SHA-256 sidecar and signed provenance before extracting either archive. The Windows preview is not an official trusted Windows binary release.
           EOF
           )"
+          if [[ "${RELEASE_LIVE_EVAL_OVERRIDE}" == "true" ]]; then
+            release_notes="${release_notes}
+
+          ## Live evaluation exception
+
+          The quick-five live evaluation gate was explicitly skipped for this tag: ${RELEASE_LIVE_EVAL_OVERRIDE_REASON}
+
+          All deterministic platform, security, live-provider, package, checksum, SBOM, and signed-provenance gates still passed. See \`release-live-evaluation-override.json\` for the audit record."
+          fi
           assets=(
             "release-assets/agent-cli-linux-x64.tgz#Linux x64 — stable"
             "release-assets/agent-cli-linux-x64.tgz.sha256"
@@ -282,4 +351,7 @@ jobs:
             "release-assets/agent-cli-win32-x64.provenance.json"
             "release-assets/release-provenance-public.pem"
           )
+          if [[ "${RELEASE_LIVE_EVAL_OVERRIDE}" == "true" ]]; then
+            assets+=("release-assets/release-live-evaluation-override.json")
+          fi
           gh release create "${GITHUB_REF_NAME}" "${assets[@]}" --notes "${release_notes}" "${options[@]}"

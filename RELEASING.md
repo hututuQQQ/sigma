@@ -68,6 +68,34 @@ release; a suffixed version is published as a prerelease.
 Never replace assets on an existing release. If a published candidate is wrong,
 publish a new version so checksums and provenance remain immutable.
 
+## Explicit live-evaluation exception
+
+The default release policy requires all five live quick scenarios and zero
+safety failures. A project owner may explicitly exclude that stochastic
+quick-suite gate from one exact release tag while the evaluation policy is
+being revised. This exception does not bypass platform, sandbox, live-provider,
+package, checksum, SBOM, or signed-provenance verification, and it must not be
+used to feed verifier output back into the solving agent or retry a solving
+attempt.
+
+Bind the exception to the exact package tag and record a non-empty public
+reason before pushing the tag:
+
+```powershell
+$Tag = "v$((Get-Content package.json -Raw | ConvertFrom-Json).version)"
+gh variable set RELEASE_LIVE_EVAL_OVERRIDE_TAG --body $Tag
+gh variable set RELEASE_LIVE_EVAL_OVERRIDE_REASON --body "<approved reason>"
+```
+
+The tag workflow publishes `release-live-evaluation-override.json` and includes
+the reason in the Release notes. Delete both repository variables immediately
+after the Release is verified so every later tag returns to the default gate:
+
+```powershell
+gh variable delete RELEASE_LIVE_EVAL_OVERRIDE_TAG
+gh variable delete RELEASE_LIVE_EVAL_OVERRIDE_REASON
+```
+
 ## Reduced publication fallback
 
 When hosted Actions or required platform verification is unavailable, a
