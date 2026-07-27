@@ -14,8 +14,8 @@
 </p>
 
 <p align="center">
-  <img alt="Status: 0.1.0 development preview" src="https://img.shields.io/badge/status-0.1.0%20development%20preview-f59e0b">
-  <img alt="Release targets: Linux and Windows previews" src="https://img.shields.io/badge/release%20targets-Linux%20preview%20%2B%20Windows%20unsigned%20preview-0078d4">
+  <img alt="Status: 0.1.0 first stable release" src="https://img.shields.io/badge/status-0.1.0%20stable-2ea44f">
+  <img alt="Release targets: Linux stable and Windows unsigned preview" src="https://img.shields.io/badge/release%20targets-Linux%20stable%20%2B%20Windows%20unsigned%20preview-0078d4">
   <img alt="Formal evaluation: preregistered" src="https://img.shields.io/badge/formal%20evaluation-preregistered-4cc9c0">
 </p>
 
@@ -25,16 +25,16 @@
 
 Sigma Code turns a coding task into a durable stream of typed decisions and evidence. It can explore a repository, make scoped changes, run sandboxed commands, validate the result, ask an independent reviewer, and recover the same session after interruption. The product uses one event-sourced kernel, one session format, and one terminal UI instead of separate execution paths that drift apart.
 
-`0.1.0` is a development preview and the only supported product baseline. Linux
-x64 and Windows x64 artifacts are preview candidates; Windows remains explicitly
-unsigned until trusted Authenticode signing is available. See the [security
+`0.1.0` is the first formal release and the only supported product baseline.
+Linux x64 is the stable release target. Windows x64 remains an explicitly
+unsigned preview until trusted Authenticode signing is available. See the [security
 policy](SECURITY.md) and [contribution guide](CONTRIBUTING.md) before reporting
 or proposing changes.
 
 > [!IMPORTANT]
 > **Current product boundary**
 >
-> - **Sigma Code 0.1.0 is a development preview on both Tier 1 targets.** Linux x64 and Windows x64 candidates must pass native sandbox, packaged-product, checksum, SBOM, and signed-provenance gates. Windows executables do not yet have a trusted Authenticode signature and may trigger Windows security warnings.
+> - **Sigma Code 0.1.0 is stable on Linux x64; Windows x64 is an unsigned preview.** Both candidates must pass native sandbox, packaged-product, checksum, SBOM, and signed-provenance gates. Windows executables do not yet have a trusted Authenticode signature and may trigger Windows security warnings.
 > - **Formal evaluation is preregistered, not provider-coded.** The SHA-bound run manifest freezes the provider, model, source, archive, task selection, network, timeouts, concurrency, attempts, and retries before execution.
 > - Provider comparisons are valid only when their SHA-bound run manifests freeze comparable controls; the harness does not infer comparability from a model name.
 
@@ -48,9 +48,9 @@ or proposing changes.
 | Fail-closed containment | Process execution stays in the required native sandbox even when host reads or networking are authorized. If the sandbox is unhealthy, Sigma refuses to execute. |
 | One product path | CLI automation and the TUI use the same `RuntimeClient`, kernel, store, tools, recovery logic, and outcome protocol. |
 
-## Quick start on Linux (development preview)
+## Quick start on Linux
 
-Obtain a `0.1.0` Linux x64 preview archive from a verified project release or
+Obtain the `0.1.0` Linux x64 stable archive from a verified project release or
 build it from source, verify its SHA-256 sidecar and signed provenance, and
 extract it:
 
@@ -92,9 +92,9 @@ $env:DEEPSEEK_API_KEY = "your-api-key"
 
 The example sets the key only for the current PowerShell process. Keep secrets out of `.agent/config.toml` and source control.
 
-Published preview archives include a SHA-256 checksum, CycloneDX SBOM, signed
-provenance, and the public provenance verification key. Neither target is a
-stable release at `0.1.0`; Windows x64 additionally remains unsigned. See
+Published archives include a SHA-256 checksum, CycloneDX SBOM, signed
+provenance, and the public provenance verification key. Linux x64 is stable at
+`0.1.0`; Windows x64 remains an unsigned preview. See
 [SECURITY.md](SECURITY.md) for the trust boundary and
 [RELEASING.md](RELEASING.md) for the maintainer process.
 

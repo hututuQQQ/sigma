@@ -1470,12 +1470,23 @@ exit /b %ERRORLEVEL%
 `;
 }
 
-function createBundleReadme(targetPlatform, targetArch, nodeRuntime) {
+function releaseChannelFor(version, targetPlatform, windowsSignerPolicyVerified) {
+  if (targetPlatform === "win32" && windowsSignerPolicyVerified !== true) {
+    return "preview";
+  }
+  const prerelease = String(version).split("-", 2)[1];
+  return prerelease ? prerelease.split(".", 1)[0] : "stable";
+}
+
+function createBundleReadme(targetPlatform, targetArch, nodeRuntime, releaseChannel) {
   const isWindows = targetPlatform === "win32";
   const agent = isWindows ? String.raw`.\bin\agent.cmd` : "./bin/agent";
   const workspace = isWindows ? String.raw`D:\path\to\repo` : "/path/to/repo";
   const platformLabel = isWindows ? `Windows ${targetArch}` : `Linux ${targetArch}`;
-  const trustNotice = isWindows
+  const releaseDescription = releaseChannel === "stable"
+    ? "stable CLI"
+    : `${releaseChannel} prerelease CLI`;
+  const trustNotice = isWindows && releaseChannel === "preview"
     ? `
 > [!WARNING]
 > This Windows bundle is an unsigned preview. The GitHub Release publishes its SHA-256
@@ -1487,7 +1498,7 @@ function createBundleReadme(targetPlatform, targetArch, nodeRuntime) {
   return `# Sigma Code CLI Bundle
 
 This archive contains the Sigma Code ${sigmaManifest.productVersion}
-development-preview CLI for ${platformLabel}. It is not a stable release.
+${releaseDescription} for ${platformLabel}. ${releaseChannel === "stable" ? "This is a stable release." : "It is not a stable release."}
 ${trustNotice}
 
 ## Start
@@ -1767,7 +1778,7 @@ async function stagePortableRuntime(context) {
   return { nodeArchiveIntegrity, nodeRuntime, sigmaExec, linuxCompatibility, windowsSigningStage };
 }
 
-async function writeBundleEntrypoints(context, nodeRuntime) {
+async function writeBundleEntrypoints(context, nodeRuntime, signing) {
   const { rootDir, bundleDir, targetPlatform, targetArch, release } = context;
   await writeFile(
     path.join(bundleDir, "package.json"),
@@ -1796,14 +1807,30 @@ async function writeBundleEntrypoints(context, nodeRuntime) {
   }
   await writeFile(
     path.join(bundleDir, "README.md"),
-    createBundleReadme(targetPlatform, targetArch, nodeRuntime),
+    createBundleReadme(
+      targetPlatform,
+      targetArch,
+      nodeRuntime,
+      releaseChannelFor(release.version, targetPlatform, signing?.policyVerified)
+    ),
     "utf8"
   );
   await cp(path.join(rootDir, "LICENSE"), path.join(bundleDir, "LICENSE"));
 }
 
-async function writeBundleEvidence(context, runtime) {
-  const { rootDir, bundleDir, packages, targetPlatform, targetArch, options, env } = context;
+function inspectBundleSigning(context, runtime) {
+  const { targetPlatform, options, env } = context;
+  const { sigmaExec, nodeRuntime } = runtime;
+  const allowedSigners = options.allowedWindowsSignerCertificateSha256
+    ?? loadAllowedWindowsSignerCertificateSha256(env);
+  return inspectWindowsAuthenticode(
+    nodeRuntime.bundledNodePath, sigmaExec.destination, targetPlatform,
+    nodeRuntime.compatibility, allowedSigners
+  );
+}
+
+async function writeBundleEvidence(context, runtime, signing) {
+  const { rootDir, bundleDir, packages, targetPlatform, targetArch } = context;
   const { sigmaExec, nodeArchiveIntegrity, nodeRuntime, linuxCompatibility } = runtime;
   const tokenizerAssets = await copyTokenizerAssets(rootDir, bundleDir);
   const sbomPath = await writePortableSbom(
@@ -1812,12 +1839,6 @@ async function writeBundleEvidence(context, runtime) {
   );
   const integrity = await writeIntegrityManifest(
     bundleDir, targetPlatform, targetArch, nodeRuntime, linuxCompatibility
-  );
-  const allowedSigners = options.allowedWindowsSignerCertificateSha256
-    ?? loadAllowedWindowsSignerCertificateSha256(env);
-  const signing = inspectWindowsAuthenticode(
-    nodeRuntime.bundledNodePath, sigmaExec.destination, targetPlatform,
-    nodeRuntime.compatibility, allowedSigners
   );
   return { tokenizerAssets, sbomPath, integrity, signing };
 }
@@ -1889,13 +1910,11 @@ function packageMetadata(context, runtime, evidence) {
 
 async function writePackageMetadata(context, runtime, evidence) {
   const { release, targetPlatform, targetArch, bundleDir } = context;
-  const releaseChannel = targetPlatform === "win32" && evidence.signing?.policyVerified !== true
-    ? "preview"
-    : release.version.startsWith("0.")
-      ? "preview"
-      : release.version.includes("-")
-      ? release.version.split("-")[1].split(".")[0]
-      : "stable";
+  const releaseChannel = releaseChannelFor(
+    release.version,
+    targetPlatform,
+    evidence.signing?.policyVerified
+  );
   const metadata = {
     schemaVersion: 1,
     productVersion: release.version,
@@ -1929,8 +1948,9 @@ export async function packageAgentCli(options = {}) {
   await prepareBundleDirectories(context);
   await copyBundlePackages(context);
   const runtime = await stagePortableRuntime(context);
-  await writeBundleEntrypoints(context, runtime.nodeRuntime);
-  const evidence = await writeBundleEvidence(context, runtime);
+  const signing = inspectBundleSigning(context, runtime);
+  await writeBundleEntrypoints(context, runtime.nodeRuntime, signing);
+  const evidence = await writeBundleEvidence(context, runtime, signing);
   await writePackageMetadata(context, runtime, evidence);
   const sidecars = await finalizePackage(context, runtime, evidence);
   return {

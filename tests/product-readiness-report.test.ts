@@ -60,21 +60,21 @@ async function fixture(targetWrapper: Record<string, unknown>, providerSmoke?: R
       provenance: true,
       provenanceSignature: true,
       archiveChecksum: true,
-      windowsSignerPolicy: true,
+      windowsSignerPolicy: targetPlatform !== "win32",
       hostCli: true,
       targetWrapper: targetWrapper.ok === true
     },
     metadata: {
       schemaVersion: 1,
       productVersion: "0.1.0",
-      releaseChannel: "preview",
+      releaseChannel: targetPlatform === "win32" ? "preview" : "stable",
       sigmaExec: { sha256: "a".repeat(64) },
       node: { sha256: "c".repeat(64) },
-      signing: { authenticodeVerified: targetPlatform === "win32" }
+      signing: { authenticodeVerified: false }
     },
     signing: {
-      authenticodeVerified: targetPlatform === "win32",
-      policyVerified: true
+      authenticodeVerified: false,
+      policyVerified: targetPlatform !== "win32"
     },
     integrity: {
       manifestDigest: "d".repeat(64),
@@ -173,7 +173,11 @@ async function promoteCurrentEvidence(
   });
   verification.metadata.schemaVersion = 1;
   verification.metadata.productVersion = version;
-  verification.metadata.releaseChannel = version.startsWith("0.") ? "preview" : "stable";
+  verification.metadata.releaseChannel = windowsSignerPolicy
+    ? version.includes("-")
+      ? version.split("-")[1].split(".")[0]
+      : "stable"
+    : "preview";
   verification.metadata.signing = { authenticodeVerified: windowsSignerPolicy };
   verification.signing = {
     authenticodeVerified: windowsSignerPolicy,
@@ -227,7 +231,7 @@ describe("product readiness report", () => {
     expect(report.releaseChecks.some((item) => item.name === "lspSandboxSmoke:ready" && item.ok)).toBe(true);
   });
 
-  it("marks a complete 0.x Windows artifact preview-ready", async () => {
+  it("marks a complete unsigned Windows artifact preview-ready", async () => {
     const { rootDir, artifactsDir } = await fixture({
       ok: true,
       status: "passed",
@@ -261,7 +265,7 @@ describe("product readiness report", () => {
     });
   });
 
-  it("marks Linux x64 as an independent Tier 1 preview target", async () => {
+  it("marks Linux x64 as an independent Tier 1 stable target", async () => {
     const { rootDir, artifactsDir } = await fixture({
       ok: true,
       status: "passed",
@@ -281,16 +285,19 @@ describe("product readiness report", () => {
     const report = await buildProductReadinessReport({ rootDir, artifactsDir });
 
     expect(report).toMatchObject({
-      status: "preview-ready",
+      status: "release-ready",
       internalReady: true,
-      releaseReady: false,
-      previewReady: true
+      releaseReady: true,
+      previewReady: false
     });
     expect(report.releaseChecks).toContainEqual({
       name: "package:tier1Target",
       ok: true,
       detail: "linux-x64"
     });
+    await expect(writeProductReadinessReport({
+      rootDir, artifactsDir, requireReleaseReady: true
+    })).resolves.toMatchObject({ report: { releaseReady: true } });
   });
 
   it("requires the replay snapshot to be rebuilt before release", async () => {
@@ -403,7 +410,7 @@ describe("product readiness report", () => {
     });
   });
 
-  it("keeps a trusted signed 0.x Windows artifact on the preview channel", async () => {
+  it("marks a trusted signed 0.x Windows artifact release-ready", async () => {
     const { rootDir, artifactsDir } = await fixture({
       ok: true,
       status: "passed",
@@ -420,7 +427,7 @@ describe("product readiness report", () => {
 
     const report = await buildProductReadinessReport({ rootDir, artifactsDir });
     expect(report).toMatchObject({
-      status: "preview-ready", internalReady: true, releaseReady: false, previewReady: true
+      status: "release-ready", internalReady: true, releaseReady: true, previewReady: false
     });
     expect(report.releaseChecks).toEqual(expect.arrayContaining([
       expect.objectContaining({ name: "package:provenanceSignature", ok: true }),

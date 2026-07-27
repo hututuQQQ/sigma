@@ -14,8 +14,8 @@
 </p>
 
 <p align="center">
-  <img alt="状态：0.1.0 开发预览版" src="https://img.shields.io/badge/status-0.1.0%20development%20preview-f59e0b">
-  <img alt="发布目标：Linux 与 Windows 预览版" src="https://img.shields.io/badge/release%20targets-Linux%20preview%20%2B%20Windows%20unsigned%20preview-0078d4">
+  <img alt="状态：0.1.0 首个稳定版" src="https://img.shields.io/badge/status-0.1.0%20stable-2ea44f">
+  <img alt="发布目标：Linux 稳定版与 Windows 未签名预览版" src="https://img.shields.io/badge/release%20targets-Linux%20stable%20%2B%20Windows%20unsigned%20preview-0078d4">
   <img alt="正式评估：预注册" src="https://img.shields.io/badge/formal%20evaluation-preregistered-4cc9c0">
 </p>
 
@@ -25,15 +25,15 @@
 
 Sigma Code 把一次编码任务变成一条可持久化、可验证、可重放的类型化事件流。它可以理解仓库、执行范围明确的修改、在沙箱内运行命令、验证结果、请求独立审查，并在进程中断后恢复原来的会话。CLI 与 TUI 不各自维护一套 Agent：产品只有一个事件溯源内核、一种会话格式和一条执行链。
 
-`0.1.0` 是开发预览版，也是唯一受支持的产品基线。Linux x64 与 Windows x64
-产物都属于预览候选；在取得可信 Authenticode 签名之前，Windows 还必须明确标记为
-未签名。提交问题或参与贡献前，请先查看[安全策略](SECURITY.md)和
+`0.1.0` 是首个正式版本，也是唯一受支持的产品基线。Linux x64 是稳定发布目标；
+在取得可信 Authenticode 签名之前，Windows x64 仍必须明确标记为未签名预览版。
+提交问题或参与贡献前，请先查看[安全策略](SECURITY.md)和
 [贡献指南](CONTRIBUTING.md)。
 
 > [!IMPORTANT]
 > **当前产品边界**
 >
-> - **Sigma Code 0.1.0 在两个 Tier 1 目标上都是开发预览版。** Linux x64 与 Windows x64 候选都必须通过原生沙箱、打包产品、校验和、SBOM 与签名来源证明门禁；Windows 可执行文件目前没有可信 Authenticode 签名，可能触发 Windows 安全警告。
+> - **Sigma Code 0.1.0 在 Linux x64 上是稳定版；Windows x64 是未签名预览版。** 两个候选都必须通过原生沙箱、打包产品、校验和、SBOM 与签名来源证明门禁；Windows 可执行文件目前没有可信 Authenticode 签名，可能触发 Windows 安全警告。
 > - **正式评估由预注册清单约束，而不是写死 Provider。** SHA 绑定的运行清单会在执行前冻结 Provider、模型、源码、归档、任务选择、网络、超时、并发、尝试次数和重试次数。
 > - 只有 SHA 绑定的运行清单中的控制条件可比时，Provider 对比才有效；harness 不会根据模型名称推断可比性。
 
@@ -47,9 +47,9 @@ Sigma Code 把一次编码任务变成一条可持久化、可验证、可重放
 | 沙箱失效即拒绝 | 即使授权了宿主机只读输入或网络，进程仍运行在必需的原生沙箱中；沙箱不健康时，Sigma 会拒绝执行。 |
 | 一条产品执行链 | CLI 自动化和 TUI 共用同一个 `RuntimeClient`、内核、事件仓库、工具、恢复逻辑和结果协议。 |
 
-## Linux 快速开始（开发预览版）
+## Linux 快速开始
 
-从经过验证的项目 Release 获取 `0.1.0` Linux x64 预览归档，或从源码构建；
+从经过验证的项目 Release 获取 `0.1.0` Linux x64 稳定版归档，或从源码构建；
 核对 SHA-256 侧文件与签名来源证明后再解压：
 
 ```sh
@@ -87,8 +87,8 @@ $env:DEEPSEEK_API_KEY = "your-api-key"
 
 上面的 API Key 只对当前 PowerShell 进程生效。不要把密钥写进 `.agent/config.toml` 或提交到版本库。
 
-发布的预览归档都会带有 SHA-256 校验和、CycloneDX SBOM、签名的来源证明和
-公开验证密钥。`0.1.0` 的两个目标都不是稳定发布；Windows x64 还属于未签名预览。
+发布的归档都会带有 SHA-256 校验和、CycloneDX SBOM、签名的来源证明和
+公开验证密钥。Linux x64 在 `0.1.0` 是稳定发布；Windows x64 仍属于未签名预览。
 信任边界见 [SECURITY.md](SECURITY.md)，维护者发布流程见
 [RELEASING.md](RELEASING.md)。
 

@@ -2,15 +2,15 @@
 
 ## Supported versions
 
-Security fixes are provided for the current development baseline only. The
-project does not maintain compatibility or security backports for superseded
-preview formats.
+Security fixes are provided for the current release baseline only. The project
+does not maintain compatibility or security backports for superseded releases
+or preview formats.
 
 | Version | Supported |
 | --- | --- |
-| Current `0.1.x` Linux development preview | Yes |
-| Current `0.1.x` Windows unsigned development preview | Yes, with preview limitations |
-| Superseded previews and other schemas | No |
+| Current `0.1.x` Linux stable release | Yes |
+| Current `0.1.x` Windows unsigned preview | Yes, with preview limitations |
+| Superseded releases, previews, and other schemas | No |
 
 ## Reporting a vulnerability
 
@@ -30,10 +30,11 @@ open a minimal issue asking the maintainer to enable a private contact path.
 
 ## Release verification
 
-Portable product archives are official preview candidates only when created by
+Portable product archives are official release artifacts only when created by
 the repository's GitHub Actions release workflow. Each archive is accompanied
 by a SHA-256 checksum, CycloneDX SBOM, signed provenance statement, and the
-public provenance verification key. No `0.x` archive is a stable release.
+public provenance verification key. For `0.1.0`, Linux x64 is stable and
+Windows x64 is an unsigned preview.
 
 Windows x64 is an explicitly labeled unsigned preview until trusted
 Authenticode signing is available. Its package, sandbox, wrapper, live-provider,
@@ -44,9 +45,10 @@ A GitHub prerelease may be source-only when hosted Actions or trusted signing is
 unavailable. Such a prerelease does not contain official portable product archives
 and must state which publication gates remain unavailable.
 
-All `0.x` GitHub Releases are prereleases and must not be marked latest.
-Release notes, asset labels, bundle READMEs, and package metadata must disclose
-the development-preview status. Trusted provenance is mandatory; an explicitly
+An unsuffixed product SemVer is a formal Release and may be marked latest; a
+version with a prerelease suffix must be published as a prerelease. Release
+notes, asset labels, bundle READMEs, and package metadata must disclose each
+target's release channel. Trusted provenance is mandatory; an explicitly
 unsigned Windows candidate may leave only the Authenticode signer policy
 unsatisfied.
 

@@ -16,13 +16,14 @@ Configure these GitHub Actions secrets:
 The public provenance key must match the private signing key. Keep the private key out
 of the repository and all workflow artifacts.
 
-## Development-preview policy
+## Release-channel policy
 
-Every `0.x` publication is a development prerelease. Linux x64 and Windows x64
-are independent Tier 1 preview targets; neither is a stable channel. Windows is
-published as an explicitly labeled unsigned preview until the project has
-access to a trusted Authenticode signing service. Both archives must pass the
-packaged native sandbox, wrapper, live-provider, checksum, CycloneDX SBOM, and
+A product SemVer without a prerelease suffix, including `0.1.0`, is a formal
+stable release. A version with a suffix such as `-rc.1` is a prerelease. Linux
+x64 is the stable Tier 1 release target for `0.1.0`. Windows x64 is published
+as an explicitly labeled unsigned preview until the project has access to a
+trusted Authenticode signing service. Both archives must pass the packaged
+native sandbox, wrapper, live-provider, checksum, CycloneDX SBOM, and
 signed-provenance gates.
 
 The Windows preview gate additionally proves that the executables remain unsigned and
@@ -33,7 +34,7 @@ block execution. Checksums, SBOMs, and signed provenance do not replace Authenti
 
 When trusted signing becomes available, integrate the signing service in the
 hosted workflow, require a timestamped signature from the approved identity,
-and publish the first signed Windows archive under a new preview version. Never
+and publish the first signed Windows archive under a new product version. Never
 replace the unsigned assets of an existing immutable Release.
 
 ## Prepare a release
@@ -58,10 +59,11 @@ git push origin "v$Version"
 ```
 
 The tag workflow verifies that the tag exactly equals the root package version.
-It then independently verifies the Linux x64 preview candidate and the Windows
-x64 unsigned preview. If both jobs pass, it creates one GitHub prerelease with
+It then independently verifies the Linux x64 stable candidate and the Windows
+x64 unsigned preview. If both jobs pass, it creates one GitHub Release with
 both archives, checksums, SBOMs, signed provenance, and the public verification
-key. Every `0.x` publication is marked prerelease and is never marked latest.
+key. A version without a prerelease suffix is published as the latest formal
+release; a suffixed version is published as a prerelease.
 
 Never replace assets on an existing release. If a published candidate is wrong,
 publish a new version so checksums and provenance remain immutable.
@@ -69,23 +71,25 @@ publish a new version so checksums and provenance remain immutable.
 ## Reduced publication fallback
 
 When hosted Actions or required platform verification is unavailable, a
-maintainer may publish a source-only GitHub prerelease from an annotated tag on
-`main`. The release must not be marked latest, must not include locally built
-portable archives, and must name the unavailable publication gates. Resume
-binary publication with a new version after the normal workflow passes; do not
-add binaries to the existing source-only release later.
+maintainer may publish a source-only GitHub prerelease from a new annotated
+prerelease tag on `main`. The release must not be marked latest, must not
+include locally built portable archives, and must name the unavailable
+publication gates. Resume binary publication with a new version after the
+normal workflow passes; do not add binaries to the existing source-only
+release later.
 
 Do not bypass the dual-target workflow to attach locally built archives. If
-either target preview gate is unavailable, publish neither binary from that
+either target release gate is unavailable, publish neither binary from that
 tag; a source-only GitHub prerelease remains the only fallback.
 
 ## After publication
 
 - Download every asset from GitHub and compare it with its `.sha256` sidecar.
 - Confirm provenance verification succeeds with the published public key.
-- Confirm the Linux archive is labeled development preview and passes
+- Confirm the Linux archive is labeled stable and passes
   `agent doctor` plus a packaged-product smoke run on a clean machine.
 - Confirm the Windows archive, package metadata, bundle README, and Release asset label all say unsigned preview, and confirm its executables have no Authenticode signer.
-- Confirm the GitHub Release is a prerelease, is not marked latest, and that
-  both package metadata files report schema 1 and the exact manifest product
-  version.
+- For an unsuffixed version, confirm the GitHub Release is not a prerelease and
+  is marked latest. For a suffixed version, confirm the inverse.
+- Confirm both package metadata files report schema 1, the exact manifest
+  product version, and the target-appropriate release channel.

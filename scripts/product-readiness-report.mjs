@@ -367,12 +367,12 @@ export async function buildProductReadinessReport(options = {}) {
     || packageVerify?.signing?.policyVerified === true;
   const windowsUnsigned = targetPlatform === "win32"
     && packageVerify?.signing?.authenticodeVerified === false;
+  const prerelease = expectedProductVersion.split("-", 2)[1];
+  const isPrerelease = Boolean(prerelease);
   const expectedReleaseChannel = windowsUnsigned
     ? "preview"
-    : expectedProductVersion.startsWith("0.")
-      ? "preview"
-      : expectedProductVersion.includes("-")
-      ? expectedProductVersion.split("-")[1].split(".")[0]
+    : isPrerelease
+      ? prerelease.split(".", 1)[0]
       : "stable";
   const releaseChecks = [
     check("package:tier1Target", supportedReleaseTargets.has(target), target),
@@ -401,9 +401,9 @@ export async function buildProductReadinessReport(options = {}) {
   ];
   const internalReady = checks.every((item) => item.ok);
   const releaseChecksPassed = releaseChecks.every((item) => item.ok);
-  const releaseReady = !expectedProductVersion.startsWith("0.") && internalReady && releaseChecksPassed;
+  const releaseReady = !isPrerelease && internalReady && releaseChecksPassed;
   const unsignedWindowsPreview = targetPlatform === "win32" && windowsUnsigned && provenanceTrusted;
-  const previewReady = expectedProductVersion.startsWith("0.") && internalReady
+  const previewReady = (isPrerelease || unsignedWindowsPreview) && internalReady
     && releaseChecks.every((item) =>
       item.name === "package:windowsSignerPolicy" && unsignedWindowsPreview
         ? true

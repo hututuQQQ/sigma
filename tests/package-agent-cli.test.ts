@@ -165,6 +165,7 @@ async function writePackageFixture() {
   await writeBuiltPackage(rootDir, "agent-runtime", { "agent-protocol": "workspace:*" });
   await writeBuiltPackage(rootDir, "agent-tui", { "agent-protocol": "workspace:*" });
   await writeBuiltPackage(rootDir, "agent-cli", { "agent-runtime": "workspace:*", "agent-tui": "workspace:*" });
+  await writeDefaultLinuxBroker(rootDir);
   return rootDir;
 }
 
@@ -200,6 +201,14 @@ async function writeMinimalExecutable(
   header.writeUInt32LE(0x200, section + 16);
   header.writeUInt32LE(0x200, section + 20);
   await writeFile(filePath, header);
+}
+
+async function writeDefaultLinuxBroker(rootDir: string) {
+  const broker = path.join(rootDir, ".artifacts", "linux-portable-runtime", "bin", "sigma-exec");
+  await mkdir(path.dirname(broker), { recursive: true });
+  await writeMinimalExecutable(broker, "linux");
+  await chmod(broker, 0o755);
+  return broker;
 }
 
 async function writeDynamicLinuxExecutable(filePath: string) {
@@ -415,6 +424,9 @@ describe("package-agent-cli", () => {
 
     const readme = await readFile(path.join(result.bundleDir, "README.md"), "utf8");
     expect(readme).toContain("Sigma Code CLI Bundle");
+    expect(readme).toContain("stable CLI for Linux x64");
+    expect(readme).toContain("This is a stable release.");
+    expect(readme).not.toContain("development-preview");
     expect(readme).toContain("./bin/agent init");
     expect(readme).toContain("./bin/agent version --json");
     expect(readme).toContain("./bin/agent doctor --workspace /path/to/repo --json --strict");
@@ -426,8 +438,7 @@ describe("package-agent-cli", () => {
   }, 60_000);
 
   linuxPackagingIt("recursively deploys target optional dependencies and preserves nested version conflicts", async () => {
-    const rootDir = await mkdtemp(path.join(os.tmpdir(), "sigma-package-dependency-graph-"));
-    await writeFile(path.join(rootDir, "LICENSE"), "MIT License\n", "utf8");
+    const rootDir = await writePackageFixture();
     await writeBuiltPackage(rootDir, "agent-tui", { "@opentui/core": "0.4.3", "root-dep": "1.0.0" });
     await writeBuiltPackage(rootDir, "agent-cli", { "agent-tui": "workspace:*" });
     const modules = path.join(rootDir, "packages", "agent-tui", "node_modules");
@@ -472,7 +483,7 @@ describe("package-agent-cli", () => {
     const wrapper = await readFile(path.join(result.bundleDir, "bin", "agent"), "utf8");
     expect(wrapper).toContain('if [ "${1:-}" = "tui" ]; then');
     expect(wrapper).toContain("--experimental-ffi");
-  });
+  }, 60_000);
 
   linuxPackagingIt("uses a cached Node runtime tarball when env override is absent", async () => {
     const rootDir = await writePackageFixture();
@@ -592,6 +603,7 @@ describe("package-agent-cli", () => {
         }
       },
       metadata: {
+        releaseChannel: "stable",
         targetPlatform: "linux",
         targetArch: "x64",
         node: {
@@ -750,7 +762,7 @@ describe("package-agent-cli", () => {
       targetWrapperSmoke: false,
       env: {}
     })).rejects.toThrow("unexpected builder identity");
-  });
+  }, 60_000);
 
   linuxPackagingIt("rejects every unmanifested file in the portable bundle tree", async () => {
     const { rootDir, broker } = await writePackagingWorkspace("linux");
