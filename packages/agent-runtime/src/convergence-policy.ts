@@ -16,6 +16,12 @@ export interface DeadlineForecast {
   settlementReserveMs: number;
 }
 
+export interface ConvergenceActionScope {
+  signal: AbortSignal;
+  forecast: DeadlineForecast;
+  close(): void;
+}
+
 type BudgetFailure = Extract<RunOutcome, { kind: "recoverable_failure" }>;
 
 export function deadlineForecast(session: RuntimeSession, now = Date.now()): DeadlineForecast {
@@ -48,6 +54,55 @@ function budgetFailure(message: string): BudgetFailure {
     code: "budget_exhausted",
     message,
     decisionAuthority: "resource_boundary"
+  };
+}
+
+function convergenceBoundaryError(action: ConvergenceAction, forecast: DeadlineForecast): Error {
+  const error = Object.assign(new Error(
+    `The active ${action.kind} action reached the durable settlement boundary; `
+      + `${forecast.settlementReserveMs}ms remains reserved for convergence.`
+  ), {
+    code: "budget_exhausted",
+    decisionAuthority: "resource_boundary"
+  });
+  error.name = "ResourceBoundaryError";
+  return error;
+}
+
+/**
+ * Bound already-admitted non-terminal work to the same convergence boundary
+ * used for admission. The outer run signal remains live during the settlement
+ * reserve so interrupted work can commit its ledger and hand off cleanly.
+ */
+export function openConvergenceActionScope(
+  session: RuntimeSession,
+  parent: AbortSignal,
+  action: ConvergenceAction,
+  now = Date.now()
+): ConvergenceActionScope {
+  const forecast = deadlineForecast(session, now);
+  const controller = new AbortController();
+  const onParentAbort = (): void => {
+    controller.abort(parent.reason ?? new Error("Runtime action aborted."));
+  };
+  if (parent.aborted) onParentAbort();
+  else parent.addEventListener("abort", onParentAbort, { once: true });
+  const timer = forecast.usableMs > 0
+    ? setTimeout(
+        () => controller.abort(convergenceBoundaryError(action, forecast)),
+        Math.min(2_147_483_647, Math.max(1, Math.floor(forecast.usableMs)))
+      )
+    : undefined;
+  if (forecast.usableMs <= 0 && !controller.signal.aborted) {
+    controller.abort(convergenceBoundaryError(action, forecast));
+  }
+  return {
+    signal: controller.signal,
+    forecast,
+    close: () => {
+      if (timer) clearTimeout(timer);
+      parent.removeEventListener("abort", onParentAbort);
+    }
   };
 }
 

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   createBudgetLedger,
   type AgentEventEnvelope,
@@ -8,7 +8,8 @@ import { BudgetController } from "../packages/agent-runtime/src/budget-controlle
 import {
   ACTION_SETTLEMENT_GRACE_MS,
   convergenceAdmissionFailure,
-  deadlineForecast
+  deadlineForecast,
+  openConvergenceActionScope
 } from "../packages/agent-runtime/src/convergence-policy.js";
 import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
 import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
@@ -105,6 +106,31 @@ describe("hard-ledger convergence admission", () => {
       code: "budget_exhausted",
       message: expect.stringContaining("absolute run deadline")
     });
+  });
+
+  it("interrupts admitted work at the convergence boundary without aborting the outer run", () => {
+    vi.useFakeTimers();
+    try {
+      const target = runtimeSessionFixture();
+      target.durable.state.deadlineRemainingMs = ACTION_SETTLEMENT_GRACE_MS + 250;
+      const outer = new AbortController();
+      const scope = openConvergenceActionScope(target, outer.signal, { kind: "model" });
+
+      expect(scope.signal.aborted).toBe(false);
+      vi.advanceTimersByTime(249);
+      expect(scope.signal.aborted).toBe(false);
+      vi.advanceTimersByTime(1);
+      expect(scope.signal.aborted).toBe(true);
+      expect(outer.signal.aborted).toBe(false);
+      expect(scope.signal.reason).toMatchObject({
+        name: "ResourceBoundaryError",
+        code: "budget_exhausted",
+        decisionAuthority: "resource_boundary"
+      });
+      scope.close();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("settles measured resources exactly and refuses only a request the ledger cannot fund", async () => {

@@ -125,6 +125,65 @@ class InspectableGateway implements ModelGateway {
   async countTokens(): Promise<number> { return 100; }
 }
 
+class BoundaryBlockingGateway implements ModelGateway {
+  readonly provider = "fake";
+  readonly model = "boundary-blocking";
+  readonly requests: ModelRequest[] = [];
+  interruptedReason: unknown;
+  readonly capabilities: ModelCapabilities = {
+    contextWindowTokens: 128_000,
+    maxOutputTokens: 32_768,
+    tools: true,
+    parallelTools: false,
+    reasoning: true,
+    structuredOutput: false,
+    promptCache: true,
+    tokenizer: "approximate",
+    strictToolChoice: true
+  };
+
+  constructor(private readonly beforeFirstResponse: () => void) {}
+
+  async complete(_request: ModelRequest): Promise<never> {
+    throw new Error("This test consumes the streaming path.");
+  }
+
+  async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    this.requests.push(request);
+    if (this.requests.length === 1) {
+      this.beforeFirstResponse();
+      yield {
+        type: "done",
+        response: {
+          message: {
+            role: "assistant",
+            content: "I inspected the workspace before the time boundary.",
+            toolCalls: [{
+              id: "read-before-time-boundary",
+              name: "read",
+              arguments: { path: "seed.txt" }
+            }]
+          },
+          finishReason: "tool_calls",
+          usage: measuredUsage(100, 10)
+        }
+      };
+      return;
+    }
+    await new Promise<never>((_resolve, reject) => {
+      const interrupted = (): void => {
+        request.signal.removeEventListener("abort", interrupted);
+        this.interruptedReason = request.signal.reason;
+        reject(request.signal.reason);
+      };
+      if (request.signal.aborted) interrupted();
+      else request.signal.addEventListener("abort", interrupted, { once: true });
+    });
+  }
+
+  async countTokens(): Promise<number> { return 100; }
+}
+
 function requestInputResponse(): ModelResponse {
   return {
     message: {
@@ -523,6 +582,68 @@ describe("provider-measured model budget settlement", () => {
       now.mockRestore();
     }
   });
+
+  it("interrupts an active model stream before the settlement reserve and submits durable work", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-model-boundary-workspace-"));
+    const state = await mkdtemp(path.join(os.tmpdir(), "sigma-model-boundary-state-"));
+    await writeFile(path.join(workspace, "seed.txt"), "seed\n", "utf8");
+    const startedAt = Date.now();
+    let currentTime = startedAt;
+    let enterBoundary: ReturnType<typeof setTimeout> | undefined;
+    const now = vi.spyOn(Date, "now").mockImplementation(() => currentTime);
+    try {
+      const gateway = new BoundaryBlockingGateway(() => {
+        currentTime = startedAt + 8_000;
+        enterBoundary = setTimeout(() => {
+          currentTime = startedAt + 10_000;
+        }, 2_000);
+      });
+      const store = new SegmentedJsonlStore({ rootDir: state });
+      const runtime = createRuntime({
+        gateway,
+        store,
+        storeRootDir: state,
+        tools: registerBuiltinTools(new EffectToolRegistry()),
+        permissionMode: "auto",
+        outputReserveTokens: 100,
+        runDeadlineMs: 20_000
+      });
+      const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" }, {
+        inputTokens: 10_000, outputTokens: 1_000, costMicroUsd: 10_000_000, modelTurns: 10,
+        toolCalls: 1_000, children: 32, maxDepth: 4
+      });
+      await runtime.command({
+        type: "submit",
+        sessionId: session.sessionId,
+        text: "Inspect seed.txt, then continue until interrupted."
+      });
+
+      await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+        kind: "completed",
+        message: "I inspected the workspace before the time boundary.",
+        decisionAuthority: "resource_boundary"
+      });
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.interruptedReason).toMatchObject({
+        name: "ResourceBoundaryError",
+        code: "budget_exhausted"
+      });
+      const events = await storedEvents(store, session.sessionId);
+      expect(events.some((event) => event.type === "run.failed")).toBe(false);
+      expect(events.at(-1)?.type).toBe("run.completed");
+      expect(replayBudget(events).reservations.every((item) => item.status !== "reserved")).toBe(true);
+      expect(events).toContainEqual(expect.objectContaining({
+        type: "diagnostic",
+        payload: expect.objectContaining({
+          kind: "resource_boundary.submission",
+          sourceOutcomeCode: "budget_exhausted"
+        })
+      }));
+    } finally {
+      if (enterBoundary) clearTimeout(enterBoundary);
+      now.mockRestore();
+    }
+  }, 10_000);
 
   it("returns typed budget exhaustion before an unfundable final request", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-exhausted-budget-workspace-"));

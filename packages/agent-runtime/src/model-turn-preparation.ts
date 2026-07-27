@@ -15,7 +15,6 @@ import {
 } from "agent-context";
 import { isToolAllowed } from "agent-tools";
 import { refreshContextArchive } from "./context-archive-refresh.js";
-import { deadlineForecast, type DeadlineForecast } from "./convergence-policy.js";
 import { sessionModelToolProjectionCapabilities } from "./effect-helpers.js";
 import type { EffectRunnerOptions } from "./effect-runner.js";
 import {
@@ -37,7 +36,6 @@ import type { RuntimeSession } from "./types.js";
 export interface PreparedModelAttempt {
   turn?: PreparedModelTurn;
   plan?: ContextPlan;
-  forecast?: DeadlineForecast;
   failure?: RunOutcome;
 }
 
@@ -168,7 +166,6 @@ export async function prepareModelAttempt(
   const dynamic = await repositoryContext.collect(
     session.identity.workspacePath, query, signal
   );
-  const forecast = deadlineForecast(session);
   let available = availableOrchestratorBudget(session);
   if (!session.durable.frozenCustomization) {
     throw Object.assign(new Error(
@@ -219,7 +216,6 @@ export async function prepareModelAttempt(
   }
   return {
     turn: { ...prepared.turn, budget: fittedBudget },
-    plan: prepared.plan,
-    forecast
+    plan: prepared.plan
   };
 }
