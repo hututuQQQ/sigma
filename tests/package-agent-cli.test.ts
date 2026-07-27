@@ -63,6 +63,33 @@ async function writeExternalPackage(packageDir: string, manifest: Record<string,
   await writeFile(path.join(packageDir, "index.js"), "export {};\n", "utf8");
 }
 
+async function writePortableAssetFixtures(rootDir: string) {
+  await writeFile(
+    path.join(rootDir, "packages", "agent-code-intel", "dist", "typescript-server.mjs"),
+    "export {};\n",
+    "utf8"
+  );
+  const modules = path.join(rootDir, "packages", "agent-code-intel", "node_modules");
+  for (const [name, version, entry] of [
+    ["pyright", "1.1.411", "langserver.index.js"],
+    ["typescript", "5.9.3", "lib/typescript.js"]
+  ] as const) {
+    const packageDir = path.join(modules, name);
+    await writeExternalPackage(packageDir, { name, version });
+    const entryPath = path.join(packageDir, ...entry.split("/"));
+    await mkdir(path.dirname(entryPath), { recursive: true });
+    await writeFile(entryPath, "export {};\n", "utf8");
+  }
+  const tokenizerAsset = path.join(rootDir, "assets", "tokenizers", "sigma-cjk-byte.json");
+  await mkdir(path.dirname(tokenizerAsset), { recursive: true });
+  await writeFile(tokenizerAsset, `${JSON.stringify({
+    schemaVersion: 1,
+    id: "sigma/cjk-byte",
+    accuracy: "approximate",
+    safetyMarginPercent: 20
+  })}\n`, "utf8");
+}
+
 async function writeFakeNodeRuntimeTarball(tmpDir: string, arch = "x64") {
   const runtimeRoot = path.join(tmpDir, "runtime");
   const runtimeDirName = `node-${pinnedNodeVersion}-linux-${arch}`;
@@ -159,12 +186,16 @@ async function writePackageFixture() {
   await writeFile(path.join(rootDir, "LICENSE"), "MIT License\n", "utf8");
   await writeBuiltPackage(rootDir, "agent-protocol");
   await writeBuiltPackage(rootDir, "agent-execution");
-  await writeBuiltPackage(rootDir, "agent-code-intel");
+  await writeBuiltPackage(rootDir, "agent-code-intel", {
+    pyright: "1.1.411",
+    typescript: "5.9.3"
+  });
   await writeBuiltPackage(rootDir, "agent-checkpoint");
   await writeBuiltPackage(rootDir, "agent-extensions");
   await writeBuiltPackage(rootDir, "agent-runtime", { "agent-protocol": "workspace:*" });
   await writeBuiltPackage(rootDir, "agent-tui", { "agent-protocol": "workspace:*" });
   await writeBuiltPackage(rootDir, "agent-cli", { "agent-runtime": "workspace:*", "agent-tui": "workspace:*" });
+  await writePortableAssetFixtures(rootDir);
   await writeDefaultLinuxBroker(rootDir);
   return rootDir;
 }
@@ -251,32 +282,9 @@ async function writePackagingWorkspace(
     pyright: "1.1.411",
     typescript: "5.9.3"
   }, version);
-  await writeFile(
-    path.join(rootDir, "packages", "agent-code-intel", "dist", "typescript-server.mjs"),
-    "export {};\n",
-    "utf8"
-  );
+  await writePortableAssetFixtures(rootDir);
   await writeBuiltPackage(rootDir, "agent-runtime", { "agent-protocol": "workspace:*" }, version);
   await writeBuiltPackage(rootDir, "agent-cli", { "agent-runtime": "workspace:*" }, version);
-  const modules = path.join(rootDir, "packages", "agent-code-intel", "node_modules");
-  for (const [name, packageVersion, entry] of [
-    ["pyright", "1.1.411", "langserver.index.js"],
-    ["typescript", "5.9.3", "lib/typescript.js"]
-  ] as const) {
-    const packageDir = path.join(modules, name);
-    await writeExternalPackage(packageDir, { name, version: packageVersion });
-    const entryPath = path.join(packageDir, ...entry.split("/"));
-    await mkdir(path.dirname(entryPath), { recursive: true });
-    await writeFile(entryPath, "export {};\n", "utf8");
-  }
-  const tokenizerAsset = path.join(rootDir, "assets", "tokenizers", "sigma-cjk-byte.json");
-  await mkdir(path.dirname(tokenizerAsset), { recursive: true });
-  await writeFile(tokenizerAsset, `${JSON.stringify({
-    schemaVersion: 1,
-    id: "sigma/cjk-byte",
-    accuracy: "approximate",
-    safetyMarginPercent: 20
-  })}\n`, "utf8");
   const broker = path.join(rootDir, "sigma-exec");
   await writeMinimalExecutable(broker, brokerTarget, brokerArch);
   return { rootDir, broker, version };
@@ -394,6 +402,7 @@ describe("package-agent-cli", () => {
 
     const result = await packageAgentCli({
       rootDir,
+      allowNonElfLinuxNodeFixture: true,
       env: {
         NODE_RUNTIME_TARBALL: runtimeTarball,
         AGENT_TARGET_ARCH: "x64"
@@ -470,7 +479,9 @@ describe("package-agent-cli", () => {
     });
     const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
     const result = await packageAgentCli({
-      rootDir, env: { NODE_RUNTIME_TARBALL: runtimeTarball, AGENT_TARGET_ARCH: "x64" }
+      rootDir,
+      allowNonElfLinuxNodeFixture: true,
+      env: { NODE_RUNTIME_TARBALL: runtimeTarball, AGENT_TARGET_ARCH: "x64" }
     });
 
     const targetModules = path.join(result.bundleDir, "node_modules");
@@ -506,6 +517,7 @@ describe("package-agent-cli", () => {
       rootDir,
       env: {},
       artifactsDir,
+      allowNonElfLinuxNodeFixture: true,
       nodeChecksumDownloader: async (url: string) => {
         checksumUrls.push(url);
         return `${cachedDigest}  ${nodeRuntimeArchiveName("linux", "x64")}\n`;
@@ -537,6 +549,7 @@ describe("package-agent-cli", () => {
     const result = await packageAgentCli({
       rootDir,
       env: {},
+      allowNonElfLinuxNodeFixture: true,
       downloader: async (url: string, destination: string) => {
         downloads.push({ url, destination });
         await mkdir(path.dirname(destination), { recursive: true });
@@ -568,6 +581,7 @@ describe("package-agent-cli", () => {
     const packaged = await packageAgentCli({
       rootDir,
       artifactsDir,
+      allowNonElfLinuxNodeFixture: true,
       env: {
         NODE_RUNTIME_TARBALL: runtimeTarball,
         AGENT_TARGET_ARCH: "x64"
@@ -1037,6 +1051,7 @@ describe("package-agent-cli", () => {
     const packaged = await packageAgentCli({
       rootDir,
       artifactsDir,
+      allowNonElfLinuxNodeFixture: true,
       env: {
         NODE_RUNTIME_TARBALL: runtimeTarball,
         AGENT_TARGET_ARCH: "x64"
