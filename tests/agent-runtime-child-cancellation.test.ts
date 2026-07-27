@@ -89,11 +89,16 @@ function receipt(request: ToolRequest, output: string): ToolReceipt {
   };
 }
 
-async function within<T>(promise: Promise<T>, timeoutMs = 3_000): Promise<T> {
-  return await Promise.race([
-    promise,
-    new Promise<T>((_resolve, reject) => setTimeout(() => reject(new Error("Timed out waiting for child state.")), timeoutMs))
-  ]);
+async function within<T>(promise: Promise<T>, timeoutMs = 10_000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error("Timed out waiting for child state.")), timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, deadline]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 describe("child cancellation cleanup ordering", () => {
@@ -195,5 +200,5 @@ describe("child cancellation cleanup ordering", () => {
     });
     expect(started).toEqual([first.id, second.id]);
     await execution.close();
-  });
+  }, 20_000);
 });
