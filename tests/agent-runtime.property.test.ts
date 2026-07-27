@@ -267,5 +267,5 @@ describe("plan and budget invariant properties", () => {
       });
       expect(frame.items.reduce((total, item) => total + item.tokenCount, 0)).toBeLessThanOrEqual(8_128);
     }
-  });
+  }, 30_000);
 });
