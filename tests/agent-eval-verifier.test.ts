@@ -68,6 +68,74 @@ describe("agent evaluation verifier isolation", () => {
     expect(result.checks[0].message).toMatch(/symbolic link|junction/iu);
   });
 
+  it("keeps a broker-projected scratch home out of ordinary verifier roots", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-eval-verifier-policy-"));
+    temporary.push(root);
+    const workspace = path.join(root, "workspace");
+    const manifestDir = path.join(root, "manifest");
+    const artifactDir = path.join(root, "artifacts");
+    const nodePath = path.join(root, "runtime", "node");
+    const verifierHome = path.join(root, "sandbox-home");
+    await Promise.all([mkdir(workspace), mkdir(manifestDir), mkdir(artifactDir)]);
+    const scratchLease = {
+      protocolVersion: 1,
+      leaseId: "scratch-1",
+      sessionId: "verifier-1",
+      lifetime: "runtime_session",
+      isolation: "private",
+      persistentAcrossCalls: true,
+      home: verifierHome,
+      temp: path.join(root, "sandbox-temp")
+    };
+    const requests: Array<{
+      command: { environment: { overrides: Record<string, string> } };
+      policy: { readRoots: string[]; writeRoots: string[]; scratchLease?: typeof scratchLease };
+    }> = [];
+    const broker = {
+      execute: async (request: (typeof requests)[number]) => {
+        requests.push(request);
+        return {
+          exitCode: 0,
+          signal: null,
+          stdout: "",
+          stderr: "",
+          timedOut: false,
+          outputTruncated: false
+        };
+      }
+    };
+
+    const result = await runPostVerifier({
+      scenario: {
+        expectedTerminal: "completed",
+        verifier: { checks: [{ type: "command", argv: ["node", "verify.mjs"] }] }
+      },
+      workspace,
+      manifestDir,
+      delta: { added: [], modified: [], deleted: [] },
+      initialGit: { status: "", diff: "" },
+      finalGit: { status: "", diff: "" },
+      subjectResult: { result: { status: "completed" } },
+      events: [],
+      metrics: { terminal: { type: "run.completed" } },
+      artifactDir,
+      redactor: String,
+      verifierHome,
+      scratchLease,
+      broker,
+      nodePath
+    });
+
+    expect(result.status).toBe("pass");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.policy).toMatchObject({
+      readRoots: [workspace, manifestDir, path.dirname(nodePath)],
+      writeRoots: [workspace],
+      scratchLease
+    });
+    expect(requests[0]?.command.environment.overrides.HOME).toBe(verifierHome);
+  });
+
   it("verifies one user interruption by event count even when the message has multiple question marks", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-eval-event-check-"));
     temporary.push(root);

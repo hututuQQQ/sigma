@@ -894,6 +894,19 @@ async function runVerifierWitness(context, lifecycle, prepared, subjectResult, c
   return { verifier, verifierDelta };
 }
 
+export function verifierWitnessPaths(controllerDir, scratchLease, platform = process.platform) {
+  // Windows exposes the broker-issued scratch path as a host-writable ACL
+  // boundary. Linux exposes an in-sandbox mount destination instead, so host
+  // staging must stay in the attempt's unique controller directory.
+  const stagingRoot = platform === "win32" ? scratchLease.home : controllerDir;
+  const pathApi = platform === "win32" ? path.win32 : path.posix;
+  return {
+    verifierWorkspace: pathApi.join(stagingRoot, "verifier-workspace"),
+    verifierManifestDir: pathApi.join(stagingRoot, "verifier-manifest"),
+    verifierHome: scratchLease.home
+  };
+}
+
 async function verifyAttempt(context, lifecycle, prepared, subjectResult, collected) {
   const { scenario, verifierRuntime } = context;
   const { controllerDir } = prepared;
@@ -924,15 +937,12 @@ async function verifyAttempt(context, lifecycle, prepared, subjectResult, collec
       protocolVersion: 1,
       sessionId: verifierSessionId
     }, { timeoutMs: 5_000 });
-    const verifierWorkspace = path.join(scratchLease.home, "workspace");
-    const verifierManifestDir = path.join(scratchLease.home, "manifest");
+    const witnessPaths = verifierWitnessPaths(controllerDir, scratchLease);
     // Windows has no same-path COW mount. A broker-issued RuntimeSession
     // scratch lease supplies the equivalent ephemeral writable witness while
     // preserving Git metadata and host-workspace fail-closed defaults.
     return await runVerifierWitness(context, lifecycle, prepared, subjectResult, collected, {
-      verifierWorkspace,
-      verifierManifestDir,
-      verifierHome: scratchLease.home,
+      ...witnessPaths,
       scratchLease,
       broker
     });
