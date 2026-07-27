@@ -169,6 +169,22 @@ export class ToolBatchCoordinator {
     }
   }
 
+  async rejectForResourceBoundary(
+    session: RuntimeSession,
+    attempts: readonly ToolAttempt[],
+    message: string
+  ): Promise<void> {
+    const startedAt = new Date().toISOString();
+    for (const { call, modelTurn } of attempts) {
+      await this.emitReceipt(session, failed(
+        call,
+        startedAt,
+        message,
+        "budget_exhausted"
+      ), modelTurn);
+    }
+  }
+
   private async rejectProjection(
     session: RuntimeSession,
     attempts: readonly ToolAttempt[]

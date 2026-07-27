@@ -7,7 +7,7 @@ export type ConvergenceAction =
   | { kind: "model" }
   | { kind: "tool"; count: number; terminalOnly?: boolean };
 
-export type DeadlineStage = "normal" | "stop";
+export type DeadlineStage = "normal" | "converge" | "stop";
 
 export interface DeadlineForecast {
   stage: DeadlineStage;
@@ -16,11 +16,15 @@ export interface DeadlineForecast {
   settlementReserveMs: number;
 }
 
+type BudgetFailure = Extract<RunOutcome, { kind: "recoverable_failure" }>;
+
 export function deadlineForecast(session: RuntimeSession, now = Date.now()): DeadlineForecast {
   const remainingMs = session.durable.state.deadlineRemainingMs
     ?? Date.parse(session.durable.state.deadlineAt) - now;
   const usableMs = Math.max(0, remainingMs - ACTION_SETTLEMENT_GRACE_MS);
-  const stage: DeadlineStage = remainingMs <= 0 ? "stop" : "normal";
+  const stage: DeadlineStage = remainingMs <= 0
+    ? "stop"
+    : usableMs <= 0 ? "converge" : "normal";
   return {
     stage,
     remainingMs,
@@ -38,7 +42,7 @@ function availableBudget(session: RuntimeSession, dimension: keyof BudgetAmounts
   return Math.max(0, session.durable.state.budget.limits[dimension] - usedBudget(session, dimension));
 }
 
-function budgetFailure(message: string): RunOutcome {
+function budgetFailure(message: string): BudgetFailure {
   return {
     kind: "recoverable_failure",
     code: "budget_exhausted",
@@ -47,7 +51,7 @@ function budgetFailure(message: string): RunOutcome {
   };
 }
 
-function hardBudgetFailure(session: RuntimeSession, action: ConvergenceAction): RunOutcome | null {
+function hardBudgetFailure(session: RuntimeSession, action: ConvergenceAction): BudgetFailure | null {
   if (action.kind === "tool") {
     const available = availableBudget(session, "toolCalls");
     return action.count > available
@@ -63,20 +67,27 @@ function hardBudgetFailure(session: RuntimeSession, action: ConvergenceAction): 
 
 /**
  * Admit only against facts the runtime can prove: the durable hard ledger and
- * the absolute deadline. Latency forecasts remain telemetry and never end a
- * run early or narrow the model's choices.
+ * the absolute deadline. The fixed settlement reserve is not a latency
+ * forecast: it prevents starting non-terminal work after the runtime has
+ * committed the remaining active time to durable settlement.
  */
 export function convergenceAdmissionFailure(
   session: RuntimeSession,
   action: ConvergenceAction,
   now = Date.now()
-): RunOutcome | null {
+): BudgetFailure | null {
   const hardFailure = hardBudgetFailure(session, action);
   if (hardFailure) return hardFailure;
-  const remainingMs = session.durable.state.deadlineRemainingMs
-    ?? Date.parse(session.durable.state.deadlineAt) - now;
-  if (remainingMs > 0) return null;
+  const forecast = deadlineForecast(session, now);
+  if (forecast.remainingMs <= 0) {
+    return budgetFailure(
+      `The absolute run deadline has elapsed; no further ${action.kind} action can be admitted.`
+    );
+  }
+  if (action.kind === "tool" && action.terminalOnly === true) return null;
+  if (forecast.usableMs > 0) return null;
   return budgetFailure(
-    `The absolute run deadline has elapsed; no further ${action.kind} action can be admitted.`
+    `Only ${Math.max(0, Math.floor(forecast.remainingMs))}ms of active time remains, `
+      + `which is reserved for durable settlement; no further non-terminal ${action.kind} action can be admitted.`
   );
 }

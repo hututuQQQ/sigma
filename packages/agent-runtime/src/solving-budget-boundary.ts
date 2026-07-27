@@ -36,7 +36,8 @@ function lastAssistantText(session: RuntimeSession): string | undefined {
  * A normal hard-ledger boundary is an intentional stop, not a runtime crash.
  * Settle owned work, preserve hard lifecycle invariants, run binding assurance
  * when configured, and submit the current state for external evaluation.
- * Only an actual outer deadline bypasses this boundary handoff.
+ * Only an elapsed outer deadline bypasses this boundary handoff. The reserved
+ * convergence window exists specifically so this settlement can complete.
  */
 export async function finishSolvingBudgetBoundary(
   session: RuntimeSession,
@@ -45,7 +46,7 @@ export async function finishSolvingBudgetBoundary(
   options: SolvingBudgetBoundaryOptions
 ): Promise<boolean> {
   if (!isOrdinaryBudgetExhaustion(outcome)
-    || deadlineForecast(session).stage !== "normal") {
+    || deadlineForecast(session).stage === "stop") {
     return await options.finish(session, outcome);
   }
   await settleBudgetBoundaryProcesses(session, signal, {

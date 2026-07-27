@@ -1,7 +1,7 @@
 import { mkdtemp, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type {
   AgentEventEnvelope,
   BudgetLedgerState,
@@ -93,7 +93,8 @@ class InspectableGateway implements ModelGateway {
 
   constructor(
     private readonly responses: ModelResponse[],
-    capabilityOverrides: Partial<ModelCapabilities> = {}
+    capabilityOverrides: Partial<ModelCapabilities> = {},
+    private readonly beforeResponse?: (request: ModelRequest) => void
   ) {
     this.capabilities = {
       contextWindowTokens: 128_000,
@@ -115,6 +116,7 @@ class InspectableGateway implements ModelGateway {
 
   async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
     this.requests.push(request);
+    this.beforeResponse?.(request);
     const response = this.responses[this.requests.length - 1];
     if (!response) throw new Error("Unexpected model request.");
     yield { type: "done", response };
@@ -451,6 +453,75 @@ describe("provider-measured model budget settlement", () => {
         sourceOutcomeCode: "budget_exhausted"
       })
     }));
+  });
+
+  it("settles pending tool calls without executing them once only the deadline reserve remains", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-deadline-settlement-workspace-"));
+    const state = await mkdtemp(path.join(os.tmpdir(), "sigma-deadline-settlement-state-"));
+    await writeFile(path.join(workspace, "seed.txt"), "seed\n", "utf8");
+    const startedAt = Date.now();
+    let currentTime = startedAt;
+    const now = vi.spyOn(Date, "now").mockImplementation(() => currentTime);
+    try {
+      const gateway = new InspectableGateway([{
+        message: {
+          role: "assistant",
+          content: "I reached the resource boundary after preparing the inspection.",
+          toolCalls: [{
+            id: "read-at-boundary",
+            name: "read",
+            arguments: { path: "seed.txt" }
+          }]
+        },
+        finishReason: "tool_calls",
+        usage: measuredUsage(100, 10)
+      }], {}, () => {
+        currentTime = startedAt + 15_000;
+      });
+      const store = new SegmentedJsonlStore({ rootDir: state });
+      const runtime = createRuntime({
+        gateway,
+        store,
+        storeRootDir: state,
+        tools: registerBuiltinTools(new EffectToolRegistry()),
+        permissionMode: "auto",
+        outputReserveTokens: 100,
+        runDeadlineMs: 20_000
+      });
+      const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" }, {
+        inputTokens: 10_000, outputTokens: 1_000, costMicroUsd: 10_000_000, modelTurns: 10,
+        toolCalls: 1_000, children: 32, maxDepth: 4
+      });
+      await runtime.command({
+        type: "submit",
+        sessionId: session.sessionId,
+        text: "Inspect seed.txt."
+      });
+
+      await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+        kind: "completed",
+        decisionAuthority: "resource_boundary"
+      });
+      expect(gateway.requests).toHaveLength(1);
+      const events = await storedEvents(store, session.sessionId);
+      expect(events.some((event) => event.type === "tool.started")).toBe(false);
+      expect(events).toContainEqual(expect.objectContaining({
+        type: "tool.failed",
+        payload: expect.objectContaining({
+          callId: "read-at-boundary",
+          diagnostics: expect.arrayContaining(["budget_exhausted"])
+        })
+      }));
+      expect(events).toContainEqual(expect.objectContaining({
+        type: "diagnostic",
+        payload: expect.objectContaining({
+          kind: "resource_boundary.submission",
+          sourceOutcomeCode: "budget_exhausted"
+        })
+      }));
+    } finally {
+      now.mockRestore();
+    }
   });
 
   it("returns typed budget exhaustion before an unfundable final request", async () => {

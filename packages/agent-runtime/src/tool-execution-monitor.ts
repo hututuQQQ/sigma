@@ -48,12 +48,26 @@ function processTimeout(message: string, code: "process_deadline" | "process_idl
   return Object.assign(new Error(message), { name: "TimeoutError", code });
 }
 
+function terminalOnlyDescriptor(descriptor: ToolDescriptor): boolean {
+  const effects = [
+    ...descriptor.possibleEffects,
+    ...(descriptor.maximumEffects ?? descriptor.possibleEffects)
+  ];
+  return effects.length > 0 && effects.every((effect) =>
+    effect === "outcome.propose"
+      || effect === "outcome.report_blocked"
+      || effect === "outcome.request_input");
+}
+
 function deadlineBoundedToolTimeoutMs(session: RuntimeSession, descriptor: ToolDescriptor): number {
   const remainingMs = session.durable.state.deadlineRemainingMs
     ?? Date.parse(session.durable.state.deadlineAt) - Date.now();
+  const settlementReserveMs = terminalOnlyDescriptor(descriptor)
+    ? 0
+    : ACTION_SETTLEMENT_GRACE_MS;
   return Math.max(1, Math.min(
     descriptor.timeoutMs,
-    Math.max(1, remainingMs - ACTION_SETTLEMENT_GRACE_MS)
+    Math.max(1, remainingMs - settlementReserveMs)
   ));
 }
 
