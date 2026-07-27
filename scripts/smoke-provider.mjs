@@ -175,8 +175,8 @@ async function main(argv = process.argv.slice(2)) {
     "Create a file named provider-smoke.js in the workspace.",
     "The file must contain exactly this line:",
     'const sigmaProviderSmoke = "ready";',
-    "After writing the file, run node --check provider-smoke.js with this exact read-only tool call before finishing:",
-    'validate({"executable":"node","args":["--check","provider-smoke.js"],"access":"readonly"})',
+    "After writing the file, run node --check provider-smoke.js with this exact read-only validation tool call before finishing:",
+    'shell({"executable":"node","args":["--check","provider-smoke.js"],"access":"readonly","validation":true})',
     "Do not pass expectedChanges or writeRoots to that validation call."
   ].join("\n");
   const run = await captureProcessWrites(async (stdout, stderr) => await runCommand([
