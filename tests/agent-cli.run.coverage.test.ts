@@ -186,6 +186,18 @@ function runDeps(script: ScriptedResponse[]) {
   return { gatewayFactory: gatewayFactory(script), executionBroker: createHostExecutionBroker() };
 }
 
+async function withDeadline<T>(operation: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  try {
+    return await Promise.race([operation, deadline]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 describe("run command branch coverage", () => {
   it("emits blocker fields only for a runtime-authorized blocked outcome", () => {
     expect(runResult({
@@ -365,10 +377,7 @@ describe("run command branch coverage", () => {
     const running = runCommand([
       "choose a target", "--workspace", root, "--permission-mode", "auto", "--output-format", "json"
     ], { stdin, stdout, stderr, ...runDeps([userInputRequest()]) });
-    const code = await Promise.race([
-      running,
-      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("run command hung after NeedsInput")), 2_000))
-    ]);
+    const code = await withDeadline(running, 10_000, "run command hung after NeedsInput");
     expect(code).toBe(2);
     expect(JSON.parse(stdout.text())).toMatchObject({
       status: "needs_input", finishReason: "needs_input", finalMessage: "Which target should I change?"

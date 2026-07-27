@@ -164,6 +164,12 @@ const diagnosticSchema = z.discriminatedUnion("kind", [
     decisionAuthority: z.literal("resource_boundary")
   }).strict(),
   z.object({
+    kind: z.literal("resource_boundary.submission"),
+    sourceOutcomeCode: z.literal("budget_exhausted"),
+    message: nonEmptyStringSchema,
+    decisionAuthority: z.literal("resource_boundary")
+  }).strict(),
+  z.object({
     kind: z.literal("runtime.dependency_observed"),
     protocolVersion: z.literal(1),
     callId: nonEmptyStringSchema,

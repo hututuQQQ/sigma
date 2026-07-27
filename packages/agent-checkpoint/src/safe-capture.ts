@@ -1,4 +1,4 @@
-import { constants } from "node:fs";
+import { constants, type BigIntStats } from "node:fs";
 import { lstat, open, readlink, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import { portable } from "./manifest.js";
@@ -12,6 +12,15 @@ import {
   type CheckpointManifest
 } from "./types.js";
 
+export interface CachedCheckpointFile {
+  entry: CheckpointEntry;
+  sourceIdentity: CheckpointCasIdentity;
+}
+
+export interface CheckpointCaptureCache {
+  files: Map<string, CachedCheckpointFile>;
+}
+
 interface CaptureOptions {
   workspacePath: string;
   scopePaths: readonly string[];
@@ -19,20 +28,13 @@ interface CaptureOptions {
   maxBytes: number;
   excludedNames: ReadonlySet<string>;
   ignoredRootName?: string;
+  cache?: CheckpointCaptureCache;
+  assertReusableCas?(entry: CheckpointEntry): Promise<void>;
   putCas(content: AsyncIterable<Uint8Array>): Promise<{
     digest: string;
     size: number;
     identity: CheckpointCasIdentity;
   }>;
-}
-
-interface FileIdentity {
-  dev: number;
-  ino: number;
-  mode: number;
-  size: number;
-  mtimeMs: number;
-  ctimeMs: number;
 }
 
 /**
@@ -57,16 +59,20 @@ export function preflightCheckpointByteReservation(input: {
   }
 }
 
-function identity(info: Awaited<ReturnType<typeof lstat>>): FileIdentity {
+function identity(info: BigIntStats): CheckpointCasIdentity {
   return {
-    dev: Number(info.dev), ino: Number(info.ino), mode: Number(info.mode),
-    size: Number(info.size), mtimeMs: Number(info.mtimeMs), ctimeMs: Number(info.ctimeMs)
+    dev: info.dev.toString(),
+    ino: info.ino.toString(),
+    mode: info.mode.toString(),
+    size: info.size.toString(),
+    mtimeNs: info.mtimeNs.toString(),
+    ctimeNs: info.ctimeNs.toString()
   };
 }
 
-function sameIdentity(left: FileIdentity, right: FileIdentity): boolean {
-  return left.dev === right.dev && left.ino === right.ino && left.mode === right.mode
-    && left.size === right.size && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
+function sameIdentity(left: CheckpointCasIdentity, right: CheckpointCasIdentity): boolean {
+  const fields = ["dev", "ino", "mode", "size", "mtimeNs", "ctimeNs"] as const;
+  return fields.every((field) => left[field] === right[field]);
 }
 
 function excluded(options: CaptureOptions, portablePath: string): boolean {
@@ -75,8 +81,8 @@ function excluded(options: CaptureOptions, portablePath: string): boolean {
   return portablePath !== "." && portablePath.split("/").some((part) => options.excludedNames.has(part));
 }
 
-async function existingInfo(target: string): Promise<Awaited<ReturnType<typeof lstat>> | null> {
-  return await lstat(target).catch((error: NodeJS.ErrnoException) => {
+async function existingInfo(target: string): Promise<BigIntStats | null> {
+  return await lstat(target, { bigint: true }).catch((error: NodeJS.ErrnoException) => {
     if (error.code === "ENOENT") return null;
     throw error;
   });
@@ -84,23 +90,29 @@ async function existingInfo(target: string): Promise<Awaited<ReturnType<typeof l
 
 async function captureStableFile(
   pinned: PinnedCheckpointParent,
-  expected: Awaited<ReturnType<typeof lstat>>,
+  expected: BigIntStats,
   portablePath: string,
   putCas: CaptureOptions["putCas"]
-): Promise<{ digest: string; size: number; identity: CheckpointCasIdentity }> {
+): Promise<{
+  digest: string;
+  size: number;
+  identity: CheckpointCasIdentity;
+  sourceIdentity: CheckpointCasIdentity;
+}> {
   const handle = await open(pinned.targetPath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)).catch((error) => {
     throw new CheckpointConflictError(`Checkpoint file could not be opened without following links: ${portablePath}`, {
       cause: error
     });
   });
   try {
-    const before = identity(await handle.stat());
+    const before = identity(await handle.stat({ bigint: true }));
     if (!sameIdentity(before, identity(expected))) {
       throw new CheckpointConflictError(`Checkpoint file changed before capture: ${portablePath}`);
     }
+    const beforeSize = Number(expected.size);
     const content = (async function* (): AsyncGenerator<Buffer> {
       let position = 0;
-      const readLimit = before.size + 1;
+      const readLimit = beforeSize + 1;
       while (position < readLimit) {
         const length = Math.min(64 * 1024, readLimit - position);
         const buffer = Buffer.allocUnsafe(length);
@@ -111,12 +123,12 @@ async function captureStableFile(
       }
     })();
     const stored = await putCas(content);
-    const after = identity(await handle.stat());
-    if (!sameIdentity(before, after) || stored.size !== after.size) {
+    const after = identity(await handle.stat({ bigint: true }));
+    if (!sameIdentity(before, after) || stored.size.toString() !== after.size) {
       throw new CheckpointConflictError(`Checkpoint file changed during capture: ${portablePath}`);
     }
     await pinned.verify();
-    return stored;
+    return { ...stored, sourceIdentity: after };
   } finally {
     await handle.close();
   }
@@ -129,14 +141,19 @@ async function pinDirectory(options: CaptureOptions, portablePath: string): Prom
 
 class CheckpointCapture {
   private readonly entries = new Map<string, CheckpointEntry>();
+  private readonly previousFiles: ReadonlyMap<string, CachedCheckpointFile>;
+  private readonly nextFiles = new Map<string, CachedCheckpointFile>();
   private totalBytes = 0;
 
-  constructor(private readonly options: CaptureOptions) {}
+  constructor(private readonly options: CaptureOptions) {
+    this.previousFiles = new Map(options.cache?.files ?? []);
+  }
 
   async run(): Promise<CheckpointManifest> {
     for (const scope of this.options.scopePaths) await this.visit(scope);
     const ordered = [...this.entries.values()].sort((left, right) =>
       left.path < right.path ? -1 : left.path > right.path ? 1 : 0);
+    if (this.options.cache) this.options.cache.files = this.nextFiles;
     return { entries: ordered, fileCount: ordered.length, totalBytes: this.totalBytes };
   }
 
@@ -149,12 +166,12 @@ class CheckpointCapture {
   private async visitDirectory(
     relative: string,
     portablePath: string,
-    expected: Awaited<ReturnType<typeof lstat>>
+    expected: BigIntStats
   ): Promise<void> {
     const pinned = await pinDirectory(this.options, portablePath);
     try {
       await pinned.verify();
-      const before = identity(await stat(pinned.parentPath));
+      const before = identity(await stat(pinned.parentPath, { bigint: true }));
       if (!sameIdentity(before, identity(expected))) {
         throw new CheckpointConflictError(`Checkpoint directory changed before capture: ${portablePath}`);
       }
@@ -163,7 +180,7 @@ class CheckpointCapture {
       const children = await readdir(pinned.parentPath);
       children.sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
       for (const child of children) await this.visit(portable(path.join(relative, child)));
-      const after = identity(await stat(pinned.parentPath));
+      const after = identity(await stat(pinned.parentPath, { bigint: true }));
       if (!sameIdentity(before, after)) {
         throw new CheckpointConflictError(`Checkpoint directory changed during capture: ${portablePath}`);
       }
@@ -175,12 +192,12 @@ class CheckpointCapture {
 
   private async captureSymlink(
     pinned: PinnedCheckpointParent,
-    info: Awaited<ReturnType<typeof lstat>>,
+    info: BigIntStats,
     portablePath: string
   ): Promise<void> {
     const linkTarget = await readlink(pinned.targetPath);
     const linkType = process.platform === "win32" ? windowsLinkType(pinned.targetPath) : undefined;
-    const after = await lstat(pinned.targetPath);
+    const after = await lstat(pinned.targetPath, { bigint: true });
     if (!sameIdentity(identity(info), identity(after))) {
       throw new CheckpointConflictError(`Checkpoint symlink changed during capture: ${portablePath}`);
     }
@@ -192,7 +209,7 @@ class CheckpointCapture {
 
   private async captureFile(
     pinned: PinnedCheckpointParent,
-    info: Awaited<ReturnType<typeof lstat>>,
+    info: BigIntStats,
     portablePath: string
   ): Promise<void> {
     const expectedSize = Number(info.size);
@@ -201,19 +218,39 @@ class CheckpointCapture {
       totalBytes: this.totalBytes,
       expectedSize
     });
+    const sourceIdentity = identity(info);
+    const cached = this.previousFiles.get(portablePath);
+    if (cached?.entry.kind === "file"
+      && cached.entry.casIdentity
+      && this.options.assertReusableCas
+      && sameIdentity(cached.sourceIdentity, sourceIdentity)) {
+      await this.options.assertReusableCas(cached.entry);
+      const after = await lstat(pinned.targetPath, { bigint: true });
+      if (!sameIdentity(sourceIdentity, identity(after))) {
+        throw new CheckpointConflictError(`Checkpoint file changed while reusing capture: ${portablePath}`);
+      }
+      await pinned.verify();
+      const entry = { ...cached.entry };
+      this.totalBytes += entry.size;
+      this.entries.set(portablePath, entry);
+      this.nextFiles.set(portablePath, { entry, sourceIdentity });
+      return;
+    }
     const stored = await captureStableFile(pinned, info, portablePath, this.options.putCas);
     this.totalBytes += stored.size;
-    this.entries.set(portablePath, {
+    const entry: CheckpointEntry = {
       path: portablePath, kind: "file", mode: Number(info.mode), size: stored.size,
       digest: stored.digest, casIdentity: stored.identity
-    });
+    };
+    this.entries.set(portablePath, entry);
+    this.nextFiles.set(portablePath, { entry, sourceIdentity: stored.sourceIdentity });
   }
 
   private async visit(relative: string): Promise<void> {
     const portablePath = portable(relative);
     if (excluded(this.options, portablePath)) return;
     if (portablePath === ".") {
-      const info = await lstat(this.options.workspacePath);
+      const info = await lstat(this.options.workspacePath, { bigint: true });
       await this.visitDirectory(relative, portablePath, info);
       return;
     }
@@ -235,7 +272,10 @@ class CheckpointCapture {
     } finally {
       await pinned.close();
     }
-    const directoryInfo = await lstat(path.join(this.options.workspacePath, ...portablePath.split("/")));
+    const directoryInfo = await lstat(
+      path.join(this.options.workspacePath, ...portablePath.split("/")),
+      { bigint: true }
+    );
     await this.visitDirectory(relative, portablePath, directoryInfo);
   }
 }

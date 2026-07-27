@@ -8,8 +8,12 @@ import type {
 import { createKernelState } from "../packages/agent-kernel/src/index.js";
 import { completionGateDecision } from "../packages/agent-runtime/src/completion-evidence-gate.js";
 import { terminateRunProcesses } from "../packages/agent-runtime/src/process-cleanup.js";
-import { settleBudgetBoundaryProcesses } from "../packages/agent-runtime/src/process-budget-settlement.js";
+import {
+  settleBudgetBoundaryProcesses,
+  terminateUnhandedBudgetBoundaryProcesses
+} from "../packages/agent-runtime/src/process-budget-settlement.js";
 import { finishRuntimeSession } from "../packages/agent-runtime/src/runtime-session-finish.js";
+import { finishSolvingBudgetBoundary } from "../packages/agent-runtime/src/solving-budget-boundary.js";
 import type { ProcessExecutionPort } from "../packages/agent-platform/src/index.js";
 import {
   recordLostProcess,
@@ -247,6 +251,136 @@ describe("durable process lifecycle events", () => {
     )).resolves.toEqual({ attempted: 0, settled: 0, unavailable: false });
     expect(poll).not.toHaveBeenCalled();
     expect(target.execution.processHandles.has("service")).toBe(true);
+  });
+
+  it("terminates an unhanded deliverable before resource-boundary completion", async () => {
+    const target = runtimeSessionFixture({
+      execution: {
+        processHandles: new Map([[
+          "service",
+          { id: "service", brokerInstanceId: "broker-1", lifecycle: "deliverable" }
+        ]])
+      }
+    });
+    target.durable.state.activeProcessIds.push("service");
+    target.durable.state.deadlineRemainingMs = 60_000;
+    target.durable.state.messages.push({
+      role: "assistant",
+      content: "Current workspace state is ready for external evaluation."
+    });
+    const events: Array<{ type: AgentEventType; payload: unknown }> = [];
+    const emit = vi.fn(async (
+      current: typeof target,
+      type: AgentEventType,
+      _authority: string,
+      payload: unknown
+    ) => {
+      events.push({ type, payload });
+      if (type === "process.exited" || type === "process.lost") {
+        const processId = (payload as { processId?: unknown }).processId;
+        current.durable.state.activeProcessIds =
+          current.durable.state.activeProcessIds.filter((id) => id !== processId);
+      }
+      return {} as never;
+    });
+    const terminate = vi.fn(async (handle) => ({
+      handle,
+      state: "terminated" as const,
+      exitCode: null,
+      signal: "SIGTERM",
+      durationMs: 1,
+      stdout: "",
+      stderr: "",
+      stdoutDroppedBytes: 0,
+      stderrDroppedBytes: 0,
+      outputTruncated: false
+    }));
+    const finish = vi.fn(async () => true);
+
+    await expect(finishSolvingBudgetBoundary(
+      target,
+      new AbortController().signal,
+      {
+        kind: "recoverable_failure",
+        code: "budget_exhausted",
+        message: "No model-turn budget remains.",
+        decisionAuthority: "resource_boundary"
+      },
+      {
+        reviews: {} as never,
+        longHorizon: {} as never,
+        emit: emit as never,
+        finish,
+        runtime: {
+          execution: {
+            execute: async () => { throw new Error("not used"); },
+            terminate
+          }
+        } as never,
+        createArtifact: async () => "unused"
+      }
+    )).resolves.toBe(true);
+
+    expect(terminate).toHaveBeenCalledTimes(1);
+    expect(target.execution.processHandles.size).toBe(0);
+    expect(target.durable.state.activeProcessIds).toEqual([]);
+    expect(events).toContainEqual({
+      type: "process.exited",
+      payload: expect.objectContaining({
+        processId: "service",
+        reason: "budget_boundary_unhanded_deliverable"
+      })
+    });
+    expect(finish).toHaveBeenCalledWith(
+      target,
+      expect.objectContaining({
+        kind: "completed",
+        decisionAuthority: "resource_boundary"
+      }),
+      target.durable.state.revision
+    );
+  });
+
+  it("terminates only deliverable processes in the boundary cleanup", async () => {
+    const target = runtimeSessionFixture({
+      execution: {
+        processHandles: new Map([
+          ["service", { id: "service", brokerInstanceId: "broker-1", lifecycle: "deliverable" }],
+          ["helper", { id: "helper", brokerInstanceId: "broker-1", lifecycle: "session" }]
+        ])
+      }
+    });
+    const recorded = recorder();
+    const terminate = vi.fn(async (handle) => ({
+      handle,
+      state: "terminated" as const,
+      exitCode: null,
+      signal: "SIGTERM",
+      durationMs: 1,
+      stdout: "",
+      stderr: "",
+      stdoutDroppedBytes: 0,
+      stderrDroppedBytes: 0,
+      outputTruncated: false
+    }));
+
+    await expect(terminateUnhandedBudgetBoundaryProcesses(
+      target,
+      new AbortController().signal,
+      {
+        execution: {
+          execute: async () => { throw new Error("not used"); },
+          terminate
+        },
+        emit: recorded.emit,
+        createArtifact: async () => "unused"
+      }
+    )).resolves.toEqual({ attempted: 1, settled: 1, unavailable: false });
+
+    expect(terminate).toHaveBeenCalledTimes(1);
+    expect(terminate.mock.calls[0]?.[0]).toMatchObject({ id: "service" });
+    expect(target.execution.processHandles.has("service")).toBe(false);
+    expect(target.execution.processHandles.has("helper")).toBe(true);
   });
 
   it("records background and PTY process handles", async () => {

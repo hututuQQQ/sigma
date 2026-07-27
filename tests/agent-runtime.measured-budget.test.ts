@@ -1,7 +1,7 @@
 import { mkdtemp, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type {
   AgentEventEnvelope,
   BudgetLedgerState,
@@ -93,7 +93,8 @@ class InspectableGateway implements ModelGateway {
 
   constructor(
     private readonly responses: ModelResponse[],
-    capabilityOverrides: Partial<ModelCapabilities> = {}
+    capabilityOverrides: Partial<ModelCapabilities> = {},
+    private readonly beforeResponse?: (request: ModelRequest) => void
   ) {
     this.capabilities = {
       contextWindowTokens: 128_000,
@@ -115,9 +116,69 @@ class InspectableGateway implements ModelGateway {
 
   async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
     this.requests.push(request);
+    this.beforeResponse?.(request);
     const response = this.responses[this.requests.length - 1];
     if (!response) throw new Error("Unexpected model request.");
     yield { type: "done", response };
+  }
+
+  async countTokens(): Promise<number> { return 100; }
+}
+
+class BoundaryBlockingGateway implements ModelGateway {
+  readonly provider = "fake";
+  readonly model = "boundary-blocking";
+  readonly requests: ModelRequest[] = [];
+  interruptedReason: unknown;
+  readonly capabilities: ModelCapabilities = {
+    contextWindowTokens: 128_000,
+    maxOutputTokens: 32_768,
+    tools: true,
+    parallelTools: false,
+    reasoning: true,
+    structuredOutput: false,
+    promptCache: true,
+    tokenizer: "approximate",
+    strictToolChoice: true
+  };
+
+  constructor(private readonly beforeFirstResponse: () => void) {}
+
+  async complete(_request: ModelRequest): Promise<never> {
+    throw new Error("This test consumes the streaming path.");
+  }
+
+  async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    this.requests.push(request);
+    if (this.requests.length === 1) {
+      this.beforeFirstResponse();
+      yield {
+        type: "done",
+        response: {
+          message: {
+            role: "assistant",
+            content: "I inspected the workspace before the time boundary.",
+            toolCalls: [{
+              id: "read-before-time-boundary",
+              name: "read",
+              arguments: { path: "seed.txt" }
+            }]
+          },
+          finishReason: "tool_calls",
+          usage: measuredUsage(100, 10)
+        }
+      };
+      return;
+    }
+    await new Promise<never>((_resolve, reject) => {
+      const interrupted = (): void => {
+        request.signal.removeEventListener("abort", interrupted);
+        this.interruptedReason = request.signal.reason;
+        reject(request.signal.reason);
+      };
+      if (request.signal.aborted) interrupted();
+      else request.signal.addEventListener("abort", interrupted, { once: true });
+    });
   }
 
   async countTokens(): Promise<number> { return 100; }
@@ -135,6 +196,14 @@ function requestInputResponse(): ModelResponse {
       }]
     },
     finishReason: "tool_calls",
+    usage: measuredUsage(100, 10)
+  };
+}
+
+function stopResponse(content: string): ModelResponse {
+  return {
+    message: { role: "assistant", content },
+    finishReason: "stop",
     usage: measuredUsage(100, 10)
   };
 }
@@ -368,10 +437,10 @@ describe("provider-measured model budget settlement", () => {
     }));
   });
 
-  it("keeps all permitted tools visible when one hard-ledger request fits", async () => {
+  it("uses a text-only final response when only one hard-ledger request fits", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-terminal-budget-workspace-"));
     const state = await mkdtemp(path.join(os.tmpdir(), "sigma-terminal-budget-state-"));
-    const gateway = new InspectableGateway([requestInputResponse()]);
+    const gateway = new InspectableGateway([stopResponse("Final budget-aware status.")]);
     const runtime = createRuntime({
       gateway,
       store: new SegmentedJsonlStore({ rootDir: state }),
@@ -386,17 +455,195 @@ describe("provider-measured model budget settlement", () => {
     });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "finish within budget" });
 
-    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "needs_input" });
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "completed",
+      message: "Final budget-aware status."
+    });
     expect(gateway.requests).toHaveLength(1);
-    expect(gateway.requests[0].toolChoice).toBeUndefined();
-    expect(gateway.requests[0].tools.map((tool) => tool.name)).toEqual(
-      expect.arrayContaining([
-        "read", "shell", "report_blocked", "request_user_input"
-      ])
-    );
-    expect(gateway.requests[0].tools.map((tool) => tool.name)).not.toContain("validate");
-    expect(gateway.requests[0].tools.map((tool) => tool.name)).not.toContain("runtime_finalize");
+    expect(gateway.requests[0].toolChoice).toBe("none");
+    expect(gateway.requests[0].tools).toEqual([]);
+    expect(gateway.requests[0].messages.some((message) =>
+      message.content.includes("final model turn allowed"))).toBe(true);
   });
+
+  it("submits settled work for evaluation when measured usage consumes the next request budget", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-boundary-submit-workspace-"));
+    const state = await mkdtemp(path.join(os.tmpdir(), "sigma-boundary-submit-state-"));
+    await writeFile(path.join(workspace, "seed.txt"), "seed\n", "utf8");
+    const gateway = new InspectableGateway([{
+      message: {
+        role: "assistant",
+        content: "I inspected the workspace before the resource boundary.",
+        toolCalls: [{
+          id: "read-before-boundary",
+          name: "read",
+          arguments: { path: "seed.txt" }
+        }]
+      },
+      finishReason: "tool_calls",
+      usage: measuredUsage(200, 10)
+    }]);
+    const store = new SegmentedJsonlStore({ rootDir: state });
+    const runtime = createRuntime({
+      gateway,
+      store,
+      storeRootDir: state,
+      tools: registerBuiltinTools(new EffectToolRegistry()),
+      permissionMode: "auto",
+      outputReserveTokens: 100
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" }, {
+      inputTokens: 300, outputTokens: 1_000, costMicroUsd: 10_000_000, modelTurns: 10,
+      toolCalls: 1_000, children: 32, maxDepth: 4
+    });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect the workspace" });
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "completed",
+      message: "I inspected the workspace before the resource boundary.",
+      decisionAuthority: "resource_boundary"
+    });
+    expect(gateway.requests).toHaveLength(1);
+    const events = await storedEvents(store, session.sessionId);
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "diagnostic",
+      payload: expect.objectContaining({
+        kind: "resource_boundary.submission",
+        sourceOutcomeCode: "budget_exhausted"
+      })
+    }));
+  });
+
+  it("settles pending tool calls without executing them once only the deadline reserve remains", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-deadline-settlement-workspace-"));
+    const state = await mkdtemp(path.join(os.tmpdir(), "sigma-deadline-settlement-state-"));
+    await writeFile(path.join(workspace, "seed.txt"), "seed\n", "utf8");
+    const startedAt = Date.now();
+    let currentTime = startedAt;
+    const now = vi.spyOn(Date, "now").mockImplementation(() => currentTime);
+    try {
+      const gateway = new InspectableGateway([{
+        message: {
+          role: "assistant",
+          content: "I reached the resource boundary after preparing the inspection.",
+          toolCalls: [{
+            id: "read-at-boundary",
+            name: "read",
+            arguments: { path: "seed.txt" }
+          }]
+        },
+        finishReason: "tool_calls",
+        usage: measuredUsage(100, 10)
+      }], {}, () => {
+        currentTime = startedAt + 15_000;
+      });
+      const store = new SegmentedJsonlStore({ rootDir: state });
+      const runtime = createRuntime({
+        gateway,
+        store,
+        storeRootDir: state,
+        tools: registerBuiltinTools(new EffectToolRegistry()),
+        permissionMode: "auto",
+        outputReserveTokens: 100,
+        runDeadlineMs: 20_000
+      });
+      const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" }, {
+        inputTokens: 10_000, outputTokens: 1_000, costMicroUsd: 10_000_000, modelTurns: 10,
+        toolCalls: 1_000, children: 32, maxDepth: 4
+      });
+      await runtime.command({
+        type: "submit",
+        sessionId: session.sessionId,
+        text: "Inspect seed.txt."
+      });
+
+      await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+        kind: "completed",
+        decisionAuthority: "resource_boundary"
+      });
+      expect(gateway.requests).toHaveLength(1);
+      const events = await storedEvents(store, session.sessionId);
+      expect(events.some((event) => event.type === "tool.started")).toBe(false);
+      expect(events).toContainEqual(expect.objectContaining({
+        type: "tool.failed",
+        payload: expect.objectContaining({
+          callId: "read-at-boundary",
+          diagnostics: expect.arrayContaining(["budget_exhausted"])
+        })
+      }));
+      expect(events).toContainEqual(expect.objectContaining({
+        type: "diagnostic",
+        payload: expect.objectContaining({
+          kind: "resource_boundary.submission",
+          sourceOutcomeCode: "budget_exhausted"
+        })
+      }));
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it("interrupts an active model stream before the settlement reserve and submits durable work", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-model-boundary-workspace-"));
+    const state = await mkdtemp(path.join(os.tmpdir(), "sigma-model-boundary-state-"));
+    await writeFile(path.join(workspace, "seed.txt"), "seed\n", "utf8");
+    const startedAt = Date.now();
+    let currentTime = startedAt;
+    let enterBoundary: ReturnType<typeof setTimeout> | undefined;
+    const now = vi.spyOn(Date, "now").mockImplementation(() => currentTime);
+    try {
+      const gateway = new BoundaryBlockingGateway(() => {
+        currentTime = startedAt + 8_000;
+        enterBoundary = setTimeout(() => {
+          currentTime = startedAt + 10_000;
+        }, 2_000);
+      });
+      const store = new SegmentedJsonlStore({ rootDir: state });
+      const runtime = createRuntime({
+        gateway,
+        store,
+        storeRootDir: state,
+        tools: registerBuiltinTools(new EffectToolRegistry()),
+        permissionMode: "auto",
+        outputReserveTokens: 100,
+        runDeadlineMs: 20_000
+      });
+      const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" }, {
+        inputTokens: 10_000, outputTokens: 1_000, costMicroUsd: 10_000_000, modelTurns: 10,
+        toolCalls: 1_000, children: 32, maxDepth: 4
+      });
+      await runtime.command({
+        type: "submit",
+        sessionId: session.sessionId,
+        text: "Inspect seed.txt, then continue until interrupted."
+      });
+
+      await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+        kind: "completed",
+        message: "I inspected the workspace before the time boundary.",
+        decisionAuthority: "resource_boundary"
+      });
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.interruptedReason).toMatchObject({
+        name: "ResourceBoundaryError",
+        code: "budget_exhausted"
+      });
+      const events = await storedEvents(store, session.sessionId);
+      expect(events.some((event) => event.type === "run.failed")).toBe(false);
+      expect(events.at(-1)?.type).toBe("run.completed");
+      expect(replayBudget(events).reservations.every((item) => item.status !== "reserved")).toBe(true);
+      expect(events).toContainEqual(expect.objectContaining({
+        type: "diagnostic",
+        payload: expect.objectContaining({
+          kind: "resource_boundary.submission",
+          sourceOutcomeCode: "budget_exhausted"
+        })
+      }));
+    } finally {
+      if (enterBoundary) clearTimeout(enterBoundary);
+      now.mockRestore();
+    }
+  }, 10_000);
 
   it("returns typed budget exhaustion before an unfundable final request", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-exhausted-budget-workspace-"));

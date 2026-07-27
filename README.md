@@ -14,8 +14,8 @@
 </p>
 
 <p align="center">
-  <img alt="Status: 0.1.0 development preview" src="https://img.shields.io/badge/status-0.1.0%20development%20preview-f59e0b">
-  <img alt="Release targets: Linux and Windows previews" src="https://img.shields.io/badge/release%20targets-Linux%20preview%20%2B%20Windows%20unsigned%20preview-0078d4">
+  <img alt="Status: 0.1.0 first stable release" src="https://img.shields.io/badge/status-0.1.0%20stable-2ea44f">
+  <img alt="Release targets: Linux stable and Windows unsigned preview" src="https://img.shields.io/badge/release%20targets-Linux%20stable%20%2B%20Windows%20unsigned%20preview-0078d4">
   <img alt="Formal evaluation: preregistered" src="https://img.shields.io/badge/formal%20evaluation-preregistered-4cc9c0">
 </p>
 
@@ -25,19 +25,18 @@
 
 Sigma Code turns a coding task into a durable stream of typed decisions and evidence. It can explore a repository, make scoped changes, run sandboxed commands, validate the result, ask an independent reviewer, and recover the same session after interruption. The product uses one event-sourced kernel, one session format, and one terminal UI instead of separate execution paths that drift apart.
 
-`0.1.0` is a development preview and the only supported product baseline. Linux
-x64 and Windows x64 artifacts are preview candidates; Windows remains explicitly
-unsigned until trusted Authenticode signing is available. See the [security
+`0.1.0` is the first formal release and the only supported product baseline.
+Linux x64 is the stable release target. Windows x64 remains an explicitly
+unsigned preview until trusted Authenticode signing is available. See the [security
 policy](SECURITY.md) and [contribution guide](CONTRIBUTING.md) before reporting
 or proposing changes.
 
 > [!IMPORTANT]
 > **Current product boundary**
 >
-> - **Sigma Code 0.1.0 is a development preview on both Tier 1 targets.** Linux x64 and Windows x64 candidates must pass native sandbox, packaged-product, checksum, SBOM, and signed-provenance gates. Windows executables do not yet have a trusted Authenticode signature and may trigger Windows security warnings.
+> - **Sigma Code 0.1.0 is stable on Linux x64; Windows x64 is an unsigned preview.** Both candidates must pass native sandbox, packaged-product, checksum, SBOM, and signed-provenance gates. Windows executables do not yet have a trusted Authenticode signature and may trigger Windows security warnings.
 > - **Formal evaluation is preregistered, not provider-coded.** The SHA-bound run manifest freezes the provider, model, source, archive, task selection, network, timeouts, concurrency, attempts, and retries before execution.
 > - Provider comparisons are valid only when their SHA-bound run manifests freeze comparable controls; the harness does not infer comparability from a model name.
-> - Sigma treats **OpenCode as a direct competitor and a product target, not a parity claim**. There is still a real gap between Sigma and OpenCode in overall practical performance and maturity today.
 
 ## Why Sigma Code
 
@@ -49,9 +48,9 @@ or proposing changes.
 | Fail-closed containment | Process execution stays in the required native sandbox even when host reads or networking are authorized. If the sandbox is unhealthy, Sigma refuses to execute. |
 | One product path | CLI automation and the TUI use the same `RuntimeClient`, kernel, store, tools, recovery logic, and outcome protocol. |
 
-## Quick start on Linux (development preview)
+## Quick start on Linux
 
-Obtain a `0.1.0` Linux x64 preview archive from a verified project release or
+Obtain the `0.1.0` Linux x64 stable archive from a verified project release or
 build it from source, verify its SHA-256 sidecar and signed provenance, and
 extract it:
 
@@ -93,9 +92,9 @@ $env:DEEPSEEK_API_KEY = "your-api-key"
 
 The example sets the key only for the current PowerShell process. Keep secrets out of `.agent/config.toml` and source control.
 
-Published preview archives include a SHA-256 checksum, CycloneDX SBOM, signed
-provenance, and the public provenance verification key. Neither target is a
-stable release at `0.1.0`; Windows x64 additionally remains unsigned. See
+Published archives include a SHA-256 checksum, CycloneDX SBOM, signed
+provenance, and the public provenance verification key. Linux x64 is stable at
+`0.1.0`; Windows x64 remains an unsigned preview. See
 [SECURITY.md](SECURITY.md) for the trust boundary and
 [RELEASING.md](RELEASING.md) for the maintainer process.
 
@@ -363,6 +362,28 @@ a `SigmaFormalRunPreregistration`; code supplies no formal dataset, model,
 quota, retry, or score threshold default.
 
 The evaluator may select a task, launch the packaged CLI, and collect artifacts after the run. It must not send scenario identity, verifier output, scores, rewards, hidden checks, or post-run failures into the solving session, and verifier feedback never triggers another solving attempt. This fairness boundary is enforced by protocol types and production-source scans.
+
+### Terminal-Bench 2.1: Sigma Code + DeepSeek vs OpenCode + DeepSeek
+
+A staged diagnostic run on July 27–28, 2026 compared both agents with
+DeepSeek `deepseek-v4-pro` on the same 89-task Terminal-Bench 2.1 population.
+The Sigma lane used a maximum concurrency of 5, one attempt per task, zero
+retries, and no verifier feedback.
+
+| View | Sigma Code + DeepSeek | OpenCode + DeepSeek | Difference |
+| --- | ---: | ---: | ---: |
+| Raw 89 tasks | 51/89 (57.303%) | 49/89 (55.056%) | Sigma +2 passes / +2.247 pp |
+| Infrastructure-valid subset | 51/83 (61.446%) | 47/83 (56.627%) | Sigma +4 passes / +4.819 pp |
+
+The raw view keeps six externally caused Sigma infrastructure-invalid
+observations as non-passes. The secondary view removes those same six task
+identities from both agents. Sigma's immutable observation union is
+`49 + 4 + 1 + 9 + 26 = 89`: each source revision ran only the then-unconsumed
+suffix, so this is a mixed-source diagnostic result rather than a score for the
+final PR head. No consumed task was rerun, and the generic lifecycle fix made
+after the final observation is intentionally not included in the score. See
+[PR #73](https://github.com/hututuQQQ/sigma/pull/73) for the source-boundary,
+stop-loss, and validation record.
 
 ```powershell
 # Audit existing sessions without a model call.

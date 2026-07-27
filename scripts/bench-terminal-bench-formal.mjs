@@ -26,7 +26,8 @@ import { runTerminalBenchCli } from "./bench-terminal-bench.mjs";
 
 const execFileAsync = promisify(execFile);
 const ALLOWED_FLAGS = new Set([
-  "preregistration-file", "expected-preregistration-sha256", "output", "batch", "resume"
+  "preregistration-file", "expected-preregistration-sha256", "output", "batch", "resume",
+  "infrastructure-recovery-file", "expected-infrastructure-recovery-sha256"
 ]);
 
 function requiredString(value, label) {
@@ -45,6 +46,25 @@ function formalOptions(argv) {
   if (flags.resume !== undefined && flags.resume !== true) {
     throw new Error("--resume is a boolean flag.");
   }
+  const recoveryFile = flags["infrastructure-recovery-file"]
+    ? path.resolve(requiredString(
+      flags["infrastructure-recovery-file"], "--infrastructure-recovery-file"
+    ))
+    : null;
+  const recoverySha256 = flags["expected-infrastructure-recovery-sha256"]
+    ? requiredString(
+      flags["expected-infrastructure-recovery-sha256"],
+      "--expected-infrastructure-recovery-sha256"
+    ).toLowerCase()
+    : null;
+  if ((recoveryFile === null) !== (recoverySha256 === null)) {
+    throw new Error(
+      "--infrastructure-recovery-file and --expected-infrastructure-recovery-sha256 are required together."
+    );
+  }
+  if (recoverySha256 !== null && !/^[a-f0-9]{64}$/u.test(recoverySha256)) {
+    throw new Error("--expected-infrastructure-recovery-sha256 must be a SHA-256 digest.");
+  }
   return {
     preregistrationFile: path.resolve(requiredString(
       flags["preregistration-file"], "--preregistration-file"
@@ -54,7 +74,9 @@ function formalOptions(argv) {
     ).toLowerCase(),
     outputDir: flags.output ? path.resolve(requiredString(flags.output, "--output")) : null,
     batchId: requiredString(flags.batch, "--batch"),
-    resume: flags.resume === true
+    resume: flags.resume === true,
+    infrastructureRecoveryFile: recoveryFile,
+    expectedInfrastructureRecoverySha256: recoverySha256
   };
 }
 
@@ -135,6 +157,106 @@ async function ensureStableJson(filePath, value) {
   }
 }
 
+function assertExactFields(value, expected, label) {
+  const observed = Object.keys(value).sort();
+  const allowed = [...expected].sort();
+  if (canonicalJson(observed) !== canonicalJson(allowed)) {
+    throw new Error(`${label} has an invalid field set.`);
+  }
+}
+
+function validateInfrastructureRecovery(value, manifest, preregistrationSha256) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Infrastructure recovery receipt must be a JSON object.");
+  }
+  assertExactFields(value, [
+    "schemaVersion",
+    "kind",
+    "formal_run_id",
+    "consumption_identity_sha256",
+    "preregistration_sha256",
+    "decision",
+    "rerun_consumed_tasks",
+    "verifier_feedback_to_agent",
+    "recoveries"
+  ], "Infrastructure recovery receipt");
+  if (value.schemaVersion !== 1 || value.kind !== "SigmaFormalInfrastructureRecoveryReceipt"
+    || value.formal_run_id !== manifest.formal_run_id
+    || value.consumption_identity_sha256 !== manifest.consumption_identity_sha256
+    || value.preregistration_sha256 !== preregistrationSha256
+    || value.decision !== "continue_unconsumed_suffix"
+    || value.rerun_consumed_tasks !== false
+    || value.verifier_feedback_to_agent !== false
+    || !Array.isArray(value.recoveries) || value.recoveries.length === 0) {
+    throw new Error("Infrastructure recovery receipt is stale or malformed.");
+  }
+  const batches = new Set();
+  for (const recovery of value.recoveries) {
+    if (!recovery || typeof recovery !== "object" || Array.isArray(recovery)) {
+      throw new Error("Infrastructure recovery entry must be a JSON object.");
+    }
+    assertExactFields(recovery, [
+      "batch",
+      "completed_batch_sha256",
+      "repair_scope",
+      "recovered_at",
+      "recovery_checks"
+    ], "Infrastructure recovery entry");
+    if (typeof recovery.batch !== "string" || recovery.batch.length === 0
+      || batches.has(recovery.batch)
+      || !/^[a-f0-9]{64}$/u.test(recovery.completed_batch_sha256)
+      || recovery.repair_scope !== "neutral_infrastructure"
+      || typeof recovery.recovered_at !== "string"
+      || Number.isNaN(Date.parse(recovery.recovered_at))
+      || !Array.isArray(recovery.recovery_checks) || recovery.recovery_checks.length === 0) {
+      throw new Error("Infrastructure recovery entry is stale or malformed.");
+    }
+    batches.add(recovery.batch);
+    for (const check of recovery.recovery_checks) {
+      if (!check || typeof check !== "object" || Array.isArray(check)) {
+        throw new Error("Infrastructure recovery check must be a JSON object.");
+      }
+      assertExactFields(check, ["kind", "status", "observed_at"], "Infrastructure recovery check");
+      if (typeof check.kind !== "string" || check.kind.length === 0
+        || check.status !== "passed"
+        || typeof check.observed_at !== "string"
+        || Number.isNaN(Date.parse(check.observed_at))) {
+        throw new Error("Infrastructure recovery check is stale or malformed.");
+      }
+    }
+  }
+  return value;
+}
+
+async function loadInfrastructureRecovery(options, manifest, preregistrationSha256) {
+  if (!options.infrastructureRecoveryFile) return null;
+  let bytes;
+  try {
+    bytes = await readFile(options.infrastructureRecoveryFile);
+  } catch (error) {
+    throw new Error(
+      `Infrastructure recovery receipt is unavailable at ${options.infrastructureRecoveryFile}.`,
+      { cause: error }
+    );
+  }
+  const observed = sha256(bytes);
+  if (observed !== options.expectedInfrastructureRecoverySha256) {
+    throw new Error(
+      `Infrastructure recovery receipt SHA-256 ${observed} does not match ${options.expectedInfrastructureRecoverySha256}.`
+    );
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(bytes.toString("utf8"));
+  } catch (error) {
+    throw new Error("Infrastructure recovery receipt is not valid JSON.", { cause: error });
+  }
+  return {
+    receipt: validateInfrastructureRecovery(parsed, manifest, preregistrationSha256),
+    sha256: observed
+  };
+}
+
 function assertBatchMarker(marker, kind, batch, manifest, preregistrationSha256) {
   if (!marker || typeof marker !== "object" || Array.isArray(marker)
     || marker.schemaVersion !== 1 || marker.kind !== kind
@@ -150,19 +272,45 @@ function assertBatchMarker(marker, kind, batch, manifest, preregistrationSha256)
 function batchOperationallyComplete(record, batch) {
   const report = record?.report;
   const accounting = report?.trial_accounting;
+  const tasks = Array.isArray(report?.tasks) ? report.tasks : [];
   const expected = batch.task_indexes.length;
   return Boolean(report && report.incomplete_reason === null
     && record.docker_cleanup?.clean === true
     && Number(accounting?.expected) === expected
     && Number(accounting?.observed) === expected
     && Number(accounting?.missing) === 0
-    && Number(accounting?.errored) === 0);
+    && tasks.length === expected
+    && tasks.every((task) => task?.validity === "valid"));
 }
 
-async function completedBatchRecords(outputDir, manifest, preregistrationSha256) {
+function batchHasRecoverableInfrastructureGap(record, batch) {
+  const report = record?.report;
+  const accounting = report?.trial_accounting;
+  const tasks = Array.isArray(report?.tasks) ? report.tasks : [];
+  const expected = batch.task_indexes.length;
+  return Boolean(report && report.incomplete_reason === null
+    && record.docker_cleanup?.clean === true
+    && Number(accounting?.expected) === expected
+    && Number(accounting?.observed) === expected
+    && Number(accounting?.missing) === 0
+    && tasks.length === expected
+    && tasks.some((task) => task?.validity === "infra_failed")
+    && tasks.every((task) => task?.validity === "valid" || task?.validity === "infra_failed"));
+}
+
+async function completedBatchRecords(
+  outputDir,
+  manifest,
+  preregistrationSha256,
+  infrastructureRecovery = null
+) {
   const records = [];
   let incompleteStarted = null;
   let incompleteCompleted = null;
+  const recoveries = new Map(
+    infrastructureRecovery?.receipt.recoveries.map((item) => [item.batch, item]) ?? []
+  );
+  const appliedRecoveries = new Set();
   for (const batch of manifest.execution.batches) {
     const files = batchPaths(outputDir, batch.id);
     const [started, completed] = await Promise.all([
@@ -191,8 +339,29 @@ async function completedBatchRecords(outputDir, manifest, preregistrationSha256)
         throw new Error(`Formal batch ${batch.id} completion receipt does not bind its started marker.`);
       }
       records.push(completed);
-      if (!batchOperationallyComplete(completed, batch)) incompleteCompleted = batch.id;
+      if (!batchOperationallyComplete(completed, batch)) {
+        const recovery = recoveries.get(batch.id);
+        if (!recovery) {
+          incompleteCompleted = batch.id;
+          continue;
+        }
+        if (!batchHasRecoverableInfrastructureGap(completed, batch)) {
+          throw new Error(
+            `Formal batch ${batch.id} is not eligible for infrastructure recovery continuation.`
+          );
+        }
+        const completedSha256 = sha256(await readFile(files.completed));
+        if (completedSha256 !== recovery.completed_batch_sha256) {
+          throw new Error(
+            `Infrastructure recovery for batch ${batch.id} does not bind its completion receipt.`
+          );
+        }
+        appliedRecoveries.add(batch.id);
+      }
     }
+  }
+  if (appliedRecoveries.size !== recoveries.size) {
+    throw new Error("Infrastructure recovery receipt names a batch without an eligible completed gap.");
   }
   return { records, incompleteStarted, incompleteCompleted };
 }
@@ -255,7 +424,6 @@ export function aggregateFormalReports(manifest, batchRecords) {
   const executionComplete = allBatchesRecorded
     && reports.length === manifest.execution.batches.length
     && accounting.observed === expected
-    && accounting.errored === 0
     && accounting.missing === 0
     && reports.every((report) => report.incomplete_reason === null)
     && batchRecords.every((record) => {
@@ -388,7 +556,16 @@ export async function runFormalBenchmark(argv = process.argv.slice(2), deps = {}
     await writeExclusiveJson(frozenPath, manifest);
   }
 
-  const history = await completedBatchRecords(outputDir, manifest, bundle.sha256);
+  const infrastructureRecovery = await loadInfrastructureRecovery(options, manifest, bundle.sha256);
+  const history = await completedBatchRecords(
+    outputDir, manifest, bundle.sha256, infrastructureRecovery
+  );
+  if (infrastructureRecovery) {
+    await ensureStableJson(
+      path.join(outputDir, `infrastructure-recovery-${infrastructureRecovery.sha256}.json`),
+      infrastructureRecovery.receipt
+    );
+  }
   if (history.incompleteStarted) {
     throw new Error(
       `Formal batch ${history.incompleteStarted} was already started; retrying a consumed batch is prohibited.`

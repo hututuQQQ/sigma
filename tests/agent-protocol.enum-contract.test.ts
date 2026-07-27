@@ -252,6 +252,10 @@ describe("protocol enum and invariant contracts", () => {
       { kind: "nested_instructions_loaded", callId: "call", provenance: [], items: [item], affectsMutation: false },
       { kind: "hook_context_added", event: "pre_model", items: [item] },
       { kind: "recovery.retry_model", message: "retry" },
+      {
+        kind: "resource_boundary.submission", sourceOutcomeCode: "budget_exhausted",
+        message: "submitted", decisionAuthority: "resource_boundary"
+      },
       { kind: "recovery.reset_tool", callId: "call", approval: "not_required" },
       {
         kind: "hook_model_recovered", hookId: "hook", event: "pre_model", requestId: "request",

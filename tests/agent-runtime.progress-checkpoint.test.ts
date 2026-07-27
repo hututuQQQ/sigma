@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_PROFILE_ASSURANCE,
+  DEFAULT_PROFILE_BUDGET,
+  freezeAgentProfile
+} from "../packages/agent-extensions/src/index.js";
+import {
   EVENT_SCHEMA_VERSION,
   isLongHorizonState,
   type AgentEventEnvelope,
@@ -79,6 +84,30 @@ function addBatch(
 
 function refresh(session: ReturnType<typeof runtimeSessionFixture>): void {
   session.durable.state.longHorizon = nextLongHorizonState(session);
+}
+
+function requiredReviewSession() {
+  return runtimeSessionFixture({
+    services: {
+      profile: freezeAgentProfile({
+        id: "fixture-required",
+        roleRoutes: {},
+        toolAllow: null,
+        toolDeny: [],
+        skills: [],
+        hooks: [],
+        permissionMode: "auto",
+        budget: { ...DEFAULT_PROFILE_BUDGET },
+        mutationPolicy: {
+          requirePlanBeforeMutation: false,
+          checkpointBeforeMutation: true,
+          reviewMode: "required"
+        },
+        assurancePolicy: { ...DEFAULT_PROFILE_ASSURANCE },
+        allowedChildProfiles: []
+      })
+    }
+  });
 }
 
 function consumeModelTurns(
@@ -649,8 +678,8 @@ describe("objective long-horizon triggers", () => {
     expect(active.durable.state.longHorizon.strategy?.trigger).toBe("resource_band");
   });
 
-  it("measures the resource band against main capacity after assurance reserve", async () => {
-    const session = runtimeSessionFixture();
+  it("measures the required-review resource band against main capacity after assurance reserve", async () => {
+    const session = requiredReviewSession();
     session.durable.state.plan = {
       revision: 1,
       goal: "Finish the active work.",
@@ -677,6 +706,33 @@ describe("objective long-horizon triggers", () => {
 
     expect(gateway.calls).toBe(1);
     expect(session.durable.state.longHorizon.strategy?.trigger).toBe("resource_band");
+  });
+
+  it("does not advance the Standard resource band for an optional assurance pool", async () => {
+    const session = runtimeSessionFixture();
+    session.durable.state.plan = {
+      revision: 1,
+      goal: "Finish the active work.",
+      activeNodeId: "active",
+      nodes: [{
+        id: "active",
+        title: "Finish",
+        dependencies: [],
+        status: "in_progress",
+        owner: { kind: "root" },
+        acceptanceCriteria: [],
+        evidence: []
+      }]
+    };
+    const limit = session.durable.state.budget.limits.inputTokens;
+    consumeInputTokens(session, Math.floor(limit * 0.6));
+    const gateway = new StrategistGateway();
+
+    await coordinatorHarness(session, gateway)
+      .prepareForMainModel(session, new AbortController().signal);
+
+    expect(gateway.calls).toBe(0);
+    expect(session.durable.state.longHorizon.strategy).toBeUndefined();
   });
 
   it("honors strategist_mode=off for every objective trigger", async () => {

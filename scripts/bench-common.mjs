@@ -1,10 +1,10 @@
-import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import spawn from "cross-spawn";
 import {
   assertUniqueHarborTaskExecutionIdentities,
   buildResolvedTaskAttestation,
@@ -1035,7 +1035,7 @@ export async function runProcess(command, args, options = {}) {
       child = spawn(command, args, {
         cwd,
         env,
-        shell: process.platform === "win32" && /\.(cmd|bat)$/i.test(command),
+        shell: false,
         windowsHide: true
       });
     } catch (error) {
@@ -1233,13 +1233,16 @@ export function classifyFailure(input = {}) {
   const logText = String(input.logText ?? "");
   const events = input.traceEvents ?? [];
 
-  const declared = input.failureKind
-    ?? input.metadata?.failure_kind
-    ?? summary.failure_kind;
-  if ([
+  const declaredFailureKinds = [
     "needs_input", "timeout", "tool_error", "api_error", "verifier_failure", "structured_blocker",
-    "agent_setup_failed", "infrastructure_incomplete"
-  ].includes(declared)) {
+    "agent_setup_failed", "infrastructure_incomplete", "agent_timeout"
+  ];
+  const declared = [
+    input.failureKind,
+    input.metadata?.failure_kind,
+    summary.failure_kind
+  ].find((candidate) => declaredFailureKinds.includes(candidate));
+  if (declared) {
     return declared;
   }
 
@@ -1266,6 +1269,21 @@ export function classifyFailure(input = {}) {
   }
   if (/api request failed|rate limit|missing api key/i.test(logText) || /\b(401|403|429|500)\b/.test(logText)) {
     return "api_error";
+  }
+  const summaryFailureCodes = [
+    summary.failure_code,
+    summary.model_failure?.code,
+    summary.last_event?.payload?.code
+  ];
+  const traceFailureCodes = events.map((event) => {
+    const payload = event?.sigma_event?.payload ?? event?.payload ?? event?.metadata?.payload ?? {};
+    return payload?.code ?? payload?.diagnosticCode ?? payload?.failureCode;
+  });
+  if ([...summaryFailureCodes, ...traceFailureCodes]
+    .some((code) => typeof code === "string" && code.toLowerCase() === "run_deadline")
+    || /(?:\brun (?:exceeded|reached|expired|hit)\b[^\n]*\bdeadline\b|\brun deadline\b[^\n]*\b(?:elapsed|exceeded|expired)\b|\bdurable active-time deadline\b)/i
+      .test(logText)) {
+    return "agent_timeout";
   }
   if (summaryHasFinishReason(summary, "max_turns")) return "max_turns";
   if (traceHasToolTimeout(events)) return "tool_timeout";
@@ -1640,6 +1658,7 @@ function verifierInfrastructureEvidence(stdoutText, failedTests) {
     .test(text);
   if (hasProductTestResult) return [];
   const evidence = [];
+  const mutablePackageState = /dpkg was interrupted(?:,\s*you must manually run)?/iu.test(text);
   const checks = [
     ["dependency_install_network", /(?:failed to fetch|bad gateway|temporary failure resolving|could not resolve|network is unreachable|connection (?:timed out|reset))/iu],
     ["dependency_install_failed", /(?:unable to fetch some archives|could not install packages|subprocess-exited-with-error|npm err!|pnpm.*err)/iu],
@@ -1648,6 +1667,7 @@ function verifierInfrastructureEvidence(stdoutText, failedTests) {
     ["verifier_module_missing", /(?:error collecting|ModuleNotFoundError:\s*No module named)/iu]
   ];
   for (const [code, pattern] of checks) {
+    if (code === "verifier_toolchain_missing" && mutablePackageState) continue;
     if (pattern.test(text)) evidence.push(code);
   }
   return evidence;
@@ -2091,6 +2111,7 @@ function mergeHarborTrialResult(task, trialResult) {
   const traceSummary = {
     ...(task.runtime_status ? { status: task.runtime_status } : {}),
     ...(task.finish_reason ? { finish_reason: task.finish_reason } : {}),
+    ...(task.failure_category ? { failure_kind: task.failure_category } : {}),
     ...(task.terminal_origin ? { terminal_origin: task.terminal_origin } : {}),
     ...(task.termination_source ? { termination_source: task.termination_source } : {}),
     ...(trialResult?.agent_trace_summary ?? {})

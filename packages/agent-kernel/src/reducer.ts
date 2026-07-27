@@ -210,7 +210,8 @@ const runCompleted: EventReducer = (state, _event, payload) => {
 
 const diagnostic: EventReducer = (state, _event, payload) => {
   if (payload.kind === "steering.restart" || payload.kind === "tool.batch_settled") return state;
-  if (payload.kind === "assurance.review_transfer") {
+  if (payload.kind === "assurance.review_transfer"
+    || payload.kind === "resource_boundary.submission") {
     return proposedOutcomeState(state, {
       kind: "completed",
       message: text(payload.message),

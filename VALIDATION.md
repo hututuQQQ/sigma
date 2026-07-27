@@ -62,9 +62,10 @@ What these commands prove:
 - `perf:replay-100k`: validates schema 1 segmented reads, envelope validation,
   reducer replay, snapshot rebuild, and tail replay over 100,000 events.
 - `package:harbor-runtime`: packages the already-built CLI archive with the external Harbor adapter; it does not add Harbor behavior to the solving runtime.
-- `product:readiness`: evaluates generated smoke/package evidence. For `0.x`,
-  it distinguishes internal readiness from preview readiness on each Tier 1
-  target; it does not claim stable release readiness.
+- `product:readiness`: evaluates generated smoke/package evidence and derives
+  readiness from the product SemVer and target trust evidence. For `0.1.0`,
+  Linux x64 must be release-ready while unsigned Windows x64 must be
+  preview-ready.
 
 `pnpm verify:product` combines only platform-neutral lint, coverage, fake product/TUI smoke, and internal readiness. Target archive, wrapper, sandbox, provider smoke, replay performance, and release readiness belong to `verify:release:linux` or `verify:release:windows`.
 

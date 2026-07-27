@@ -13,7 +13,7 @@ import {
 } from "./run-restoration.js";
 import { manifestEqual } from "./restore-manifest-validation.js";
 import { restoreCheckpointTransaction } from "./restore-transaction.js";
-import type { RestoreCasReader } from "./restore-cas.js";
+import type { RestoreCasInspector, RestoreCasReader } from "./restore-cas.js";
 
 export interface RunRestorationDependencies {
   list(sessionId: string): Promise<CheckpointRecord[]>;
@@ -24,6 +24,7 @@ export interface RunRestorationDependencies {
   transactionRoot(workspacePath: string): Promise<string>;
   writeRecords(records: readonly CheckpointRecord[]): Promise<void>;
   readCas: RestoreCasReader;
+  inspectCas: RestoreCasInspector;
   restoreFaultInjector?: CheckpointRestoreFaultInjector;
 }
 
@@ -83,6 +84,7 @@ export class RunRestorationCoordinator {
       desired: reconstructed.desired,
       current,
       readCas: (digest) => this.dependencies.readCas(digest),
+      inspectCas: async (entry) => await this.dependencies.inspectCas(entry),
       capture: async (ignoredRootName) => await this.dependencies.capture(workspacePath, scopes, ignoredRootName),
       finalization: { kind: "run", records: restored, desiredManifestDigest },
       finalize: async () => await this.dependencies.writeRecords(restored),

@@ -9,6 +9,7 @@ import {
   runTerminalBenchCli,
   terminalBenchHelpText
 } from "../scripts/bench-terminal-bench.mjs";
+import { runProcess } from "../scripts/bench-common.mjs";
 
 interface RunnerLogOptions {
   stdoutPath?: string;
@@ -136,6 +137,42 @@ describe("Terminal-Bench CLI verifier result handling", () => {
     expect(jobsDir).toMatch(/^C:\\t\\sigma-harbor\\[a-f0-9]{24}$/u);
     expect(jobsDir).not.toContain(runId);
   });
+
+  it.runIf(process.platform === "win32")(
+    "runs Windows command scripts with spaces without generic shell argument concatenation",
+    async () => {
+      const fixtureDir = await mkdtemp(path.join(os.tmpdir(), "sigma-bench-command-"));
+      const scriptDir = path.join(fixtureDir, "with space");
+      const scriptPath = path.join(scriptDir, "probe command.cmd");
+      await mkdir(scriptDir, { recursive: true });
+      await writeFile(
+        scriptPath,
+        "@echo off\r\nif \"%~1\"==\"--stdio\" (echo command-ok& exit /b 0)\r\nexit /b 7\r\n",
+        "utf8"
+      );
+
+      try {
+        const moduleUrl = new URL("../scripts/bench-common.mjs", import.meta.url).href;
+        const probe = await runProcess(process.execPath, [
+          "--throw-deprecation",
+          "--input-type=module",
+          "--eval",
+          [
+            `import { runProcess } from ${JSON.stringify(moduleUrl)};`,
+            `const result = await runProcess(${JSON.stringify(scriptPath)}, ["--stdio"]);`,
+            "process.stdout.write(result.stdout);",
+            "process.stderr.write(result.stderr);",
+            "process.exitCode = result.exitCode;"
+          ].join("\n")
+        ]);
+        expect(probe.exitCode).toBe(0);
+        expect(probe.stderr).toBe("");
+        expect(probe.stdout.trim()).toBe("command-ok");
+      } finally {
+        await rm(fixtureDir, { recursive: true, force: true });
+      }
+    }
+  );
 
   it("reuses only an archive matching the frozen SHA-256", async () => {
     const fixtureDir = await mkdtemp(path.join(os.tmpdir(), "sigma-bench-archive-"));

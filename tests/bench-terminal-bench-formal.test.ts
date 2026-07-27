@@ -124,6 +124,24 @@ function report(taskCount: number, passed: number, blocker = false) {
   };
 }
 
+function reportWithValidAgentTimeout(taskCount: number, passed: number) {
+  const value = report(taskCount, passed);
+  const timedOut = taskCount - passed;
+  for (let index = passed; index < taskCount; index += 1) {
+    value.tasks[index] = {
+      ...value.tasks[index],
+      verifier_outcome: "not_run",
+      failure_category: "agent_timeout"
+    };
+  }
+  value.trial_accounting.scored = passed;
+  value.trial_accounting.errored = timedOut;
+  value.trial_accounting.meanReward = passed > 0 ? 1 : null;
+  value.counts.failed = 0;
+  (value.counts as Record<string, number>).timeout = timedOut;
+  return value;
+}
+
 async function frozenManifest(directory: string, value = manifest()) {
   const file = path.join(directory, "preregistration.json");
   const bytes = `${JSON.stringify(value, null, 2)}\n`;
@@ -302,6 +320,28 @@ describe("formal benchmark controller", () => {
     expect(aggregate).not.toHaveProperty("minimum_passes");
   });
 
+  it("treats fully observed valid agent timeouts as completed outcomes", () => {
+    const value = manifest();
+    const aggregate = aggregateFormalReports(value, [
+      {
+        batch: "001",
+        report: reportWithValidAgentTimeout(2, 1),
+        docker_cleanup: { clean: true }
+      },
+      {
+        batch: "002",
+        report: report(1, 1),
+        docker_cleanup: { clean: true }
+      }
+    ]);
+    expect(aggregate).toMatchObject({
+      status: "complete",
+      trial_accounting: { expected: 3, observed: 3, scored: 2, errored: 1, missing: 0 },
+      counts: { passed: 2, timeout: 1 },
+      failure_categories: { agent_timeout: 1 }
+    });
+  });
+
   it("runs each frozen batch once and derives every CLI control from the manifest", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "sigma-formal-controller-"));
     const output = path.join(directory, "output");
@@ -444,6 +484,23 @@ describe("formal benchmark controller", () => {
     expect(aggregate.status).toBe("incomplete");
   });
 
+  it("does not accept an infrastructure-invalid task even when accounting has no errors", () => {
+    const value = manifest();
+    const invalid = report(2, 1);
+    invalid.tasks[1] = {
+      ...invalid.tasks[1],
+      status: "infra_failed",
+      validity: "infra_failed",
+      verifier_outcome: "infra_failed",
+      failure_category: "verifier_setup_failed"
+    };
+    const aggregate = aggregateFormalReports(value, [
+      { batch: "001", report: invalid, docker_cleanup: { clean: true } },
+      { batch: "002", report: report(1, 1), docker_cleanup: { clean: true } }
+    ]);
+    expect(aggregate.status).toBe("incomplete");
+  });
+
   it("does not continue after a completed batch has infrastructure gaps", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "sigma-formal-incomplete-prefix-"));
     const output = path.join(directory, "output");
@@ -479,6 +536,174 @@ describe("formal benchmark controller", () => {
         ...verificationDeps,
         runBatch: async () => { throw new Error("must not dispatch"); }
       })).rejects.toThrow(/infrastructure gaps/u);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("continues only the unconsumed suffix after a SHA-bound neutral infrastructure recovery", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "sigma-formal-infra-recovery-"));
+    const output = path.join(directory, "output");
+    try {
+      const frozen = await frozenManifest(directory);
+      const invalid = report(2, 1);
+      invalid.tasks[1] = {
+        ...invalid.tasks[1],
+        status: "infra_failed",
+        validity: "infra_failed",
+        verifier_outcome: "infra_failed",
+        failure_category: "verifier_setup_failed"
+      };
+      invalid.counts.failed = 0;
+      invalid.counts.infra_failed = 1;
+      const dispatched: string[] = [];
+      await runFormalBenchmark([
+        "--preregistration-file", frozen.file,
+        "--expected-preregistration-sha256", frozen.sha256,
+        "--output", output,
+        "--batch", "001"
+      ], {
+        ...verificationDeps,
+        runBatch: async (_manifest, batch, _options, deps) => {
+          dispatched.push(batch.id);
+          await deps.beforeHarborDispatch();
+          return {
+            exitCode: 1,
+            runDir: "infra-invalid-run",
+            dockerCleanup: { clean: true },
+            report: invalid
+          };
+        }
+      });
+
+      const completedPath = path.join(output, "batch-001.completed.json");
+      const recovery = {
+        schemaVersion: 1,
+        kind: "SigmaFormalInfrastructureRecoveryReceipt",
+        formal_run_id: frozen.value.formal_run_id,
+        consumption_identity_sha256: frozen.value.consumption_identity_sha256,
+        preregistration_sha256: frozen.sha256,
+        decision: "continue_unconsumed_suffix",
+        rerun_consumed_tasks: false,
+        verifier_feedback_to_agent: false,
+        recoveries: [
+          {
+            batch: "001",
+            completed_batch_sha256: sha256(await readFile(completedPath)),
+            repair_scope: "neutral_infrastructure",
+            recovered_at: "2026-01-02T03:04:05.000Z",
+            recovery_checks: [
+              {
+                kind: "generic-network-probe",
+                status: "passed",
+                observed_at: "2026-01-02T03:03:05.000Z"
+              }
+            ]
+          }
+        ]
+      };
+      const recoveryPath = path.join(directory, "infrastructure-recovery.json");
+      const recoveryBytes = `${JSON.stringify(recovery, null, 2)}\n`;
+      await writeFile(recoveryPath, recoveryBytes, "utf8");
+      const recoverySha256 = sha256(recoveryBytes);
+
+      await expect(runFormalBenchmark([
+        "--preregistration-file", frozen.file,
+        "--expected-preregistration-sha256", frozen.sha256,
+        "--output", output,
+        "--batch", "002",
+        "--resume",
+        "--infrastructure-recovery-file", recoveryPath,
+        "--expected-infrastructure-recovery-sha256", "f".repeat(64)
+      ], {
+        ...verificationDeps,
+        runBatch: async () => { throw new Error("must not dispatch"); }
+      })).rejects.toThrow(/does not match/u);
+
+      const second = await runFormalBenchmark([
+        "--preregistration-file", frozen.file,
+        "--expected-preregistration-sha256", frozen.sha256,
+        "--output", output,
+        "--batch", "002",
+        "--resume",
+        "--infrastructure-recovery-file", recoveryPath,
+        "--expected-infrastructure-recovery-sha256", recoverySha256
+      ], {
+        ...verificationDeps,
+        runBatch: async (_manifest, batch, _options, deps) => {
+          dispatched.push(batch.id);
+          await deps.beforeHarborDispatch();
+          return {
+            exitCode: 0,
+            runDir: "following-run",
+            dockerCleanup: { clean: true },
+            report: report(1, 1)
+          };
+        }
+      });
+
+      expect(dispatched).toEqual(["001", "002"]);
+      expect(second.report).toMatchObject({
+        status: "incomplete",
+        batches: { expected: 2, completed: 2 },
+        trial_accounting: { expected: 3, observed: 3, missing: 0 },
+        counts: { passed: 2, infra_failed: 1 }
+      });
+      await expect(readFile(
+        path.join(output, `infrastructure-recovery-${recoverySha256}.json`),
+        "utf8"
+      )).resolves.toContain("SigmaFormalInfrastructureRecoveryReceipt");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("continues after a completed batch contains a valid agent timeout", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "sigma-formal-valid-timeout-"));
+    const output = path.join(directory, "output");
+    try {
+      const frozen = await frozenManifest(directory);
+      const first = await runFormalBenchmark([
+        "--preregistration-file", frozen.file,
+        "--expected-preregistration-sha256", frozen.sha256,
+        "--output", output,
+        "--batch", "001"
+      ], {
+        ...verificationDeps,
+        runBatch: async (_manifest, _batch, _options, deps) => {
+          await deps.beforeHarborDispatch();
+          return {
+            exitCode: 1,
+            runDir: "valid-timeout-run",
+            dockerCleanup: { clean: true },
+            report: reportWithValidAgentTimeout(2, 1)
+          };
+        }
+      });
+      expect(first.report.status).toBe("running");
+
+      const second = await runFormalBenchmark([
+        "--preregistration-file", frozen.file,
+        "--expected-preregistration-sha256", frozen.sha256,
+        "--output", output,
+        "--batch", "002",
+        "--resume"
+      ], {
+        ...verificationDeps,
+        runBatch: async (_manifest, _batch, _options, deps) => {
+          await deps.beforeHarborDispatch();
+          return {
+            exitCode: 0,
+            runDir: "following-run",
+            dockerCleanup: { clean: true },
+            report: report(1, 1)
+          };
+        }
+      });
+      expect(second.report).toMatchObject({
+        status: "complete",
+        trial_accounting: { expected: 3, observed: 3, errored: 1, missing: 0 }
+      });
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

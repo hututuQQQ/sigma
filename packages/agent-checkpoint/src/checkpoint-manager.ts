@@ -18,8 +18,8 @@ import { checkpointDelta } from "./manifest.js";
 import { normalizeCheckpointScopes, safeCheckpointId as safeId } from "./path-safety.js";
 import { restoreCheckpointTransaction } from "./restore-transaction.js";
 import { recoverCheckpointTransactions } from "./restore-recovery.js";
-import { captureCheckpointManifest } from "./safe-capture.js";
 import { CheckpointCasStore } from "./cas-store.js";
+import { CheckpointCaptureCoordinator } from "./checkpoint-capture-coordinator.js";
 import { buildCheckpointReviewMaterial } from "./checkpoint-review.js";
 import { checkpointOpaqueArtifacts } from "./opaque-artifacts.js";
 import type { CheckpointRestoreFaultInjector } from "./fault-injection.js";
@@ -39,6 +39,7 @@ export class CheckpointManager {
   private readonly restoreFaultInjector: CheckpointRestoreFaultInjector | undefined;
   private readonly cas: CheckpointCasStore;
   private readonly records: CheckpointRecordStore;
+  private readonly captures: CheckpointCaptureCoordinator;
   constructor(options: CheckpointManagerOptions, restoreFaultInjector?: CheckpointRestoreFaultInjector) {
     this.rootDir = path.resolve(options.rootDir);
     this.maxFiles = options.maxFiles ?? 250_000;
@@ -47,6 +48,9 @@ export class CheckpointManager {
     this.restoreFaultInjector = restoreFaultInjector;
     this.cas = new CheckpointCasStore(this.rootDir);
     this.records = new CheckpointRecordStore(this.rootDir);
+    this.captures = new CheckpointCaptureCoordinator(
+      this.cas, this.maxFiles, this.maxBytes, this.excludedNames
+    );
   }
   async create(input: CreateCheckpointInput): Promise<CheckpointRecord> {
     const { workspacePath, scopePaths } = await normalizeCheckpointScopes(input.workspacePath, input.scopePaths);
@@ -288,15 +292,7 @@ export class CheckpointManager {
     scopePaths: readonly string[],
     ignoredRootName?: string
   ): Promise<CheckpointManifest> {
-    return await captureCheckpointManifest({
-      workspacePath,
-      scopePaths,
-      maxFiles: this.maxFiles,
-      maxBytes: this.maxBytes,
-      excludedNames: this.excludedNames,
-      ...(ignoredRootName ? { ignoredRootName } : {}),
-      putCas: async (content) => await this.cas.putStream(content)
-    });
+    return await this.captures.capture(workspacePath, scopePaths, ignoredRootName);
   }
 
   private async sealedReviewState(
@@ -329,6 +325,7 @@ export class CheckpointManager {
       desired,
       current,
       readCas: (digest) => this.cas.stream(digest),
+      inspectCas: async (entry) => await this.captures.inspectCas(entry),
       capture: async (ignoredRootName) => await this.capture(workspacePath, scopePaths, ignoredRootName),
       finalization: { record: restored, desiredManifestDigest: restored.preManifestDigest },
       finalize: async () => await this.records.write(restored),
@@ -392,6 +389,7 @@ export class CheckpointManager {
       transactionRoot: async (workspacePath) => await this.transactionRoot(workspacePath),
       writeRecords: async (records) => await this.records.writeMany(records),
       readCas: (digest) => this.cas.stream(digest),
+      inspectCas: async (entry) => await this.captures.inspectCas(entry),
       ...(this.restoreFaultInjector ? { restoreFaultInjector: this.restoreFaultInjector } : {})
     });
   }

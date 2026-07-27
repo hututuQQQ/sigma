@@ -4,13 +4,19 @@ import path from "node:path";
 import { CheckpointConflictError, type CheckpointEntry, type CheckpointManifest } from "./types.js";
 
 export type RestoreCasReader = (digest: string) => AsyncIterable<Uint8Array>;
+export type RestoreCasInspector = (entry: CheckpointEntry) => Promise<void>;
 
 export async function validateRestoreCas(
   manifest: CheckpointManifest,
-  readCas: RestoreCasReader
+  readCas: RestoreCasReader,
+  inspectCas: RestoreCasInspector
 ): Promise<void> {
   for (const entry of manifest.entries) {
     if (entry.kind !== "file") continue;
+    if (entry.casIdentity) {
+      await inspectCas(entry);
+      continue;
+    }
     const hash = createHash("sha256");
     let size = 0;
     for await (const chunk of readCas(entry.digest!)) {

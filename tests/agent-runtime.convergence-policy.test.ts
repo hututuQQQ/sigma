@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   createBudgetLedger,
   type AgentEventEnvelope,
@@ -6,8 +6,10 @@ import {
 } from "../packages/agent-protocol/src/index.js";
 import { BudgetController } from "../packages/agent-runtime/src/budget-controller.js";
 import {
+  ACTION_SETTLEMENT_GRACE_MS,
   convergenceAdmissionFailure,
-  deadlineForecast
+  deadlineForecast,
+  openConvergenceActionScope
 } from "../packages/agent-runtime/src/convergence-policy.js";
 import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
 import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
@@ -37,7 +39,7 @@ function controller(target: RuntimeSession): BudgetController {
 }
 
 describe("hard-ledger convergence admission", () => {
-  it("keeps latency forecasts telemetry-only while absolute time remains", () => {
+  it("keeps latency forecasts telemetry-only while usable action time remains", () => {
     const target = runtimeSessionFixture();
     target.durable.state.usage = [10_000, 30_000, 120_000, 180_000]
       .map((latencyMs, index) => ({
@@ -62,13 +64,40 @@ describe("hard-ledger convergence admission", () => {
         attempt: 1,
         occurredAt: new Date().toISOString()
       }));
-    target.durable.state.deadlineRemainingMs = 1;
-    expect(deadlineForecast(target)).toMatchObject({ stage: "normal", remainingMs: 1 });
+    target.durable.state.deadlineRemainingMs = ACTION_SETTLEMENT_GRACE_MS + 1;
+    expect(deadlineForecast(target)).toMatchObject({
+      stage: "normal",
+      remainingMs: ACTION_SETTLEMENT_GRACE_MS + 1,
+      usableMs: 1
+    });
     expect(convergenceAdmissionFailure(target, { kind: "model" })).toBeNull();
     expect(convergenceAdmissionFailure(target, { kind: "tool", count: 1 })).toBeNull();
   });
 
-  it("rejects only once the absolute deadline has elapsed", () => {
+  it("reserves the convergence window for settlement and pure terminal actions", () => {
+    const target = runtimeSessionFixture();
+    target.durable.state.deadlineRemainingMs = ACTION_SETTLEMENT_GRACE_MS;
+    expect(deadlineForecast(target)).toMatchObject({
+      stage: "converge",
+      usableMs: 0
+    });
+    expect(convergenceAdmissionFailure(target, { kind: "model" })).toMatchObject({
+      kind: "recoverable_failure",
+      code: "budget_exhausted",
+      message: expect.stringContaining("reserved for durable settlement")
+    });
+    expect(convergenceAdmissionFailure(target, {
+      kind: "tool", count: 1
+    })).toMatchObject({
+      kind: "recoverable_failure",
+      code: "budget_exhausted"
+    });
+    expect(convergenceAdmissionFailure(target, {
+      kind: "tool", count: 1, terminalOnly: true
+    })).toBeNull();
+  });
+
+  it("classifies an elapsed absolute deadline as a hard stop", () => {
     const target = runtimeSessionFixture();
     target.durable.state.deadlineRemainingMs = 0;
     expect(deadlineForecast(target).stage).toBe("stop");
@@ -77,6 +106,31 @@ describe("hard-ledger convergence admission", () => {
       code: "budget_exhausted",
       message: expect.stringContaining("absolute run deadline")
     });
+  });
+
+  it("interrupts admitted work at the convergence boundary without aborting the outer run", () => {
+    vi.useFakeTimers();
+    try {
+      const target = runtimeSessionFixture();
+      target.durable.state.deadlineRemainingMs = ACTION_SETTLEMENT_GRACE_MS + 250;
+      const outer = new AbortController();
+      const scope = openConvergenceActionScope(target, outer.signal, { kind: "model" });
+
+      expect(scope.signal.aborted).toBe(false);
+      vi.advanceTimersByTime(249);
+      expect(scope.signal.aborted).toBe(false);
+      vi.advanceTimersByTime(1);
+      expect(scope.signal.aborted).toBe(true);
+      expect(outer.signal.aborted).toBe(false);
+      expect(scope.signal.reason).toMatchObject({
+        name: "ResourceBoundaryError",
+        code: "budget_exhausted",
+        decisionAuthority: "resource_boundary"
+      });
+      scope.close();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("settles measured resources exactly and refuses only a request the ledger cannot fund", async () => {

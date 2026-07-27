@@ -1,6 +1,6 @@
 import type { WorkspaceTransactionDirectoryLease } from "agent-platform";
 import type { RestoreImageIdentity } from "./restore-image-identity.js";
-import type { RestoreCasReader } from "./restore-cas.js";
+import type { RestoreCasInspector, RestoreCasReader } from "./restore-cas.js";
 import type { CheckpointEntry, CheckpointManifest, CheckpointRecord } from "./types.js";
 import type { CheckpointRestoreFaultEvent } from "./fault-injection.js";
 
@@ -25,6 +25,7 @@ export interface RestoreTransactionOptions {
   desired: CheckpointManifest;
   current: CheckpointManifest;
   readCas: RestoreCasReader;
+  inspectCas: RestoreCasInspector;
   capture(ignoredRootName?: string): Promise<CheckpointManifest>;
   finalization: RestoreFinalization;
   finalize: () => Promise<void>;

@@ -24,7 +24,12 @@ import {
   modelFailureMessage,
   streamModelResponse
 } from "./model-effect-support.js";
-import type { DeadlineForecast } from "./convergence-policy.js";
+import {
+  convergenceAdmissionFailure,
+  deadlineForecast,
+  openConvergenceActionScope,
+  type DeadlineForecast
+} from "./convergence-policy.js";
 import {
   budgetFailure,
   type PreparedModelTurn
@@ -101,7 +106,7 @@ export class ModelEffectRunner {
       return failure ? await this.finishBudgetBoundary(session, turnSignal, failure) : false;
     } catch (error) {
       if ((error as { code?: unknown })?.code === "hook_gate_denied") throw error;
-      if ((error as { code?: unknown })?.code === "budget_exhausted") {
+      if (modelFailureCode(error) === "budget_exhausted") {
         return await this.finishBudgetBoundary(session, turnSignal, budgetFailure(
           error instanceof Error ? error.message : "The remaining budget cannot fund a final model request."
         ));
@@ -211,10 +216,13 @@ export class ModelEffectRunner {
       hookContext
     );
     if (prepared.failure) return prepared.failure;
-    const { turn, plan, forecast } = prepared;
-    if (!turn || !plan || !forecast) {
+    const { turn, plan } = prepared;
+    if (!turn || !plan) {
       throw new Error("Model turn preparation completed without a turn.");
     }
+    const admissionFailure = convergenceAdmissionFailure(session, { kind: "model" });
+    if (admissionFailure) return admissionFailure;
+    const forecast = deadlineForecast(session);
     await this.options.emit(session, "model.prompt_materialized", "runtime", {
       turnId,
       effectRevision,
@@ -257,14 +265,15 @@ export class ModelEffectRunner {
   ): Promise<void> {
     const startedAt = performance.now();
     const state: ModelReservationState = { settled: false };
+    const boundary = openConvergenceActionScope(session, signal, { kind: "model" });
     try {
       const response = await streamModelResponse(
-        this.options, session, turnId, turn.messages, turn.tools, turn.toolChoice, signal,
+        this.options, session, turnId, turn.messages, turn.tools, turn.toolChoice, boundary.signal,
         turn.budget.routeConstraints, turn.outputReserveTokens
       );
       state.response = response;
       await this.completeReservation(
-        session, turnId, effectRevision, signal, turn, requestId, reservationId, response, startedAt, state
+        session, turnId, effectRevision, boundary.signal, turn, requestId, reservationId, response, startedAt, state
       );
     } catch (error) {
       if (!state.settled && state.response) {
@@ -276,6 +285,8 @@ export class ModelEffectRunner {
         await this.commitFailure(session, turn, requestId, reservationId, startedAt, error);
       }
       throw error;
+    } finally {
+      boundary.close();
     }
   }
 

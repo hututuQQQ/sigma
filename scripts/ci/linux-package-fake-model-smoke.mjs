@@ -18,10 +18,11 @@ const stateRoot = path.resolve(process.env.SIGMA_SMOKE_STATE_ROOT ?? "/tmp/sigma
 export const linuxPackageFakeModelSmokeScript = fileURLToPath(import.meta.url);
 
 function realSandboxValidationTurn() {
-  return fakeToolTurn([fakeToolCall("validate-package-smoke", "validate", {
+  return fakeToolTurn([fakeToolCall("validate-package-smoke", "shell", {
     executable: "node",
     args: ["--check", "hello.js"],
-    access: "readonly"
+    access: "readonly",
+    validation: true
   })]);
 }
 

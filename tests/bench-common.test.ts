@@ -957,6 +957,26 @@ describe("failure classifier", () => {
     ).toBe("tool_timeout");
     expect(classifyFailure({ logText: '{"max_wall_time_sec":2700}', exitCode: 1 })).toBe("agent_crashed");
     expect(classifyFailure({ summary: { finish_reason: "max_wall_time" } })).toBe("agent_timeout");
+    expect(classifyFailure({
+      summary: {
+        status: "error",
+        finish_reason: "recoverable_failure",
+        failure_kind: "agent_failure",
+        model_failure: { code: "run_deadline" },
+        last_event: {
+          payload: {
+            code: "budget_exhausted",
+            message: "Run exceeded its durable active-time deadline."
+          }
+        }
+      },
+      exitCode: 1
+    })).toBe("agent_timeout");
+    expect(classifyFailure({
+      failureKind: "agent_failure",
+      summary: { failure_kind: "agent_timeout" },
+      exitCode: 1
+    })).toBe("agent_timeout");
     expect(classifyFailure({ summary: { status: "error" }, exitCode: 1 })).toBe("agent_crashed");
   });
 
@@ -1381,6 +1401,50 @@ describe("benchmark report generation", () => {
     expect(report.counts.infra_failed).toBe(1);
     expect(report.validity).toEqual({ valid: 0, infra_failed: 1 });
     expect(report.effective_correctness).toEqual({ passed: 0, total: 0, pass_rate: null });
+  });
+
+  it("keeps verifier tool loss valid when mutable package state is already interrupted", async () => {
+    const runDir = await mkdtemp(path.join(os.tmpdir(), "sigma-bench-verifier-mutable-state-"));
+    await writeFile(path.join(runDir, "config.json"), `${JSON.stringify({
+      run_id: "verifier-mutable-state-run", provider: "deepseek", model: "model",
+      dataset: terminalBenchDataset, k: 1, exit_code: 0, status: "failed"
+    })}\n`, "utf8");
+    for (const name of ["harbor.stdout.log", "harbor.stderr.log", "result.raw.log"]) {
+      await writeFile(path.join(runDir, name), "", "utf8");
+    }
+    const trialDir = path.join(runDir, "harbor-jobs", "job-1", "trial-1");
+    const taskDir = path.join(runDir, "tasks", "task-a");
+    await mkdir(taskDir, { recursive: true });
+    await writeFile(path.join(taskDir, "metadata.json"), `${JSON.stringify({
+      task_id: "task-a", status: "passed", source_logs_dir: path.join(trialDir, "agent")
+    })}\n`, "utf8");
+    await writeFile(path.join(taskDir, "summary.json"), JSON.stringify({
+      status: "completed", commands_executed: 2
+    }), "utf8");
+    await mkdir(path.join(trialDir, "verifier"), { recursive: true });
+    await writeFile(path.join(trialDir, "result.json"), `${JSON.stringify({
+      trial_name: "trial-1", task_name: "registry/task-one",
+      verifier_result: { rewards: { reward: 0 } }, exception_info: null
+    })}\n`, "utf8");
+    await writeFile(path.join(trialDir, "verifier", "test-stdout.txt"), [
+      "E: dpkg was interrupted, you must manually run 'dpkg --configure -a'",
+      "/tests/test.sh: line 8: curl: command not found",
+      "/tests/test.sh: line 9: uvx: command not found"
+    ].join("\n"), "utf8");
+    await writeHarborJobResult(path.dirname(trialDir), 1);
+
+    const report = await generateBenchReport(runDir);
+
+    expect(report.tasks[0]).toMatchObject({
+      status: "failed",
+      failure_category: "verifier_failed",
+      agent_outcome: "completed",
+      verifier_outcome: "failed",
+      validity: "valid",
+      verifier_infrastructure_evidence: []
+    });
+    expect(report.validity).toEqual({ valid: 1, infra_failed: 0 });
+    expect(report.effective_correctness).toEqual({ passed: 0, total: 1, pass_rate: 0 });
   });
 
   it("keeps reward=1 tasks passed when Harbor also reports an agent exception", async () => {

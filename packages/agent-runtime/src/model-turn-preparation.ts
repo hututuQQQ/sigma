@@ -1,4 +1,9 @@
-import type { ContextItem, ModelMessage, RunOutcome } from "agent-protocol";
+import type {
+  BudgetAmounts,
+  ContextItem,
+  ModelMessage,
+  RunOutcome
+} from "agent-protocol";
 import {
   historyAfterArchive,
   projectReasoningSafeHistory,
@@ -10,13 +15,14 @@ import {
 } from "agent-context";
 import { isToolAllowed } from "agent-tools";
 import { refreshContextArchive } from "./context-archive-refresh.js";
-import { deadlineForecast, type DeadlineForecast } from "./convergence-policy.js";
 import { sessionModelToolProjectionCapabilities } from "./effect-helpers.js";
 import type { EffectRunnerOptions } from "./effect-runner.js";
 import {
   budgetFailure,
   fitPreparedBudget,
   prepareBudgetedModelTurn,
+  projectedModelTurnBoundary,
+  type ModelTurnBoundaryStage,
   type PreparedModelTurn,
   type TurnPreparationInput
 } from "./model-budget-convergence.js";
@@ -30,7 +36,6 @@ import type { RuntimeSession } from "./types.js";
 export interface PreparedModelAttempt {
   turn?: PreparedModelTurn;
   plan?: ContextPlan;
-  forecast?: DeadlineForecast;
   failure?: RunOutcome;
 }
 
@@ -38,6 +43,8 @@ interface ProjectedModelHistory {
   history: ModelMessage[];
   archiveProjection: ReturnType<typeof historyAfterArchive>;
 }
+
+type BudgetedModelTurn = Awaited<ReturnType<typeof prepareBudgetedModelTurn>>;
 
 async function projectedToolHistory(
   options: EffectRunnerOptions,
@@ -110,6 +117,37 @@ async function projectedModelHistory(
   return { history, archiveProjection };
 }
 
+async function applyProjectedResourceBoundary(
+  options: EffectRunnerOptions,
+  session: RuntimeSession,
+  preparation: TurnPreparationInput,
+  available: BudgetAmounts,
+  initial: BudgetedModelTurn
+): Promise<BudgetedModelTurn> {
+  const prepareBoundaryTurn = async (
+    stage: ModelTurnBoundaryStage
+  ): Promise<BudgetedModelTurn> => {
+    const projection = await projectedModelHistory(options, session);
+    return await prepareBudgetedModelTurn({
+      ...preparation,
+      available,
+      history: projection.history,
+      archive: projection.archiveProjection.archive?.item,
+      modelTurnBoundaryStage: stage
+    });
+  };
+  let prepared = initial;
+  let stage = projectedModelTurnBoundary(available, prepared.turn.budget);
+  if (!stage) return prepared;
+  prepared = await prepareBoundaryTurn(stage);
+  if (stage === "tool_closure"
+    && projectedModelTurnBoundary(available, prepared.turn.budget) === "final") {
+    stage = "final";
+    prepared = await prepareBoundaryTurn(stage);
+  }
+  return prepared;
+}
+
 export async function prepareModelAttempt(
   options: EffectRunnerOptions,
   repositoryContext: RepositoryContextProvider,
@@ -128,7 +166,6 @@ export async function prepareModelAttempt(
   const dynamic = await repositoryContext.collect(
     session.identity.workspacePath, query, signal
   );
-  const forecast = deadlineForecast(session);
   let available = availableOrchestratorBudget(session);
   if (!session.durable.frozenCustomization) {
     throw Object.assign(new Error(
@@ -162,6 +199,9 @@ export async function prepareModelAttempt(
     summarizer,
     emit: options.emit
   }));
+  prepared = await applyProjectedResourceBoundary(
+    options, session, preparation, available, prepared
+  );
   const fittedBudget = fitPreparedBudget(
     prepared.turn.budget,
     available,
@@ -176,7 +216,6 @@ export async function prepareModelAttempt(
   }
   return {
     turn: { ...prepared.turn, budget: fittedBudget },
-    plan: prepared.plan,
-    forecast
+    plan: prepared.plan
   };
 }

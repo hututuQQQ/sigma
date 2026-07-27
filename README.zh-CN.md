@@ -14,8 +14,8 @@
 </p>
 
 <p align="center">
-  <img alt="状态：0.1.0 开发预览版" src="https://img.shields.io/badge/status-0.1.0%20development%20preview-f59e0b">
-  <img alt="发布目标：Linux 与 Windows 预览版" src="https://img.shields.io/badge/release%20targets-Linux%20preview%20%2B%20Windows%20unsigned%20preview-0078d4">
+  <img alt="状态：0.1.0 首个稳定版" src="https://img.shields.io/badge/status-0.1.0%20stable-2ea44f">
+  <img alt="发布目标：Linux 稳定版与 Windows 未签名预览版" src="https://img.shields.io/badge/release%20targets-Linux%20stable%20%2B%20Windows%20unsigned%20preview-0078d4">
   <img alt="正式评估：预注册" src="https://img.shields.io/badge/formal%20evaluation-preregistered-4cc9c0">
 </p>
 
@@ -25,18 +25,17 @@
 
 Sigma Code 把一次编码任务变成一条可持久化、可验证、可重放的类型化事件流。它可以理解仓库、执行范围明确的修改、在沙箱内运行命令、验证结果、请求独立审查，并在进程中断后恢复原来的会话。CLI 与 TUI 不各自维护一套 Agent：产品只有一个事件溯源内核、一种会话格式和一条执行链。
 
-`0.1.0` 是开发预览版，也是唯一受支持的产品基线。Linux x64 与 Windows x64
-产物都属于预览候选；在取得可信 Authenticode 签名之前，Windows 还必须明确标记为
-未签名。提交问题或参与贡献前，请先查看[安全策略](SECURITY.md)和
+`0.1.0` 是首个正式版本，也是唯一受支持的产品基线。Linux x64 是稳定发布目标；
+在取得可信 Authenticode 签名之前，Windows x64 仍必须明确标记为未签名预览版。
+提交问题或参与贡献前，请先查看[安全策略](SECURITY.md)和
 [贡献指南](CONTRIBUTING.md)。
 
 > [!IMPORTANT]
 > **当前产品边界**
 >
-> - **Sigma Code 0.1.0 在两个 Tier 1 目标上都是开发预览版。** Linux x64 与 Windows x64 候选都必须通过原生沙箱、打包产品、校验和、SBOM 与签名来源证明门禁；Windows 可执行文件目前没有可信 Authenticode 签名，可能触发 Windows 安全警告。
+> - **Sigma Code 0.1.0 在 Linux x64 上是稳定版；Windows x64 是未签名预览版。** 两个候选都必须通过原生沙箱、打包产品、校验和、SBOM 与签名来源证明门禁；Windows 可执行文件目前没有可信 Authenticode 签名，可能触发 Windows 安全警告。
 > - **正式评估由预注册清单约束，而不是写死 Provider。** SHA 绑定的运行清单会在执行前冻结 Provider、模型、源码、归档、任务选择、网络、超时、并发、尝试次数和重试次数。
 > - 只有 SHA 绑定的运行清单中的控制条件可比时，Provider 对比才有效；harness 不会根据模型名称推断可比性。
-> - Sigma 把 **OpenCode 视为直接竞争对手和追赶目标，而不是已经达到的水平**。就当前整体实际表现与成熟度而言，Sigma 和 OpenCode 仍有真实差距。
 
 ## 为什么是 Sigma Code
 
@@ -48,9 +47,9 @@ Sigma Code 把一次编码任务变成一条可持久化、可验证、可重放
 | 沙箱失效即拒绝 | 即使授权了宿主机只读输入或网络，进程仍运行在必需的原生沙箱中；沙箱不健康时，Sigma 会拒绝执行。 |
 | 一条产品执行链 | CLI 自动化和 TUI 共用同一个 `RuntimeClient`、内核、事件仓库、工具、恢复逻辑和结果协议。 |
 
-## Linux 快速开始（开发预览版）
+## Linux 快速开始
 
-从经过验证的项目 Release 获取 `0.1.0` Linux x64 预览归档，或从源码构建；
+从经过验证的项目 Release 获取 `0.1.0` Linux x64 稳定版归档，或从源码构建；
 核对 SHA-256 侧文件与签名来源证明后再解压：
 
 ```sh
@@ -88,8 +87,8 @@ $env:DEEPSEEK_API_KEY = "your-api-key"
 
 上面的 API Key 只对当前 PowerShell 进程生效。不要把密钥写进 `.agent/config.toml` 或提交到版本库。
 
-发布的预览归档都会带有 SHA-256 校验和、CycloneDX SBOM、签名的来源证明和
-公开验证密钥。`0.1.0` 的两个目标都不是稳定发布；Windows x64 还属于未签名预览。
+发布的归档都会带有 SHA-256 校验和、CycloneDX SBOM、签名的来源证明和
+公开验证密钥。Linux x64 在 `0.1.0` 是稳定发布；Windows x64 仍属于未签名预览。
 信任边界见 [SECURITY.md](SECURITY.md)，维护者发布流程见
 [RELEASING.md](RELEASING.md)。
 
@@ -331,6 +330,25 @@ Sigma 的正式体验评估器会在全新、不透明的工作区中运行已�
 阈值默认值。
 
 评估器可以选择任务、启动正式包，并在运行结束后收集 Artifact；它不能把场景身份、Verifier 输出、分数、Reward、隐藏检查或运行后失败传给求解会话，也不能利用 Verifier 反馈重试求解。协议类型和生产源码扫描会共同约束这条公平性边界。
+
+### Terminal-Bench 2.1：Sigma Code + DeepSeek 对比 OpenCode + DeepSeek
+
+2026 年 7 月 27–28 日完成的分阶段诊断运行，使用 DeepSeek
+`deepseek-v4-pro`，在同一组 89 个 Terminal-Bench 2.1 任务上对比两个
+Agent。Sigma 侧最大并发为 5，每个任务只尝试 1 次，重试为 0，也没有把
+Verifier 反馈传回求解 Agent。
+
+| 口径 | Sigma Code + DeepSeek | OpenCode + DeepSeek | 差值 |
+| --- | ---: | ---: | ---: |
+| 原始 89 项 | 51/89（57.303%） | 49/89（55.056%） | Sigma +2 项 / +2.247 pp |
+| 基础设施有效子集 | 51/83（61.446%） | 47/83（56.627%） | Sigma +4 项 / +4.819 pp |
+
+原始口径把 6 个经审计确认由外部原因造成的 Sigma 基础设施无效样本保留为未通过；
+次要口径则从双方结果中排除同一组 6 个任务。Sigma 的不可变观测并集为
+`49 + 4 + 1 + 9 + 26 = 89`：每个源码修订只运行当时尚未消费的后缀，因此这是
+混合源码诊断结果，不是最终 PR HEAD 的单版本分数。没有重跑已消费任务，最后一次
+观测后完成的通用生命周期修复也有意不计入本次分数。源码边界、止损与验证记录见
+[PR #73](https://github.com/hututuQQQ/sigma/pull/73)。
 
 ```powershell
 # 不调用模型，只审计已经存在的会话。

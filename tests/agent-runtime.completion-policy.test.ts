@@ -198,6 +198,21 @@ describe("Standard and Strict completion policy", () => {
     });
   });
 
+  it("reports unresolved Standard advisory status when no model turn remains", () => {
+    const session = candidateSession("advisory");
+    session.durable.state.budget.consumed.modelTurns =
+      session.durable.state.budget.limits.modelTurns;
+
+    expect(completionGateDecision(session)).toMatchObject({
+      action: "complete",
+      authority: "user_policy",
+      validationStatus: "unverified",
+      statusNote: expect.stringContaining(
+        "reported without an impossible repair turn"
+      )
+    });
+  });
+
   it("gives a failed validation one repair opportunity and then reports it honestly", () => {
     const session = candidateSession("off");
     session.durable.state.evidence.push(validation(session, "failed"));
@@ -259,7 +274,7 @@ describe("Standard and Strict completion policy", () => {
     });
   });
 
-  it("treats an explicit review as a one-repair protocol barrier", () => {
+  it("keeps explicit review advisory in Standard and binding in Strict", () => {
     const session = candidateSession("advisory");
     session.durable.state.evidence.push(
       review(session, "explicit-first", "changes_requested")
@@ -274,11 +289,18 @@ describe("Standard and Strict completion policy", () => {
       role: "developer",
       content: first.message
     });
-    expect(explicitReviewGateDecision(session)).toMatchObject({
-      action: "fail",
-      code: "verification_failed",
+    const unresolved = explicitReviewGateDecision(session);
+    expect(unresolved).toMatchObject({
+      action: "continue",
       authority: "verification_verdict"
     });
+    if (unresolved?.action !== "continue") throw new Error("Expected an unresolved-review advisory.");
+    expect(unresolved.message).toContain("does not convert an advisory review into a runtime failure");
+    session.durable.state.messages.push({
+      role: "developer",
+      content: unresolved.message
+    });
+    expect(explicitReviewGateDecision(session)).toBeUndefined();
 
     const rereviewed = candidateSession("advisory");
     rereviewed.durable.state.evidence.push(
@@ -302,9 +324,40 @@ describe("Standard and Strict completion policy", () => {
       review(rereviewed, "explicit-second", "changes_requested")
     );
     expect(explicitReviewGateDecision(rereviewed)).toMatchObject({
+      action: "continue",
+      message: expect.stringContaining("unresolved")
+    });
+
+    const strict = candidateSession("required");
+    strict.durable.state.evidence.push(
+      review(strict, "strict-first", "changes_requested")
+    );
+    const strictFirst = explicitReviewGateDecision(strict);
+    if (strictFirst?.action !== "continue") throw new Error("Expected one Strict repair opportunity.");
+    strict.durable.state.messages.push({
+      role: "developer",
+      content: strictFirst.message
+    });
+    expect(explicitReviewGateDecision(strict)).toMatchObject({
       action: "fail",
       code: "verification_failed",
-      message: expect.stringContaining("after repair and re-review")
+      authority: "verification_verdict"
+    });
+  });
+
+  it("reports unresolved Standard review findings on natural completion", () => {
+    const session = candidateSession("advisory");
+    session.durable.state.evidence.push(validation(session, "passed"));
+    session.durable.state.evidence.push(
+      review(session, "advisory-review", "changes_requested")
+    );
+    expect(completionGateDecision(session)).toMatchObject({
+      action: "complete",
+      authority: "user_policy",
+      validationStatus: "passed",
+      statusNote: expect.stringContaining(
+        "Independent advisory review status: changes_requested; unresolved findings remain."
+      )
     });
   });
 

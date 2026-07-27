@@ -194,7 +194,7 @@ function requestReviewTool(): RegisteredEffectTool {
   return {
     descriptor: descriptor(
       "request_review",
-      "Request an independent review of the current mutation frontier as a standalone tool call. Supply no evidence IDs: the runtime binds the current frontier and objective receipts. The first substantive rejection opens one repair opportunity; an unchanged repeat or non-approved final review round ends with a typed verification failure.",
+      "Request an independent review of the current mutation frontier as a standalone tool call. Supply no evidence IDs: the runtime binds the current frontier and objective receipts. The first substantive rejection opens one repair opportunity. In Standard mode unresolved findings remain advisory and must be reported honestly; in Strict mode an unchanged repeat or non-approved final review round ends with a typed verification failure.",
       {}
     ),
     async execute(request, context) {

@@ -1,4 +1,4 @@
-import type { RunOutcome } from "agent-protocol";
+import type { RunOutcome, ToolDescriptor } from "agent-protocol";
 import { decide, mutationFrontierHasChanges, type KernelEffect } from "agent-kernel";
 import {
   attemptFromEffect,
@@ -47,6 +47,18 @@ export interface EffectRunnerOptions {
   reviewer: ReviewerPort;
   reviewerForSession?: (session: RuntimeSession) => ReviewerPort;
   hooks: RuntimeHookCoordinator;
+}
+
+function terminalOnlyDescriptor(descriptor: ToolDescriptor | undefined): boolean {
+  if (!descriptor) return false;
+  const effects = [
+    ...descriptor.possibleEffects,
+    ...(descriptor.maximumEffects ?? descriptor.possibleEffects)
+  ];
+  return effects.length > 0 && effects.every((effect) =>
+    effect === "outcome.propose"
+      || effect === "outcome.report_blocked"
+      || effect === "outcome.request_input");
 }
 
 export class EffectRunner {
@@ -107,19 +119,27 @@ export class EffectRunner {
     effects: ExecuteToolEffect[]
   ): Promise<boolean> {
     const descriptors = this.options.runtime.tools.descriptors();
-    const terminalOnly = effects.every((effect) => descriptors
-      .find((item) => item.name === effect.request.name)
-          ?.possibleEffects.every((item) => item === "outcome.propose" || item === "outcome.report_blocked"
-            || item === "outcome.request_input") === true);
+    const terminalOnly = effects.every((effect) => terminalOnlyDescriptor(
+      descriptors.find((item) => item.name === effect.request.name)
+    ));
     const failure = convergenceAdmissionFailure(session, {
       kind: "tool", count: effects.length, terminalOnly
     });
+    const deadline = deadlineForecast(session);
     // At a live deadline, cancellation remains an outer hard boundary. A
     // mere tool-ledger shortage is instead represented by durable per-call
     // failure receipts so pending tool calls are settled exactly once and the
     // completion assurance can still run from a clean kernel phase.
-    if (failure && deadlineForecast(session).stage === "stop") {
+    if (failure && deadline.stage === "stop") {
       return await this.options.finish(session, failure);
+    }
+    if (failure && deadline.stage === "converge") {
+      await this.toolBatches.rejectForResourceBoundary(
+        session,
+        effects.map(attemptFromEffect),
+        failure.message
+      );
+      return false;
     }
     await this.toolBatches.execute(session, effects.map(attemptFromEffect), signal);
     if (effects.some((effect) => effect.request.name === "request_review")) {
