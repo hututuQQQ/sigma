@@ -354,4 +354,5 @@ jobs:
           if [[ "${RELEASE_LIVE_EVAL_OVERRIDE}" == "true" ]]; then
             assets+=("release-assets/release-live-evaluation-override.json")
           fi
-          gh release create "${GITHUB_REF_NAME}" "${assets[@]}" --notes "${release_notes}" "${options[@]}"
+          gh release create "${GITHUB_REF_NAME}" "${assets[@]}" \
+            --repo "${GITHUB_REPOSITORY}" --notes "${release_notes}" "${options[@]}"
