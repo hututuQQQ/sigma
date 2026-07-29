@@ -36,7 +36,7 @@ export function currentAuxiliaryUsage(session: RuntimeSession): CurrentAuxiliary
       total + Math.max(1, item.attempt), 0),
     inputTokens: usage.reduce((total, item) => total + item.inputTokens, 0),
     outputTokens: usage.reduce((total, item) => total + item.outputTokens, 0),
-    costMicroUsd: usage.reduce((total, item) => total + item.costMicroUsd, 0)
+    costMicroUsd: usage.reduce((total, item) => total + (item.costMicroUsd ?? 0), 0)
   };
 }
 

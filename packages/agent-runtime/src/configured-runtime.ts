@@ -39,7 +39,7 @@ import {
 } from "./configured-runtime-assembly.js";
 export interface RuntimeCompositionConfig {
   workspace: string;
-  provider: "deepseek" | "glm";
+  provider: "deepseek" | "glm" | "openai-codex";
   model: string;
   permissionMode: "workspace-auto" | "ask" | "auto" | "deny";
   runDeadlineSec: number;
@@ -78,7 +78,7 @@ export interface RuntimeCompositionConfig {
   checkpoint?: { maxFiles: number; maxBytes: number };
 }
 export interface RuntimeFactoryDeps {
-  gatewayFactory?: (options: { provider: "deepseek" | "glm"; model: string; maxRetries: number;
+  gatewayFactory?: (options: { provider: "deepseek" | "glm" | "openai-codex"; model: string; maxRetries: number;
     requestTimeoutMs: number; idleTimeoutMs: number; activeStreamTimeoutMs?: number }) => ModelGateway;
   stateRootDir?: string;
   executionBroker?: ExecutionBroker;

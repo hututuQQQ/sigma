@@ -30,7 +30,10 @@ export function assistantReviewMessage(
     ...(response.message.reasoningContent
       ? { reasoningContent: response.message.reasoningContent }
       : {}),
-    ...(calls ? { toolCalls: calls } : {})
+    ...(calls ? { toolCalls: calls } : {}),
+    ...(response.message.providerState
+      ? { providerState: response.message.providerState }
+      : {})
   };
 }
 

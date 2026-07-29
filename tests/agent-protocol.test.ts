@@ -101,6 +101,47 @@ describe("AgentEventEnvelope runtime boundary", () => {
     })).toBe(true);
   });
 
+  it("accepts opaque provider replay state and nullable subscription cost", () => {
+    const event = validAgentEventFixture("model.completed");
+    const payload = event.payload as typeof fixtures["model.completed"];
+    expect(isAgentEventEnvelope({
+      ...event,
+      payload: {
+        ...payload,
+        message: {
+          ...payload.message,
+          providerState: {
+            provider: "openai-codex",
+            version: 1,
+            data: {
+              responseId: "resp_1",
+              opaque: [{ encrypted: "signature" }]
+            }
+          }
+        },
+        usage: {
+          ...payload.usage,
+          costMicroUsd: null,
+          billingMode: "subscription"
+        }
+      }
+    })).toBe(true);
+    expect(isAgentEventEnvelope({
+      ...event,
+      payload: {
+        ...payload,
+        message: {
+          ...payload.message,
+          providerState: {
+            provider: "openai-codex",
+            version: 2,
+            data: {}
+          }
+        }
+      }
+    })).toBe(false);
+  });
+
   it("accepts only the explicit blocked run failure marker", () => {
     const event = validAgentEventFixture("run.failed");
     expect(isAgentEventEnvelope({

@@ -30,7 +30,7 @@ export interface AcpCommandDeps {
 }
 
 interface SelectedModel {
-  provider: "deepseek" | "glm";
+  provider: "deepseek" | "glm" | "openai-codex";
   model: string;
 }
 
@@ -42,7 +42,11 @@ function selectedModel(value: string): SelectedModel {
   const separator = value.indexOf("/");
   const provider = value.slice(0, separator);
   const model = value.slice(separator + 1);
-  if ((provider !== "deepseek" && provider !== "glm") || separator < 1 || !model) {
+  if (
+    (provider !== "deepseek" && provider !== "glm" && provider !== "openai-codex")
+    || separator < 1
+    || !model
+  ) {
     throw new Error(`Invalid Sigma ACP model identifier '${value}'.`);
   }
   return { provider, model };
@@ -60,7 +64,13 @@ function catalogFor(
     ...BUILTIN_MODEL_SPECS.map((spec) => ({
       id: modelId(spec.providerId, spec.upstreamModel),
       name: spec.upstreamModel,
-      description: `${spec.providerId} · ${spec.capabilities.reasoning ? "reasoning" : "standard"}`
+      description: `${spec.providerId} · ${
+        spec.billingMode === "subscription"
+          ? "ChatGPT subscription (experimental)"
+          : spec.capabilities.reasoning
+            ? "reasoning"
+            : "standard"
+      }`
     })),
     ...config.modelSpecs.map((spec) => ({
       id: modelId(spec.providerId, spec.upstreamModel),
@@ -140,4 +150,3 @@ export async function runAcpCommand(
   }
   return 0;
 }
-

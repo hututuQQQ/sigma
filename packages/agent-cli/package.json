@@ -24,6 +24,7 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "1.3.0",
+    "agent-codex": "workspace:*",
     "agent-code-intel": "workspace:*",
     "agent-config": "workspace:*",
     "agent-execution": "workspace:*",

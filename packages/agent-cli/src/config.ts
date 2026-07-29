@@ -23,7 +23,7 @@ export interface ParsedArgs {
 
 export interface CliConfig {
   workspace: string;
-  provider: "deepseek" | "glm";
+  provider: "deepseek" | "glm" | "openai-codex";
   model: string;
   agentProfile: string;
   permissionMode: "workspace-auto" | "ask" | "auto" | "deny";

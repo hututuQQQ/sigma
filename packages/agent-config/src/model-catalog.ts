@@ -1,6 +1,7 @@
 import type { ModelCapabilities } from "agent-protocol";
 
-export type ConfigModelProvider = "deepseek" | "glm";
+export type ConfigModelProvider = "deepseek" | "glm" | "openai-codex";
+export type ConfigModelBillingMode = "metered" | "subscription";
 export type ConfigTokenizerAccuracy = "exact" | "approximate";
 export type ConfigModelFallback = "rate_limit" | "capacity" | "network" | "server" | "timeout";
 
@@ -17,6 +18,7 @@ export interface ModelSpecConfigValue {
   id: string;
   providerId: ConfigModelProvider;
   upstreamModel: string;
+  billingMode: ConfigModelBillingMode;
   capabilities: ModelCapabilities;
   tokenizer: { id: string; accuracy: ConfigTokenizerAccuracy; assetDigest?: string };
   pricing?: ModelPricingConfigValue;
@@ -31,7 +33,9 @@ export interface ModelRouteConfigValue {
   maxAttempts: number;
 }
 
-const SPEC_KEYS = new Set(["id", "provider", "upstream_model", "capabilities", "tokenizer", "pricing"]);
+const SPEC_KEYS = new Set([
+  "id", "provider", "upstream_model", "billing_mode", "capabilities", "tokenizer", "pricing"
+]);
 const CAPABILITY_KEYS = new Set([
   "context_window_tokens", "max_output_tokens", "tools", "parallel_tools", "reasoning",
   "structured_output", "prompt_cache", "tokenizer"
@@ -61,8 +65,11 @@ function modelSpec(raw: unknown, label: string): ModelSpecConfigValue {
     : pricingValue(object(value.pricing, `${label}.pricing`, PRICING_KEYS), `${label}.pricing`);
   return {
     id: text(value.id, `${label}.id`),
-    providerId: choice(value.provider, ["deepseek", "glm"], `${label}.provider`),
+    providerId: choice(value.provider, ["deepseek", "glm", "openai-codex"], `${label}.provider`),
     upstreamModel: text(value.upstream_model, `${label}.upstream_model`),
+    billingMode: value.billing_mode === undefined
+      ? "metered"
+      : choice(value.billing_mode, ["metered", "subscription"], `${label}.billing_mode`),
     capabilities: capabilitiesValue(capabilities, `${label}.capabilities`),
     tokenizer: {
       id: text(tokenizer.id, `${label}.tokenizer.id`),

@@ -130,7 +130,7 @@ export class OpenAIModelGateway implements ModelGateway {
       raw: jsonValue(raw)
     };
     return normalizeModelResponse({
-      spec: { pricing: this.pricing },
+      spec: { pricing: this.pricing, billingMode: "metered" },
       request,
       response,
       rawUsage: rawUsage(usage),
@@ -164,7 +164,7 @@ export class OpenAIModelGateway implements ModelGateway {
           )) {
             if (event.type === "done") {
               yield { type: "done", response: normalizeModelResponse({
-                spec: { pricing: this.pricing },
+                spec: { pricing: this.pricing, billingMode: "metered" },
                 request,
                 response: event.response,
                 rawUsage: event.rawUsage,

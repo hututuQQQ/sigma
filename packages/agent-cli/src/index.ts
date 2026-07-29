@@ -18,6 +18,7 @@ import { runCommand } from "./commands/run.js";
 import { runSessionCommand, runSessionsCommand } from "./commands/session.js";
 import { runVersionCommand } from "./commands/version.js";
 import { runAcpCommand } from "./commands/acp.js";
+import { runAuthCommand } from "./commands/auth.js";
 import {
   loadCliConfig, parseArgs, workspaceCustomizationTrustMessage, workspaceMcpTrustMessage
 } from "./config.js";
@@ -92,6 +93,7 @@ async function dispatchCommand(
       runtime: options.runtime,
       stderr: options.stderr
     });
+    case "auth": return await runAuthCommand(argv);
     case "session": return definition.sessionAction === "list"
       ? await runSessionsCommand(argv, { runtime: options.runtime })
       : await runSessionCommand(definition.sessionAction ? [definition.sessionAction, ...argv] : argv, {

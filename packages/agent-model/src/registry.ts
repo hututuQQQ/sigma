@@ -1,11 +1,15 @@
 import type { ModelCapabilities, ModelGateway } from "agent-protocol";
+import {
+  OpenAICodexGateway,
+  OPENAI_CODEX_DEFAULT_MODEL
+} from "agent-codex";
 import { OpenAIModelGateway } from "./openai-gateway.js";
 import type { OpenAIWireProfile } from "./openai-wire.js";
 import { builtinModelSpec, type ModelSpec } from "./catalog.js";
 import { classifyModelFailure } from "./failure-policy.js";
 import type { ProviderSpi } from "./provider-spi.js";
 
-export type SupportedProvider = "deepseek" | "glm";
+export type SupportedProvider = "deepseek" | "glm" | "openai-codex";
 
 export interface CreateGatewayOptions {
   provider: SupportedProvider;
@@ -79,6 +83,16 @@ function glmGateway(options: CreateGatewayOptions, model: string, spec?: ModelSp
   });
 }
 
+function openAICodexGateway(options: CreateGatewayOptions, model: string): ModelGateway {
+  return new OpenAICodexGateway({
+    model,
+    maxRetries: options.maxRetries,
+    requestTimeoutMs: options.requestTimeoutMs,
+    idleTimeoutMs: options.idleTimeoutMs,
+    activeStreamTimeoutMs: options.activeStreamTimeoutMs
+  });
+}
+
 function commonGatewayOptions(options: CreateGatewayOptions) {
   return {
     maxRetries: options.maxRetries,
@@ -124,6 +138,11 @@ const providerAdapters: Readonly<Record<SupportedProvider, ProviderSpi>> = {
     ...sharedAdapter("glm"),
     defaultModel: (env) => env.GLM_MODEL ?? "glm-5.2",
     prepare: glmGateway
+  },
+  "openai-codex": {
+    ...sharedAdapter("openai-codex"),
+    defaultModel: () => OPENAI_CODEX_DEFAULT_MODEL,
+    prepare: openAICodexGateway
   }
 };
 

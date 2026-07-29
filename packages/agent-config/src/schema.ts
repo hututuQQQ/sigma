@@ -149,7 +149,7 @@ export const SIGMA_CONFIG_SCHEMA: readonly ConfigField[] = [
     }
     return value;
   }, hidden: true },
-  { key: "provider", flag: "provider", env: "SIGMA_PROVIDER", toml: "model.provider", description: "Model provider", defaultValue: "deepseek", parse: (raw) => enumValue(raw, "provider", ["deepseek", "glm"] as const) },
+  { key: "provider", flag: "provider", env: "SIGMA_PROVIDER", toml: "model.provider", description: "Model provider", defaultValue: "deepseek", parse: (raw) => enumValue(raw, "provider", ["deepseek", "glm", "openai-codex"] as const) },
   { key: "model", flag: "model", env: "SIGMA_MODEL", toml: "model.name", description: "Model name (auto selects provider default)", defaultValue: "auto", parse: (raw) => stringValue(raw, "model") },
   {
     key: "modelSpecs", flag: "model-spec", kind: "repeatable", env: "SIGMA_MODEL_SPECS", toml: "model.specs",

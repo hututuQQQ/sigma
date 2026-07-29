@@ -6,3 +6,4 @@ export * from "./workspace-transaction-root.js";
 export * from "./windows-directory-lock.js";
 export * from "./durable-file.js";
 export * from "./text-lines.js";
+export { restrictWindowsPathToCurrentUser } from "agent-execution";

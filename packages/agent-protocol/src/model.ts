@@ -8,12 +8,19 @@ export interface ModelToolCall {
   arguments: JsonValue;
 }
 
+export interface ModelProviderState {
+  provider: string;
+  version: 1;
+  data: JsonValue;
+}
+
 export interface ModelMessage {
   role: ModelRole;
   content: string;
   reasoningContent?: string;
   toolCallId?: string;
   toolCalls?: ModelToolCall[];
+  providerState?: ModelProviderState;
 }
 
 export interface ModelToolDefinition {
@@ -56,6 +63,7 @@ export interface ModelResponseUsage {
   cacheWriteTokens: number;
   providerReported: boolean;
   costMicroUsd: number | null;
+  billingMode?: "metered" | "subscription";
   latencyMs: number;
   /** Zero-based retry index within the selected provider/model. */
   retryAttempt: number;

@@ -35,7 +35,12 @@ export const modelMessageSchema = z.object({
   content: z.string(),
   reasoningContent: z.string().optional(),
   toolCallId: z.string().optional(),
-  toolCalls: z.array(modelToolCallSchema).optional()
+  toolCalls: z.array(modelToolCallSchema).optional(),
+  providerState: z.object({
+    provider: nonEmptyStringSchema,
+    version: z.literal(1),
+    data: jsonValueSchema
+  }).strict().optional()
 }).strict();
 
 export const toolEffectSchema = z.enum([

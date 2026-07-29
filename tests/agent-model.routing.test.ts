@@ -4,7 +4,8 @@ import type {
   ModelGateway,
   ModelRequest,
   ModelResponse,
-  ModelStreamEvent
+  ModelStreamEvent,
+  UsageRecord
 } from "../packages/agent-protocol/src/index.js";
 import type { ModelSpecConfigValue } from "../packages/agent-config/src/index.js";
 import {
@@ -27,7 +28,14 @@ import {
   createRoleGateways,
   productionModelCandidates
 } from "../packages/agent-runtime/src/model-composition.js";
+import {
+  consumedBudget,
+  failedModelUsage,
+  prepareModelBudget,
+  successfulModelUsage
+} from "../packages/agent-runtime/src/model-accounting.js";
 import type { RuntimeCustomization } from "../packages/agent-runtime/src/customization.js";
+import { aggregateReviewerUsage } from "../packages/agent-runtime/src/reviewer-accounting.js";
 
 const capabilities: ModelCapabilities = {
   contextWindowTokens: 10_000,
@@ -46,6 +54,7 @@ function spec(id: string, overrides: Partial<ModelSpec> = {}): ModelSpec {
     providerId: id.startsWith("glm") ? "glm" : "deepseek",
     wireProtocol: "openai_chat",
     upstreamModel: id,
+    billingMode: "metered",
     capabilities,
     tokenizer: { id: "test", accuracy: "approximate" },
     pricing: {
@@ -69,6 +78,7 @@ function specConfig(
     id,
     providerId: "deepseek",
     upstreamModel,
+    billingMode: "metered",
     capabilities,
     tokenizer: { id: `${id}-tokenizer`, accuracy },
     ...(priced ? { pricing: {
@@ -111,12 +121,22 @@ describe("capability-aware model routing", () => {
     expect(classifyModelFailure(Object.assign(new Error("slow"), { code: "ETIMEDOUT" }))).toBe("timeout");
     expect(classifyModelFailure(Object.assign(new Error("bad config"), { category: "configuration" }))).toBe("configuration");
   });
-  it("ships deterministic DeepSeek and GLM catalog entries", () => {
+  it("ships deterministic metered and ChatGPT subscription catalog entries", () => {
     expect(BUILTIN_MODEL_SPECS.map((item) => item.id)).toEqual([
       "deepseek/deepseek-v4-pro",
-      "glm/glm-5.2"
+      "glm/glm-5.2",
+      "openai-codex/gpt-5.3-codex-spark",
+      "openai-codex/gpt-5.4",
+      "openai-codex/gpt-5.4-mini",
+      "openai-codex/gpt-5.5",
+      "openai-codex/gpt-5.6-luna",
+      "openai-codex/gpt-5.6-sol",
+      "openai-codex/gpt-5.6-terra"
     ]);
-    expect(BUILTIN_MODEL_SPECS.every((item) => item.pricing && item.tokenizer.accuracy === "approximate")).toBe(true);
+    expect(BUILTIN_MODEL_SPECS.filter((item) => item.billingMode === "metered")
+      .every((item) => item.pricing && item.tokenizer.accuracy === "approximate")).toBe(true);
+    expect(BUILTIN_MODEL_SPECS.filter((item) => item.billingMode === "subscription")
+      .every((item) => item.providerId === "openai-codex" && item.pricing === undefined)).toBe(true);
     const gateway = createModelGatewayForSpec(spec("deepseek/custom", {
       capabilities: { ...capabilities, contextWindowTokens: 42_000 }
     }), { apiKey: "secret" });
@@ -137,6 +157,54 @@ describe("capability-aware model routing", () => {
       { provider: "deepseek", model: "auto" },
       { DEEPSEEK_API_KEY: "primary" }
     ).map((item) => item.id)).toEqual(["deepseek/deepseek-v4-pro"]);
+    expect(productionModelCandidates(
+      { provider: "openai-codex", model: "gpt-5.6-terra" },
+      { OPENAI_API_KEY: "must-not-be-used", DEEPSEEK_API_KEY: "must-not-fallback" }
+    ).map((item) => item.id)).toEqual(["openai-codex/gpt-5.6-terra"]);
+  });
+
+  it("never routes subscription auth, allowance, rate-limit, or server failures to paid providers", async () => {
+    const profile = freezeAgentProfile({
+      id: "subscription-route",
+      roleRoutes: {},
+      toolAllow: null,
+      toolDeny: [],
+      skills: [],
+      hooks: [],
+      permissionMode: "deny",
+      budget: { ...DEFAULT_PROFILE_BUDGET },
+      mutationPolicy: {
+        requirePlanBeforeMutation: true,
+        checkpointBeforeMutation: true,
+        reviewMode: "advisory"
+      },
+      allowedChildProfiles: []
+    });
+    for (const category of ["auth", "capacity", "rate_limit", "server"] as const) {
+      const calls: string[] = [];
+      const gateways = createRoleGateways({
+        provider: "openai-codex",
+        model: "gpt-5.6-terra",
+        modelDeadlineSec: 10,
+        streamIdleSec: 5
+      }, {
+        gatewayFactory: ({ provider, model }) => gateway(`${provider}/${model}`, async () => {
+          calls.push(provider);
+          throw Object.assign(new Error(category), { category });
+        })
+      }, {
+        profile,
+        profileSource: "builtin",
+        availableProfiles: [{ profile, source: "builtin" }]
+      } as unknown as RuntimeCustomization, {
+        OPENAI_API_KEY: "must-not-be-used",
+        DEEPSEEK_API_KEY: "must-not-fallback",
+        GLM_API_KEY: "must-not-fallback"
+      });
+
+      await expect(gateways.orchestrator.complete(request())).rejects.toThrow(category);
+      expect(calls).toEqual(["openai-codex"]);
+    }
   });
 
   it("uses explicit profile route ids as distinct production policies", async () => {
@@ -476,6 +544,132 @@ describe("normalized model usage", () => {
       attempt: 3,
       role: "reviewer",
       tokenizerAssetDigest: "c".repeat(64)
+    });
+  });
+
+  it("persists subscription usage as null cost while charging zero to the budget ledger", async () => {
+    const subscriptionGateway: ModelGateway = {
+      ...gateway("subscription", async () => response("ok")),
+      provider: "openai-codex",
+      model: "gpt-5.6-terra",
+      async countTokens() { return 4; }
+    };
+    const prepared = await prepareModelBudget(
+      subscriptionGateway,
+      request().messages,
+      [],
+      10,
+      10_000
+    );
+    expect(prepared.spec).toMatchObject({
+      providerId: "openai-codex",
+      billingMode: "subscription"
+    });
+    expect(prepared.reserved.costMicroUsd).toBe(0);
+
+    const result = response("ok");
+    result.usage = {
+      ...result.usage,
+      inputTokens: 4,
+      outputTokens: 2,
+      costMicroUsd: null,
+      billingMode: "subscription"
+    };
+    const usage = successfulModelUsage(
+      { sessionId: "session", runId: "run" },
+      subscriptionGateway,
+      "request",
+      { messages: request().messages, tools: [] },
+      result,
+      prepared,
+      5
+    );
+    expect(usage).toMatchObject({
+      providerId: "openai-codex",
+      costMicroUsd: null,
+      billingMode: "subscription"
+    });
+    expect(consumedBudget(usage).costMicroUsd).toBe(0);
+    expect(failedModelUsage(
+      { sessionId: "session", runId: "run" },
+      subscriptionGateway,
+      "failed-request",
+      prepared,
+      5
+    )).toMatchObject({
+      costMicroUsd: null,
+      billingMode: "subscription"
+    });
+  });
+
+  it("allows null persisted cost only when usage is explicitly subscription billed", () => {
+    const unpriced = normalizeUsage({
+      request: request(),
+      response: response("answer"),
+      latencyMs: 1,
+      retryAttempt: 0
+    });
+    const identity = {
+      usageId: "usage-subscription",
+      requestId: "request-subscription",
+      sessionId: "session",
+      runId: "run",
+      role: "orchestrator" as const,
+      routeId: "default",
+      providerId: "openai-codex",
+      modelId: "openai-codex/gpt-5.6-terra",
+      tokenizer: { id: "test", accuracy: "approximate" as const },
+      occurredAt: "2026-07-29T00:00:00.000Z"
+    };
+
+    expect(() => toUsageRecord(unpriced, identity)).toThrow(
+      "has no pricing for cost accounting"
+    );
+    expect(toUsageRecord({
+      ...unpriced,
+      billingMode: "subscription"
+    }, identity)).toMatchObject({
+      costMicroUsd: null,
+      billingMode: "subscription"
+    });
+  });
+
+  it("keeps aggregated reviewer subscription usage distinct from zero API cost", () => {
+    const base: UsageRecord = {
+      usageId: "usage-1",
+      requestId: "review-1",
+      sessionId: "session",
+      runId: "run",
+      role: "reviewer",
+      routeId: "default",
+      providerId: "openai-codex",
+      modelId: "openai-codex/gpt-5.6-terra",
+      tokenizerId: "test",
+      tokenizerAccuracy: "approximate",
+      providerReported: true,
+      inputTokens: 4,
+      outputTokens: 2,
+      reasoningTokens: 1,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      costMicroUsd: null,
+      billingMode: "subscription",
+      latencyMs: 2,
+      attempt: 1,
+      occurredAt: "2026-07-29T00:00:00.000Z"
+    };
+    const aggregated = aggregateReviewerUsage(
+      {} as never,
+      "review-aggregate",
+      [base, { ...base, usageId: "usage-2" }],
+      {} as never,
+      {} as never
+    );
+    expect(aggregated).toMatchObject({
+      billingMode: "subscription",
+      costMicroUsd: null,
+      inputTokens: 8,
+      outputTokens: 4
     });
   });
 

@@ -1,4 +1,5 @@
 import type { ModelCapabilities, ModelExecutionRole } from "agent-protocol";
+import { listOpenAICodexModels } from "agent-codex";
 
 export type ModelRole = ModelExecutionRole;
 
@@ -83,9 +84,10 @@ export interface ModelPricing {
 
 export interface ModelSpec {
   id: string;
-  providerId: "deepseek" | "glm";
-  wireProtocol: "openai_chat";
+  providerId: "deepseek" | "glm" | "openai-codex";
+  wireProtocol: "openai_chat" | "openai-codex-responses";
   upstreamModel: string;
+  billingMode: "metered" | "subscription";
   capabilities: ModelCapabilities;
   tokenizer: TokenizerMetadata;
   pricing?: ModelPricing;
@@ -112,6 +114,7 @@ export const BUILTIN_MODEL_SPECS: readonly ModelSpec[] = [
     providerId: "deepseek",
     wireProtocol: "openai_chat",
     upstreamModel: "deepseek-v4-pro",
+    billingMode: "metered",
     capabilities: {
       contextWindowTokens: 1_000_000,
       maxOutputTokens: 384_000,
@@ -136,6 +139,7 @@ export const BUILTIN_MODEL_SPECS: readonly ModelSpec[] = [
     providerId: "glm",
     wireProtocol: "openai_chat",
     upstreamModel: "glm-5.2",
+    billingMode: "metered",
     capabilities: {
       contextWindowTokens: 1_000_000,
       maxOutputTokens: 128_000,
@@ -156,7 +160,26 @@ export const BUILTIN_MODEL_SPECS: readonly ModelSpec[] = [
       effectiveAt: "2026-07-11",
       sourceUrl: "https://open.bigmodel.cn/pricing"
     }
-  }
+  },
+  ...listOpenAICodexModels().map((model): ModelSpec => ({
+    id: `openai-codex/${model.id}`,
+    providerId: "openai-codex",
+    wireProtocol: "openai-codex-responses",
+    upstreamModel: model.id,
+    billingMode: "subscription",
+    capabilities: {
+      contextWindowTokens: model.contextWindowTokens,
+      maxOutputTokens: model.maxOutputTokens,
+      tools: true,
+      parallelTools: true,
+      reasoning: model.reasoning,
+      structuredOutput: true,
+      promptCache: true,
+      tokenizer: "approximate",
+      strictToolChoice: true
+    },
+    tokenizer: approximateTokenizer
+  }))
 ] as const;
 
 export function builtinModelSpec(provider: ModelSpec["providerId"], model?: string): ModelSpec | undefined {

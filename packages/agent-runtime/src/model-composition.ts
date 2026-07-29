@@ -15,7 +15,7 @@ import type { ModelExecutionRole, ModelGateway } from "agent-protocol";
 import type { RuntimeCustomization } from "./customization.js";
 
 export interface ModelCompositionConfig {
-  provider: "deepseek" | "glm";
+  provider: "deepseek" | "glm" | "openai-codex";
   model: string;
   modelDeadlineSec: number;
   streamIdleSec: number;
@@ -29,7 +29,7 @@ export interface ModelCompositionConfig {
 
 export interface ModelCompositionDeps {
   gatewayFactory?: (options: {
-    provider: "deepseek" | "glm";
+    provider: "deepseek" | "glm" | "openai-codex";
     model: string;
     maxRetries: number;
     requestTimeoutMs: number;
@@ -54,6 +54,7 @@ const TOOL_ROLES = new Set<ModelExecutionRole>([
 
 function hasCredential(provider: ModelSpec["providerId"], env: NodeJS.ProcessEnv): boolean {
   if (provider === "deepseek") return Boolean(env.DEEPSEEK_API_KEY?.trim());
+  if (provider === "openai-codex") return false;
   return Boolean(env.GLM_API_KEY?.trim() || env.ZAI_API_KEY?.trim() || env.BIGMODEL_API_KEY?.trim());
 }
 
@@ -64,21 +65,29 @@ export function productionModelCandidates(
   const model = config.model === "auto" ? defaultModel(config.provider, env) : config.model;
   const primary = builtinModelSpec(config.provider, model);
   if (!primary) return [];
-  if (config.explicitSingleModelRoute) return [primary];
+  if (config.explicitSingleModelRoute || primary.billingMode === "subscription") return [primary];
   return [
     primary,
     ...BUILTIN_MODEL_SPECS.filter((spec) => spec.id !== primary.id && hasCredential(spec.providerId, env))
   ];
 }
 
-function injectedModelSpec(provider: "deepseek" | "glm", model: string, gateway: ModelGateway): ModelSpec {
-  return {
+function injectedModelSpec(
+  provider: "deepseek" | "glm" | "openai-codex",
+  model: string,
+  gateway: ModelGateway
+): ModelSpec {
+  const base: ModelSpec = {
     id: `${provider}/${model}`,
     providerId: provider,
-    wireProtocol: "openai_chat",
+    wireProtocol: provider === "openai-codex" ? "openai-codex-responses" : "openai_chat",
     upstreamModel: model,
+    billingMode: provider === "openai-codex" ? "subscription" : "metered",
     capabilities: gateway.capabilities,
-    tokenizer: { id: "injected/test-tokenizer", accuracy: "approximate" },
+    tokenizer: { id: "injected/test-tokenizer", accuracy: "approximate" }
+  };
+  return provider === "openai-codex" ? base : {
+    ...base,
     pricing: {
       inputMicroUsdPerMillion: 0,
       outputMicroUsdPerMillion: 0,
@@ -89,7 +98,13 @@ function injectedModelSpec(provider: "deepseek" | "glm", model: string, gateway:
 }
 
 function configuredSpec(value: ModelSpecConfigValue): ModelSpec {
-  return { ...value, wireProtocol: "openai_chat" };
+  return {
+    ...value,
+    billingMode: value.billingMode ?? "metered",
+    wireProtocol: value.providerId === "openai-codex"
+      ? "openai-codex-responses"
+      : "openai_chat"
+  };
 }
 
 function configuredRoute(value: ModelRouteConfigValue): ModelRoute {
@@ -111,7 +126,7 @@ function explicitSpecs(config: ModelCompositionConfig): ModelSpec[] {
     }
     if (ids.has(value.id)) throw new Error(`Duplicate custom model spec id '${value.id}'.`);
     ids.add(value.id);
-    if (!value.pricing) {
+    if ((value.billingMode ?? "metered") === "metered" && !value.pricing) {
       throw new Error(`Custom model '${value.id}' requires explicit pricing while a cost cap is enabled.`);
     }
     return configuredSpec(value);
@@ -138,7 +153,7 @@ function catalog(
   available.set(primary.id, primary);
   const explicitRoutes = (config.modelRoutes ?? []).map(configuredRoute);
   let routes: ModelRoute[];
-  if (config.explicitSingleModelRoute) {
+  if (config.explicitSingleModelRoute || (primary.billingMode === "subscription" && explicitRoutes.length === 0)) {
     routes = [{ id: "default", candidates: [primary.id], fallbackOn: FALLBACK_ON, maxAttempts: 1 }];
   } else if (explicitRoutes.length > 0) {
     routes = explicitRoutes;

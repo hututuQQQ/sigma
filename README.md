@@ -277,6 +277,9 @@ writer worktree keeps the parent open.
 | `agent cancel <session-id> --workspace .` | Cancel an active session. |
 | `agent approval <session-id> <request-id> --decision allow --workspace .` | Resolve a pending approval. |
 | `agent doctor --workspace . --check-api` | Check configuration, sandbox, toolchains, and provider access. |
+| `sigma auth status openai-codex --json` | Read the local ChatGPT subscription login state without network access. |
+| `sigma auth login openai-codex --method browser --json` | Start the machine-readable ChatGPT browser login flow. |
+| `sigma auth logout openai-codex --json` | Remove the host-scoped ChatGPT credential. |
 | `agent sandbox setup` | Prepare and self-test the Windows sandbox. |
 | `agent init --workspace .` | Create `.agent/config.toml`. |
 
@@ -350,6 +353,45 @@ process_handoff = "deny"
 configuration migration command and does not read another durable store layout.
 Back up or move incompatible state yourself; rejection is deliberately
 read-only.
+
+### ChatGPT/Codex subscription provider (experimental)
+
+Sigma can keep its own runtime, tools, recovery, budgets, reviewer, strategist,
+and durable state while sending model requests through a ChatGPT/Codex
+subscription:
+
+```toml
+[model]
+provider = "openai-codex"
+name = "gpt-5.6-terra"
+```
+
+This route uses ChatGPT OAuth and
+`https://chatgpt.com/backend-api/codex/responses`; it never reads
+`OPENAI_API_KEY` and does not use API-key billing. Credentials are shared by
+Sigma processes on the same host in `~/.sigma/auth.json`. Subscription usage
+keeps token accounting, but records `billingMode = "subscription"` and a null
+API cost. Authentication, allowance, rate-limit, network, timeout, and server
+failures are returned directly. The built-in subscription route has one
+candidate and cannot silently fall back to DeepSeek, GLM, or
+`api.openai.com/v1`.
+
+The JSONL login interface is intended for trusted desktop clients:
+
+```text
+sigma auth status openai-codex --json
+sigma auth login openai-codex --method browser --json
+sigma auth login openai-codex --method device-code --json
+sigma auth logout openai-codex --json
+```
+
+ChatGPT subscription authentication and API-key billing are separate; see
+OpenAI's [authentication](https://learn.chatgpt.com/docs/auth) and
+[pricing](https://learn.chatgpt.com/docs/pricing) documentation. The backend
+used here is integrated through the version-pinned Pi community adapter rather
+than a public third-party API with a stability commitment, so upgrades require
+an explicit dependency bump and contract-test run. See OpenAI's
+[Codex community projects](https://developers.openai.com/community/codex-for-oss).
 
 DeepSeek uses `DEEPSEEK_API_KEY`. The runtime also recognizes `GLM_API_KEY`, `ZAI_API_KEY`, or `BIGMODEL_API_KEY` for the experimental GLM/Z.ai path. Web search uses the [Exa hosted MCP service](https://exa.ai/docs/reference/exa-mcp); `EXA_API_KEY` is optional, and a 429 response tells the operator to configure it without silently changing providers. A provider is part of a formal claim only when it is frozen in that run's preregistration.
 

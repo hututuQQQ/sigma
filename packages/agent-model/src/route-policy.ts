@@ -97,6 +97,7 @@ export function modelReservationEstimate(
   const margin = tokenizerMargin(spec);
   const inputTokens = Math.ceil((constraints.estimatedInputTokens ?? 0) * margin);
   const outputTokens = Math.ceil((constraints.maxOutputTokens ?? spec.capabilities.maxOutputTokens) * margin);
+  if (spec.billingMode === "subscription") return { inputTokens, outputTokens, costMicroUsd: 0 };
   if (!spec.pricing) return { inputTokens, outputTokens, costMicroUsd: null };
   return {
     inputTokens,

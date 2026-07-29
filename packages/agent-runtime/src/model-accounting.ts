@@ -62,7 +62,8 @@ function budgetAware(gateway: ModelGateway): gateway is BudgetAwareGateway {
 }
 
 function matchingSpec(gateway: ModelGateway): ModelSpec | undefined {
-  if (gateway.provider !== "deepseek" && gateway.provider !== "glm") return undefined;
+  if (gateway.provider !== "deepseek" && gateway.provider !== "glm"
+    && gateway.provider !== "openai-codex") return undefined;
   return builtinModelSpec(gateway.provider, gateway.model);
 }
 
@@ -123,13 +124,26 @@ function normalizedUsage(
   latencyMs: number
 ): NormalizedModelUsage {
   const existing = (response as ModelResponse & { usage?: NormalizedModelUsage }).usage;
-  return existing ?? normalizeUsage({
+  if (existing) {
+    const billingMode = existing.billingMode ?? prepared.spec?.billingMode;
+    return {
+      ...existing,
+      ...(billingMode ? { billingMode } : {}),
+      ...(billingMode === "subscription" ? { costMicroUsd: null } : {})
+    };
+  }
+  const normalized = normalizeUsage({
     request,
     response,
     pricing: prepared.spec?.pricing,
     latencyMs,
     retryAttempt: 0
   });
+  return {
+    ...normalized,
+    ...(prepared.spec ? { billingMode: prepared.spec.billingMode } : {}),
+    ...(prepared.spec?.billingMode === "subscription" ? { costMicroUsd: null } : {})
+  };
 }
 
 interface RoutedResponseIdentity {
@@ -210,7 +224,8 @@ function record(
     reasoningTokens: usage.reasoningTokens,
     cacheReadTokens: usage.cacheReadTokens,
     cacheWriteTokens: usage.cacheWriteTokens,
-    costMicroUsd: usage.costMicroUsd ?? 0,
+    costMicroUsd: usage.costMicroUsd,
+    ...(usage.billingMode ? { billingMode: usage.billingMode } : {}),
     latencyMs: usage.latencyMs,
     attempt: usage.retryAttempt + 1,
     occurredAt: new Date().toISOString()
@@ -241,7 +256,10 @@ export function successfulModelUsage(
   return {
     ...usage,
     inputTokens: usage.inputTokens + priorAttempts.reduce((total, item) => total + item.inputTokens, 0),
-    costMicroUsd: usage.costMicroUsd + priorAttempts.reduce((total, item) => total + (item.costMicroUsd ?? 0), 0),
+    costMicroUsd: usage.billingMode === "subscription"
+      ? null
+      : (usage.costMicroUsd ?? 0)
+        + priorAttempts.reduce((total, item) => total + (item.costMicroUsd ?? 0), 0),
     providerReported: false
   };
 }
@@ -263,16 +281,21 @@ export function failedModelUsage(
     cacheReadTokens: 0,
     cacheWriteTokens: 0,
     providerReported: false,
-    costMicroUsd: prepared.spec
-      ? maximumCost(prepared.spec, inputTokens, 0)
-      : prepared.reserved.costMicroUsd ?? 0,
+    costMicroUsd: prepared.spec?.billingMode === "subscription"
+      ? null
+      : prepared.spec
+        ? maximumCost(prepared.spec, inputTokens, 0)
+        : prepared.reserved.costMicroUsd ?? 0,
+    ...(prepared.spec ? { billingMode: prepared.spec.billingMode } : {}),
     latencyMs: Math.max(0, Math.round(latencyMs)),
     retryAttempt: Math.max(0, attempt - 1)
   }, undefined, role);
   return prepared.attemptReservations
     ? {
         ...usage,
-        costMicroUsd: prepared.attemptReservations.reduce((total, item) => total + (item.costMicroUsd ?? 0), 0)
+        costMicroUsd: prepared.spec?.billingMode === "subscription"
+          ? null
+          : prepared.attemptReservations.reduce((total, item) => total + (item.costMicroUsd ?? 0), 0)
       }
     : usage;
 }
@@ -284,7 +307,7 @@ export function consumedBudget(
   return {
     inputTokens: usage.inputTokens,
     outputTokens: usage.outputTokens,
-    costMicroUsd: usage.costMicroUsd,
+    costMicroUsd: usage.costMicroUsd ?? 0,
     modelTurns: Math.min(
       Math.max(1, usage.attempt),
       Math.max(1, prepared?.reservedAttempts ?? usage.attempt)

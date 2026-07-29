@@ -358,6 +358,7 @@ describe("Sigma ACP v1 contract", () => {
       expect(initialized.protocolVersion).toBe(1);
       expect(initialized.agentCapabilities?.loadSession).toBe(true);
       expect(initialized.agentCapabilities?.sessionCapabilities?.resume).toEqual({});
+      expect(Object.hasOwn(initialized as object, "authMethods")).toBe(false);
       const health = await clientConnection.agent.request<SigmaHealthForTest, Record<string, never>>(
         "_sigma/health",
         {}
@@ -399,6 +400,12 @@ describe("Sigma ACP v1 contract", () => {
       });
       expect(created.sessionId).toMatch(/^sigma-/u);
       expect(created.configOptions?.[0]?.category).toBe("model");
+      expect(created.configOptions?.[0]?.options).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          value: "openai-codex/gpt-5.6-terra",
+          description: expect.stringContaining("ChatGPT subscription")
+        })
+      ]));
       const changedModel = await clientConnection.agent.request(
         acp.methods.agent.session.setConfigOption,
         {
