@@ -17,6 +17,7 @@ import { runReplayCommand } from "./commands/replay.js";
 import { runCommand } from "./commands/run.js";
 import { runSessionCommand, runSessionsCommand } from "./commands/session.js";
 import { runVersionCommand } from "./commands/version.js";
+import { runAcpCommand } from "./commands/acp.js";
 import {
   loadCliConfig, parseArgs, workspaceCustomizationTrustMessage, workspaceMcpTrustMessage
 } from "./config.js";
@@ -31,17 +32,17 @@ export interface AgentCliMainOptions {
 
 function printHelp(): void {
   const commands = new CommandRegistry().definitions();
-  process.stdout.write(`Sigma Code ${SIGMA_PROJECT_FACTS.productVersion}\n\nUsage: agent <command> [options]\n\nCommands:\n${commands.map((item) => `  ${item.name.padEnd(10)} ${item.summary}`).join("\n")}\n\nConfiguration:\n${configHelp().join("\n")}\n`);
+  process.stdout.write(`Sigma Code ${SIGMA_PROJECT_FACTS.productVersion}\n\nUsage: sigma <command> [options]\n\nCommands:\n${commands.map((item) => `  ${item.name.padEnd(10)} ${item.summary}`).join("\n")}\n\nConfiguration:\n${configHelp().join("\n")}\n`);
 }
 
 function completionScript(shell: string): string {
   const commands = new CommandRegistry().definitions().flatMap((item) => [item.name, ...(item.aliases ?? [])]);
   const flags = SIGMA_CONFIG_SCHEMA.map((item) => `--${item.flag}`);
-  if (shell === "bash") return `_agent_completion() { COMPREPLY=( $(compgen -W "${[...commands, ...flags].join(" ")}" -- "\${COMP_WORDS[COMP_CWORD]}") ); }\ncomplete -F _agent_completion agent\n`;
-  if (shell === "zsh") return `#compdef agent\n_arguments '*: :(${[...commands, ...flags].join(" ")})'\n`;
+  if (shell === "bash") return `_sigma_completion() { COMPREPLY=( $(compgen -W "${[...commands, ...flags].join(" ")}" -- "\${COMP_WORDS[COMP_CWORD]}") ); }\ncomplete -F _sigma_completion sigma\n`;
+  if (shell === "zsh") return `#compdef sigma\n_arguments '*: :(${[...commands, ...flags].join(" ")})'\n`;
   if (shell === "fish") return [
-    ...commands.map((command) => `complete -c agent -f -n "__fish_is_first_arg" -a ${command}`),
-    ...flags.map((flag) => `complete -c agent -f -l ${flag.slice(2)}`)
+    ...commands.map((command) => `complete -c sigma -f -n "__fish_is_first_arg" -a ${command}`),
+    ...flags.map((flag) => `complete -c sigma -f -l ${flag.slice(2)}`)
   ].join("\n") + "\n";
   throw new Error("completion shell must be bash, zsh, or fish");
 }
@@ -86,6 +87,11 @@ async function dispatchCommand(
   switch (definition.handler) {
     case "run": return await runCommand(argv, { mode: definition.mode });
     case "tui": return await runTuiCommand(argv, options);
+    case "acp": return await runAcpCommand(argv, {
+      runtimeFactoryDeps: options.runtimeFactoryDeps,
+      runtime: options.runtime,
+      stderr: options.stderr
+    });
     case "session": return definition.sessionAction === "list"
       ? await runSessionsCommand(argv, { runtime: options.runtime })
       : await runSessionCommand(definition.sessionAction ? [definition.sessionAction, ...argv] : argv, {

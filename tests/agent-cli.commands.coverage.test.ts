@@ -464,6 +464,7 @@ describe("CLI command registry dispatch", () => {
     await expect(runAgentCommand(["run", "--help"])).resolves.toBe(0);
     await expect(runAgentCommand(["inspect", "--help"])).resolves.toBe(0);
     await expect(runAgentCommand(["tui", "--help"])).resolves.toBe(0);
+    await expect(runAgentCommand(["acp", "--help"])).resolves.toBe(0);
     await expect(runAgentCommand(["session", "--help"])).resolves.toBe(0);
     await expect(runAgentCommand(["cancel", "--help"])).resolves.toBe(0);
     await expect(runAgentCommand(["replay", "--help"])).resolves.toBe(0);

@@ -99,7 +99,11 @@ export interface ConfiguredRuntime {
   execution: ExecutionBroker;
   close(): Promise<void>;
 }
-export interface RuntimeFactoryOptions { connectMcp?: boolean; surface?: "cli" | "tui"; interactiveApprovals?: boolean; }
+export interface RuntimeFactoryOptions {
+  connectMcp?: boolean;
+  surface?: "cli" | "tui" | "acp";
+  interactiveApprovals?: boolean;
+}
 
 interface PreparedComposition extends RuntimeAssemblyPrepared {
   workspace: string;

@@ -1481,6 +1481,7 @@ function releaseChannelFor(version, targetPlatform, windowsSignerPolicyVerified)
 function createBundleReadme(targetPlatform, targetArch, nodeRuntime, releaseChannel) {
   const isWindows = targetPlatform === "win32";
   const agent = isWindows ? String.raw`.\bin\agent.cmd` : "./bin/agent";
+  const sigma = isWindows ? String.raw`.\bin\sigma.cmd` : "./bin/sigma";
   const workspace = isWindows ? String.raw`D:\path\to\repo` : "/path/to/repo";
   const platformLabel = isWindows ? `Windows ${targetArch}` : `Linux ${targetArch}`;
   const releaseDescription = releaseChannel === "stable"
@@ -1504,22 +1505,32 @@ ${trustNotice}
 ## Start
 
 \`\`\`${isWindows ? "powershell" : "sh"}
-${agent} init --workspace ${workspace}
-${agent} version --json
-${agent} doctor --workspace ${workspace}
-${agent} doctor --workspace ${workspace} --json --strict
-${agent} tui --workspace ${workspace}
+${sigma} init --workspace ${workspace}
+${sigma} version --json
+${sigma} doctor --workspace ${workspace}
+${sigma} doctor --workspace ${workspace} --json --strict
+${sigma} tui --workspace ${workspace}
 \`\`\`
 
 For non-interactive use:
 
 \`\`\`${isWindows ? "powershell" : "sh"}
-${agent} run "Fix failing tests" --workspace ${workspace} --permission-mode auto
+${sigma} run "Fix failing tests" --workspace ${workspace} --permission-mode auto
+${sigma} inspect "Review the architecture" --workspace ${workspace}
+${sigma} sessions --workspace ${workspace}
+\`\`\`
+
+The \`${agent}\` command remains as a compatibility alias:
+
+\`\`\`${isWindows ? "powershell" : "sh"}
+${agent} init --workspace ${workspace}
+${agent} version --json
+${agent} doctor --workspace ${workspace} --json --strict
 ${agent} inspect "Review the architecture" --workspace ${workspace}
 ${agent} sessions --workspace ${workspace}
 \`\`\`
 
-The wrapper requires the pinned bundled Node runtime. It never falls back to a system \`node\` on PATH. The archive also includes the target-native \`sigma-exec\` broker, pinned TypeScript/Python language-server assets, and the offline tokenizer-estimator asset; their SHA-256 values are recorded in \`integrity-manifest.json\`.
+The \`${sigma}\` wrapper requires the pinned bundled Node runtime and never falls back to a system \`node\` on PATH. The compatibility \`${agent}\` wrapper follows the same pinned-runtime rule. The archive also includes the target-native \`sigma-exec\` broker, pinned TypeScript/Python language-server assets, and the offline tokenizer-estimator asset; their SHA-256 values are recorded in \`integrity-manifest.json\`.
 
 ## Provider Keys
 
@@ -1790,6 +1801,7 @@ async function writeBundleEntrypoints(context, nodeRuntime, signing) {
         license: "MIT",
         type: "module",
         bin: {
+          sigma: targetPlatform === "win32" ? "./bin/sigma.cmd" : "./bin/sigma",
           agent: targetPlatform === "win32" ? "./bin/agent.cmd" : "./bin/agent"
         }
       },
@@ -1800,10 +1812,14 @@ async function writeBundleEntrypoints(context, nodeRuntime, signing) {
   );
   if (targetPlatform === "win32") {
     await writeFile(path.join(bundleDir, "bin", "agent.cmd"), createAgentCmdWrapper(), "utf8");
+    await writeFile(path.join(bundleDir, "bin", "sigma.cmd"), createAgentCmdWrapper(), "utf8");
   } else {
     const agentBin = path.join(bundleDir, "bin", "agent");
     await writeFile(agentBin, createAgentWrapper(), "utf8");
     await chmod(agentBin, 0o755).catch(() => undefined);
+    const sigmaBin = path.join(bundleDir, "bin", "sigma");
+    await writeFile(sigmaBin, createAgentWrapper(), "utf8");
+    await chmod(sigmaBin, 0o755).catch(() => undefined);
   }
   await writeFile(
     path.join(bundleDir, "README.md"),

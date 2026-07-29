@@ -219,10 +219,10 @@ describe("run command branch coverage", () => {
   it("renders both run and inspect help and reports empty instructions", async () => {
     const runHelp = new Capture();
     await expect(runCommand(["--help"], { stdout: runHelp })).resolves.toBe(0);
-    expect(runHelp.text()).toContain("agent run");
+    expect(runHelp.text()).toContain("sigma run");
     const inspectHelp = new Capture();
     await expect(runCommand(["-h"], { mode: "analyze", stdout: inspectHelp })).resolves.toBe(0);
-    expect(inspectHelp.text()).toContain("agent inspect");
+    expect(inspectHelp.text()).toContain("sigma inspect");
 
     const stderr = new Capture();
     const stdin = Object.assign(new PassThrough(), { isTTY: true });
