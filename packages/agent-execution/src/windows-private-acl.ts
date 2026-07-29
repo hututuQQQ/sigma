@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 
 const PRIVATE_ACL_SCRIPT = `
 $ErrorActionPreference = "Stop"
+Import-Module Microsoft.PowerShell.Security -ErrorAction Stop
 $target = [Environment]::GetEnvironmentVariable("SIGMA_PRIVATE_ACL_TARGET", "Process")
 $userSidText = [Environment]::GetEnvironmentVariable("SIGMA_PRIVATE_ACL_USER_SID", "Process")
 $isDirectory = [Environment]::GetEnvironmentVariable("SIGMA_PRIVATE_ACL_DIRECTORY", "Process") -eq "1"
@@ -103,6 +104,10 @@ export async function restrictWindowsPathToCurrentUser(
 ): Promise<void> {
   if (process.platform !== "win32") return;
   const sid = await currentWindowsUserSid();
+  const environment = { ...process.env };
+  for (const name of Object.keys(environment)) {
+    if (name.toLowerCase() === "psmodulepath") delete environment[name];
+  }
   await new Promise<void>((resolve, reject) => {
     execFile("powershell.exe", [
       "-NoLogo",
@@ -115,14 +120,14 @@ export async function restrictWindowsPathToCurrentUser(
       encoding: "utf8",
       maxBuffer: 64 * 1_024,
       env: {
-        ...process.env,
+        ...environment,
         SIGMA_PRIVATE_ACL_TARGET: target,
         SIGMA_PRIVATE_ACL_USER_SID: sid,
         SIGMA_PRIVATE_ACL_DIRECTORY: options.directory ? "1" : "0"
       }
     }, (error) => {
       if (error) {
-        reject(new Error("Windows ACL hardening failed.", { cause: error }));
+        reject(new Error("Windows ACL hardening failed."));
         return;
       }
       resolve();
