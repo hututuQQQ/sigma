@@ -291,7 +291,7 @@ export async function runCommand(argv: string[], deps: RunCommandDeps = {}): Pro
   let errorOutput: Pick<CliConfig, "outputFormat" | "streamJsonMaxLineBytes"> | undefined;
   try {
     if (argv.includes("--help") || argv.includes("-h")) {
-      stdout.write(`Usage: agent ${deps.mode === "analyze" ? "inspect" : "run"} [instruction] [--workspace <path>] [--permission-mode ask|auto|deny] [--output-format text|json|stream-json]\n`);
+      stdout.write(`Usage: sigma ${deps.mode === "analyze" ? "inspect" : "run"} [instruction] [--workspace <path>] [--permission-mode ask|auto|deny] [--output-format text|json|stream-json]\n`);
       return 0;
     }
     const parsed = parseArgs(argv);
