@@ -1530,7 +1530,7 @@ ${agent} inspect "Review the architecture" --workspace ${workspace}
 ${agent} sessions --workspace ${workspace}
 \`\`\`
 
-The wrappers require the pinned bundled Node runtime. They never fall back to a system \`node\` on PATH. The archive also includes the target-native \`sigma-exec\` broker, pinned TypeScript/Python language-server assets, and the offline tokenizer-estimator asset; their SHA-256 values are recorded in \`integrity-manifest.json\`.
+The \`${sigma}\` wrapper requires the pinned bundled Node runtime and never falls back to a system \`node\` on PATH. The compatibility \`${agent}\` wrapper follows the same pinned-runtime rule. The archive also includes the target-native \`sigma-exec\` broker, pinned TypeScript/Python language-server assets, and the offline tokenizer-estimator asset; their SHA-256 values are recorded in \`integrity-manifest.json\`.
 
 ## Provider Keys
 
