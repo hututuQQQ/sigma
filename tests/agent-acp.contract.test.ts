@@ -403,7 +403,7 @@ describe("Sigma ACP v1 contract", () => {
       expect(created.configOptions?.[0]?.options).toEqual(expect.arrayContaining([
         expect.objectContaining({
           value: "openai-codex/gpt-5.6-terra",
-          description: expect.stringContaining("ChatGPT subscription")
+          description: "openai-codex · subscription"
         })
       ]));
       const changedModel = await clientConnection.agent.request(

@@ -255,9 +255,16 @@ describe("doctor command branch coverage", () => {
     ["raw_error", "raw API failure"]
   ] as const)("reports %s API failures", async (mode, expected) => {
     const root = await workspace();
+    vi.stubEnv("DEEPSEEK_API_KEY", "configured-for-test");
     api.mode = mode;
     const stdout = new Capture();
-    await expect(runDoctorCommand(["--workspace", root, "--check-api", "--json"], {
+    await expect(runDoctorCommand([
+      "--workspace", root,
+      "--provider", "deepseek",
+      "--model", "doctor-model",
+      "--check-api",
+      "--json"
+    ], {
       stdout,
       executionBroker: healthyBroker()
     })).resolves.toBe(1);
