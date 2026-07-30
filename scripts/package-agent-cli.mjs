@@ -1442,9 +1442,9 @@ if [ ! -x "$NODE" ]; then
 fi
 
 if [ "\${1:-}" = "tui" ]; then
-  exec "$NODE" --experimental-ffi --disable-warning=ExperimentalWarning "$SCRIPT_DIR/../packages/agent-cli/dist/index.js" "$@"
+  exec "$NODE" --experimental-ffi --disable-warning=ExperimentalWarning "$SCRIPT_DIR/../packages/agent-cli/dist/bin.js" "$@"
 fi
-exec "$NODE" "$SCRIPT_DIR/../packages/agent-cli/dist/index.js" "$@"
+exec "$NODE" "$SCRIPT_DIR/../packages/agent-cli/dist/bin.js" "$@"
 `;
 }
 
@@ -1462,10 +1462,10 @@ if not exist "%NODE_EXE%" (
 )
 :run
 if /I "%~1"=="tui" goto run_tui
-"%NODE_EXE%" "%SCRIPT_DIR%..\\packages\\agent-cli\\dist\\index.js" %*
+"%NODE_EXE%" "%SCRIPT_DIR%..\\packages\\agent-cli\\dist\\bin.js" %*
 exit /b %ERRORLEVEL%
 :run_tui
-"%NODE_EXE%" --experimental-ffi --disable-warning=ExperimentalWarning "%SCRIPT_DIR%..\\packages\\agent-cli\\dist\\index.js" %*
+"%NODE_EXE%" --experimental-ffi --disable-warning=ExperimentalWarning "%SCRIPT_DIR%..\\packages\\agent-cli\\dist\\bin.js" %*
 exit /b %ERRORLEVEL%
 `;
 }

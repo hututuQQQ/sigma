@@ -1,5 +1,6 @@
 import { Writable } from "node:stream";
 import { describe, expect, it } from "vitest";
+import { runAgentCli } from "../packages/agent-cli/src/bin.js";
 import { runAgentCommand } from "../packages/agent-cli/src/index.js";
 import { buildVersionReport, runVersionCommand, type VersionReport } from "../packages/agent-cli/src/commands/version.js";
 
@@ -110,5 +111,51 @@ describe("agent-cli version", () => {
     }
 
     expect(stdout.text()).toContain("Sigma Code 0.1.0 (agent-cli)");
+  });
+
+  it("loads only the lightweight version command for version probes", async () => {
+    const versionArgs: string[][] = [];
+    let agentLoads = 0;
+
+    await expect(
+      runAgentCli(["version", "--json"], {
+        loadVersionCommand: async () => ({
+          runVersionCommand: async (args) => {
+            versionArgs.push(args);
+            return 0;
+          },
+        }),
+        loadAgentCommand: async () => {
+          agentLoads += 1;
+          return { runAgentCommand };
+        },
+      }),
+    ).resolves.toBe(0);
+
+    expect(versionArgs).toEqual([["--json"]]);
+    expect(agentLoads).toBe(0);
+  });
+
+  it("loads the full command graph for non-version commands", async () => {
+    const forwardedArgs: string[][] = [];
+    let versionLoads = 0;
+
+    await expect(
+      runAgentCli(["doctor", "--help"], {
+        loadVersionCommand: async () => {
+          versionLoads += 1;
+          return { runVersionCommand };
+        },
+        loadAgentCommand: async () => ({
+          runAgentCommand: async (args) => {
+            forwardedArgs.push(args);
+            return 0;
+          },
+        }),
+      }),
+    ).resolves.toBe(0);
+
+    expect(forwardedArgs).toEqual([["doctor", "--help"]]);
+    expect(versionLoads).toBe(0);
   });
 });
