@@ -38,7 +38,10 @@ async function writeBuiltPackage(
         ""
       ].join("\n")
     : "export {};\n";
-  await writeFile(path.join(packageDir, "dist", "index.js"), distIndex, "utf8");
+  await writeFile(path.join(packageDir, "dist", "index.js"), "export {};\n", "utf8");
+  if (packageName === "agent-cli") {
+    await writeFile(path.join(packageDir, "dist", "bin.js"), distIndex, "utf8");
+  }
   await writeFile(
     path.join(packageDir, "package.json"),
     `${JSON.stringify(
@@ -420,13 +423,13 @@ describe("package-agent-cli", () => {
     expect(wrapper).toContain("unset NODE_OPTIONS NODE_PATH");
     expect(wrapper).not.toContain("command -v node");
     expect(wrapper).toContain("Sigma Code cannot start: the bundled Node runtime is missing or not executable.");
-    expect(wrapper).toContain('exec "$NODE" "$SCRIPT_DIR/../packages/agent-cli/dist/index.js" "$@"');
+    expect(wrapper).toContain('exec "$NODE" "$SCRIPT_DIR/../packages/agent-cli/dist/bin.js" "$@"');
 
     const listing = spawnSync("tar", ["-tzf", result.outputPath], { encoding: "utf8" });
     expect(listing.status, listing.stderr).toBe(0);
     expect(listing.stdout).toContain("agent-cli-linux-x64/bin/agent");
     expect(listing.stdout).toContain("agent-cli-linux-x64/bin/node");
-    expect(listing.stdout).toContain("agent-cli-linux-x64/packages/agent-cli/dist/index.js");
+    expect(listing.stdout).toContain("agent-cli-linux-x64/packages/agent-cli/dist/bin.js");
     expect(listing.stdout).toContain("agent-cli-linux-x64/node_modules/agent-runtime/package.json");
     expect(listing.stdout).toContain("agent-cli-linux-x64/node_modules/agent-protocol/package.json");
     expect(listing.stdout).not.toContain("agent-core");
@@ -962,7 +965,7 @@ describe("package-agent-cli", () => {
     expect(wrapper).toContain("set \"NODE_OPTIONS=--preserve-symlinks-main\"");
     expect(wrapper).toContain("set \"NODE_PATH=\"");
     expect(wrapper).not.toContain("where node");
-    expect(wrapper).toContain("\"%NODE_EXE%\" \"%SCRIPT_DIR%..\\packages\\agent-cli\\dist\\index.js\" %*");
+    expect(wrapper).toContain("\"%NODE_EXE%\" \"%SCRIPT_DIR%..\\packages\\agent-cli\\dist\\bin.js\" %*");
 
     const readme = await readFile(path.join(result.bundleDir, "README.md"), "utf8");
     expect(readme).toContain(String.raw`.\bin\agent.cmd doctor --workspace D:\path\to\repo --json --strict`);

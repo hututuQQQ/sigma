@@ -28,6 +28,8 @@ export interface AtomicPatchOptions {
   preimageHashes?: Record<string, string>;
   /** Durable state root. Transaction data is always kept outside the workspace. */
   stateRootDir?: string;
+  /** Cancels preflight or rolls an in-progress transaction back before returning. */
+  signal?: AbortSignal;
   /** Test/integration synchronization point; callers cannot supply this through the model tool schema. */
   beforeCommit?: () => Promise<void>;
   /** Test-only fault-injection point; callers cannot supply this through the model tool schema. */
@@ -197,6 +199,7 @@ async function commitChanges(
     await rootLease.verify();
     const cleanupWarning = await commitPreparedPatch({
       workspace, transaction, changes,
+      ...(options.signal ? { signal: options.signal } : {}),
       beforeCommit: options.beforeCommit,
       beforeMutation: options.beforeMutation,
       validators: {
@@ -238,8 +241,10 @@ export async function replaceWorkspaceTextFile(
   requestedPath: string,
   options: AtomicTextReplaceOptions
 ): Promise<AtomicPatchResult> {
+  options.signal?.throwIfAborted();
   const workspace = await realpath(path.resolve(workspacePath));
   await recoverAtomicPatchTransactions(workspace, options.stateRootDir);
+  options.signal?.throwIfAborted();
   const relative = await normalizePatchRelative(workspace, requestedPath);
   await verifyPatchParentContainment(workspace, relative);
   const original = await readPatchFile(workspace, relative);
@@ -267,7 +272,10 @@ export async function replaceWorkspaceTextFile(
     content,
     kind: "file",
     mode: original.mode
-  }], options.stateRootDir ? { stateRootDir: options.stateRootDir } : {});
+  }], {
+    ...(options.stateRootDir ? { stateRootDir: options.stateRootDir } : {}),
+    ...(options.signal ? { signal: options.signal } : {})
+  });
 }
 
 export async function applyUnifiedPatch(
@@ -275,10 +283,13 @@ export async function applyUnifiedPatch(
   source: string,
   options: AtomicPatchOptions = {}
 ): Promise<AtomicPatchResult> {
+  options.signal?.throwIfAborted();
   const workspace = await realpath(path.resolve(workspacePath));
   await recoverAtomicPatchTransactions(workspace, options.stateRootDir);
+  options.signal?.throwIfAborted();
   const patches = parseUnifiedPatch(source);
   const changes = await Promise.all(patches.map(async (patch) =>
     await preparePatchChange(workspace, patch, options.preimageHashes ?? {})));
+  options.signal?.throwIfAborted();
   return await commitChanges(workspace, changes, options);
 }

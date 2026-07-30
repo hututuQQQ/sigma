@@ -387,7 +387,7 @@ fn run_launcher_with_params(params: ProcessParams) -> Result<i32, RpcError> {
     // executable is resolved and authorized again immediately before launch,
     // so this is only a fail-fast check and does not weaken the TOCTOU guard.
     resolve_executable(&params)?;
-    if params.policy.write_roots.is_empty() {
+    if scratch_only_writes(&params) {
         if let Some(workspace) = eligible_workspace_read_lease_root(&params)? {
             return run_with_workspace_read_lease(&params, &workspace);
         }
@@ -412,7 +412,7 @@ fn run_launcher_with_params(params: ProcessParams) -> Result<i32, RpcError> {
     // writer from inside the sandbox.
     let granted = {
         let _acl_transaction = RecoveryMutex::acquire(&recovery)?;
-        if params.policy.repository_metadata_roots.is_empty() {
+        if params.policy.repository_metadata_roots.is_empty() || scratch_only_writes(&params) {
             grant_root_lease_access(&params, profile.sid, &user_profile, &mut journal)
         } else {
             grant_policy_access(&params, profile.sid, &user_profile, &mut journal)
@@ -457,7 +457,12 @@ fn run_with_workspace_read_lease(
 }
 
 fn workspace_lease_root(params: &ProcessParams) -> Result<RecoveryRootIdentity, RpcError> {
-    let cwd = params.command.cwd.canonicalize().map_err(|error| {
+    let requested_root = params
+        .policy
+        .repository_workspace_root
+        .as_ref()
+        .unwrap_or(&params.command.cwd);
+    let cwd = requested_root.canonicalize().map_err(|error| {
         RpcError::new(
             "filesystem_acl_unsupported",
             format!("cannot identify workspace lease root: {error}"),
@@ -483,7 +488,10 @@ fn eligible_workspace_read_lease_root(
     let workspace = workspace_lease_root(params)?;
     let mut declared = params.policy.read_roots.clone();
     declared.extend(params.policy.execution_roots.iter().cloned());
-    let roots = canonical_unique(&declared)?;
+    let roots = session_scratch_filtered(
+        params,
+        repository_runtime_filtered(params, canonical_unique(&declared)?),
+    );
     Ok(roots
         .iter()
         .all(|root| windows_path_within(&workspace.path, root))
@@ -666,7 +674,10 @@ fn ensure_workspace_read_lease(
 ) -> Result<(), RpcError> {
     let mut declared = params.policy.read_roots.clone();
     declared.extend(params.policy.execution_roots.iter().cloned());
-    let roots = minimal_windows_roots(&canonical_unique(&declared)?);
+    let roots = minimal_windows_roots(&session_scratch_filtered(
+        params,
+        repository_runtime_filtered(params, canonical_unique(&declared)?),
+    ));
     for path in policy_ancestor_paths(params, user_profile)? {
         ensure_persistent_acl(
             &path,
@@ -685,6 +696,19 @@ fn ensure_workspace_read_lease(
             &root,
             sid,
             FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+            directory,
+            directory,
+        )?;
+    }
+    for root in minimal_windows_roots(&canonical_unique(&params.policy.session_scratch_roots)?) {
+        let handle = open_acl_target(&root)?;
+        assert_acl_handle_target(&handle, &root, None)?;
+        let information = acl_target_information(handle.0)?;
+        let directory = information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+        ensure_persistent_acl(
+            &root,
+            sid,
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
             directory,
             directory,
         )?;
@@ -913,7 +937,7 @@ fn grant_root_lease_access(
 ) -> Result<(), RpcError> {
     let mut readable = params.policy.read_roots.clone();
     readable.extend(params.policy.execution_roots.iter().cloned());
-    let declared_read = canonical_unique(&readable)?;
+    let declared_read = repository_runtime_filtered(params, canonical_unique(&readable)?);
     let read = minimal_windows_roots(&declared_read);
     let write = minimal_windows_roots(&canonical_unique(&params.policy.write_roots)?);
     let scratch = canonical_unique(&params.policy.session_scratch_roots)?;
@@ -1007,7 +1031,7 @@ fn grant_policy_access(
     let workspace_read = canonical_unique(&params.policy.read_roots)?;
     let mut read_and_execute = params.policy.read_roots.clone();
     read_and_execute.extend(params.policy.execution_roots.iter().cloned());
-    let declared_read = canonical_unique(&read_and_execute)?;
+    let declared_read = repository_runtime_filtered(params, canonical_unique(&read_and_execute)?);
     let read = minimal_windows_roots(&declared_read);
     let write = minimal_windows_roots(&canonical_unique(&params.policy.write_roots)?);
     let mut plan = Vec::new();
@@ -1062,7 +1086,8 @@ fn policy_ancestor_paths(
     // traversal chain. Collapsing first keeps warm lease checks proportional
     // to the effective roots (for example workspace + external runtime), not
     // to every executable and dependency path inside the workspace.
-    let roots = minimal_windows_roots(&canonical_unique(&declared)?);
+    let roots =
+        repository_runtime_filtered(params, minimal_windows_roots(&canonical_unique(&declared)?));
     let root_keys = roots
         .iter()
         .map(|path| path.to_string_lossy().to_lowercase())
@@ -1408,6 +1433,42 @@ fn repository_filtered_protected(params: &ProcessParams, paths: Vec<PathBuf>) ->
         .collect()
 }
 
+fn repository_runtime_filtered(params: &ProcessParams, paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    if params.policy.repository_metadata_roots.is_empty()
+        || params.policy.executable_sha256.is_none()
+    {
+        return paths;
+    }
+    let runtime_root = &params.command.cwd;
+    paths
+        .into_iter()
+        .filter(|path| !windows_path_within(runtime_root, path))
+        .collect()
+}
+
+fn session_scratch_filtered(params: &ProcessParams, paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths
+        .into_iter()
+        .filter(|path| {
+            !params
+                .policy
+                .session_scratch_roots
+                .iter()
+                .any(|scratch| windows_path_within(scratch, path))
+        })
+        .collect()
+}
+
+fn scratch_only_writes(params: &ProcessParams) -> bool {
+    params.policy.write_roots.iter().all(|root| {
+        params
+            .policy
+            .session_scratch_roots
+            .iter()
+            .any(|scratch| windows_path_within(scratch, root))
+    })
+}
+
 fn canonical_unique(paths: &[PathBuf]) -> Result<Vec<PathBuf>, RpcError> {
     let mut seen = HashSet::new();
     let mut result = Vec::new();
@@ -1522,36 +1583,45 @@ fn file_access_mask(mask: u32) -> u32 {
     mapped
 }
 
-/// Prove that an immutable system/runtime object already grants the LPAC
-/// restricting SID read+execute. This is the only case where a read root may
-/// bypass DACL mutation. Any deny ACE is treated conservatively as blocking.
+/// Prove that a directly non-writable system/runtime object already grants the
+/// LPAC restricting SID read+execute. Owners may have implicit WRITE_DAC (for
+/// example a standard UAC administrator whose Administrators group owns a Git
+/// installation), so DACL ownership alone must not reject an otherwise
+/// read-only executable. The caller pins and hashes the executable around use.
+/// Any deny ACE is treated conservatively as blocking.
 pub(crate) fn existing_lpac_read_execute(path: &Path) -> Result<bool, RpcError> {
     let metadata = std::fs::symlink_metadata(path).map_err(RpcError::from)?;
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Ok(false);
     }
     let path_wide = wide_null(path.as_os_str());
-    let mutable = unsafe {
-        CreateFileW(
-            path_wide.as_ptr(),
-            READ_CONTROL | WRITE_DAC,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            null(),
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            null_mut(),
-        )
-    };
-    if mutable != INVALID_HANDLE_VALUE {
-        unsafe { CloseHandle(mutable) };
-        return Ok(false);
-    }
-    let mutable_error = unsafe { GetLastError() };
-    if mutable_error != ERROR_ACCESS_DENIED {
-        return Err(win32_code_error(
-            "CreateFileW(existing LPAC immutability proof)",
-            mutable_error,
-        ));
+    // Probe independent mutation rights separately. Asking for WRITE|DELETE
+    // in one CreateFile call would fail when either one is denied and could
+    // therefore misclassify a content-writable or replaceable executable as
+    // immutable.
+    for desired_access in [FILE_GENERIC_WRITE, DELETE] {
+        let mutable = unsafe {
+            CreateFileW(
+                path_wide.as_ptr(),
+                desired_access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        };
+        if mutable != INVALID_HANDLE_VALUE {
+            unsafe { CloseHandle(mutable) };
+            return Ok(false);
+        }
+        let mutable_error = unsafe { GetLastError() };
+        if mutable_error != ERROR_ACCESS_DENIED {
+            return Err(win32_code_error(
+                "CreateFileW(existing LPAC write proof)",
+                mutable_error,
+            ));
+        }
     }
     let handle = unsafe {
         CreateFileW(
@@ -4937,6 +5007,7 @@ fn self_test() -> Result<(), RpcError> {
             session_scratch_roots: Vec::new(),
             repository_metadata_lease_id: None,
             repository_metadata_roots: Vec::new(),
+            repository_workspace_root: None,
             #[cfg(test)]
             unsafe_host_exec_approved: false,
         },
@@ -6727,6 +6798,7 @@ mod tests {
                 session_scratch_roots: Vec::new(),
                 repository_metadata_lease_id: None,
                 repository_metadata_roots: Vec::new(),
+                repository_workspace_root: None,
                 unsafe_host_exec_approved: false,
             },
             max_output_bytes: 1_024,
@@ -6752,9 +6824,30 @@ mod tests {
             .is_none()
         );
         assert!(
-            eligible_workspace_read_lease_root(&params(vec![workspace.clone()], vec![external],))
-                .expect("evaluate external execution root")
-                .is_none()
+            eligible_workspace_read_lease_root(&params(
+                vec![workspace.clone()],
+                vec![external.clone()],
+            ))
+            .expect("evaluate external execution root")
+            .is_none()
+        );
+        let scratch = fixture.join("scratch");
+        std::fs::create_dir_all(&scratch).expect("create broker scratch root");
+        let mut repository_read = params(
+            vec![workspace.clone(), external.clone(), scratch.clone()],
+            vec![external.clone()],
+        );
+        repository_read.command.cwd = external;
+        repository_read.policy.write_roots = vec![scratch.clone()];
+        repository_read.policy.session_scratch_roots = vec![scratch];
+        repository_read.policy.repository_metadata_roots = vec![workspace.join(".git")];
+        repository_read.policy.repository_workspace_root = Some(workspace.clone());
+        repository_read.policy.executable_sha256 = Some("0".repeat(64));
+        assert!(scratch_only_writes(&repository_read));
+        assert!(
+            eligible_workspace_read_lease_root(&repository_read)
+                .expect("evaluate repository read lease")
+                .is_some()
         );
 
         std::fs::remove_dir_all(&fixture).expect("remove read lease selection fixture");
@@ -6798,6 +6891,7 @@ mod tests {
                 session_scratch_roots: Vec::new(),
                 repository_metadata_lease_id: None,
                 repository_metadata_roots: Vec::new(),
+                repository_workspace_root: None,
                 #[cfg(test)]
                 unsafe_host_exec_approved: false,
             },

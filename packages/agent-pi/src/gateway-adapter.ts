@@ -49,6 +49,7 @@ function replayState(
   }
   const data = state.data as Record<string, JsonValue>;
   if (!Array.isArray(data.content)) return undefined;
+  if (data.model !== model.id) return undefined;
   const apiMatches = data.api === model.api
     || (data.api === undefined && model.provider === OPENAI_CODEX_PROVIDER_ID);
   if (!apiMatches) return undefined;

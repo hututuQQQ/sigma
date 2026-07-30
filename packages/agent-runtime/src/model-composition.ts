@@ -92,19 +92,11 @@ function injectedModelSpec(
     id: `${provider}/${model}`,
     providerId: provider,
     upstreamModel: model,
-    billingMode: provider === "openai-codex" ? "subscription" : "metered",
+    billingMode: provider === "openai-codex" ? "subscription" : "unpriced",
     capabilities: gateway.capabilities,
     tokenizer: { id: "injected/test-tokenizer", accuracy: "approximate" }
   };
-  return provider === "openai-codex" ? base : {
-    ...base,
-    pricing: {
-      inputMicroUsdPerMillion: 0,
-      outputMicroUsdPerMillion: 0,
-      cacheReadMicroUsdPerMillion: 0,
-      effectiveAt: "1970-01-01"
-    }
-  };
+  return base;
 }
 
 function configuredSpec(value: ModelSpecConfigValue): ModelSpec {

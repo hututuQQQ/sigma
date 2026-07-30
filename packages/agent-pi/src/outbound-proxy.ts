@@ -1,10 +1,7 @@
-import { spawnSync } from "node:child_process";
 import * as http from "node:http";
-import * as path from "node:path";
+import { readWindowsInternetProxySettings } from "agent-platform";
 
 const LOOPBACK_BYPASSES = ["localhost", "127.0.0.1", "::1"] as const;
-const WINDOWS_INTERNET_SETTINGS_KEY =
-  String.raw`HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`;
 
 interface ProxyCapableHttpModule {
   setGlobalProxyFromEnv?: (environment?: NodeJS.ProcessEnv) => () => void;
@@ -165,46 +162,16 @@ export function resolveWindowsStaticProxy(
   };
 }
 
-function queryWindowsInternetSetting(
-  name: "ProxyEnable" | "ProxyServer" | "ProxyOverride",
-  environment: NodeJS.ProcessEnv
-): string | undefined {
-  const windowsDirectory = environment.SystemRoot?.trim()
-    || environment.WINDIR?.trim()
-    || process.env.SystemRoot?.trim()
-    || process.env.WINDIR?.trim();
-  const executable = windowsDirectory
-    ? path.join(windowsDirectory, "System32", "reg.exe")
-    : "reg.exe";
-  try {
-    const result = spawnSync(executable, [
-      "query", WINDOWS_INTERNET_SETTINGS_KEY, "/v", name
-    ], {
-      encoding: "utf8",
-      env: environment,
-      maxBuffer: 64 * 1024,
-      timeout: 2_000,
-      windowsHide: true
-    });
-    if (result.status !== 0 || !result.stdout) return undefined;
-    const line = result.stdout
-      .split(/\r?\n/u)
-      .find((candidate) => candidate.trimStart().toLowerCase().startsWith(name.toLowerCase()));
-    return line?.match(/\s+REG_(?:DWORD|SZ|EXPAND_SZ)\s+(.+?)\s*$/iu)?.[1]?.trim();
-  } catch {
-    return undefined;
-  }
-}
-
 function resolveWindowsSystemProxy(environment: NodeJS.ProcessEnv): OutboundSystemProxy | undefined {
-  const enabledValue = queryWindowsInternetSetting("ProxyEnable", environment);
+  const settings = readWindowsInternetProxySettings(environment);
+  const enabledValue = settings?.ProxyEnable;
   const enabled = enabledValue?.toLowerCase().startsWith("0x")
     ? Number.parseInt(enabledValue.slice(2), 16)
     : Number.parseInt(enabledValue ?? "", 10);
   if (!Number.isFinite(enabled) || enabled === 0) return undefined;
   return resolveWindowsStaticProxy(
-    queryWindowsInternetSetting("ProxyServer", environment),
-    queryWindowsInternetSetting("ProxyOverride", environment)
+    settings?.ProxyServer,
+    settings?.ProxyOverride
   );
 }
 

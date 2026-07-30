@@ -1,5 +1,6 @@
 import type { ModelRequest, ModelResponse, ModelResponseUsage, UsageRecord } from "agent-protocol";
 import type { ModelPricing, ModelRole, ModelSpec, TokenizerMetadata } from "./catalog.js";
+import { modelPricingRates } from "./pricing.js";
 
 export type NormalizedModelUsage = ModelResponseUsage;
 
@@ -59,12 +60,13 @@ export function estimatedResponseTokens(response: Pick<UnnormalizedModelResponse
 
 export function usageCostMicroUsd(usage: Omit<NormalizedModelUsage, "costMicroUsd">, pricing?: ModelPricing): number | null {
   if (!pricing) return null;
+  const rates = modelPricingRates(pricing, usage.inputTokens);
   const uncachedInput = Math.max(0, usage.inputTokens - usage.cacheReadTokens - usage.cacheWriteTokens);
   const numerator =
-    uncachedInput * pricing.inputMicroUsdPerMillion
-    + usage.outputTokens * pricing.outputMicroUsdPerMillion
-    + usage.cacheReadTokens * pricing.cacheReadMicroUsdPerMillion
-    + usage.cacheWriteTokens * (pricing.cacheWriteMicroUsdPerMillion ?? pricing.inputMicroUsdPerMillion);
+    uncachedInput * rates.inputMicroUsdPerMillion
+    + usage.outputTokens * rates.outputMicroUsdPerMillion
+    + usage.cacheReadTokens * rates.cacheReadMicroUsdPerMillion
+    + usage.cacheWriteTokens * (rates.cacheWriteMicroUsdPerMillion ?? rates.inputMicroUsdPerMillion);
   return Math.ceil(numerator / 1_000_000);
 }
 

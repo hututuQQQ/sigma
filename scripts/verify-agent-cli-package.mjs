@@ -62,7 +62,7 @@ function assertContains(label, content, expected) {
 }
 
 function runHostCliVersion(bundleDir, spawn = spawnSync) {
-  const cliEntry = path.join(bundleDir, "packages", "agent-cli", "dist", "index.js");
+  const cliEntry = path.join(bundleDir, "packages", "agent-cli", "dist", "bin.js");
   const result = spawn(process.execPath, [cliEntry, "version", "--json"], {
     cwd: bundleDir,
     encoding: "utf8",

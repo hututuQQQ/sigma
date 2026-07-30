@@ -455,15 +455,19 @@ describe("sensitive per-call approvals", () => {
         type: "submit", sessionId: session.sessionId, text: "Wait for approval, then cancel."
       });
       await expect(approval).resolves.toMatchObject({ type: "tool.approval_requested" });
-      await runtime.command({ type: "cancel", sessionId: session.sessionId, reason: "release test" });
+      let cancelled = false;
+      const cancellation = runtime.command({
+        type: "cancel", sessionId: session.sessionId, reason: "release test"
+      }).then(() => { cancelled = true; });
       await terminalAppend;
+      expect(cancelled).toBe(false);
 
       let released = false;
       releasing = runtime.releaseSession(session.sessionId).then(() => { released = true; });
       await Promise.resolve();
       expect(released).toBe(false);
       allowTerminalAppend();
-      await releasing;
+      await Promise.all([cancellation, releasing]);
       expect(released).toBe(true);
     } finally {
       allowTerminalAppend();

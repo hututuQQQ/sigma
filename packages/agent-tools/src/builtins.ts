@@ -60,9 +60,12 @@ function applyPatchTool(atomicPatchStateRootDir?: string): RegisteredEffectTool 
   return {
     descriptor: descriptor({
       name: "apply_patch",
-      description: "Atomically apply a unified multi-file patch inside the workspace. All hunks are preflighted; any failure leaves every file unchanged.",
+      description: "Atomically apply either a Git unified diff or the Codex '*** Begin Patch' multi-file format inside the workspace. All hunks are preflighted; cancellation or failure restores every file.",
       properties: {
-        patch: { type: "string" },
+        patch: {
+          type: "string",
+          description: "A complete Git unified diff, or a Codex patch enclosed by '*** Begin Patch' and '*** End Patch' with Add File, Delete File, or Update File sections."
+        },
         preimageHashes: { type: "object", additionalProperties: { type: "string" } }
       },
       required: ["patch"],
@@ -100,7 +103,8 @@ function applyPatchTool(atomicPatchStateRootDir?: string): RegisteredEffectTool 
         : undefined;
       const result = await applyUnifiedPatch(context.workspacePath, stringArg(input, "patch"), {
         ...(preimageHashes ? { preimageHashes } : {}),
-        ...(atomicPatchStateRootDir ? { stateRootDir: atomicPatchStateRootDir } : {})
+        ...(atomicPatchStateRootDir ? { stateRootDir: atomicPatchStateRootDir } : {}),
+        signal: context.signal
       });
       const completedAt = new Date().toISOString();
       const output = JSON.stringify(result);

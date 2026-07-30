@@ -1,5 +1,6 @@
 import type { ModelCapabilities } from "agent-protocol";
 import type { ModelRoute, ModelSpec } from "./catalog.js";
+import { modelPricingRates } from "./pricing.js";
 
 export interface ModelRouteConstraints {
   requiredCapabilities?: Partial<ModelCapabilities>;
@@ -101,12 +102,13 @@ export function modelReservationEstimate(
   const outputTokens = Math.ceil((constraints.maxOutputTokens ?? spec.capabilities.maxOutputTokens) * margin);
   if (spec.billingMode !== "metered") return { inputTokens, outputTokens, costMicroUsd: null };
   if (!spec.pricing) return { inputTokens, outputTokens, costMicroUsd: null };
+  const rates = modelPricingRates(spec.pricing, inputTokens);
   return {
     inputTokens,
     outputTokens,
     costMicroUsd: Math.ceil((
-      inputTokens * spec.pricing.inputMicroUsdPerMillion
-      + outputTokens * spec.pricing.outputMicroUsdPerMillion
+      inputTokens * rates.inputMicroUsdPerMillion
+      + outputTokens * rates.outputMicroUsdPerMillion
     ) / 1_000_000)
   };
 }

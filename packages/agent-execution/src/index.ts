@@ -17,6 +17,7 @@ export * from "./repository-transaction-types.js";
 export * from "./windows-node-compatibility.js";
 export * from "./windows-directory-lock-helper.js";
 export * from "./windows-private-acl.js";
+export * from "./windows-internet-proxy.js";
 export * from "./generated-project-facts.js";
 export * from "./lazy-execution-broker.js";
 export * from "./container-execution-broker.js";

@@ -2,8 +2,9 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import type { ContextItem } from "agent-protocol";
 import {
+  repositoryTopology,
   resolveWorkspacePath,
-  runProcess,
+  runLeasedRepositoryGit,
   selfContainedGitRoot,
   type ProcessExecutionPort
 } from "agent-platform";
@@ -40,15 +41,15 @@ async function gitVersion(
   signal: AbortSignal,
   execution: ProcessExecutionPort
 ): Promise<{ digest: string; cacheable: boolean } | null> {
-  const status = await runProcess({
+  const topology = await repositoryTopology(repositoryRoot, signal, execution);
+  if (!topology?.worktreeRoot || topology.trust === "external_untrusted") return null;
+  const status = await runLeasedRepositoryGit(
     execution,
-    executable: "git",
-    args: [
-      "status", "--porcelain=v2", "--branch", "--untracked-files=all", "--ignored=matching"
-    ],
-    cwd: repositoryRoot,
-    timeoutMs: 30_000, maxOutputBytes: 2_000_000, signal
-  }).catch(() => null);
+    { ...topology, worktreeRoot: topology.worktreeRoot },
+    ["status", "--porcelain=v2", "--branch", "--untracked-files=all", "--ignored=matching"],
+    signal,
+    2_000_000
+  ).catch(() => null);
   if (!status || status.exitCode !== 0 || status.outputTruncated) return null;
   const lines = status.stdout.split(/\r?\n/u).filter(Boolean);
   return {

@@ -90,6 +90,108 @@ describe("applyUnifiedPatch", () => {
     await expectNoWorkspaceTransactionState(root);
   });
 
+  it("accepts the Codex apply_patch envelope for multi-file changes", async () => {
+    const root = await workspace();
+    await writeFile(path.join(root, "catalog.ts"), [
+      "export interface ModelPricing {",
+      "  sourceUrl?: string;",
+      "}",
+      ""
+    ].join("\n"), "utf8");
+    await writeFile(path.join(root, "obsolete.txt"), "remove me\n", "utf8");
+
+    const result = await applyUnifiedPatch(root, [
+      "*** Begin Patch",
+      "*** Add File: pricing.ts",
+      "+export const tier = 1;",
+      "+",
+      "+export const enabled = true;",
+      "*** Update File: catalog.ts",
+      "@@",
+      " export interface ModelPricing {",
+      "   sourceUrl?: string;",
+      "+  tiers?: readonly number[];",
+      " }",
+      "*** Delete File: obsolete.txt",
+      "*** End Patch"
+    ].join("\n"));
+
+    expect(result.delta).toEqual({
+      added: ["pricing.ts"],
+      modified: ["catalog.ts"],
+      deleted: ["obsolete.txt"]
+    });
+    await expect(readFile(path.join(root, "pricing.ts"), "utf8"))
+      .resolves.toBe("export const tier = 1;\n\nexport const enabled = true;\n");
+    await expect(readFile(path.join(root, "catalog.ts"), "utf8")).resolves.toContain(
+      "  tiers?: readonly number[];\n"
+    );
+    await expect(lstat(path.join(root, "obsolete.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("uses Codex change-context anchors for updates and moves", async () => {
+    const root = await workspace();
+    await writeFile(path.join(root, "source.ts"), [
+      "const untouched = true;",
+      "export function value() {",
+      "  return \"old\";",
+      "}",
+      ""
+    ].join("\n"), "utf8");
+
+    await applyUnifiedPatch(root, [
+      "*** Begin Patch",
+      "*** Update File: source.ts",
+      "*** Move to: moved.ts",
+      "@@ export function value() {",
+      "-  return \"old\";",
+      "+  return \"new\";",
+      " }",
+      "*** End of File",
+      "*** End Patch"
+    ].join("\n"));
+
+    await expect(lstat(path.join(root, "source.ts"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(path.join(root, "moved.ts"), "utf8")).resolves.toBe([
+      "const untouched = true;",
+      "export function value() {",
+      "  return \"new\";",
+      "}",
+      ""
+    ].join("\n"));
+  });
+
+  it("rolls an atomic patch back when cancellation reaches the commit window", async () => {
+    const root = await workspace();
+    await writeFile(path.join(root, "cancelled.txt"), "before\n", "utf8");
+    const controller = new AbortController();
+    let reached!: () => void;
+    let release!: () => void;
+    const commitWindow = new Promise<void>((resolve) => { reached = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const pending = applyUnifiedPatch(root, [
+      "--- a/cancelled.txt",
+      "+++ b/cancelled.txt",
+      "@@ -1 +1 @@",
+      "-before",
+      "+after"
+    ].join("\n"), {
+      signal: controller.signal,
+      beforeMutation: async (operation) => {
+        if (operation.direction !== "commit" || operation.phase !== "install_target_pinned") return;
+        reached();
+        await gate;
+      }
+    });
+
+    await commitWindow;
+    controller.abort(new Error("cancel patch"));
+    release();
+    await expect(pending).rejects.toThrow("cancel patch");
+    await expect(readFile(path.join(root, "cancelled.txt"), "utf8")).resolves.toBe("before\n");
+    await expectNoWorkspaceTransactionState(root);
+  });
+
   it("rejects staged content replacement and restores the original", async () => {
     const root = await workspace();
     const transactions = await patchTransactionRoot(root);

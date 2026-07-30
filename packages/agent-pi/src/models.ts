@@ -17,7 +17,14 @@ import {
 } from "@earendil-works/pi-ai/providers/all";
 import type { ModelCapabilities } from "agent-protocol";
 import { FileCredentialStore } from "./credential-store.js";
+import {
+  hasKnownPricing,
+  piModelPricing,
+  type PiModelPricing
+} from "./model-pricing.js";
 import { FileModelsStore } from "./models-store.js";
+
+export type { PiModelPricing, PiModelPricingTier } from "./model-pricing.js";
 
 export const OPENAI_CODEX_PROVIDER_ID = "openai-codex" as const;
 export const OPENAI_CODEX_DEFAULT_MODEL = "gpt-5.6-terra" as const;
@@ -27,14 +34,6 @@ export const GLM_DEFAULT_MODEL = "glm-5.2" as const;
 export const PI_AI_VERSION = "0.82.1" as const;
 
 export type PiBillingMode = "metered" | "subscription" | "unpriced";
-
-export interface PiModelPricing {
-  inputMicroUsdPerMillion: number;
-  outputMicroUsdPerMillion: number;
-  cacheReadMicroUsdPerMillion: number;
-  cacheWriteMicroUsdPerMillion?: number;
-  effectiveAt: string;
-}
 
 export interface PiAuthMethodDescriptor {
   id: string;
@@ -139,26 +138,8 @@ function freshProviders(): Provider[] {
   return [...builtinProviders(), glmProvider()];
 }
 
-function hasKnownPricing(model: Model<Api>): boolean {
-  return model.cost.input > 0
-    || model.cost.output > 0
-    || model.cost.cacheRead > 0
-    || model.cost.cacheWrite > 0;
-}
-
-function microUsdPerMillion(value: number): number {
-  return Math.max(0, Math.round(value * 1_000_000));
-}
-
 function pricing(model: Model<Api>): PiModelPricing | undefined {
-  if (!hasKnownPricing(model)) return undefined;
-  return {
-    inputMicroUsdPerMillion: microUsdPerMillion(model.cost.input),
-    outputMicroUsdPerMillion: microUsdPerMillion(model.cost.output),
-    cacheReadMicroUsdPerMillion: microUsdPerMillion(model.cost.cacheRead),
-    cacheWriteMicroUsdPerMillion: microUsdPerMillion(model.cost.cacheWrite),
-    effectiveAt: catalogEffectiveAt
-  };
+  return piModelPricing(model, catalogEffectiveAt);
 }
 
 export function piBillingMode(

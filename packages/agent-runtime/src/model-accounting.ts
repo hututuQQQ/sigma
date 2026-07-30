@@ -11,6 +11,7 @@ import type {
 import {
   APPROXIMATE_TOKEN_RESERVATION_MARGIN,
   builtinModelSpec,
+  modelPricingRates,
   normalizeUsage,
   type ModelRouteConstraints,
   type ModelReservationEstimate,
@@ -69,9 +70,10 @@ function matchingSpec(gateway: ModelGateway): ModelSpec | undefined {
 
 function maximumCost(spec: ModelSpec | undefined, inputTokens: number, outputTokens: number): number {
   if (!spec?.pricing) return 0;
+  const rates = modelPricingRates(spec.pricing, inputTokens);
   return Math.ceil((
-    inputTokens * spec.pricing.inputMicroUsdPerMillion
-    + outputTokens * spec.pricing.outputMicroUsdPerMillion
+    inputTokens * rates.inputMicroUsdPerMillion
+    + outputTokens * rates.outputMicroUsdPerMillion
   ) / 1_000_000);
 }
 

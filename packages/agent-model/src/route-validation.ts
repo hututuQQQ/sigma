@@ -100,14 +100,21 @@ function validateCapabilities(spec: ModelSpec): void {
 }
 
 function validatePricing(specId: string, pricing: NonNullable<ModelSpec["pricing"]>): void {
-  for (const value of [
-    pricing.inputMicroUsdPerMillion,
-    pricing.outputMicroUsdPerMillion,
-    pricing.cacheReadMicroUsdPerMillion,
-    pricing.cacheWriteMicroUsdPerMillion ?? 0
-  ]) {
-    if (!Number.isSafeInteger(value) || value < 0) {
-      throw new Error(`Model spec '${specId}' has invalid pricing.`);
+  for (const rates of [pricing, ...(pricing.tiers ?? [])]) {
+    for (const value of [
+      rates.inputMicroUsdPerMillion,
+      rates.outputMicroUsdPerMillion,
+      rates.cacheReadMicroUsdPerMillion,
+      rates.cacheWriteMicroUsdPerMillion ?? 0
+    ]) {
+      if (!Number.isSafeInteger(value) || value < 0) {
+        throw new Error(`Model spec '${specId}' has invalid pricing.`);
+      }
     }
+  }
+  const thresholds = pricing.tiers?.map((tier) => tier.inputTokensAbove) ?? [];
+  if (thresholds.some((value) => !Number.isSafeInteger(value) || value < 0)
+    || new Set(thresholds).size !== thresholds.length) {
+    throw new Error(`Model spec '${specId}' has invalid pricing tiers.`);
   }
 }

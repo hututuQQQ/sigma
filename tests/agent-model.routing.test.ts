@@ -141,6 +141,13 @@ describe("capability-aware model routing", () => {
     const terra = BUILTIN_MODEL_SPECS.find((item) => item.id === "openai-codex/gpt-5.6-terra");
     expect(terra).toMatchObject({ billingMode: "subscription" });
     expect(terra?.pricing).toBeUndefined();
+    expect(BUILTIN_MODEL_SPECS.find((item) => item.id === "openai/gpt-5.4")?.pricing)
+      .toMatchObject({
+        tiers: [expect.objectContaining({
+          inputTokensAbove: 272_000,
+          inputMicroUsdPerMillion: 5_000_000
+        })]
+      });
     const gateway = createModelGatewayForSpec(spec("deepseek/custom", {
       capabilities: { ...capabilities, contextWindowTokens: 42_000 }
     }));
@@ -766,6 +773,43 @@ describe("capability-aware model routing", () => {
 });
 
 describe("normalized model usage", () => {
+  it("uses the highest matching request-wide pricing tier for usage and reservation", () => {
+    const tiered = spec("deepseek/tiered", {
+      tokenizer: { id: "exact", accuracy: "exact" },
+      pricing: {
+        inputMicroUsdPerMillion: 1_000_000,
+        outputMicroUsdPerMillion: 2_000_000,
+        cacheReadMicroUsdPerMillion: 100_000,
+        cacheWriteMicroUsdPerMillion: 1_000_000,
+        effectiveAt: "2026-01-01",
+        tiers: [{
+          inputTokensAbove: 999,
+          inputMicroUsdPerMillion: 3_000_000,
+          outputMicroUsdPerMillion: 4_000_000,
+          cacheReadMicroUsdPerMillion: 200_000,
+          cacheWriteMicroUsdPerMillion: 5_000_000
+        }]
+      }
+    });
+    expect(normalizeUsage({
+      request: request(),
+      response: response("answer"),
+      raw: {
+        inputTokens: 1_000,
+        outputTokens: 100,
+        cacheReadTokens: 250,
+        cacheWriteTokens: 50
+      },
+      pricing: tiered.pricing,
+      latencyMs: 1,
+      retryAttempt: 0
+    }).costMicroUsd).toBe(2_800);
+    expect(modelReservationEstimate(tiered, {
+      estimatedInputTokens: 1_000,
+      maxOutputTokens: 100
+    }).costMicroUsd).toBe(3_400);
+  });
+
   it("always supplies token, cost, latency, and reporting fields", () => {
     const usage = normalizeUsage({
       request: request(),

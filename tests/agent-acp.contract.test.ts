@@ -46,6 +46,7 @@ function envelope(
 class FakeRuntime implements RuntimeClient {
   readonly commands: RunCommand[] = [];
   readonly releasedSessions: string[] = [];
+  cancelSettlement?: { started(): void; wait: Promise<void> };
   private readonly events: AgentEventEnvelope[] = [];
   private readonly eventWaiters = new Set<() => void>();
   private readonly outcomes = new Map<string, RunOutcome>();
@@ -96,6 +97,8 @@ class FakeRuntime implements RuntimeClient {
       return;
     }
     if (command.type === "cancel") {
+      this.cancelSettlement?.started();
+      await this.cancelSettlement?.wait;
       this.finish(command.sessionId, { kind: "cancelled", reason: command.reason ?? "cancelled" });
     }
   }
@@ -499,10 +502,23 @@ describe("Sigma ACP v1 contract", () => {
         prompt: [{ type: "text", text: "wait for cancellation" }]
       });
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
-      await clientConnection.agent.notify(acp.methods.agent.session.cancel, {
+      let cancelStarted!: () => void;
+      let releaseCancel!: () => void;
+      const cancelStartedPromise = new Promise<void>((resolve) => { cancelStarted = resolve; });
+      const cancelGate = new Promise<void>((resolve) => { releaseCancel = resolve; });
+      runtime.cancelSettlement = { started: cancelStarted, wait: cancelGate };
+      const notification = clientConnection.agent.notify(acp.methods.agent.session.cancel, {
         sessionId: cancellable.sessionId
       });
+      await cancelStartedPromise;
+      let promptSettled = false;
+      void pendingPrompt.then(() => { promptSettled = true; });
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      expect(promptSettled).toBe(false);
+      releaseCancel();
+      await notification;
       expect((await pendingPrompt).stopReason).toBe("cancelled");
+      delete runtime.cancelSettlement;
 
       const failing = await clientConnection.agent.request(acp.methods.agent.session.new, {
         cwd: root,

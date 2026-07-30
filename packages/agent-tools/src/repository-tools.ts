@@ -1,7 +1,7 @@
 import type { JsonValue, ToolDescriptor, ToolReceipt, ToolRequest } from "agent-protocol";
 import {
-  runProcess,
   repositoryTopology,
+  runLeasedRepositoryGit,
   type ProcessExecutionPort
 } from "agent-platform";
 import type { RegisteredEffectTool } from "./registry.js";
@@ -243,13 +243,13 @@ function gitReadTool(
           ["external_read_required"]
         );
       }
-      const repositoryRoot = topology.worktreeRoot;
-      const output = await runProcess({
-        execution: execution!,
-        executable: "git", args, cwd: repositoryRoot, timeoutMs: 30_000,
-        maxOutputBytes: name === "git_diff" ? gitCaptureCharacters : 2_000_000,
-        signal: context.signal
-      });
+      const output = await runLeasedRepositoryGit(
+        execution!,
+        { ...topology, worktreeRoot: topology.worktreeRoot },
+        args,
+        context.signal,
+        name === "git_diff" ? gitCaptureCharacters : 2_000_000
+      );
       const complete = [output.stdout, output.stderr].filter(Boolean).join("\n");
       const diagnostics = [`exit_code=${output.exitCode}`];
       if (name !== "git_diff" || complete.length <= gitDiffPreviewCharacters) {

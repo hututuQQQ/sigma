@@ -3,6 +3,7 @@ export * from "./catalog.js";
 export * from "./router.js";
 export * from "./failure-policy.js";
 export * from "./usage.js";
+export * from "./pricing.js";
 export * from "./routed-gateway.js";
 export * from "./provider-health.js";
 export * from "./provider-spi.js";

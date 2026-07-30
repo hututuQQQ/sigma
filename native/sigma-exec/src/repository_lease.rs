@@ -164,6 +164,10 @@ impl RepositoryMetadataLeases {
         // Both native launchers re-pin the exact executable object and verify
         // this digest immediately before exec/CreateProcess.
         params.policy.executable_sha256 = Some(lease.executable_sha256.clone());
+        // The lease, rather than a caller-controlled execution root, is the
+        // authority for this exact Git executable. Materialize only the pinned
+        // file so the ordinary launcher authorization check stays in force.
+        params.policy.execution_roots.push(lease.executable.clone());
         let cwd = params.command.cwd.canonicalize().map_err(RpcError::from)?;
         if cwd != lease.repository_root {
             return Err(RpcError::new(
@@ -171,6 +175,7 @@ impl RepositoryMetadataLeases {
                 "repository metadata lease is bound to a different repository root",
             ));
         }
+        params.policy.repository_workspace_root = Some(lease.repository_root.clone());
         validate_git_invocation(params, &lease)?;
         let permitted = [
             lease.repository_root.as_path(),
@@ -469,7 +474,14 @@ pub(crate) fn trusted_git_executable(requested: &str) -> Result<PathBuf, RpcErro
         vec![path.to_owned()]
     } else if !requested.contains('/') && !requested.contains('\\') {
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .map(|directory| directory.join(requested))
+            .flat_map(|directory| {
+                let mut values = vec![directory.join(requested)];
+                #[cfg(windows)]
+                if path.extension().is_none() {
+                    values.push(directory.join(format!("{requested}.exe")));
+                }
+                values
+            })
             .collect()
     } else {
         Vec::new()
@@ -522,7 +534,14 @@ fn resolve_command_executable(params: &ProcessParams) -> Result<PathBuf, RpcErro
             .map(String::as_str)
             .unwrap_or("");
         std::env::split_paths(search)
-            .map(|directory| directory.join(requested))
+            .flat_map(|directory| {
+                let mut values = vec![directory.join(requested)];
+                #[cfg(windows)]
+                if requested.extension().is_none() {
+                    values.push(directory.join(format!("{}.exe", params.command.executable)));
+                }
+                values
+            })
             .collect()
     };
     candidates
@@ -657,6 +676,7 @@ mod tests {
                 scratch_lease_id: None,
                 scratch_session_id: None,
                 repository_metadata_roots: vec![root.parent().unwrap().to_owned()],
+                repository_workspace_root: None,
                 session_scratch_roots: Vec::new(),
                 #[cfg(test)]
                 unsafe_host_exec_approved: false,
@@ -678,6 +698,17 @@ mod tests {
         assert_eq!(
             first.policy.repository_metadata_roots,
             vec![git_dir.clone()]
+        );
+        assert_eq!(
+            first.policy.repository_workspace_root,
+            Some(root.canonicalize().unwrap())
+        );
+        assert!(
+            first
+                .policy
+                .execution_roots
+                .iter()
+                .any(|root| root == &executable)
         );
         #[cfg(windows)]
         assert_eq!(
@@ -755,6 +786,7 @@ mod tests {
                 scratch_lease_id: None,
                 scratch_session_id: None,
                 repository_metadata_roots: Vec::new(),
+                repository_workspace_root: None,
                 session_scratch_roots: Vec::new(),
                 unsafe_host_exec_approved: false,
             },

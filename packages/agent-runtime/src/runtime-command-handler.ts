@@ -29,6 +29,41 @@ async function waitForTerminalRunSettlement(session: RuntimeSession): Promise<vo
   });
 }
 
+async function waitForCancelledRunSettlement(
+  session: RuntimeSession,
+  running: Promise<void> | null
+): Promise<void> {
+  if (!running) return;
+  let settled = false;
+  const settlement = running.then(
+    () => { settled = true; },
+    () => { settled = true; }
+  );
+  while (
+    !settled
+    && session.execution.running === running
+    && session.durable.state.phase !== "terminal"
+  ) {
+    await Promise.race([
+      settlement,
+      new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, 10);
+        timer.unref();
+      })
+    ]);
+  }
+  // A durable terminal event is emitted only after tool/process/child
+  // settlement. It may be waiting for the external command inbox dispatch to
+  // return before the run promise itself can settle, so treating that event as
+  // the boundary avoids a cancellation/release cycle.
+  if (session.durable.state.phase === "terminal") return;
+  await settlement;
+  if (session.execution.running !== running) return;
+  await new Promise<void>((resolve, reject) => {
+    session.interaction.idleWaiters.push({ resolve, reject });
+  }).catch(() => undefined);
+}
+
 function approvalDecision(
   approval: ApprovalWaiter,
   requested: "allow" | "deny" | "always_allow"
@@ -101,12 +136,18 @@ export class RuntimeCommandHandler {
 
   async cancel(session: RuntimeSession, command: Extract<RunCommand, { type: "cancel" }>): Promise<void> {
     const reason = command.reason ?? "Cancelled by user.";
+    const running = session.execution.running;
     session.execution.controller?.abort(new Error(reason));
     for (const approval of session.interaction.approvals.values()) approval.resolve("deny");
     session.interaction.approvals.clear();
     session.interaction.callApprovals.clear();
-    await this.options.cancelChildren?.(session.identity.sessionId, reason);
-    if (!session.execution.running && session.durable.state.phase !== "terminal") {
+    const children = Promise.resolve().then(async () =>
+      await this.options.cancelChildren?.(session.identity.sessionId, reason));
+    // A cancellation acknowledgement is a quiescence boundary: mutation
+    // tools and broker processes must settle before the caller can observe it.
+    await waitForCancelledRunSettlement(session, running);
+    await children;
+    if (session.durable.state.phase !== "terminal") {
       await this.options.finish(session, { kind: "cancelled", reason });
     }
   }

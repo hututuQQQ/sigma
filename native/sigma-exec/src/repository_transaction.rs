@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json, to_value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -2180,9 +2180,9 @@ fn run_git_bounded_inner(
     for value in config_overrides {
         command.args(["-c", value]);
     }
-    command.arg(format!("--git-dir={}", journal.git_dir.display()));
+    command.arg(git_path_argument("--git-dir=", &journal.git_dir));
     if journal.repository_root != journal.git_dir {
-        command.arg(format!("--work-tree={}", journal.repository_root.display()));
+        command.arg(git_path_argument("--work-tree=", &journal.repository_root));
     }
     command
         .args(args)
@@ -2526,9 +2526,7 @@ fn sync_tree(root: &Path) -> Result<(), RpcError> {
         return Ok(());
     }
     if metadata.is_file() {
-        File::open(root)
-            .and_then(|file| file.sync_all())
-            .map_err(snapshot_error)?;
+        sync_snapshot_tree_file(root)?;
         return Ok(());
     }
     if !metadata.is_dir() {
@@ -2540,6 +2538,21 @@ fn sync_tree(root: &Path) -> Result<(), RpcError> {
         sync_tree(&entry.map_err(snapshot_error)?.path())?;
     }
     sync_directory(root)
+}
+
+#[cfg(windows)]
+fn sync_snapshot_tree_file(_path: &Path) -> Result<(), RpcError> {
+    // Snapshot files are flushed through their writable destination handles
+    // before source permissions (including readonly) are restored.
+    // FlushFileBuffers rejects the read-only handles from File::open.
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn sync_snapshot_tree_file(path: &Path) -> Result<(), RpcError> {
+    File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| snapshot_path_error("sync snapshot file", path, error))
 }
 
 #[cfg(unix)]
@@ -2568,11 +2581,17 @@ fn copy_tree_filtered(
     budget: &mut SnapshotBudget,
     excluded_names: &[&OsStr],
 ) -> Result<(), RpcError> {
-    fs::create_dir_all(destination).map_err(snapshot_error)?;
-    let source_metadata = fs::symlink_metadata(source).map_err(snapshot_error)?;
-    fs::set_permissions(destination, source_metadata.permissions()).map_err(snapshot_error)?;
-    for entry in fs::read_dir(source).map_err(snapshot_error)? {
-        let entry = entry.map_err(snapshot_error)?;
+    fs::create_dir_all(destination)
+        .map_err(|error| snapshot_path_error("create snapshot directory", destination, error))?;
+    let source_metadata = fs::symlink_metadata(source)
+        .map_err(|error| snapshot_path_error("inspect snapshot source", source, error))?;
+    fs::set_permissions(destination, source_metadata.permissions())
+        .map_err(|error| snapshot_path_error("copy snapshot permissions", destination, error))?;
+    for entry in fs::read_dir(source)
+        .map_err(|error| snapshot_path_error("enumerate snapshot source", source, error))?
+    {
+        let entry =
+            entry.map_err(|error| snapshot_path_error("read snapshot entry", source, error))?;
         if excluded_names
             .iter()
             .any(|name| entry.file_name() == **name)
@@ -2585,16 +2604,19 @@ fn copy_tree_filtered(
         }
         let from = entry.path();
         let to = destination.join(entry.file_name());
-        let metadata = fs::symlink_metadata(&from).map_err(snapshot_error)?;
+        let metadata = fs::symlink_metadata(&from)
+            .map_err(|error| snapshot_path_error("inspect snapshot entry", &from, error))?;
         if metadata.file_type().is_symlink() {
-            let target = fs::read_link(&from).map_err(snapshot_error)?;
+            let target = fs::read_link(&from)
+                .map_err(|error| snapshot_path_error("read snapshot link", &from, error))?;
             budget.bytes = budget
                 .bytes
                 .saturating_add(target.as_os_str().as_encoded_bytes().len() as u64);
             if budget.bytes > budget.max_bytes {
                 return Err(snapshot_limit_error());
             }
-            create_symlink(&target, &to, from.is_dir()).map_err(snapshot_error)?;
+            create_symlink(&target, &to, from.is_dir())
+                .map_err(|error| snapshot_path_error("create snapshot link", &to, error))?;
         } else if metadata.is_dir() {
             copy_tree_filtered(&from, &to, budget, &[])?;
         } else if metadata.is_file() {
@@ -2602,8 +2624,9 @@ fn copy_tree_filtered(
             if budget.bytes > budget.max_bytes {
                 return Err(snapshot_limit_error());
             }
-            fs::copy(&from, &to).map_err(snapshot_error)?;
-            fs::set_permissions(&to, metadata.permissions()).map_err(snapshot_error)?;
+            copy_snapshot_file(&from, &to)?;
+            fs::set_permissions(&to, metadata.permissions())
+                .map_err(|error| snapshot_path_error("copy snapshot permissions", &to, error))?;
         } else {
             return Err(atomicity_unavailable(
                 "repository contains an unsupported filesystem object",
@@ -2611,6 +2634,21 @@ fn copy_tree_filtered(
         }
     }
     Ok(())
+}
+
+fn copy_snapshot_file(source: &Path, destination: &Path) -> Result<(), RpcError> {
+    let mut input = File::open(source)
+        .map_err(|error| snapshot_path_error("open snapshot source", source, error))?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(|error| snapshot_path_error("create snapshot file", destination, error))?;
+    std::io::copy(&mut input, &mut output)
+        .map_err(|error| snapshot_path_error("copy snapshot file", source, error))?;
+    output
+        .sync_all()
+        .map_err(|error| snapshot_path_error("sync snapshot file", destination, error))
 }
 
 fn clear_tree_filtered(root: &Path, excluded_names: &[&OsStr]) -> Result<(), RpcError> {
@@ -2822,6 +2860,44 @@ fn executable_parent_path(executable: &Path) -> String {
         .into_owned()
 }
 
+fn git_path_argument(option: &str, path: &Path) -> OsString {
+    let mut argument = OsString::from(option);
+    argument.push(git_cli_path(path));
+    argument
+}
+
+#[cfg(windows)]
+fn git_cli_path(path: &Path) -> OsString {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    const VERBATIM_PREFIX: &[u16] = &[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    const VERBATIM_UNC_PREFIX: &[u16] = &[
+        b'\\' as u16,
+        b'\\' as u16,
+        b'?' as u16,
+        b'\\' as u16,
+        b'U' as u16,
+        b'N' as u16,
+        b'C' as u16,
+        b'\\' as u16,
+    ];
+    let encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if let Some(rest) = encoded.strip_prefix(VERBATIM_UNC_PREFIX) {
+        let mut normalized = vec![b'\\' as u16, b'\\' as u16];
+        normalized.extend_from_slice(rest);
+        OsString::from_wide(&normalized)
+    } else if let Some(rest) = encoded.strip_prefix(VERBATIM_PREFIX) {
+        OsString::from_wide(rest)
+    } else {
+        path.as_os_str().to_owned()
+    }
+}
+
+#[cfg(not(windows))]
+fn git_cli_path(path: &Path) -> OsString {
+    path.as_os_str().to_owned()
+}
+
 #[cfg(unix)]
 fn directory_identity(path: &Path) -> Result<DirectoryIdentity, RpcError> {
     use std::os::unix::fs::MetadataExt;
@@ -3002,6 +3078,13 @@ fn snapshot_error(error: std::io::Error) -> RpcError {
         "repository_atomicity_unavailable",
         format!("repository preimage journal failed: {error}"),
     )
+}
+
+fn snapshot_path_error(action: &str, path: &Path, error: std::io::Error) -> RpcError {
+    snapshot_error(std::io::Error::new(
+        error.kind(),
+        format!("{action} '{}': {error}", path.display()),
+    ))
 }
 
 fn atomicity_unavailable(message: impl Into<String>) -> RpcError {

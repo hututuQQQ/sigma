@@ -84,6 +84,15 @@ export interface ModelPricing {
   cacheWriteMicroUsdPerMillion?: number;
   effectiveAt: string;
   sourceUrl?: string;
+  tiers?: readonly ModelPricingTier[];
+}
+
+export interface ModelPricingTier {
+  inputTokensAbove: number;
+  inputMicroUsdPerMillion: number;
+  outputMicroUsdPerMillion: number;
+  cacheReadMicroUsdPerMillion: number;
+  cacheWriteMicroUsdPerMillion?: number;
 }
 
 export interface ModelSpec {
