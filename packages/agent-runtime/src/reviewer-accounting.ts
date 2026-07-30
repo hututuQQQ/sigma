@@ -31,9 +31,12 @@ export function aggregateReviewerUsage(
     };
   }
   const subscriptionOnly = usages.every((item) => item.billingMode === "subscription");
+  const containsUnpriced = usages.some((item) => item.billingMode === "unpriced");
   const billingModes = new Set(usages.flatMap((item) =>
     item.billingMode ? [item.billingMode] : []));
-  const billingMode = subscriptionOnly
+  const billingMode = containsUnpriced
+    ? "unpriced"
+    : subscriptionOnly
     ? "subscription"
     : billingModes.size > 0
       ? "metered"
@@ -48,7 +51,7 @@ export function aggregateReviewerUsage(
     reasoningTokens: usages.reduce((total, item) => total + item.reasoningTokens, 0),
     cacheReadTokens: usages.reduce((total, item) => total + item.cacheReadTokens, 0),
     cacheWriteTokens: usages.reduce((total, item) => total + item.cacheWriteTokens, 0),
-    costMicroUsd: subscriptionOnly
+    costMicroUsd: subscriptionOnly || containsUnpriced
       ? null
       : usages.reduce((total, item) => total + (item.costMicroUsd ?? 0), 0),
     ...(billingMode ? { billingMode } : {}),

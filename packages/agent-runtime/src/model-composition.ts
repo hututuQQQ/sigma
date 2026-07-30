@@ -2,7 +2,6 @@ import type { ModelRouteConfigValue, ModelSpecConfigValue } from "agent-config";
 import type { FrozenAgentProfile } from "agent-extensions";
 import {
   BUILTIN_MODEL_SPECS,
-  builtinModelSpec,
   createModelGatewayForSpec,
   defaultModel,
   ModelRouter,
@@ -15,7 +14,7 @@ import type { ModelExecutionRole, ModelGateway } from "agent-protocol";
 import type { RuntimeCustomization } from "./customization.js";
 
 export interface ModelCompositionConfig {
-  provider: "deepseek" | "glm" | "openai-codex";
+  provider: string;
   model: string;
   modelDeadlineSec: number;
   streamIdleSec: number;
@@ -24,18 +23,21 @@ export interface ModelCompositionConfig {
   explicitSingleModelRoute?: boolean;
   modelSpecs?: readonly ModelSpecConfigValue[];
   modelRoutes?: readonly ModelRouteConfigValue[];
-  budget?: { maxCostMicroUsd: number };
+  budget?: { maxCostMicroUsd: number; allowUnpricedCosts?: boolean };
+}
+
+interface ModelGatewayFactoryOptions {
+  provider: string;
+  model: string;
+  maxRetries: number;
+  requestTimeoutMs: number;
+  idleTimeoutMs: number;
+  activeStreamTimeoutMs?: number;
 }
 
 export interface ModelCompositionDeps {
-  gatewayFactory?: (options: {
-    provider: "deepseek" | "glm" | "openai-codex";
-    model: string;
-    maxRetries: number;
-    requestTimeoutMs: number;
-    idleTimeoutMs: number;
-    activeStreamTimeoutMs?: number;
-  }) => ModelGateway;
+  gatewayFactory?: (options: ModelGatewayFactoryOptions) => ModelGateway;
+  catalogSpecs?: readonly ModelSpec[];
 }
 
 export interface ModelGateways {
@@ -54,33 +56,41 @@ const TOOL_ROLES = new Set<ModelExecutionRole>([
 
 function hasCredential(provider: ModelSpec["providerId"], env: NodeJS.ProcessEnv): boolean {
   if (provider === "deepseek") return Boolean(env.DEEPSEEK_API_KEY?.trim());
-  if (provider === "openai-codex") return false;
-  return Boolean(env.GLM_API_KEY?.trim() || env.ZAI_API_KEY?.trim() || env.BIGMODEL_API_KEY?.trim());
+  if (provider === "glm") {
+    return Boolean(env.GLM_API_KEY?.trim() || env.ZAI_API_KEY?.trim() || env.BIGMODEL_API_KEY?.trim());
+  }
+  return false;
 }
 
 export function productionModelCandidates(
   config: Pick<ModelCompositionConfig, "provider" | "model" | "explicitSingleModelRoute">,
-  env: NodeJS.ProcessEnv = process.env
+  env: NodeJS.ProcessEnv = process.env,
+  catalogSpecs: readonly ModelSpec[] = BUILTIN_MODEL_SPECS
 ): ModelSpec[] {
-  const model = config.model === "auto" ? defaultModel(config.provider, env) : config.model;
-  const primary = builtinModelSpec(config.provider, model);
+  const model = selectedModel(config, env, catalogSpecs);
+  const primary = catalogSpecs.find((spec) =>
+    spec.providerId === config.provider && spec.upstreamModel === model);
   if (!primary) return [];
-  if (config.explicitSingleModelRoute || primary.billingMode === "subscription") return [primary];
-  return [
-    primary,
-    ...BUILTIN_MODEL_SPECS.filter((spec) => spec.id !== primary.id && hasCredential(spec.providerId, env))
-  ];
+  if (config.explicitSingleModelRoute || (primary.providerId !== "deepseek" && primary.providerId !== "glm")) {
+    return [primary];
+  }
+  const fallbackProvider = primary.providerId === "deepseek" ? "glm" : "deepseek";
+  const fallback = hasCredential(fallbackProvider, env)
+    ? catalogSpecs.find((spec) =>
+        spec.providerId === fallbackProvider
+        && spec.upstreamModel === defaultModel(fallbackProvider, env))
+    : undefined;
+  return fallback ? [primary, fallback] : [primary];
 }
 
 function injectedModelSpec(
-  provider: "deepseek" | "glm" | "openai-codex",
+  provider: string,
   model: string,
   gateway: ModelGateway
 ): ModelSpec {
   const base: ModelSpec = {
     id: `${provider}/${model}`,
     providerId: provider,
-    wireProtocol: provider === "openai-codex" ? "openai-codex-responses" : "openai_chat",
     upstreamModel: model,
     billingMode: provider === "openai-codex" ? "subscription" : "metered",
     capabilities: gateway.capabilities,
@@ -100,10 +110,7 @@ function injectedModelSpec(
 function configuredSpec(value: ModelSpecConfigValue): ModelSpec {
   return {
     ...value,
-    billingMode: value.billingMode ?? "metered",
-    wireProtocol: value.providerId === "openai-codex"
-      ? "openai-codex-responses"
-      : "openai_chat"
+    billingMode: value.billingMode ?? "metered"
   };
 }
 
@@ -111,16 +118,30 @@ function configuredRoute(value: ModelRouteConfigValue): ModelRoute {
   return { ...value };
 }
 
-function selectedModel(config: ModelCompositionConfig, env: NodeJS.ProcessEnv): string {
-  return config.model === "auto" ? defaultModel(config.provider, env) : config.model;
+function selectedModel(
+  config: Pick<ModelCompositionConfig, "provider" | "model">,
+  env: NodeJS.ProcessEnv,
+  catalogSpecs: readonly ModelSpec[]
+): string {
+  if (config.model !== "auto") return config.model;
+  try {
+    return defaultModel(config.provider, env);
+  } catch (error) {
+    const cached = catalogSpecs.find((spec) => spec.providerId === config.provider);
+    if (cached) return cached.upstreamModel;
+    throw error;
+  }
 }
 
-function explicitSpecs(config: ModelCompositionConfig): ModelSpec[] {
-  const builtins = new Set(BUILTIN_MODEL_SPECS.map((spec) => spec.id));
+function explicitSpecs(
+  config: ModelCompositionConfig,
+  catalogSpecs: readonly ModelSpec[]
+): ModelSpec[] {
+  const builtins = new Set(catalogSpecs.map((spec) => spec.id));
   const ids = new Set<string>();
   return (config.modelSpecs ?? []).map((value) => {
     if (builtins.has(value.id)) throw new Error(`Custom model spec '${value.id}' cannot override fixed built-in catalog data.`);
-    if (BUILTIN_MODEL_SPECS.some((spec) =>
+    if (catalogSpecs.some((spec) =>
       spec.providerId === value.providerId && spec.upstreamModel === value.upstreamModel)) {
       throw new Error(`Custom model spec '${value.id}' cannot alias a built-in model with different catalog data.`);
     }
@@ -137,28 +158,31 @@ function catalog(
   config: ModelCompositionConfig,
   env: NodeJS.ProcessEnv,
   custom: readonly ModelSpec[],
-  injected: ModelSpec | undefined
+  injected: ModelSpec | undefined,
+  catalogSpecs: readonly ModelSpec[]
 ): { primary: ModelSpec; specs: ModelSpec[]; routes: ModelRoute[] } {
-  const model = selectedModel(config, env);
-  const primary = builtinModelSpec(config.provider, model)
+  const model = selectedModel(config, env, catalogSpecs);
+  const primary = catalogSpecs.find((spec) =>
+    spec.providerId === config.provider && spec.upstreamModel === model)
     ?? custom.find((spec) => spec.providerId === config.provider && spec.upstreamModel === model)
     ?? injected;
   if (!primary) {
     throw new Error(`Custom model '${config.provider}/${model}' requires explicit capabilities, tokenizer, and pricing.`);
   }
   const available = new Map<string, ModelSpec>([
-    ...BUILTIN_MODEL_SPECS.map((spec) => [spec.id, spec] as const),
+    ...catalogSpecs.map((spec) => [spec.id, spec] as const),
     ...custom.map((spec) => [spec.id, spec] as const)
   ]);
   available.set(primary.id, primary);
   const explicitRoutes = (config.modelRoutes ?? []).map(configuredRoute);
   let routes: ModelRoute[];
-  if (config.explicitSingleModelRoute || (primary.billingMode === "subscription" && explicitRoutes.length === 0)) {
+  if (config.explicitSingleModelRoute
+    || (explicitRoutes.length === 0 && primary.providerId !== "deepseek" && primary.providerId !== "glm")) {
     routes = [{ id: "default", candidates: [primary.id], fallbackOn: FALLBACK_ON, maxAttempts: 1 }];
   } else if (explicitRoutes.length > 0) {
     routes = explicitRoutes;
   } else {
-    const candidates = productionModelCandidates(config, env).map((spec) => spec.id);
+    const candidates = productionModelCandidates(config, env, catalogSpecs).map((spec) => spec.id);
     if (!candidates.includes(primary.id)) candidates.unshift(primary.id);
     routes = [{ id: "default", candidates, fallbackOn: FALLBACK_ON, maxAttempts: candidates.length }];
   }
@@ -167,22 +191,81 @@ function catalog(
   return { primary, specs, routes };
 }
 
-function constraintsForRole(role: ModelExecutionRole): ModelRouteConstraints {
-  return TOOL_ROLES.has(role) ? { requiredCapabilities: { tools: true } } : {};
+function constraintsForRole(
+  role: ModelExecutionRole,
+  allowUnpricedCosts = false
+): ModelRouteConstraints {
+  return {
+    ...(TOOL_ROLES.has(role) ? { requiredCapabilities: { tools: true } } : {}),
+    allowUnpricedCosts
+  };
 }
 
-function validateProfileRoutes(router: ModelRouter, customization: RuntimeCustomization): void {
+function validateProfileRoutes(
+  router: ModelRouter,
+  customization: RuntimeCustomization,
+  allowUnpricedCosts: boolean
+): void {
   const profiles = [customization.profile, ...customization.availableProfiles.map((item) => item.profile)];
   for (const profile of profiles) {
     for (const [role, routeId] of Object.entries(profile.profile.roleRoutes)) {
       if (!routeId) continue;
       try {
-        router.resolve(routeId, constraintsForRole(role as ModelExecutionRole));
+        router.resolve(routeId, constraintsForRole(role as ModelExecutionRole, allowUnpricedCosts));
       } catch (error) {
         throw new Error(`Agent Profile '${profile.profile.id}' has unusable ${role} route '${routeId}'.`, { cause: error });
       }
     }
   }
+}
+
+function gatewayOptions(config: ModelCompositionConfig): Omit<
+  ModelGatewayFactoryOptions,
+  "provider" | "model"
+> {
+  return {
+    maxRetries: config.maxModelRetries ?? 2,
+    requestTimeoutMs: config.modelDeadlineSec * 1_000,
+    idleTimeoutMs: config.streamIdleSec * 1_000,
+    ...(config.streamActiveSec && config.streamActiveSec > 0
+      ? { activeStreamTimeoutMs: config.streamActiveSec * 1_000 }
+      : {})
+  };
+}
+
+function transportOptions(
+  options: Omit<ModelGatewayFactoryOptions, "provider" | "model">
+): Omit<ModelGatewayFactoryOptions, "provider" | "model" | "maxRetries"> {
+  const { maxRetries: _policyRetries, ...transport } = options;
+  void _policyRetries;
+  return transport;
+}
+
+function primaryGateway(
+  provider: string,
+  model: string,
+  spec: ModelSpec | undefined,
+  deps: ModelCompositionDeps,
+  options: Omit<ModelGatewayFactoryOptions, "provider" | "model">
+): ModelGateway {
+  const injected = deps.gatewayFactory?.({ provider, model, ...options });
+  if (injected) return injected;
+  if (!spec) {
+    throw new Error(`Custom model '${provider}/${model}' requires explicit capabilities, tokenizer, and pricing.`);
+  }
+  return createModelGatewayForSpec(spec, transportOptions(options));
+}
+
+function gatewayForSpec(
+  spec: ModelSpec,
+  deps: ModelCompositionDeps,
+  options: Omit<ModelGatewayFactoryOptions, "provider" | "model">
+): ModelGateway {
+  return deps.gatewayFactory?.({
+    provider: spec.providerId,
+    model: spec.upstreamModel,
+    ...options
+  }) ?? createModelGatewayForSpec(spec, transportOptions(options));
 }
 
 export function createRoleGateways(
@@ -191,45 +274,38 @@ export function createRoleGateways(
   customization: RuntimeCustomization,
   env: NodeJS.ProcessEnv = process.env
 ): ModelGateways {
-  const model = selectedModel(config, env);
-  const custom = explicitSpecs(config);
-  const knownPrimary = builtinModelSpec(config.provider, model)
+  const catalogSpecs = deps.catalogSpecs ?? BUILTIN_MODEL_SPECS;
+  const model = selectedModel(config, env, catalogSpecs);
+  const custom = explicitSpecs(config, catalogSpecs);
+  const knownPrimary = catalogSpecs.find((spec) =>
+    spec.providerId === config.provider && spec.upstreamModel === model)
     ?? custom.find((spec) => spec.providerId === config.provider && spec.upstreamModel === model);
-  if (!knownPrimary && !deps.gatewayFactory) {
-    throw new Error(`Custom model '${config.provider}/${model}' requires explicit capabilities, tokenizer, and pricing.`);
-  }
-  const gatewayOptions = {
-    maxRetries: config.maxModelRetries ?? 2,
-    requestTimeoutMs: config.modelDeadlineSec * 1_000,
-    idleTimeoutMs: config.streamIdleSec * 1_000,
-    ...(config.streamActiveSec && config.streamActiveSec > 0
-      ? { activeStreamTimeoutMs: config.streamActiveSec * 1_000 } : {})
-  };
-  const primaryGateway = deps.gatewayFactory?.({ provider: config.provider, model, ...gatewayOptions })
-    ?? createModelGatewayForSpec(knownPrimary as ModelSpec, {
-      ...gatewayOptions
-    });
-  const injected = knownPrimary ? undefined : injectedModelSpec(config.provider, model, primaryGateway);
-  const resolved = catalog(config, env, custom, injected);
+  const options = gatewayOptions(config);
+  const primary = primaryGateway(config.provider, model, knownPrimary, deps, options);
+  const injected = knownPrimary ? undefined : injectedModelSpec(config.provider, model, primary);
+  const resolved = catalog(config, env, custom, injected, catalogSpecs);
   const gateways = new Map<string, ModelGateway>();
   for (const spec of resolved.specs) {
     const gateway = spec.id === resolved.primary.id
-      ? primaryGateway
-      : deps.gatewayFactory?.({ provider: spec.providerId, model: spec.upstreamModel, ...gatewayOptions })
-        ?? createModelGatewayForSpec(spec, {
-          ...gatewayOptions
-        });
+      ? primary
+      : gatewayForSpec(spec, deps, options);
     gateways.set(spec.id, gateway);
   }
-  const router = new ModelRouter(resolved.specs, resolved.routes, (spec) => gateways.get(spec.id) as ModelGateway);
-  validateProfileRoutes(router, customization);
+  const router = new ModelRouter(
+    resolved.specs,
+    resolved.routes,
+    (spec) => gateways.get(spec.id) as ModelGateway,
+    { maxRetriesPerCandidate: config.maxModelRetries ?? 2 }
+  );
+  const allowUnpricedCosts = config.budget?.allowUnpricedCosts === true;
+  validateProfileRoutes(router, customization, allowUnpricedCosts);
   const cache = new Map<string, RoutedModelGateway>();
   const forRole = (role: ModelExecutionRole, profile: FrozenAgentProfile | undefined): RoutedModelGateway => {
     const routeId = profile?.profile.roleRoutes[role] ?? "default";
     const key = `${role}\0${routeId}`;
     const existing = cache.get(key);
     if (existing) return existing;
-    const constraints = constraintsForRole(role);
+    const constraints = constraintsForRole(role, allowUnpricedCosts);
     const representativeSpec = router.resolve(routeId, constraints).candidates[0] as ModelSpec;
     const gateway = new RoutedModelGateway({
       router,

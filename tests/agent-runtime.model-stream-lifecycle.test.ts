@@ -14,7 +14,7 @@ import type {
   ModelToolDefinition
 } from "../packages/agent-protocol/src/index.js";
 import { replayBudgetLedgerEvent } from "../packages/agent-kernel/src/index.js";
-import { OpenAIModelGateway } from "../packages/agent-model/src/index.js";
+import { ModelGatewayError } from "../packages/agent-model/src/index.js";
 import { createRuntime } from "../packages/agent-runtime/src/testing.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { EffectToolRegistry } from "../packages/agent-tools/src/index.js";
@@ -43,6 +43,35 @@ class IncompleteStreamGateway implements ModelGateway {
 
   async countTokens(messages: ModelMessage[], tools: ModelToolDefinition[] = []): Promise<number> {
     return Math.ceil(JSON.stringify({ messages, tools }).length / 4);
+  }
+}
+
+class DiagnosticFailureGateway extends IncompleteStreamGateway {
+  override readonly provider = "fake-provider";
+  override readonly model = "fake-model";
+
+  override async *stream(_request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    yield { type: "reasoning", delta: "partial reasoning" };
+    throw new ModelGatewayError(
+      "Provider stream ended before a terminal response.",
+      "protocol",
+      true,
+      200,
+      undefined,
+      {
+        provider: this.provider,
+        model: this.model,
+        category: "protocol",
+        httpStatus: 200,
+        doneReceived: false,
+        transportEnded: true,
+        lastEventType: "reasoning",
+        hasContent: false,
+        hasReasoning: true,
+        hasToolCall: false,
+        retryAttempts: 1
+      }
+    );
   }
 }
 
@@ -99,20 +128,7 @@ describe("runtime model stream lifecycle", () => {
   it("persists gateway diagnostics and settles the model reservation before run.failed", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-gateway-stream-failure-"));
     const storeRootDir = path.join(workspace, ".agent");
-    const gateway = new OpenAIModelGateway({
-      provider: "fake-provider",
-      model: "fake-model",
-      baseUrl: "https://example.invalid",
-      apiKey: "secret",
-      apiKeyName: "FAKE_KEY",
-      maxRetries: 0,
-      fetchImpl: (async () => new Response(
-        `data: ${JSON.stringify({
-          choices: [{ delta: { reasoning_content: "partial reasoning" }, finish_reason: null }]
-        })}\n\n`,
-        { status: 200, headers: { "content-type": "text/event-stream" } }
-      )) as typeof fetch
-    });
+    const gateway = new DiagnosticFailureGateway();
     const runtime = createRuntime({
       gateway,
       store: new SegmentedJsonlStore({ rootDir: storeRootDir }),
@@ -131,7 +147,7 @@ describe("runtime model stream lifecycle", () => {
     });
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
       kind: "recoverable_failure",
-      code: "model_stream_protocol_error"
+      code: "model_error"
     });
 
     const events: AgentEventEnvelope[] = [];
@@ -145,7 +161,7 @@ describe("runtime model stream lifecycle", () => {
       "run.failed"
     ]));
     expect(events.find((event) => event.type === "model.failed")?.payload).toMatchObject({
-      code: "model_stream_protocol_error",
+      code: "model_error",
       diagnostics: {
         provider: "fake-provider",
         model: "fake-model",
@@ -157,10 +173,7 @@ describe("runtime model stream lifecycle", () => {
         hasContent: false,
         hasReasoning: true,
         hasToolCall: false,
-        retryAttempts: 1,
-        sseFrames: 1,
-        ssePayloads: 1,
-        sseTrailingBytes: 0
+        retryAttempts: 1
       }
     });
     let ledger: BudgetLedgerState | undefined;

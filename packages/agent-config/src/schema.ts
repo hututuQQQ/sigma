@@ -149,7 +149,7 @@ export const SIGMA_CONFIG_SCHEMA: readonly ConfigField[] = [
     }
     return value;
   }, hidden: true },
-  { key: "provider", flag: "provider", env: "SIGMA_PROVIDER", toml: "model.provider", description: "Model provider", defaultValue: "deepseek", parse: (raw) => enumValue(raw, "provider", ["deepseek", "glm", "openai-codex"] as const) },
+  { key: "provider", flag: "provider", env: "SIGMA_PROVIDER", toml: "model.provider", description: "Model provider", defaultValue: "openai-codex", parse: (raw) => stringValue(raw, "provider") },
   { key: "model", flag: "model", env: "SIGMA_MODEL", toml: "model.name", description: "Model name (auto selects provider default)", defaultValue: "auto", parse: (raw) => stringValue(raw, "model") },
   {
     key: "modelSpecs", flag: "model-spec", kind: "repeatable", env: "SIGMA_MODEL_SPECS", toml: "model.specs",
@@ -182,6 +182,7 @@ export const SIGMA_CONFIG_SCHEMA: readonly ConfigField[] = [
   { key: "maxInputTokens", flag: "max-input-tokens", env: "SIGMA_MAX_INPUT_TOKENS", toml: "budget.max_input_tokens", description: "Session-tree input token budget", defaultValue: 8_000_000, parse: (raw) => numberValue(raw, "maxInputTokens", 1) },
   { key: "maxOutputTokens", flag: "max-output-tokens", env: "SIGMA_MAX_OUTPUT_TOKENS", toml: "budget.max_output_tokens", description: "Session-tree output token budget", defaultValue: 1_000_000, parse: (raw) => numberValue(raw, "maxOutputTokens", 1) },
   { key: "maxCostMicroUsd", flag: "max-cost-micro-usd", env: "SIGMA_MAX_COST_MICRO_USD", toml: "budget.max_cost_micro_usd", description: "Session-tree cost budget in micro-USD", defaultValue: 50_000_000, parse: (raw) => numberValue(raw, "maxCostMicroUsd", 1) },
+  { key: "allowUnpricedCosts", flag: "allow-unpriced-costs", env: "SIGMA_ALLOW_UNPRICED_COSTS", toml: "budget.allow_unpriced_costs", description: "Allow models whose monetary price is unknown", defaultValue: false, parse: (raw) => booleanValue(raw, "allowUnpricedCosts") },
   { key: "maxModelTurns", flag: "max-model-turns", env: "SIGMA_MAX_MODEL_TURNS", toml: "budget.max_model_turns", description: "Session-tree model turn budget", defaultValue: 256, parse: (raw) => numberValue(raw, "maxModelTurns", 1) },
   { key: "maxToolCalls", flag: "max-tool-calls", env: "SIGMA_MAX_TOOL_CALLS", toml: "budget.max_tool_calls", description: "Session-tree tool call budget", defaultValue: 2_048, parse: (raw) => numberValue(raw, "maxToolCalls", 1) },
   { key: "maxChildren", flag: "max-children", env: "SIGMA_MAX_CHILDREN", toml: "budget.max_children", description: "Session-tree child budget", defaultValue: 32, parse: (raw) => numberValue(raw, "maxChildren", 0) },
@@ -277,6 +278,9 @@ const WORKSPACE_STRICTNESS: Readonly<Record<string, Readonly<Record<string, numb
 };
 function restrictWorkspaceValue(field: ConfigField, baseline: ConfigValue, workspaceRaw: unknown): ConfigValue {
   const workspaceValue = field.parse(workspaceRaw);
+  if (field.key === "allowUnpricedCosts") {
+    return baseline === true && workspaceValue === true;
+  }
   if (WORKSPACE_NUMERIC_CAPS.has(field.key)) {
     const baselineNumber = Number(baseline), workspaceNumber = Number(workspaceValue);
     if (ZERO_MEANS_UNBOUNDED_CAPS.has(field.key)) {

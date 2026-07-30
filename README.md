@@ -5,7 +5,7 @@
 <h1 align="center">Sigma Code</h1>
 
 <p align="center">
-  A durable, evidence-driven coding agent built around DeepSeek.<br>
+  A durable, evidence-driven coding agent with a unified Pi model gateway.<br>
   Plan, inspect, edit, execute, validate, review, and resume—all from the terminal.
 </p>
 
@@ -139,7 +139,8 @@ flowchart TB
   ROOT --> CLIENT["RuntimeClient<br/>session command bus"]
   CLIENT --> KERNEL["agent-kernel<br/>pure reducer + effect decisions"]
 
-  KERNEL --> MODEL["agent-model<br/>DeepSeek / GLM gateway"]
+  KERNEL --> MODEL["agent-model<br/>routing, budgets, retry policy"]
+  MODEL --> PI["agent-pi + pi-ai<br/>provider auth and model transport"]
   KERNEL --> CONTEXT["agent-context<br/>instructions, retrieval, token budget"]
   KERNEL --> TOOLS["agent-tools<br/>typed effect plans and receipts"]
   KERNEL --> STORE["agent-store<br/>events, snapshots, artifacts"]
@@ -178,7 +179,7 @@ This separation makes replay and recovery part of the normal execution model ins
 | --- | --- | --- |
 | Contracts | `agent-protocol`, `agent-config` | Events, commands, outcomes, ports, tool effects, model capabilities, and the shared CLI/env/TOML schema. |
 | Decision engine | `agent-kernel` | Pure state reduction, convergence rules, terminal protocol repair, and effect selection. |
-| Intelligence | `agent-model`, `agent-context`, `agent-code-intel`, `agent-extensions` | Provider streaming, context fitting/compaction, repository instructions, LSP, skills, profiles, and hooks. |
+| Intelligence | `agent-model`, `agent-pi`, `agent-context`, `agent-code-intel`, `agent-extensions` | Model policy, unified Pi provider transport, context fitting/compaction, repository instructions, LSP, skills, profiles, and hooks. |
 | Capabilities | `agent-tools`, `agent-web`, `agent-mcp` | Repository/file/process/control/supervisor tools, brokered Web research, and the MCP bridge, all behind declared effects. |
 | Safety boundary | `agent-execution`, `agent-platform`, `agent-checkpoint`, `native/sigma-exec` | Path containment, process policy, native sandboxing, output redaction/artifacts, and transactional recovery. |
 | Durability and coordination | `agent-store`, `agent-supervisor`, `agent-runtime` | Event persistence, snapshots, session ownership, child isolation, recovery, review, and composition. |
@@ -277,9 +278,12 @@ writer worktree keeps the parent open.
 | `agent cancel <session-id> --workspace .` | Cancel an active session. |
 | `agent approval <session-id> <request-id> --decision allow --workspace .` | Resolve a pending approval. |
 | `agent doctor --workspace . --check-api` | Check configuration, sandbox, toolchains, and provider access. |
-| `sigma auth status openai-codex --json` | Read the local ChatGPT subscription login state without network access. |
-| `sigma auth login openai-codex --method browser --json` | Start the machine-readable ChatGPT browser login flow. |
-| `sigma auth logout openai-codex --json` | Remove the host-scoped ChatGPT credential. |
+| `sigma auth list --json` | List Pi provider authentication methods and local/ambient status without network access. |
+| `sigma auth status <provider> --json` | Read one provider's local authentication state without refreshing OAuth. |
+| `sigma auth login <provider> --method <method-id> --json` | Start a machine-readable API-key or OAuth login flow. |
+| `sigma auth logout <provider> --json` | Remove that provider's locally stored credential; ambient credentials remain visible. |
+| `sigma models list --json` | Read the pinned static model directory plus the offline dynamic cache. |
+| `sigma models refresh <provider> --json` | Explicitly refresh a dynamic provider's model directory. |
 | `agent sandbox setup` | Prepare and self-test the Windows sandbox. |
 | `agent init --workspace .` | Create `.agent/config.toml`. |
 
@@ -384,6 +388,28 @@ sigma auth login openai-codex --method browser --json
 sigma auth login openai-codex --method device-code --json
 sigma auth logout openai-codex --json
 ```
+
+### Unified Pi provider gateway
+
+All model I/O is owned by `agent-pi`, pinned to
+`@earendil-works/pi-ai@0.82.1`. The pinned directory exposes Pi's 38 built-in
+providers and 1,109 static models, plus Sigma's historical `glm` compatibility
+provider and endpoint. `agent-model` is only the policy layer: it chooses
+explicit routes, reserves budgets, classifies failures, applies retry/fallback
+rules, and tracks provider health.
+
+Provider credentials and the dynamic model cache are stored separately in
+`~/.sigma/auth.json` and `~/.sigma/models.json`. Both use atomic replacement,
+cross-process locks, and current-user-only permissions. Directory/status reads
+are offline; only an explicit model refresh, login completion, or a normal
+model request may access the network.
+
+Billing is reported as `metered`, `subscription`, or `unpriced`.
+Subscription and unpriced calls retain token usage with a null monetary cost;
+they are never presented as zero-dollar API calls. An unpriced model is
+rejected by default and requires `--allow-unpriced-costs` (or
+`budget.allow_unpriced_costs = true`) for that task. Known metered budget
+limits and token/turn/tool limits remain active.
 
 ChatGPT subscription authentication and API-key billing are separate; see
 OpenAI's [authentication](https://learn.chatgpt.com/docs/auth) and

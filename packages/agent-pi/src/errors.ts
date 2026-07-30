@@ -1,4 +1,4 @@
-export type OpenAICodexErrorCode =
+export type PiModelErrorCode =
   | "auth_required"
   | "allowance_exhausted"
   | "rate_limited"
@@ -7,7 +7,7 @@ export type OpenAICodexErrorCode =
   | "server"
   | "protocol";
 
-export type OpenAICodexFailureCategory =
+export type PiModelFailureCategory =
   | "auth"
   | "capacity"
   | "rate_limit"
@@ -16,22 +16,22 @@ export type OpenAICodexFailureCategory =
   | "server"
   | "protocol";
 
-const SAFE_MESSAGES: Readonly<Record<OpenAICodexErrorCode, string>> = {
-  auth_required: "ChatGPT authentication is required. Sign in again and retry.",
-  allowance_exhausted: "The ChatGPT Codex subscription allowance is currently exhausted.",
-  rate_limited: "ChatGPT Codex is rate limited. Retry later.",
-  network: "Could not reach the ChatGPT Codex service.",
-  timeout: "The ChatGPT Codex request timed out.",
-  server: "The ChatGPT Codex service returned a server error.",
-  protocol: "The ChatGPT Codex response could not be processed."
+const SAFE_MESSAGES: Readonly<Record<PiModelErrorCode, string>> = {
+  auth_required: "Model provider authentication is required. Sign in or configure credentials and retry.",
+  allowance_exhausted: "The model provider allowance is currently exhausted.",
+  rate_limited: "The model provider is rate limited. Retry later.",
+  network: "Could not reach the model provider.",
+  timeout: "The model provider request timed out.",
+  server: "The model provider returned a server error.",
+  protocol: "The model provider response could not be processed."
 };
 
-export class OpenAICodexError extends Error {
-  readonly name = "OpenAICodexError";
+export class PiModelError extends Error {
+  readonly name = "PiModelError";
 
   constructor(
-    readonly code: OpenAICodexErrorCode,
-    readonly category: OpenAICodexFailureCategory,
+    readonly code: PiModelErrorCode,
+    readonly category: PiModelFailureCategory,
     readonly status?: number
   ) {
     super(SAFE_MESSAGES[code]);
@@ -100,29 +100,29 @@ function isNetworkFailure(error: unknown, text: string): boolean {
     || containsAny(text, ["fetch failed", "network", "econn", "enotfound"]);
 }
 
-export function sanitizeOpenAICodexError(error: unknown): OpenAICodexError {
-  if (error instanceof OpenAICodexError) return error;
+export function sanitizePiModelError(error: unknown): PiModelError {
+  if (error instanceof PiModelError) return error;
   const text = errorText(error);
   const status = errorStatus(error);
   // Subscription exhaustion can be returned as either 403 or 429. Prefer the
   // explicit allowance signal over the generic status-code classification.
   if (containsAny(text, ALLOWANCE_MARKERS)) {
-    return new OpenAICodexError("allowance_exhausted", "capacity", status);
+    return new PiModelError("allowance_exhausted", "capacity", status);
   }
   if (isAuthFailure(status, text)) {
-    return new OpenAICodexError("auth_required", "auth", status);
+    return new PiModelError("auth_required", "auth", status);
   }
   if (isRateLimitFailure(status, text)) {
-    return new OpenAICodexError("rate_limited", "rate_limit", status);
+    return new PiModelError("rate_limited", "rate_limit", status);
   }
   if (isTimeoutFailure(text)) {
-    return new OpenAICodexError("timeout", "timeout", status);
+    return new PiModelError("timeout", "timeout", status);
   }
   if (isServerFailure(status, text)) {
-    return new OpenAICodexError("server", "server", status);
+    return new PiModelError("server", "server", status);
   }
   if (isNetworkFailure(error, text)) {
-    return new OpenAICodexError("network", "network", status);
+    return new PiModelError("network", "network", status);
   }
-  return new OpenAICodexError("protocol", "protocol", status);
+  return new PiModelError("protocol", "protocol", status);
 }

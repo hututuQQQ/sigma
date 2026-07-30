@@ -1,7 +1,7 @@
 import type { ModelCapabilities } from "agent-protocol";
 
-export type ConfigModelProvider = "deepseek" | "glm" | "openai-codex";
-export type ConfigModelBillingMode = "metered" | "subscription";
+export type ConfigModelProvider = string;
+export type ConfigModelBillingMode = "metered" | "subscription" | "unpriced";
 export type ConfigTokenizerAccuracy = "exact" | "approximate";
 export type ConfigModelFallback = "rate_limit" | "capacity" | "network" | "server" | "timeout";
 
@@ -65,11 +65,11 @@ function modelSpec(raw: unknown, label: string): ModelSpecConfigValue {
     : pricingValue(object(value.pricing, `${label}.pricing`, PRICING_KEYS), `${label}.pricing`);
   return {
     id: text(value.id, `${label}.id`),
-    providerId: choice(value.provider, ["deepseek", "glm", "openai-codex"], `${label}.provider`),
+    providerId: text(value.provider, `${label}.provider`),
     upstreamModel: text(value.upstream_model, `${label}.upstream_model`),
     billingMode: value.billing_mode === undefined
       ? "metered"
-      : choice(value.billing_mode, ["metered", "subscription"], `${label}.billing_mode`),
+      : choice(value.billing_mode, ["metered", "subscription", "unpriced"], `${label}.billing_mode`),
     capabilities: capabilitiesValue(capabilities, `${label}.capabilities`),
     tokenizer: {
       id: text(tokenizer.id, `${label}.tokenizer.id`),

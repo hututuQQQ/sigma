@@ -1,5 +1,5 @@
 import { access } from "node:fs/promises";
-import { openAICodexAuthStatus } from "agent-codex";
+import { piAuthStatus } from "agent-pi";
 import { discoverLanguageServers, type LanguageServerPreset } from "agent-code-intel";
 import { SIGMA_PROJECT_FACTS } from "agent-config";
 import type { ExecutionBroker } from "agent-execution";
@@ -112,14 +112,6 @@ interface SandboxProbe {
   lease?: Awaited<ReturnType<NonNullable<ExecutionBroker["sandboxLeaseStatus"]>>>;
 }
 
-type ConfiguredProvider = "deepseek" | "glm" | "openai-codex";
-
-function configuredKey(provider: Exclude<ConfiguredProvider, "openai-codex">): boolean {
-  return provider === "deepseek"
-    ? Boolean(process.env.DEEPSEEK_API_KEY)
-    : Boolean(process.env.GLM_API_KEY || process.env.ZAI_API_KEY || process.env.BIGMODEL_API_KEY);
-}
-
 function nodeCheck(): DoctorCheck {
   const expected = SIGMA_PROJECT_FACTS.toolchains.node;
   return process.versions.node === expected
@@ -127,13 +119,17 @@ function nodeCheck(): DoctorCheck {
     : { name: "node", status: "warning", message: `Node ${process.versions.node}; release runtime is pinned to ${expected}.` };
 }
 
-async function apiCheck(provider: ConfiguredProvider, model: string, enabled: boolean): Promise<DoctorCheck> {
+async function apiCheck(provider: string, model: string, enabled: boolean): Promise<DoctorCheck> {
   if (!enabled) return { name: "api", status: "skipped", message: "Pass --check-api to verify the provider." };
-  if (provider === "openai-codex") {
-    const auth = await openAICodexAuthStatus();
+  if (provider !== "deepseek" && provider !== "glm") {
+    const auth = await piAuthStatus(provider);
     return auth.status === "authenticated"
-      ? { name: "api", status: "ok", message: "ChatGPT subscription credentials are configured; no live request was sent." }
-      : { name: "api", status: "error", message: "ChatGPT subscription login is required." };
+      ? {
+          name: "api",
+          status: "ok",
+          message: `${provider} credentials are configured; no billable model request was sent.`
+        }
+      : { name: "api", status: "error", message: `${provider} authentication is required.` };
   }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error("API check timed out.")), 15_000);
@@ -179,15 +175,14 @@ async function workspaceCheck(workspace: string): Promise<DoctorCheck> {
   }
 }
 
-async function providerKeyCheck(provider: ConfiguredProvider): Promise<DoctorCheck> {
-  if (provider === "openai-codex") {
-    const auth = await openAICodexAuthStatus();
-    return auth.status === "authenticated"
-      ? { name: "provider_key", status: "ok", message: "ChatGPT subscription credentials are configured." }
-      : { name: "provider_key", status: "warning", message: "ChatGPT subscription login is required." };
-  }
-  return configuredKey(provider)
-    ? { name: "provider_key", status: "ok", message: `${provider} credentials are configured.` }
+async function providerKeyCheck(provider: string): Promise<DoctorCheck> {
+  const auth = await piAuthStatus(provider);
+  return auth.status === "authenticated"
+    ? {
+        name: "provider_key",
+        status: "ok",
+        message: `${provider} credentials are configured${auth.source ? ` via ${auth.source}` : ""}.`
+      }
     : { name: "provider_key", status: "warning", message: `${provider} credentials are not configured.` };
 }
 

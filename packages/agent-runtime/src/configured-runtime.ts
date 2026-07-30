@@ -6,6 +6,7 @@ import type {
   WorkspaceMcpTrustAttestation
 } from "agent-config";
 import type { ModelGateway, RuntimeClient } from "agent-protocol";
+import { loadPiRuntimeModelCatalog } from "agent-model";
 import type {
   BrokerDoctorReport,
   ContainerEngine,
@@ -39,7 +40,7 @@ import {
 } from "./configured-runtime-assembly.js";
 export interface RuntimeCompositionConfig {
   workspace: string;
-  provider: "deepseek" | "glm" | "openai-codex";
+  provider: string;
   model: string;
   permissionMode: "workspace-auto" | "ask" | "auto" | "deny";
   runDeadlineSec: number;
@@ -73,12 +74,13 @@ export interface RuntimeCompositionConfig {
   modelRoutes?: readonly ModelRouteConfigValue[];
   budget?: {
     maxInputTokens: number; maxOutputTokens: number; maxCostMicroUsd: number;
+    allowUnpricedCosts?: boolean;
     maxModelTurns: number; maxToolCalls: number; maxChildren: number; maxDepth: number;
   };
   checkpoint?: { maxFiles: number; maxBytes: number };
 }
 export interface RuntimeFactoryDeps {
-  gatewayFactory?: (options: { provider: "deepseek" | "glm" | "openai-codex"; model: string; maxRetries: number;
+  gatewayFactory?: (options: { provider: string; model: string; maxRetries: number;
     requestTimeoutMs: number; idleTimeoutMs: number; activeStreamTimeoutMs?: number }) => ModelGateway;
   stateRootDir?: string;
   executionBroker?: ExecutionBroker;
@@ -136,7 +138,18 @@ export async function createConfiguredRuntime(
   const { workspace, storeRootDir, customization, execution, executionReport } = prepared;
   let mcpClients: Awaited<ReturnType<typeof connectMcpServers>> = [];
   try {
-    const gateways = createRoleGateways(config, deps, customization);
+    const piCatalog = deps.gatewayFactory ? undefined : await loadPiRuntimeModelCatalog();
+    const gateways = createRoleGateways(
+      config,
+      piCatalog
+        ? {
+            ...deps,
+            gatewayFactory: piCatalog.gatewayFactory,
+            catalogSpecs: piCatalog.specs
+          }
+        : deps,
+      customization
+    );
     const subjectAttestation = configuredSubjectAttestation(
       config,
       deps,

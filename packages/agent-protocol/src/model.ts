@@ -54,6 +54,7 @@ export interface ModelCapabilities {
 }
 
 export type ModelFinishReason = "stop" | "length" | "tool_calls" | "content_filter" | "protocol_error";
+export type ModelBillingMode = "metered" | "subscription" | "unpriced";
 
 export interface ModelResponseUsage {
   inputTokens: number;
@@ -63,7 +64,7 @@ export interface ModelResponseUsage {
   cacheWriteTokens: number;
   providerReported: boolean;
   costMicroUsd: number | null;
-  billingMode?: "metered" | "subscription";
+  billingMode?: ModelBillingMode;
   latencyMs: number;
   /** Zero-based retry index within the selected provider/model. */
   retryAttempt: number;

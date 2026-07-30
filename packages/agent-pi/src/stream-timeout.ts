@@ -1,4 +1,4 @@
-import { OpenAICodexError } from "./errors.js";
+import { PiModelError } from "./errors.js";
 
 interface StreamTimeoutOptions {
   signal: AbortSignal;
@@ -6,8 +6,8 @@ interface StreamTimeoutOptions {
   activeTimeoutMs?: number;
 }
 
-function timeoutError(): OpenAICodexError {
-  return new OpenAICodexError("timeout", "timeout");
+function timeoutError(): PiModelError {
+  return new PiModelError("timeout", "timeout");
 }
 
 async function nextWithDeadline<T>(
@@ -37,7 +37,7 @@ async function nextWithDeadline<T>(
   }
 }
 
-export async function* monitoredCodexStream<T>(
+export async function* monitoredPiStream<T>(
   create: (signal: AbortSignal) => AsyncIterable<T>,
   options: StreamTimeoutOptions
 ): AsyncIterable<T> {
@@ -61,7 +61,7 @@ export async function* monitoredCodexStream<T>(
   } finally {
     if (activeTimer) clearTimeout(activeTimer);
     options.signal.removeEventListener("abort", onParentAbort);
-    controller.abort(new Error("Codex stream closed."));
+    controller.abort(new Error("Model stream closed."));
     await iterator.return?.().catch(() => undefined);
   }
 }

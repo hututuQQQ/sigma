@@ -78,8 +78,8 @@ export function validateSpec(spec: ModelSpec): void {
   }
   validateTokenizer(spec);
   validateCapabilities(spec);
-  if (spec.billingMode === "subscription" && spec.pricing) {
-    throw new Error(`Subscription model spec '${spec.id}' must not declare API pricing.`);
+  if (spec.billingMode !== "metered" && spec.pricing) {
+    throw new Error(`Non-metered model spec '${spec.id}' must not declare API pricing.`);
   }
   if (spec.pricing) validatePricing(spec.id, spec.pricing);
 }

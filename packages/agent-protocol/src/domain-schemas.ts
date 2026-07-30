@@ -324,7 +324,7 @@ export const usageRecordSchema = z.object({
   cacheReadTokens: nonNegativeIntegerSchema,
   cacheWriteTokens: nonNegativeIntegerSchema,
   costMicroUsd: nonNegativeIntegerSchema.nullable(),
-  billingMode: z.enum(["metered", "subscription"]).optional(),
+  billingMode: z.enum(["metered", "subscription", "unpriced"]).optional(),
   latencyMs: nonNegativeIntegerSchema,
   attempt: z.number().int().min(1),
   occurredAt: dateTimeSchema

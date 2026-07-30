@@ -17,7 +17,7 @@ export interface RunCommandDeps extends RuntimeFactoryDeps {
   stdout?: NodeJS.WritableStream & { isTTY?: boolean };
   stderr?: NodeJS.WritableStream;
   gatewayFactory?: (options: {
-    provider: "deepseek" | "glm" | "openai-codex";
+    provider: string;
     model: string;
   }) => ModelGateway;
   mode?: RunMode;

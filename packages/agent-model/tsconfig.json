@@ -8,7 +8,7 @@
   },
   "include": ["src/**/*.ts"],
   "references": [
-    { "path": "../agent-codex" },
+    { "path": "../agent-pi" },
     { "path": "../agent-protocol" }
   ]
 }

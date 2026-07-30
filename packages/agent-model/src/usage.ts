@@ -110,7 +110,7 @@ export function normalizeModelResponse(options: {
   const usage = existing
     ? {
         ...existing,
-        costMicroUsd: options.spec.billingMode === "subscription"
+        costMicroUsd: options.spec.billingMode !== "metered"
           ? null
           : existing.costMicroUsd ?? usageCostMicroUsd(existing, options.spec.pricing),
         billingMode: options.spec.billingMode,
@@ -127,13 +127,15 @@ export function normalizeModelResponse(options: {
         retryAttempt: options.retryAttempt
         }),
         billingMode: options.spec.billingMode,
-        ...(options.spec.billingMode === "subscription" ? { costMicroUsd: null } : {})
+        ...(options.spec.billingMode !== "metered" ? { costMicroUsd: null } : {})
       };
   return { ...options.response, usage };
 }
 
 export function toUsageRecord(usage: NormalizedModelUsage, identity: UsageRecordIdentity): UsageRecord {
-  if (usage.costMicroUsd === null && usage.billingMode !== "subscription") {
+  if (usage.costMicroUsd === null
+    && usage.billingMode !== "subscription"
+    && usage.billingMode !== "unpriced") {
     throw Object.assign(new Error(`Model '${identity.modelId}' has no pricing for cost accounting.`), {
       code: "model_pricing_unavailable"
     });

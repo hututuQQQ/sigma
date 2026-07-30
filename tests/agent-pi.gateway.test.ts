@@ -1,22 +1,31 @@
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { get as httpGet } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { zstdDecompressSync } from "node:zlib";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   FileCredentialStore,
-  OpenAICodexGateway,
+  FileModelsStore,
+  PiModelGateway,
   OPENAI_CODEX_DEFAULT_MODEL,
   OPENAI_CODEX_PROVIDER_ID,
   loginOpenAICodex,
+  listPiAuthStatuses,
+  listPiModels,
+  listPiProviders,
   listOpenAICodexModels,
+  getPiModel,
+  logoutPiProvider,
   openAICodexAuthStatus,
-  sanitizeOpenAICodexError,
+  piAuthStatus,
+  sanitizePiModelError,
   type Credential,
   type CredentialInfo,
   type CredentialStore,
   type OAuthCredential
-} from "../packages/agent-codex/src/index.js";
+} from "../packages/agent-pi/src/index.js";
 import type { JsonValue, ModelMessage } from "../packages/agent-protocol/src/index.js";
 
 class MemoryCredentialStore implements CredentialStore {
@@ -56,6 +65,37 @@ class MemoryCredentialStore implements CredentialStore {
       this.credential = undefined;
       return undefined;
     });
+  }
+}
+
+class ApiKeyCredentialStore implements CredentialStore {
+  constructor(
+    private readonly providerId: string,
+    private credential: Credential = { type: "api_key", key: "provider-api-key" }
+  ) {}
+
+  async read(providerId: string): Promise<Credential | undefined> {
+    return providerId === this.providerId ? this.credential : undefined;
+  }
+
+  async list(): Promise<readonly CredentialInfo[]> {
+    return [{ providerId: this.providerId, type: this.credential.type }];
+  }
+
+  async modify(
+    providerId: string,
+    fn: (current: Credential | undefined) => Promise<Credential | undefined>
+  ): Promise<Credential | undefined> {
+    if (providerId !== this.providerId) return undefined;
+    const next = await fn(this.credential);
+    if (next) this.credential = next;
+    return next;
+  }
+
+  async delete(providerId: string): Promise<void> {
+    if (providerId === this.providerId) {
+      this.credential = { type: "api_key", key: undefined };
+    }
   }
 }
 
@@ -187,6 +227,39 @@ function completedToolEvents(): Record<string, unknown>[] {
   ];
 }
 
+function openAICompletionSse(): Response {
+  const events = [
+    {
+      id: "chatcmpl_test",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "deepseek-v4-pro",
+      choices: [{
+        index: 0,
+        delta: { role: "assistant", content: "Compatible." },
+        finish_reason: null
+      }]
+    },
+    {
+      id: "chatcmpl_test",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "deepseek-v4-pro",
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      usage: {
+        prompt_tokens: 10,
+        completion_tokens: 2,
+        total_tokens: 12,
+        prompt_tokens_details: { cached_tokens: 3 }
+      }
+    }
+  ];
+  return new Response(
+    `${events.map((event) => `data: ${JSON.stringify(event)}`).join("\n\n")}\n\ndata: [DONE]\n\n`,
+    { status: 200, headers: { "content-type": "text/event-stream" } }
+  );
+}
+
 function requestBody(init: RequestInit | undefined): Record<string, unknown> {
   const headers = new Headers(init?.headers);
   const body = init?.body;
@@ -206,6 +279,23 @@ function requestBody(init: RequestInit | undefined): Record<string, unknown> {
 
 describe("OpenAI Codex subscription gateway", () => {
   it("pins the expected Pi catalog and defaults to Terra", () => {
+    const models = listPiModels();
+    const catalogSummary = models
+      .map((model) => [
+        model.providerId,
+        model.id,
+        model.api,
+        model.contextWindowTokens,
+        model.maxOutputTokens,
+        model.billingModes.join(",")
+      ].join("|"))
+      .sort()
+      .join("\n");
+    expect(listPiProviders()).toHaveLength(39);
+    expect(models).toHaveLength(1_110);
+    expect(models.filter((model) => model.providerId !== "glm")).toHaveLength(1_109);
+    expect(createHash("sha256").update(catalogSummary).digest("hex"))
+      .toBe("e613a457d3db26fbb2ea0fc4fd04214ace80768ea5d252eb64dc9f5265238569");
     expect(OPENAI_CODEX_DEFAULT_MODEL).toBe("gpt-5.6-terra");
     expect(listOpenAICodexModels().map((model) => model.id)).toEqual([
       "gpt-5.3-codex-spark",
@@ -235,10 +325,10 @@ describe("OpenAI Codex subscription gateway", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const gateway = new OpenAICodexGateway({
+    const gateway = new PiModelGateway({
+      provider: OPENAI_CODEX_PROVIDER_ID,
       model: OPENAI_CODEX_DEFAULT_MODEL,
-      credentials: new MemoryCredentialStore(oauth()),
-      maxRetries: 0
+      credentials: new MemoryCredentialStore(oauth())
     });
     const controller = new AbortController();
     const messages: ModelMessage[] = [
@@ -348,10 +438,10 @@ describe("OpenAI Codex subscription gateway", () => {
       return sse(completedTextEvents("Refreshed."));
     }));
 
-    const gateway = new OpenAICodexGateway({
+    const gateway = new PiModelGateway({
+      provider: OPENAI_CODEX_PROVIDER_ID,
       model: OPENAI_CODEX_DEFAULT_MODEL,
-      credentials: store,
-      maxRetries: 0
+      credentials: store
     });
     const result = await gateway.complete({
       messages: [{ role: "user", content: "hello" }],
@@ -378,10 +468,10 @@ describe("OpenAI Codex subscription gateway", () => {
           once: true
         });
       })));
-    const gateway = new OpenAICodexGateway({
+    const gateway = new PiModelGateway({
+      provider: OPENAI_CODEX_PROVIDER_ID,
       model: OPENAI_CODEX_DEFAULT_MODEL,
-      credentials: new MemoryCredentialStore(oauth()),
-      maxRetries: 0
+      credentials: new MemoryCredentialStore(oauth())
     });
     const pending = gateway.complete({
       messages: [{ role: "user", content: "wait" }],
@@ -390,25 +480,25 @@ describe("OpenAI Codex subscription gateway", () => {
     controller.abort(new Error("cancelled by caller"));
     await expect(pending).rejects.toThrow("cancelled by caller");
 
-    expect(sanitizeOpenAICodexError(new Error(
+    expect(sanitizePiModelError(new Error(
       "You have hit your ChatGPT usage limit; secret-token"
     ))).toMatchObject({
       code: "allowance_exhausted",
       category: "capacity",
-      message: "The ChatGPT Codex subscription allowance is currently exhausted."
+      message: "The model provider allowance is currently exhausted."
     });
-    expect(sanitizeOpenAICodexError(Object.assign(
+    expect(sanitizePiModelError(Object.assign(
       new Error("ChatGPT allowance exhausted; secret-token"),
       { status: 403 }
     ))).toMatchObject({
       code: "allowance_exhausted",
       category: "capacity"
     });
-    expect(sanitizeOpenAICodexError(new Error("rate limit: secret-token"))).toMatchObject({
+    expect(sanitizePiModelError(new Error("rate limit: secret-token"))).toMatchObject({
       code: "rate_limited",
       category: "rate_limit"
     });
-    expect(sanitizeOpenAICodexError(new Error("Provider is not configured: openai-codex")))
+    expect(sanitizePiModelError(new Error("Provider is not configured: openai-codex")))
       .toMatchObject({ code: "auth_required", category: "auth" });
   });
 
@@ -421,10 +511,10 @@ describe("OpenAI Codex subscription gateway", () => {
       status: 200,
       headers: { "content-type": "text/event-stream" }
     })));
-    const gateway = new OpenAICodexGateway({
+    const gateway = new PiModelGateway({
+      provider: OPENAI_CODEX_PROVIDER_ID,
       model: OPENAI_CODEX_DEFAULT_MODEL,
       credentials: new MemoryCredentialStore(oauth()),
-      maxRetries: 0,
       idleTimeoutMs: 10
     });
     await expect(gateway.complete({
@@ -433,12 +523,144 @@ describe("OpenAI Codex subscription gateway", () => {
     })).rejects.toMatchObject({
       code: "timeout",
       category: "timeout",
-      message: "The ChatGPT Codex request timed out."
+      message: "The model provider request timed out."
     });
   });
 });
 
+describe("Pi provider compatibility gateway", () => {
+  it("preserves DeepSeek reminders, tool policy, and metered usage through Pi", async () => {
+    let captured: { url: string; headers: Headers; body: Record<string, unknown> } | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (
+      input: string | URL | Request,
+      init?: RequestInit
+    ) => {
+      captured = {
+        url: String(input),
+        headers: new Headers(init?.headers),
+        body: requestBody(init)
+      };
+      return openAICompletionSse();
+    }));
+
+    const gateway = new PiModelGateway({
+      provider: "deepseek",
+      model: "deepseek-v4-pro",
+      baseUrl: "https://deepseek.example.test/v1",
+      credentials: new ApiKeyCredentialStore("deepseek")
+    });
+    const result = await gateway.complete({
+      messages: [
+        { role: "system", content: "Follow the workspace rules." },
+        { role: "user", content: "Inspect the repository." },
+        { role: "developer", content: "Report only verified findings." }
+      ],
+      tools: [{
+        name: "read_file",
+        description: "Read a file.",
+        inputSchema: {
+          type: "object",
+          properties: { path: { type: "string" } },
+          required: ["path"]
+        }
+      }],
+      toolChoice: "required",
+      signal: new AbortController().signal
+    });
+
+    expect(result.message.content).toBe("Compatible.");
+    expect(result.usage).toMatchObject({
+      inputTokens: 10,
+      outputTokens: 2,
+      cacheReadTokens: 3,
+      billingMode: "metered"
+    });
+    expect(result.usage.costMicroUsd).toBeTypeOf("number");
+    expect(captured?.url).toBe("https://deepseek.example.test/v1/chat/completions");
+    expect(captured?.headers.get("authorization")).toBe("Bearer provider-api-key");
+    expect(captured?.body).toMatchObject({
+      model: "deepseek-v4-pro",
+      stream: true,
+      tool_choice: "required",
+      thinking: { type: "disabled" }
+    });
+    const messages = captured?.body.messages as Array<{ role?: string; content?: string }>;
+    expect(messages[0]).toMatchObject({
+      role: "system",
+      content: expect.stringContaining("<system>")
+    });
+    expect(messages).toContainEqual(expect.objectContaining({
+      role: "user",
+      content: expect.stringContaining("<latest_reminder>")
+    }));
+  });
+
+  it("reports ambient credentials after logout without copying them into auth.json", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "ambient-provider-key");
+    const store = new MemoryCredentialStore();
+
+    expect(await piAuthStatus("anthropic", store)).toMatchObject({
+      provider: "anthropic",
+      status: "authenticated",
+      authType: "api_key"
+    });
+    expect(await logoutPiProvider("anthropic", store)).toMatchObject({
+      provider: "anthropic",
+      status: "authenticated",
+      authType: "api_key"
+    });
+    expect(await store.list()).toEqual([]);
+  });
+});
+
 describe("OpenAI Codex OAuth adapter", () => {
+  it("completes from the localhost callback without requiring a manual retry", async () => {
+    const access = jwt("callback-account", "callback@example.test");
+    let callbackResponse: Promise<number> | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      expect(String(input)).toBe("https://auth.openai.com/oauth/token");
+      return new Response(JSON.stringify({
+        access_token: access,
+        refresh_token: "callback-refresh",
+        expires_in: 3600
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }));
+    const store = new MemoryCredentialStore();
+    const status = await loginOpenAICodex("browser", {
+      notify: (event) => {
+        if (event.type !== "auth_url") return;
+        const state = new URL(event.url).searchParams.get("state");
+        expect(state).toBeTruthy();
+        callbackResponse = new Promise<number>((resolve, reject) => {
+          const request = httpGet(
+            `http://127.0.0.1:1455/auth/callback?code=callback-code&state=${encodeURIComponent(state!)}`,
+            (response) => {
+              response.resume();
+              response.on("end", () => resolve(response.statusCode ?? 0));
+            }
+          );
+          request.on("error", reject);
+        });
+      },
+      prompt: async (prompt) => await new Promise<string>((_resolve, reject) => {
+        const onAbort = (): void => reject(prompt.signal?.reason ?? new Error("cancelled"));
+        prompt.signal?.addEventListener("abort", onAbort, { once: true });
+      })
+    }, store);
+
+    expect(await callbackResponse).toBe(200);
+    expect(status).toMatchObject({
+      provider: "openai-codex",
+      status: "authenticated",
+      accountId: "callback-account",
+      email: "callback@example.test"
+    });
+    expect(await store.read(OPENAI_CODEX_PROVIDER_ID)).toMatchObject({
+      access,
+      refresh: "callback-refresh"
+    });
+  });
+
   it("supports browser login with the localhost callback and manual-code fallback", async () => {
     const access = jwt("browser-account", "browser@example.test");
     const notices: Array<Record<string, unknown>> = [];
@@ -538,6 +760,19 @@ describe("OpenAI Codex OAuth adapter", () => {
 });
 
 describe("OpenAI Codex credential persistence", () => {
+  it("lists every provider's local auth state without network access", async () => {
+    const fetchMock = vi.fn(async () => {
+      throw new Error("offline status must not call fetch");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const statuses = await listPiAuthStatuses(new MemoryCredentialStore());
+
+    expect(statuses).toHaveLength(39);
+    expect(new Set(statuses.map((status) => status.provider)).size).toBe(39);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("keeps status local and atomically persists one host-scoped credential", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "sigma-codex-auth-"));
     temporaryDirectories.push(directory);
@@ -554,7 +789,7 @@ describe("OpenAI Codex credential persistence", () => {
 
     const loginLease = await store.acquireLoginLease();
     await expect(store.acquireLoginLease()).rejects.toThrow(
-      "OpenAI Codex authentication is active"
+      "Sigma provider authentication is active"
     );
     await loginLease.release();
     await writeFile(`${filePath}.login.lock`, `${JSON.stringify({
@@ -583,5 +818,61 @@ describe("OpenAI Codex credential persistence", () => {
     await store.delete(OPENAI_CODEX_PROVIDER_ID);
     expect(await openAICodexAuthStatus(store)).toMatchObject({ status: "unauthenticated" });
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("does not echo malformed credential or model cache contents", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "sigma-private-json-"));
+    temporaryDirectories.push(directory);
+    const stateDirectory = path.join(directory, ".sigma");
+    await mkdir(stateDirectory, { recursive: true, mode: 0o700 });
+    const credentialPath = path.join(stateDirectory, "auth.json");
+    const modelsPath = path.join(stateDirectory, "models.json");
+    await writeFile(credentialPath, "{\"access\":\"secret-access-token\"", {
+      encoding: "utf8",
+      mode: 0o600
+    });
+    await writeFile(modelsPath, "{\"response\":\"secret-provider-response\"", {
+      encoding: "utf8",
+      mode: 0o600
+    });
+
+    await expect(new FileCredentialStore({ filePath: credentialPath }).list())
+      .rejects.toThrow("Sigma credential file contains invalid JSON.");
+    await expect(new FileModelsStore({ filePath: modelsPath }).read("radius"))
+      .rejects.toThrow("Sigma model catalog file contains invalid JSON.");
+  });
+
+  it("atomically persists a validated dynamic model catalog", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "sigma-model-cache-"));
+    temporaryDirectories.push(directory);
+    const filePath = path.join(directory, ".sigma", "models.json");
+    const store = new FileModelsStore({ filePath });
+    const template = getPiModel("deepseek", "deepseek-v4-pro");
+    expect(template).toBeDefined();
+    const model = {
+      ...template!,
+      provider: "dynamic-contract",
+      id: "dynamic-model",
+      name: "Dynamic Model"
+    };
+
+    await store.write("dynamic-contract", {
+      models: [model],
+      checkedAt: 123,
+      etag: "catalog-v1"
+    });
+
+    expect(await store.read("dynamic-contract")).toMatchObject({
+      checkedAt: 123,
+      etag: "catalog-v1",
+      models: [{
+        provider: "dynamic-contract",
+        id: "dynamic-model",
+        name: "Dynamic Model"
+      }]
+    });
+    if (process.platform !== "win32") {
+      expect((await stat(filePath)).mode & 0o077).toBe(0);
+    }
   });
 });

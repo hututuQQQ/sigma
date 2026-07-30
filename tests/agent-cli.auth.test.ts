@@ -3,9 +3,8 @@ import { describe, expect, it, vi } from "vitest";
 import type {
   AuthEvent,
   AuthPrompt,
-  OpenAICodexLoginInteraction,
-  OpenAICodexLoginMethod
-} from "../packages/agent-codex/src/index.js";
+  PiLoginInteraction
+} from "../packages/agent-pi/src/index.js";
 import { runAuthCommand } from "../packages/agent-cli/src/commands/auth.js";
 
 class Capture extends Writable {
@@ -73,9 +72,11 @@ describe("sigma auth machine protocol", () => {
     const stdout = new Capture();
     const stderr = new Capture();
     const login = vi.fn(async (
-      method: OpenAICodexLoginMethod,
-      interaction: OpenAICodexLoginInteraction
+      provider: string,
+      method: string,
+      interaction: PiLoginInteraction
     ) => {
+      expect(provider).toBe("openai-codex");
       expect(method).toBe("browser");
       interaction.notify({
         type: "auth_url",
@@ -141,9 +142,11 @@ describe("sigma auth machine protocol", () => {
     const stdout = new Capture();
     const stderr = new Capture();
     const login = vi.fn(async (
-      method: OpenAICodexLoginMethod,
-      interaction: OpenAICodexLoginInteraction
+      provider: string,
+      method: string,
+      interaction: PiLoginInteraction
     ) => {
+      expect(provider).toBe("openai-codex");
       expect(method).toBe("device-code");
       const event: AuthEvent = {
         type: "device_code",

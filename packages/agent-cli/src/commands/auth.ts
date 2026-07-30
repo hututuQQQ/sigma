@@ -1,23 +1,33 @@
 import { createInterface } from "node:readline";
 import {
-  loginOpenAICodex,
-  logoutOpenAICodex,
-  openAICodexAuthStatus,
-  sanitizeOpenAICodexError,
+  listPiAuthStatuses,
+  listPiProviders,
+  loginPiProvider,
+  logoutPiProvider,
+  piAuthStatus,
+  sanitizePiModelError,
   type AuthEvent,
   type AuthPrompt,
-  type OpenAICodexAuthStatus,
-  type OpenAICodexLoginInteraction,
-  type OpenAICodexLoginMethod
-} from "agent-codex";
+  type PiAuthStatus,
+  type PiLoginInteraction
+} from "agent-pi";
+
+type StatusFn = (provider: string) => Promise<PiAuthStatus>;
+type LoginFn = (
+  provider: string,
+  method: string,
+  interaction: PiLoginInteraction
+) => Promise<PiAuthStatus>;
+type LogoutFn = (provider: string) => Promise<PiAuthStatus | void>;
 
 interface AuthCommandDeps {
   stdin?: NodeJS.ReadableStream;
   stdout?: NodeJS.WritableStream;
   stderr?: NodeJS.WritableStream;
-  status?: typeof openAICodexAuthStatus;
-  login?: typeof loginOpenAICodex;
-  logout?: typeof logoutOpenAICodex;
+  status?: StatusFn;
+  statuses?: typeof listPiAuthStatuses;
+  login?: LoginFn;
+  logout?: LogoutFn;
 }
 
 interface PendingPrompt {
@@ -184,35 +194,82 @@ function authEvent(stdout: NodeJS.WritableStream, event: AuthEvent): void {
       intervalSeconds: event.intervalSeconds,
       expiresInSeconds: event.expiresInSeconds
     });
-  } else if (event.type === "progress") {
-    writeJson(stdout, { type: "progress", message: safeProtocolText(event.message) });
+  } else if (event.type === "info") {
+    writeJson(stdout, {
+      type: "progress",
+      message: safeProtocolText(event.message),
+      links: event.links?.map((link) => ({
+        label: safeProtocolText(link.label),
+        url: link.url
+      }))
+    });
   } else {
     writeJson(stdout, { type: "progress", message: safeProtocolText(event.message) });
   }
 }
 
-function loginMethod(value: unknown): OpenAICodexLoginMethod {
-  if (value === undefined || value === "browser") return "browser";
-  if (value === "device-code") return "device-code";
-  throw new Error("--method must be browser or device-code.");
+function providerDescriptor(providerId: string) {
+  const provider = listPiProviders().find((candidate) => candidate.id === providerId);
+  if (!provider) throw new Error(`Unknown Pi provider '${providerId}'.`);
+  return provider;
 }
 
-function assertProvider(value: string | undefined): void {
-  if (value !== "openai-codex") {
-    throw new Error("Auth provider must be openai-codex.");
+function loginMethod(providerId: string, requested: string | undefined): string {
+  const provider = providerDescriptor(providerId);
+  const method = requested
+    ?? (providerId === "openai-codex" ? "browser" : provider.authMethods[0]?.id);
+  if (!method || !provider.authMethods.some((candidate) => candidate.id === method)) {
+    throw new Error(
+      `Provider '${providerId}' supports: ${
+        provider.authMethods.map((item) => item.id).join(", ") || "no interactive login"
+      }.`
+    );
   }
+  return method;
 }
 
 function statusOutput(
   stdout: NodeJS.WritableStream,
-  status: OpenAICodexAuthStatus,
+  status: PiAuthStatus,
   json: boolean
 ): void {
   if (json) writeJson(stdout, status);
   else {
     const account = status.email ?? status.accountId;
-    stdout.write(`openai-codex=${status.status}${account ? ` account=${account}` : ""}\n`);
+    stdout.write(`${status.provider}=${status.status}${account ? ` account=${account}` : ""}`
+      + `${status.source ? ` source=${status.source}` : ""}\n`);
   }
+}
+
+async function listCommand(
+  parsed: ParsedAuthArgs,
+  deps: AuthCommandDeps,
+  stdout: NodeJS.WritableStream
+): Promise<number> {
+  if (parsed.positionals.length !== 1) throw new Error("auth list does not accept a provider.");
+  const statuses = await (deps.statuses ?? listPiAuthStatuses)();
+  const statusByProvider = new Map(statuses.map((status) => [status.provider, status]));
+  const connections = listPiProviders().map((provider) => ({
+    ...provider,
+    status: statusByProvider.get(provider.id)?.status ?? "unauthenticated",
+    ...(statusByProvider.get(provider.id)?.authType
+      ? { authType: statusByProvider.get(provider.id)!.authType }
+      : {}),
+    ...(statusByProvider.get(provider.id)?.source
+      ? { source: statusByProvider.get(provider.id)!.source }
+      : {}),
+    ...(statusByProvider.get(provider.id)?.email
+      ? { email: statusByProvider.get(provider.id)!.email }
+      : {})
+  }));
+  if (parsed.json) writeJson(stdout, { schemaVersion: 1, connections });
+  else {
+    for (const connection of connections) {
+      stdout.write(`${connection.id}=${connection.status}`
+        + `${connection.source ? ` source=${connection.source}` : ""}\n`);
+    }
+  }
+  return 0;
 }
 
 async function executeAuthAction(
@@ -221,56 +278,61 @@ async function executeAuthAction(
   stdout: NodeJS.WritableStream
 ): Promise<number> {
   const [action, provider] = parsed.positionals;
+  if (action === "list") return await listCommand(parsed, deps, stdout);
   if (parsed.positionals.length > 2) {
     throw new Error(`Unexpected auth argument '${parsed.positionals[2]}'.`);
   }
-  assertProvider(provider);
+  if (!provider) throw new Error("Auth provider is required.");
+  providerDescriptor(provider);
   if (action === "status") {
-    statusOutput(stdout, await (deps.status ?? openAICodexAuthStatus)(), parsed.json);
+    statusOutput(stdout, await (deps.status ?? piAuthStatus)(provider), parsed.json);
     return 0;
   }
   if (action === "login") {
-    return await loginCommand(loginMethod(parsed.method), parsed.json, {
+    return await loginCommand(provider, loginMethod(provider, parsed.method), parsed.json, {
       ...deps,
       stdin: deps.stdin ?? process.stdin,
       stdout
     });
   }
   if (action === "logout") {
-    await (deps.logout ?? logoutOpenAICodex)();
-    if (parsed.json) {
-      writeJson(stdout, { type: "completed", provider, status: "unauthenticated" });
-    } else {
-      stdout.write("Signed out of openai-codex.\n");
+    const status = await (deps.logout ?? logoutPiProvider)(provider)
+      ?? { provider, status: "unauthenticated" as const };
+    if (parsed.json) writeJson(stdout, { type: "completed", ...status });
+    else {
+      stdout.write(status.status === "authenticated"
+        ? `Removed Sigma credential for ${provider}; ambient authentication remains configured.\n`
+        : `Signed out of ${provider}.\n`);
     }
     return 0;
   }
-  throw new Error("Auth action must be status, login, or logout.");
+  throw new Error("Auth action must be list, status, login, or logout.");
 }
 
 async function loginCommand(
-  method: OpenAICodexLoginMethod,
+  provider: string,
+  method: string,
   json: boolean,
   deps: Required<Pick<AuthCommandDeps, "stdin" | "stdout">> & AuthCommandDeps
 ): Promise<number> {
   if (!json) {
-    deps.stderr?.write("Interactive subscription login requires --json so the caller can open the browser safely.\n");
+    deps.stderr?.write("Interactive provider login requires --json so prompts can be handled safely.\n");
     return 2;
   }
   const controller = new AbortController();
   const broker = new AuthPromptBroker(deps.stdin, deps.stdout, controller);
-  const interaction: OpenAICodexLoginInteraction = {
+  const interaction: PiLoginInteraction = {
     signal: controller.signal,
     prompt: (prompt) => broker.prompt(prompt),
     notify: (event) => authEvent(deps.stdout, event)
   };
   try {
-    const result = await (deps.login ?? loginOpenAICodex)(method, interaction);
+    const result = await (deps.login ?? loginPiProvider)(provider, method, interaction);
     writeJson(deps.stdout, { type: "completed", ...result });
     return 0;
   } catch (error) {
     const cancelled = controller.signal.aborted;
-    const safe = sanitizeOpenAICodexError(error);
+    const safe = sanitizePiModelError(error);
     writeJson(deps.stdout, {
       type: "error",
       code: cancelled ? "cancelled" : safe.code,
@@ -287,9 +349,10 @@ export async function runAuthCommand(argv: string[], deps: AuthCommandDeps = {})
   const stdout = deps.stdout ?? process.stdout;
   const stderr = deps.stderr ?? process.stderr;
   if (argv.includes("--help") || argv.includes("-h")) {
-    stdout.write(`sigma auth status openai-codex --json
-sigma auth login openai-codex --method browser|device-code --json
-sigma auth logout openai-codex --json
+    stdout.write(`sigma auth list --json
+sigma auth status <provider> --json
+sigma auth login <provider> --method <method-id> --json
+sigma auth logout <provider> --json
 `);
     return 0;
   }

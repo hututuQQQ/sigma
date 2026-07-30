@@ -26,7 +26,7 @@ export interface FileCredentialStoreOptions {
   homeDir?: string;
 }
 
-export function defaultOpenAICodexCredentialPath(homeDir = os.homedir()): string {
+export function defaultSigmaCredentialPath(homeDir = os.homedir()): string {
   return path.join(homeDir, ".sigma", "auth.json");
 }
 
@@ -76,7 +76,12 @@ async function readPrivateJson(filePath: string): Promise<CredentialDocument> {
   const noFollow = process.platform === "win32" ? 0 : constants.O_NOFOLLOW;
   const handle = await open(filePath, constants.O_RDONLY | noFollow);
   try {
-    return parseDocument(JSON.parse(await handle.readFile("utf8")) as unknown);
+    const content = await handle.readFile("utf8");
+    try {
+      return parseDocument(JSON.parse(content) as unknown);
+    } catch {
+      throw new Error("Sigma credential file contains invalid JSON.");
+    }
   } finally {
     await handle.close();
   }
@@ -107,7 +112,7 @@ export class FileCredentialStore implements CredentialStore {
 
   constructor(options: FileCredentialStoreOptions = {}) {
     this.filePath = path.resolve(
-      options.filePath ?? defaultOpenAICodexCredentialPath(options.homeDir)
+      options.filePath ?? defaultSigmaCredentialPath(options.homeDir)
     );
   }
 
@@ -136,7 +141,7 @@ export class FileCredentialStore implements CredentialStore {
       `${this.filePath}.login.lock`,
       { pid: process.pid, instanceId: randomUUID(), startedAt: new Date().toISOString() },
       {
-        label: "OpenAI Codex authentication",
+        label: "Sigma provider authentication",
         timeoutMs: 1_000,
         activeOwner: "reject",
         ...(signal ? { signal } : {})

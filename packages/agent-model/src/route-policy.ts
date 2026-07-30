@@ -6,6 +6,8 @@ export interface ModelRouteConstraints {
   estimatedInputTokens?: number;
   maxOutputTokens?: number;
   remainingBudgetMicroUsd?: number;
+  /** Explicit task-level consent to use a model whose monetary price is unknown. */
+  allowUnpricedCosts?: boolean;
   requireExactTokenizer?: boolean;
   /** Runtime budget convergence may intentionally reserve a smaller fallback
    * prefix so one final terminal request remains possible. */
@@ -97,7 +99,7 @@ export function modelReservationEstimate(
   const margin = tokenizerMargin(spec);
   const inputTokens = Math.ceil((constraints.estimatedInputTokens ?? 0) * margin);
   const outputTokens = Math.ceil((constraints.maxOutputTokens ?? spec.capabilities.maxOutputTokens) * margin);
-  if (spec.billingMode === "subscription") return { inputTokens, outputTokens, costMicroUsd: 0 };
+  if (spec.billingMode !== "metered") return { inputTokens, outputTokens, costMicroUsd: null };
   if (!spec.pricing) return { inputTokens, outputTokens, costMicroUsd: null };
   return {
     inputTokens,
@@ -111,6 +113,26 @@ export function modelReservationEstimate(
 
 function maximumCost(spec: ModelSpec, constraints: ModelRouteConstraints): number | null {
   return modelReservationEstimate(spec, constraints).costMicroUsd;
+}
+
+function pricingRejection(
+  spec: ModelSpec,
+  constraints: ModelRouteConstraints
+): ModelRejection | undefined {
+  const remaining = constraints.remainingBudgetMicroUsd;
+  if (remaining === undefined) return undefined;
+  const cost = maximumCost(spec, constraints);
+  if (cost === null) {
+    if (spec.billingMode === "subscription") return undefined;
+    if (spec.billingMode === "unpriced" && constraints.allowUnpricedCosts === true) return undefined;
+    return { modelSpecId: spec.id, reason: "pricing", detail: "cost budget requires model pricing" };
+  }
+  if (cost <= remaining) return undefined;
+  return {
+    modelSpecId: spec.id,
+    reason: "budget",
+    detail: `${cost} micro-USD exceeds remaining budget`
+  };
 }
 
 function rejectionFor(
@@ -131,20 +153,7 @@ function rejectionFor(
     || (constraints.maxOutputTokens ?? 0) > spec.capabilities.maxOutputTokens) {
     return { modelSpecId: spec.id, reason: "context", detail: `${context} tokens exceed candidate limits` };
   }
-  if (constraints.remainingBudgetMicroUsd !== undefined) {
-    const cost = maximumCost(spec, constraints);
-    if (cost === null) {
-      return { modelSpecId: spec.id, reason: "pricing", detail: "cost budget requires model pricing" };
-    }
-    if (cost > constraints.remainingBudgetMicroUsd) {
-      return {
-        modelSpecId: spec.id,
-        reason: "budget",
-        detail: `${cost} micro-USD exceeds remaining budget`
-      };
-    }
-  }
-  return undefined;
+  return pricingRejection(spec, constraints);
 }
 
 function withinCumulativeBudget(
@@ -157,7 +166,9 @@ function withinCumulativeBudget(
   let reserved = 0;
   return candidates.filter((spec) => {
     const cost = maximumCost(spec, constraints);
-    if (cost === null) return false;
+    if (cost === null) {
+      return spec.billingMode === "subscription" || constraints.allowUnpricedCosts === true;
+    }
     if (reserved + cost > remaining) {
       rejected.push({
         modelSpecId: spec.id,
@@ -187,6 +198,10 @@ export function resolveRouteCandidates(
 }
 
 export function validateRouteConstraints(constraints: ModelRouteConstraints): void {
+  if (constraints.allowUnpricedCosts !== undefined
+    && typeof constraints.allowUnpricedCosts !== "boolean") {
+    throw new Error("Model route constraint 'allowUnpricedCosts' must be boolean.");
+  }
   for (const [label, value] of [
     ["estimatedInputTokens", constraints.estimatedInputTokens],
     ["maxOutputTokens", constraints.maxOutputTokens],

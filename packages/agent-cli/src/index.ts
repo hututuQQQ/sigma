@@ -19,6 +19,7 @@ import { runSessionCommand, runSessionsCommand } from "./commands/session.js";
 import { runVersionCommand } from "./commands/version.js";
 import { runAcpCommand } from "./commands/acp.js";
 import { runAuthCommand } from "./commands/auth.js";
+import { runModelsCommand } from "./commands/models.js";
 import {
   loadCliConfig, parseArgs, workspaceCustomizationTrustMessage, workspaceMcpTrustMessage
 } from "./config.js";
@@ -80,6 +81,18 @@ async function runTuiCommand(argv: string[], options: AgentCliMainOptions): Prom
   return 0;
 }
 
+async function runSessionDefinition(
+  definition: CommandDefinition,
+  argv: string[],
+  options: AgentCliMainOptions
+): Promise<number> {
+  if (definition.sessionAction === "list") {
+    return await runSessionsCommand(argv, { runtime: options.runtime });
+  }
+  const sessionArgv = definition.sessionAction ? [definition.sessionAction, ...argv] : argv;
+  return await runSessionCommand(sessionArgv, { runtime: options.runtime });
+}
+
 async function dispatchCommand(
   definition: CommandDefinition,
   argv: string[],
@@ -94,11 +107,8 @@ async function dispatchCommand(
       stderr: options.stderr
     });
     case "auth": return await runAuthCommand(argv);
-    case "session": return definition.sessionAction === "list"
-      ? await runSessionsCommand(argv, { runtime: options.runtime })
-      : await runSessionCommand(definition.sessionAction ? [definition.sessionAction, ...argv] : argv, {
-        runtime: options.runtime
-      });
+    case "models": return await runModelsCommand(argv);
+    case "session": return await runSessionDefinition(definition, argv, options);
     case "replay": return await runReplayCommand(argv, { runtime: options.runtime });
     case "doctor": return await runDoctorCommand(argv, { runtimeFactoryDeps: options.runtimeFactoryDeps });
     case "sandbox": return await runSandboxCommand(argv);

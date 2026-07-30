@@ -63,6 +63,10 @@ export type RoutedModelStreamEvent =
 
 export type ModelGatewayFactory = (spec: ModelSpec) => ModelGateway;
 
+export interface ModelRouterOptions {
+  maxRetriesPerCandidate?: number;
+}
+
 interface RoutedStreamLifecycle {
   semanticDelta: boolean;
   completed: boolean;
@@ -132,6 +136,38 @@ function incompleteRoutedStreamError(
   );
 }
 
+function retrySameProvider(category: ModelFailureCategory, spec: ModelSpec | undefined): boolean {
+  return category === "rate_limit"
+    || category === "network"
+    || category === "server"
+    || category === "timeout"
+    || (category === "capacity" && spec?.providerId === "deepseek");
+}
+
+function executionCandidates(
+  resolution: ModelResolution,
+  retries: number,
+  totalAttemptLimit: number | undefined
+): ModelSpec[] {
+  const candidates = resolution.candidates.slice(0, resolution.route.maxAttempts);
+  const attempts = candidates.flatMap((spec) =>
+    Array.from({ length: retries + 1 }, () => spec));
+  return totalAttemptLimit === undefined ? attempts : attempts.slice(0, totalAttemptLimit);
+}
+
+function nextExecutionIndex(
+  attempts: readonly ModelSpec[],
+  currentIndex: number,
+  category: ModelFailureCategory
+): number | undefined {
+  const current = attempts[currentIndex];
+  const next = attempts[currentIndex + 1];
+  if (retrySameProvider(category, current) && next?.id === current?.id) return currentIndex + 1;
+  const nextProvider = attempts.findIndex((spec, index) =>
+    index > currentIndex && spec.id !== current?.id);
+  return nextProvider < 0 ? undefined : nextProvider;
+}
+
 export class ModelRoutingError extends Error {
   readonly code = "model_route_unavailable";
   constructor(readonly routeId: string, readonly rejected: readonly ModelRejection[]) {
@@ -165,11 +201,22 @@ export class ModelRouteExecutionError extends Error {
 export class ModelRouter {
   private readonly specs: ReadonlyMap<string, ModelSpec>;
   private readonly routes: ReadonlyMap<string, ModelRoute>;
+  private readonly maxRetriesPerCandidate: number;
 
-  constructor(specs: readonly ModelSpec[], routes: readonly ModelRoute[], private readonly gateways: ModelGatewayFactory) {
+  constructor(
+    specs: readonly ModelSpec[],
+    routes: readonly ModelRoute[],
+    private readonly gateways: ModelGatewayFactory,
+    options: ModelRouterOptions = {}
+  ) {
     for (const spec of specs) validateSpec(spec);
     this.specs = uniqueById(specs, "model spec");
     this.routes = uniqueById(routes, "model route");
+    const retries = options.maxRetriesPerCandidate ?? 0;
+    if (!Number.isSafeInteger(retries) || retries < 0) {
+      throw new Error("Model router retries must be a non-negative safe integer.");
+    }
+    this.maxRetriesPerCandidate = retries;
     validateDistinctRoutes(routes);
     for (const route of routes) validateRoute(route, this.specs);
   }
@@ -183,6 +230,17 @@ export class ModelRouter {
     return { route, candidates, rejected };
   }
 
+  plannedAttempts(
+    routeId: string,
+    constraints: ModelRouteConstraints = {}
+  ): readonly ModelSpec[] {
+    return executionCandidates(
+      this.resolve(routeId, constraints),
+      this.maxRetriesPerCandidate,
+      constraints.maxAttempts
+    );
+  }
+
   async complete(
     role: ModelRole,
     routeId: string,
@@ -190,27 +248,46 @@ export class ModelRouter {
     constraints: ModelRouteConstraints = {}
   ): Promise<RoutedModelResponse> {
     const resolution = this.resolveForRequest(routeId, request, constraints);
-    let lastError: unknown;
-    const attempts = Math.min(
-      resolution.route.maxAttempts,
-      constraints.maxAttempts ?? resolution.route.maxAttempts,
-      resolution.candidates.length
+    const planned = executionCandidates(
+      resolution,
+      this.maxRetriesPerCandidate,
+      constraints.maxAttempts
     );
-    for (let index = 0; index < attempts; index += 1) {
+    let lastError: unknown;
+    let executed = 0;
+    for (let index = 0; index < planned.length;) {
       request.signal.throwIfAborted();
-      const spec = resolution.candidates[index] as ModelSpec;
+      const spec = planned[index] as ModelSpec;
+      const attempt = executed++;
       const startedAt = performance.now();
       try {
         const response = await this.gateways(spec).complete(request);
-        return routedResponse(role, resolution.route.id, spec, response, request, index, performance.now() - startedAt);
+        return routedResponse(
+          role,
+          resolution.route.id,
+          spec,
+          response,
+          request,
+          attempt,
+          performance.now() - startedAt
+        );
       } catch (error) {
         request.signal.throwIfAborted();
         lastError = error;
         const category = classifyModelFailure(error);
         const semanticDelta = errorSemanticDelta(error);
-        if (!canFallback(resolution.route, category, semanticDelta) || index + 1 >= attempts) {
-          throw new ModelRouteExecutionError(routeId, spec.id, category, semanticDelta, index + 1, { cause: error });
+        const nextIndex = nextExecutionIndex(planned, index, category);
+        if (!canFallback(resolution.route, category, semanticDelta) || nextIndex === undefined) {
+          throw new ModelRouteExecutionError(
+            routeId,
+            spec.id,
+            category,
+            semanticDelta,
+            executed,
+            { cause: error }
+          );
         }
+        index = nextIndex;
       }
     }
     throw lastError;
@@ -223,14 +300,16 @@ export class ModelRouter {
     constraints: ModelRouteConstraints = {}
   ): AsyncIterable<RoutedModelStreamEvent> {
     const resolution = this.resolveForRequest(routeId, request, constraints);
-    const attempts = Math.min(
-      resolution.route.maxAttempts,
-      constraints.maxAttempts ?? resolution.route.maxAttempts,
-      resolution.candidates.length
+    const planned = executionCandidates(
+      resolution,
+      this.maxRetriesPerCandidate,
+      constraints.maxAttempts
     );
-    for (let index = 0; index < attempts; index += 1) {
+    let executed = 0;
+    for (let index = 0; index < planned.length;) {
       request.signal.throwIfAborted();
-      const spec = resolution.candidates[index] as ModelSpec;
+      const spec = planned[index] as ModelSpec;
+      const attempt = executed++;
       const startedAt = performance.now();
       const lifecycle: RoutedStreamLifecycle = {
         semanticDelta: false,
@@ -243,22 +322,30 @@ export class ModelRouter {
       try {
         for await (const event of this.gateways(spec).stream(request)) {
           observeRoutedStreamEvent(lifecycle, event);
-          yield routedStreamEvent(event, role, routeId, spec, request, index, startedAt);
+          yield routedStreamEvent(event, role, routeId, spec, request, attempt, startedAt);
         }
         if (!lifecycle.completed) {
           request.signal.throwIfAborted();
-          throw incompleteRoutedStreamError(spec, lifecycle, index + 1);
+          throw incompleteRoutedStreamError(spec, lifecycle, executed);
         }
         return;
       } catch (error) {
         request.signal.throwIfAborted();
         const category = classifyModelFailure(error);
         lifecycle.semanticDelta ||= errorSemanticDelta(error);
-        if (!canFallback(resolution.route, category, lifecycle.semanticDelta) || index + 1 >= attempts) {
+        const nextIndex = nextExecutionIndex(planned, index, category);
+        if (!canFallback(resolution.route, category, lifecycle.semanticDelta)
+          || nextIndex === undefined) {
           throw new ModelRouteExecutionError(
-            routeId, spec.id, category, lifecycle.semanticDelta, index + 1, { cause: error }
+            routeId,
+            spec.id,
+            category,
+            lifecycle.semanticDelta,
+            executed,
+            { cause: error }
           );
         }
+        index = nextIndex;
       }
     }
   }

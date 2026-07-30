@@ -129,7 +129,9 @@ function normalizedUsage(
     return {
       ...existing,
       ...(billingMode ? { billingMode } : {}),
-      ...(billingMode === "subscription" ? { costMicroUsd: null } : {})
+      ...(billingMode === "subscription" || billingMode === "unpriced"
+        ? { costMicroUsd: null }
+        : {})
     };
   }
   const normalized = normalizeUsage({
@@ -142,7 +144,10 @@ function normalizedUsage(
   return {
     ...normalized,
     ...(prepared.spec ? { billingMode: prepared.spec.billingMode } : {}),
-    ...(prepared.spec?.billingMode === "subscription" ? { costMicroUsd: null } : {})
+    ...(prepared.spec?.billingMode === "subscription"
+      || prepared.spec?.billingMode === "unpriced"
+      ? { costMicroUsd: null }
+      : {})
   };
 }
 
@@ -256,7 +261,7 @@ export function successfulModelUsage(
   return {
     ...usage,
     inputTokens: usage.inputTokens + priorAttempts.reduce((total, item) => total + item.inputTokens, 0),
-    costMicroUsd: usage.billingMode === "subscription"
+    costMicroUsd: usage.billingMode === "subscription" || usage.billingMode === "unpriced"
       ? null
       : (usage.costMicroUsd ?? 0)
         + priorAttempts.reduce((total, item) => total + (item.costMicroUsd ?? 0), 0),
@@ -282,6 +287,7 @@ export function failedModelUsage(
     cacheWriteTokens: 0,
     providerReported: false,
     costMicroUsd: prepared.spec?.billingMode === "subscription"
+      || prepared.spec?.billingMode === "unpriced"
       ? null
       : prepared.spec
         ? maximumCost(prepared.spec, inputTokens, 0)
@@ -294,6 +300,7 @@ export function failedModelUsage(
     ? {
         ...usage,
         costMicroUsd: prepared.spec?.billingMode === "subscription"
+          || prepared.spec?.billingMode === "unpriced"
           ? null
           : prepared.attemptReservations.reduce((total, item) => total + (item.costMicroUsd ?? 0), 0)
       }
