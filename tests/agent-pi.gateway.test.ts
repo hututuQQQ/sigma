@@ -330,6 +330,7 @@ describe("OpenAI Codex subscription gateway", () => {
       model: OPENAI_CODEX_DEFAULT_MODEL,
       credentials: new MemoryCredentialStore(oauth())
     });
+    const sessionId = "sigma-session-affinity";
     const controller = new AbortController();
     const messages: ModelMessage[] = [
       { role: "system", content: "System first." },
@@ -346,6 +347,7 @@ describe("OpenAI Codex subscription gateway", () => {
       { role: "user", content: "Inspect this repository." }
     ];
     const first = await gateway.complete({
+      sessionId,
       messages,
       tools: [{
         name: "read_file",
@@ -388,6 +390,7 @@ describe("OpenAI Codex subscription gateway", () => {
     });
 
     const second = await gateway.complete({
+      sessionId,
       messages: [
         ...messages,
         first.message,
@@ -408,6 +411,12 @@ describe("OpenAI Codex subscription gateway", () => {
       request.headers.get("authorization") === `Bearer ${oauth().access}`)).toBe(true);
     expect(captured.every((request) =>
       request.headers.get("authorization") !== "Bearer metered-api-key-must-not-be-read")).toBe(true);
+    expect(captured.every((request) =>
+      request.headers.get("session-id") === sessionId)).toBe(true);
+    expect(captured.every((request) =>
+      request.headers.get("x-client-request-id") === sessionId)).toBe(true);
+    expect(captured.every((request) =>
+      request.body.prompt_cache_key === sessionId)).toBe(true);
     expect(captured[0]!.body.instructions).toBe(
       "<system>\nSystem first.\n</system>\n\n<developer>\nDeveloper second.\n</developer>"
     );

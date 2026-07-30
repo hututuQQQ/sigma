@@ -5,14 +5,15 @@ import { SigmaAcpEventForwarder } from "./sigma-acp-events.js";
 import { SigmaAcpSessionRegistry } from "./sigma-acp-session-registry.js";
 import {
   MODEL_CONFIG_ID,
+  SIGMA_RUNTIME_REQUEST_ERROR,
   expectedAbort,
   listOffset,
   modelConfig,
   parseHealthRequest,
   parseSigmaTextCommand,
+  promptResponseForOutcome,
   promptText,
   sessionModes,
-  stopReason,
   titleFromPrompt,
   type ForwardState,
   type PersistedAcpSession,
@@ -347,14 +348,9 @@ export class SigmaAcpAgent {
       });
       resolved.record.updatedAt = new Date().toISOString();
       await this.sessions.upsert(resolved.handle.storeRootDir, resolved.record);
-      return {
-        stopReason: stopReason(outcome),
-        _meta: {
-          "sigma.outcome": outcome.kind,
-          ...("message" in outcome ? { "sigma.message": outcome.message } : {})
-        }
-      };
+      return promptResponseForOutcome(outcome);
     } catch (error) {
+      if (error instanceof acp.RequestError && error.code === SIGMA_RUNTIME_REQUEST_ERROR) throw error;
       if (expectedAbort(error, controller.signal)) return { stopReason: "cancelled" };
       throw error;
     } finally {

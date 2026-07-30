@@ -259,47 +259,54 @@ describe("capability-aware model routing", () => {
   });
 
   it("never routes subscription auth, allowance, rate-limit, or server failures to paid providers", async () => {
-    const profile = freezeAgentProfile({
-      id: "subscription-route",
-      roleRoutes: {},
-      toolAllow: null,
-      toolDeny: [],
-      skills: [],
-      hooks: [],
-      permissionMode: "deny",
-      budget: { ...DEFAULT_PROFILE_BUDGET },
-      mutationPolicy: {
-        requirePlanBeforeMutation: true,
-        checkpointBeforeMutation: true,
-        reviewMode: "advisory"
-      },
-      allowedChildProfiles: []
-    });
-    for (const category of ["auth", "capacity", "rate_limit", "server"] as const) {
-      const calls: string[] = [];
-      const gateways = createRoleGateways({
-        provider: "openai-codex",
-        model: "gpt-5.6-terra",
-        modelDeadlineSec: 10,
-        streamIdleSec: 5
-      }, {
-        gatewayFactory: ({ provider, model }) => gateway(`${provider}/${model}`, async () => {
-          calls.push(provider);
-          throw Object.assign(new Error(category), { category });
-        })
-      }, {
-        profile,
-        profileSource: "builtin",
-        availableProfiles: [{ profile, source: "builtin" }]
-      } as unknown as RuntimeCustomization, {
-        OPENAI_API_KEY: "must-not-be-used",
-        DEEPSEEK_API_KEY: "must-not-fallback",
-        GLM_API_KEY: "must-not-fallback"
+    vi.useFakeTimers();
+    try {
+      const profile = freezeAgentProfile({
+        id: "subscription-route",
+        roleRoutes: {},
+        toolAllow: null,
+        toolDeny: [],
+        skills: [],
+        hooks: [],
+        permissionMode: "deny",
+        budget: { ...DEFAULT_PROFILE_BUDGET },
+        mutationPolicy: {
+          requirePlanBeforeMutation: true,
+          checkpointBeforeMutation: true,
+          reviewMode: "advisory"
+        },
+        allowedChildProfiles: []
       });
+      for (const category of ["auth", "capacity", "rate_limit", "server"] as const) {
+        const calls: string[] = [];
+        const gateways = createRoleGateways({
+          provider: "openai-codex",
+          model: "gpt-5.6-terra",
+          modelDeadlineSec: 10,
+          streamIdleSec: 5
+        }, {
+          gatewayFactory: ({ provider, model }) => gateway(`${provider}/${model}`, async () => {
+            calls.push(provider);
+            throw Object.assign(new Error(category), { category });
+          })
+        }, {
+          profile,
+          profileSource: "builtin",
+          availableProfiles: [{ profile, source: "builtin" }]
+        } as unknown as RuntimeCustomization, {
+          OPENAI_API_KEY: "must-not-be-used",
+          DEEPSEEK_API_KEY: "must-not-fallback",
+          GLM_API_KEY: "must-not-fallback"
+        });
 
-      await expect(gateways.orchestrator.complete(request())).rejects.toThrow(category);
-      expect(new Set(calls)).toEqual(new Set(["openai-codex"]));
-      expect(calls).toHaveLength(category === "rate_limit" || category === "server" ? 3 : 1);
+        const failed = expect(gateways.orchestrator.complete(request())).rejects.toThrow(category);
+        await vi.runAllTimersAsync();
+        await failed;
+        expect(new Set(calls)).toEqual(new Set(["openai-codex"]));
+        expect(calls).toHaveLength(category === "rate_limit" || category === "server" ? 3 : 1);
+      }
+    } finally {
+      vi.useRealTimers();
     }
   });
 
@@ -573,6 +580,69 @@ describe("capability-aware model routing", () => {
       attempts: 1
     });
     expect(capacityCalls).toBe(1);
+  });
+
+  it("uses abortable exponential backoff only between same-provider retries", async () => {
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      const only = spec("deepseek/a");
+      const router = new ModelRouter(
+        [only],
+        [route({ candidates: [only.id], maxAttempts: 1 })],
+        () => gateway(only.id, async () => {
+          calls += 1;
+          if (calls < 3) {
+            throw Object.assign(new Error("temporary server failure"), { category: "server" });
+          }
+          return response("recovered after backoff");
+        }),
+        {
+          maxRetriesPerCandidate: 2,
+          retryBaseDelayMs: 2_000,
+          retryMaxDelayMs: 60_000
+        }
+      );
+
+      const pending = router.complete("orchestrator", "main", request());
+      await vi.advanceTimersByTimeAsync(0);
+      expect(calls).toBe(1);
+      await vi.advanceTimersByTimeAsync(1_999);
+      expect(calls).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(calls).toBe(2);
+      await vi.advanceTimersByTimeAsync(3_999);
+      expect(calls).toBe(2);
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(pending).resolves.toMatchObject({
+        modelSpecId: only.id,
+        attempt: 2
+      });
+      expect(calls).toBe(3);
+
+      const controller = new AbortController();
+      const cancellation = new Error("cancel retry backoff");
+      let cancelledCalls = 0;
+      const cancelledRouter = new ModelRouter(
+        [only],
+        [route({ candidates: [only.id], maxAttempts: 1 })],
+        () => gateway(only.id, async () => {
+          cancelledCalls += 1;
+          throw Object.assign(new Error("temporary server failure"), { category: "server" });
+        }),
+        { maxRetriesPerCandidate: 2, retryBaseDelayMs: 2_000 }
+      );
+      const cancelled = cancelledRouter.complete("orchestrator", "main", {
+        ...request(),
+        signal: controller.signal
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      controller.abort(cancellation);
+      await expect(cancelled).rejects.toBe(cancellation);
+      expect(cancelledCalls).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not fall back on protocol failures or after streamed semantic output", async () => {

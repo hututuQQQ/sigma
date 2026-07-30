@@ -295,7 +295,11 @@ export function createRoleGateways(
     resolved.specs,
     resolved.routes,
     (spec) => gateways.get(spec.id) as ModelGateway,
-    { maxRetriesPerCandidate: config.maxModelRetries ?? 2 }
+    {
+      maxRetriesPerCandidate: config.maxModelRetries ?? 2,
+      retryBaseDelayMs: 2_000,
+      retryMaxDelayMs: 60_000
+    }
   );
   const allowUnpricedCosts = config.budget?.allowUnpricedCosts === true;
   validateProfileRoutes(router, customization, allowUnpricedCosts);

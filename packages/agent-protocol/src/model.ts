@@ -71,6 +71,11 @@ export interface ModelResponseUsage {
 }
 
 export interface ModelRequest {
+  /**
+   * Stable, opaque conversation identity used only for provider-side cache
+   * affinity. It must not contain credentials or user-visible prompt text.
+   */
+  sessionId?: string;
   messages: ModelMessage[];
   tools?: ModelToolDefinition[];
   toolChoice?: "auto" | "required" | "none";

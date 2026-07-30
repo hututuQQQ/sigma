@@ -65,6 +65,10 @@ export type ModelGatewayFactory = (spec: ModelSpec) => ModelGateway;
 
 export interface ModelRouterOptions {
   maxRetriesPerCandidate?: number;
+  /** Base delay before retrying the same provider/model. Defaults to no delay. */
+  retryBaseDelayMs?: number;
+  /** Maximum delay between same-provider retries. */
+  retryMaxDelayMs?: number;
 }
 
 interface RoutedStreamLifecycle {
@@ -144,6 +148,56 @@ function retrySameProvider(category: ModelFailureCategory, spec: ModelSpec | und
     || (category === "capacity" && spec?.providerId === "deepseek");
 }
 
+function abortableDelay(delayMs: number, signal: AbortSignal): Promise<void> {
+  if (delayMs <= 0) return Promise.resolve();
+  signal.throwIfAborted();
+  return new Promise<void>((resolve, reject) => {
+    const completed = (): void => {
+      signal.removeEventListener("abort", aborted);
+      resolve();
+    };
+    const timeout = setTimeout(completed, delayMs);
+    const aborted = (): void => {
+      clearTimeout(timeout);
+      signal.removeEventListener("abort", aborted);
+      reject(signal.reason ?? Object.assign(new Error("Model retry was cancelled."), {
+        name: "AbortError"
+      }));
+    };
+    signal.addEventListener("abort", aborted, { once: true });
+  });
+}
+
+function sameCandidateRetryOrdinal(
+  attempts: readonly ModelSpec[],
+  nextIndex: number
+): number {
+  const candidateId = attempts[nextIndex]?.id;
+  if (!candidateId) return 0;
+  let ordinal = 0;
+  for (
+    let index = nextIndex - 1;
+    index >= 0 && attempts[index]?.id === candidateId;
+    index -= 1
+  ) {
+    ordinal += 1;
+  }
+  return ordinal;
+}
+
+function retryDelay(
+  attempts: readonly ModelSpec[],
+  currentIndex: number,
+  nextIndex: number,
+  baseDelayMs: number,
+  maxDelayMs: number
+): number {
+  if (baseDelayMs === 0 || attempts[currentIndex]?.id !== attempts[nextIndex]?.id) return 0;
+  const ordinal = sameCandidateRetryOrdinal(attempts, nextIndex);
+  if (ordinal < 1) return 0;
+  return Math.min(maxDelayMs, baseDelayMs * (2 ** Math.min(ordinal - 1, 30)));
+}
+
 function executionCandidates(
   resolution: ModelResolution,
   retries: number,
@@ -202,6 +256,8 @@ export class ModelRouter {
   private readonly specs: ReadonlyMap<string, ModelSpec>;
   private readonly routes: ReadonlyMap<string, ModelRoute>;
   private readonly maxRetriesPerCandidate: number;
+  private readonly retryBaseDelayMs: number;
+  private readonly retryMaxDelayMs: number;
 
   constructor(
     specs: readonly ModelSpec[],
@@ -216,7 +272,17 @@ export class ModelRouter {
     if (!Number.isSafeInteger(retries) || retries < 0) {
       throw new Error("Model router retries must be a non-negative safe integer.");
     }
+    const retryBaseDelayMs = options.retryBaseDelayMs ?? 0;
+    const retryMaxDelayMs = options.retryMaxDelayMs ?? 60_000;
+    if (!Number.isSafeInteger(retryBaseDelayMs) || retryBaseDelayMs < 0) {
+      throw new Error("Model router retry base delay must be a non-negative safe integer.");
+    }
+    if (!Number.isSafeInteger(retryMaxDelayMs) || retryMaxDelayMs < 0) {
+      throw new Error("Model router maximum retry delay must be a non-negative safe integer.");
+    }
     this.maxRetriesPerCandidate = retries;
+    this.retryBaseDelayMs = retryBaseDelayMs;
+    this.retryMaxDelayMs = retryMaxDelayMs;
     validateDistinctRoutes(routes);
     for (const route of routes) validateRoute(route, this.specs);
   }
@@ -287,6 +353,16 @@ export class ModelRouter {
             { cause: error }
           );
         }
+        await abortableDelay(
+          retryDelay(
+            planned,
+            index,
+            nextIndex,
+            this.retryBaseDelayMs,
+            this.retryMaxDelayMs
+          ),
+          request.signal
+        );
         index = nextIndex;
       }
     }
@@ -345,6 +421,16 @@ export class ModelRouter {
             { cause: error }
           );
         }
+        await abortableDelay(
+          retryDelay(
+            planned,
+            index,
+            nextIndex,
+            this.retryBaseDelayMs,
+            this.retryMaxDelayMs
+          ),
+          request.signal
+        );
         index = nextIndex;
       }
     }

@@ -194,6 +194,7 @@ export class ModelReviewer implements ReviewerPort {
         ]
       : messages;
     const request: ModelRequest = {
+      sessionId: input.sessionId,
       signal,
       tools,
       ...(toolChoice ? { toolChoice } : {}),

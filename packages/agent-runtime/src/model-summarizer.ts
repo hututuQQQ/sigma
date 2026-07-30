@@ -110,12 +110,14 @@ async function archiveItem(
 
 async function complete(
   gateway: ModelGateway,
+  sessionId: string,
   messages: ModelMessage[],
   maxOutputTokens: number,
   routeConstraints: ModelRouteConstraints | undefined,
   signal: AbortSignal
 ): Promise<ModelResponse> {
   const request: ModelRequest = {
+    sessionId,
     signal,
     messages,
     tools: [],
@@ -247,6 +249,7 @@ export class ModelSummarizer {
     try {
       response = await complete(
         call.gateway,
+        session.identity.sessionId,
         call.messages,
         call.maxOutputTokens,
         call.fitted.routeConstraints,

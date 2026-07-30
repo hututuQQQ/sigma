@@ -115,6 +115,7 @@ export class PiModelGateway implements ModelGateway {
           temperature: request.temperature,
           toolChoice: request.toolChoice,
           maxRetries: 0,
+          ...(request.sessionId ? { sessionId: request.sessionId } : {}),
           ...(this.provider === OPENAI_CODEX_PROVIDER_ID ? { transport: "sse" as const } : {}),
           ...(this.requestTimeoutMs ? { timeoutMs: this.requestTimeoutMs } : {}),
           ...(this.provider === "deepseek"

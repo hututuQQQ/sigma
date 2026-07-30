@@ -80,6 +80,14 @@ class FakeRuntime implements RuntimeClient {
         this.emit(command.sessionId, "model.reasoning_delta", { turnId: 2, delta: "Waiting." });
         return;
       }
+      if (command.text === "fail provider") {
+        this.finish(command.sessionId, {
+          kind: "recoverable_failure",
+          code: "server",
+          message: "The model provider is temporarily unavailable."
+        });
+        return;
+      }
       void this.completeTurn(command.sessionId);
       return;
     }
@@ -495,6 +503,22 @@ describe("Sigma ACP v1 contract", () => {
         sessionId: cancellable.sessionId
       });
       expect((await pendingPrompt).stopReason).toBe("cancelled");
+
+      const failing = await clientConnection.agent.request(acp.methods.agent.session.new, {
+        cwd: root,
+        mcpServers: []
+      });
+      await expect(clientConnection.agent.request(acp.methods.agent.session.prompt, {
+        sessionId: failing.sessionId,
+        prompt: [{ type: "text", text: "fail provider" }]
+      })).rejects.toMatchObject({
+        code: -32001,
+        message: "The model provider is temporarily unavailable.",
+        data: {
+          "sigma.outcome": "recoverable_failure",
+          "sigma.code": "server"
+        }
+      });
 
       await clientConnection.agent.request(acp.methods.agent.session.close, {
         sessionId: created.sessionId
