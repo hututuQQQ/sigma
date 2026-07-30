@@ -116,9 +116,13 @@ describe("agent-cli version", () => {
   it("loads only the lightweight version command for version probes", async () => {
     const versionArgs: string[][] = [];
     let agentLoads = 0;
+    let proxyConfigurations = 0;
 
     await expect(
       runAgentCli(["version", "--json"], {
+        configureOutboundProxy: () => {
+          proxyConfigurations += 1;
+        },
         loadVersionCommand: async () => ({
           runVersionCommand: async (args) => {
             versionArgs.push(args);
@@ -134,28 +138,38 @@ describe("agent-cli version", () => {
 
     expect(versionArgs).toEqual([["--json"]]);
     expect(agentLoads).toBe(0);
+    expect(proxyConfigurations).toBe(0);
   });
 
   it("loads the full command graph for non-version commands", async () => {
     const forwardedArgs: string[][] = [];
     let versionLoads = 0;
+    const lifecycle: string[] = [];
 
     await expect(
       runAgentCli(["doctor", "--help"], {
+        configureOutboundProxy: () => {
+          lifecycle.push("proxy");
+        },
         loadVersionCommand: async () => {
           versionLoads += 1;
           return { runVersionCommand };
         },
-        loadAgentCommand: async () => ({
-          runAgentCommand: async (args) => {
-            forwardedArgs.push(args);
-            return 0;
-          },
-        }),
+        loadAgentCommand: async () => {
+          lifecycle.push("load");
+          return {
+            runAgentCommand: async (args) => {
+              lifecycle.push("command");
+              forwardedArgs.push(args);
+              return 0;
+            },
+          };
+        },
       }),
     ).resolves.toBe(0);
 
     expect(forwardedArgs).toEqual([["doctor", "--help"]]);
     expect(versionLoads).toBe(0);
+    expect(lifecycle).toEqual(["proxy", "load", "command"]);
   });
 });

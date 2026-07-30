@@ -24,6 +24,7 @@ import {
   loadCliConfig, parseArgs, workspaceCustomizationTrustMessage, workspaceMcpTrustMessage
 } from "./config.js";
 import { createConfiguredRuntime, type RuntimeFactoryDeps } from "agent-runtime";
+import { configureOutboundProxy } from "agent-pi";
 
 export interface AgentCliMainOptions {
   tuiRunner?: (options: TuiAppOptions) => Promise<void>;
@@ -138,6 +139,7 @@ export async function runAgentCommand(args = process.argv.slice(2), options: Age
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  configureOutboundProxy();
   try {
     process.exitCode = await runAgentCommand();
   } catch (error) {

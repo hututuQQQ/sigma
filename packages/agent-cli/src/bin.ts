@@ -11,6 +11,7 @@ type AgentCommandModule = Pick<typeof import("./index.js"), "runAgentCommand">;
 export interface AgentCliBootstrapDeps {
   loadVersionCommand?: () => Promise<VersionCommandModule>;
   loadAgentCommand?: () => Promise<AgentCommandModule>;
+  configureOutboundProxy?: () => void;
   stderr?: NodeJS.WritableStream;
 }
 
@@ -30,6 +31,9 @@ export async function runAgentCli(
     return await version.runVersionCommand(command === "version" ? rest : []);
   }
 
+  const configureOutboundProxy = deps.configureOutboundProxy
+    ?? (await import("agent-pi")).configureOutboundProxy;
+  configureOutboundProxy();
   const agent = await (deps.loadAgentCommand ?? loadAgentCommand)();
   return await agent.runAgentCommand(args);
 }
