@@ -276,7 +276,8 @@ describe.each(apiFamilies)("Pi %s API family contract", (api) => {
     const gateway = new PiModelGateway({
       provider: model.provider,
       model: model.id,
-      models: contractModels(model, captured)
+      models: contractModels(model, captured),
+      reasoningEffort: "high"
     });
 
     const response = await gateway.complete(request(model));
@@ -349,10 +350,56 @@ describe.each(apiFamilies)("Pi %s API family contract", (api) => {
       expect.objectContaining({ thoughtSignature: "opaque-prior-tool" })
     ]));
     expect(call.options.maxRetries).toBe(0);
-    expect(call.options.maxTokens).toBe(4_096);
+    expect(call.options.maxTokens).toBe(api === "anthropic-messages" ? 16_384 : 4_096);
     expect(call.options.signal).toBeInstanceOf(AbortSignal);
+    expect(call.options.toolChoice).toBe("auto");
     expect(call.options.transport).toBe(
       api === "openai-codex-responses" ? "sse" : undefined
     );
+    const expectedReasoningOptions: Record<
+      (typeof apiFamilies)[number],
+      Record<string, unknown>
+    > = {
+      "openai-completions": { reasoningEffort: "high" },
+      "openai-responses": { reasoningEffort: "high" },
+      "openai-codex-responses": { reasoningEffort: "high" },
+      "anthropic-messages": {
+        thinkingEnabled: true,
+        thinkingBudgetTokens: 15_360
+      },
+      "google-generative-ai": {
+        thinking: { enabled: true, budgetTokens: -1 }
+      },
+      "bedrock-converse-stream": { reasoning: "high" },
+      "mistral-conversations": { promptMode: "reasoning" },
+      "pi-messages": { reasoning: "high" }
+    };
+    expect(call.options).toMatchObject(expectedReasoningOptions[api]);
+  });
+});
+
+describe("Pi token-budget reasoning adapters", () => {
+  it("reserves the selected thinking budget for non-adaptive Claude on Bedrock", async () => {
+    const model = {
+      ...contractModel("bedrock-converse-stream"),
+      id: "anthropic.claude-sonnet-3-7",
+      name: "Claude Sonnet 3.7"
+    };
+    const captured: CapturedCall[] = [];
+    const gateway = new PiModelGateway({
+      provider: model.provider,
+      model: model.id,
+      models: contractModels(model, captured),
+      reasoningEffort: "high"
+    });
+
+    await gateway.complete(request(model));
+
+    expect(captured[0]?.options).toMatchObject({
+      maxTokens: 16_384,
+      reasoning: "high",
+      thinkingBudgets: { high: 15_360 },
+      toolChoice: "auto"
+    });
   });
 });

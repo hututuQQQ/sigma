@@ -2,6 +2,7 @@ import {
   createModels,
   createProvider,
   envApiKeyAuth,
+  getSupportedThinkingLevels,
   type Api,
   type AuthType,
   type Credential,
@@ -37,6 +38,17 @@ export const GLM_DEFAULT_MODEL = "glm-5.2" as const;
 export const PI_AI_VERSION = "0.82.1" as const;
 
 export type PiBillingMode = "metered" | "subscription" | "unpriced";
+export const PI_REASONING_EFFORTS = [
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max"
+] as const;
+export type PiReasoningEffort = (typeof PI_REASONING_EFFORTS)[number];
+export const DEFAULT_PI_REASONING_EFFORT: PiReasoningEffort = "medium";
 
 export interface PiAuthMethodDescriptor {
   id: string;
@@ -66,6 +78,8 @@ export interface PiModelDescriptor {
   billingModes: readonly PiBillingMode[];
   pricing?: PiModelPricing;
   recommended: boolean;
+  supportedReasoningEfforts: readonly PiReasoningEffort[];
+  defaultReasoningEffort?: PiReasoningEffort;
 }
 
 const generatedAt = getBuiltinModelDataGeneratedAt();
@@ -143,6 +157,33 @@ function freshProviders(): Provider[] {
 
 function pricing(model: Model<Api>): PiModelPricing | undefined {
   return piModelPricing(model, catalogEffectiveAt);
+}
+
+function supportedReasoningEfforts(model: Model<Api>): readonly PiReasoningEffort[] {
+  if (!model.reasoning) return [];
+  const supportedLevels = new Set(getSupportedThinkingLevels(model));
+  const candidates = PI_REASONING_EFFORTS.flatMap((effort) => {
+    const level = effort === "none" ? "off" : effort;
+    if (!supportedLevels.has(level)) return [];
+    const mapped = model.thinkingLevelMap?.[level];
+    return [{
+      effort,
+      effective: typeof mapped === "string" ? mapped.toLowerCase() : level
+    }];
+  });
+  const effectiveLevels = new Map<string, PiReasoningEffort[]>();
+  for (const candidate of candidates) {
+    const efforts = effectiveLevels.get(candidate.effective) ?? [];
+    efforts.push(candidate.effort);
+    effectiveLevels.set(candidate.effective, efforts);
+  }
+  const supported = new Set<PiReasoningEffort>();
+  for (const [effective, efforts] of effectiveLevels) {
+    const matchingEffort = efforts.find((effort) => effort === effective);
+    supported.add(matchingEffort ?? efforts[0]!);
+  }
+  const result = PI_REASONING_EFFORTS.filter((effort) => supported.has(effort));
+  return result.length > 1 ? result : [];
 }
 
 export function piBillingMode(
@@ -328,6 +369,10 @@ export function listPiModels(models: Models = createPiModels()): readonly PiMode
     const billingModes = [...new Set(authTypes.map((type) =>
       piBillingMode(model.provider, type, model)))];
     const modelPricing = pricing(model);
+    const reasoningEfforts = supportedReasoningEfforts(model);
+    const defaultReasoningEffort = reasoningEfforts.includes(DEFAULT_PI_REASONING_EFFORT)
+      ? DEFAULT_PI_REASONING_EFFORT
+      : reasoningEfforts[0];
     return {
       id: model.id,
       name: model.name,
@@ -341,7 +386,9 @@ export function listPiModels(models: Models = createPiModels()): readonly PiMode
       capabilities: capabilities(model),
       billingModes,
       ...(modelPricing ? { pricing: modelPricing } : {}),
-      recommended: recommendedModels.has(`${model.provider}/${model.id}`)
+      recommended: recommendedModels.has(`${model.provider}/${model.id}`),
+      supportedReasoningEfforts: reasoningEfforts,
+      ...(defaultReasoningEffort ? { defaultReasoningEffort } : {})
     };
   });
 }

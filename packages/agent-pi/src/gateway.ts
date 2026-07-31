@@ -26,9 +26,11 @@ import {
   getPiModel,
   getPiProvider,
   OPENAI_CODEX_PROVIDER_ID,
-  piBillingMode
+  piBillingMode,
+  type PiReasoningEffort
 } from "./models.js";
 import { FileModelsStore } from "./models-store.js";
+import { piReasoningStreamOptions } from "./reasoning.js";
 import { monitoredPiStream } from "./stream-timeout.js";
 
 export interface PiModelGatewayOptions {
@@ -42,6 +44,7 @@ export interface PiModelGatewayOptions {
   requestTimeoutMs?: number;
   idleTimeoutMs?: number;
   activeStreamTimeoutMs?: number;
+  reasoningEffort?: PiReasoningEffort;
 }
 
 function fallbackModel(providerId: string, modelId: string): PiModel<Api> | undefined {
@@ -61,6 +64,7 @@ export class PiModelGateway implements ModelGateway {
   private readonly requestTimeoutMs?: number;
   private readonly idleTimeoutMs: number;
   private readonly activeStreamTimeoutMs?: number;
+  private readonly reasoningEffort?: PiReasoningEffort;
 
   constructor(options: PiModelGatewayOptions) {
     this.provider = options.provider;
@@ -80,6 +84,7 @@ export class PiModelGateway implements ModelGateway {
     this.activeStreamTimeoutMs = options.activeStreamTimeoutMs === undefined
       ? undefined
       : Math.max(1, Math.trunc(options.activeStreamTimeoutMs));
+    this.reasoningEffort = options.reasoningEffort;
     this.capabilities = options.capabilities ?? {
       contextWindowTokens: piModel.contextWindow,
       maxOutputTokens: piModel.maxTokens,
@@ -109,6 +114,7 @@ export class PiModelGateway implements ModelGateway {
     let responseStatus: number | undefined;
     try {
       const stream = monitoredPiStream((signal) => {
+        const context = piContext(request, this.piModel);
         const options = {
           signal,
           maxTokens: request.maxOutputTokens,
@@ -117,6 +123,12 @@ export class PiModelGateway implements ModelGateway {
           maxRetries: 0,
           ...(request.sessionId ? { sessionId: request.sessionId } : {}),
           ...(this.provider === OPENAI_CODEX_PROVIDER_ID ? { transport: "sse" as const } : {}),
+          ...piReasoningStreamOptions(
+            this.piModel,
+            this.reasoningEffort,
+            context,
+            request.maxOutputTokens
+          ),
           ...(this.requestTimeoutMs ? { timeoutMs: this.requestTimeoutMs } : {}),
           ...(this.provider === "deepseek"
             ? { onPayload: (payload: unknown) => deepSeekPayload(payload, request) }
@@ -127,7 +139,7 @@ export class PiModelGateway implements ModelGateway {
         };
         return this.models.stream(
           this.piModel,
-          piContext(request, this.piModel),
+          context,
           options as never
         );
       }, {

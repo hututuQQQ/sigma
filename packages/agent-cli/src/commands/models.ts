@@ -69,7 +69,11 @@ async function modelCatalog() {
       imageInput: model.imageInput,
       billingModes: model.billingModes,
       activeBillingMode: activeMethod?.billingMode ?? null,
-      isRecommended: model.recommended
+      isRecommended: model.recommended,
+      supportedReasoningEfforts: model.supportedReasoningEfforts,
+      ...(model.defaultReasoningEffort
+        ? { defaultReasoningEffort: model.defaultReasoningEffort }
+        : {})
     };
   });
   return {

@@ -552,15 +552,53 @@ describe("Sigma ACP v1 contract", () => {
           description: "openai-codex · subscription"
         })
       ]));
-      const changedModel = await clientConnection.agent.request(
+      expect(created.configOptions?.[1]).toMatchObject({
+        id: "sigma.reasoning_effort",
+        category: "thought_level",
+        currentValue: "medium",
+        options: [
+          { value: "none", name: "None" },
+          { value: "low", name: "Low" },
+          { value: "medium", name: "Medium" },
+          { value: "high", name: "High" },
+          { value: "xhigh", name: "Extra High" },
+          { value: "max", name: "Max" }
+        ]
+      });
+      const changedReasoning = await clientConnection.agent.request(
         acp.methods.agent.session.setConfigOption,
         {
           sessionId: created.sessionId,
+          configId: "sigma.reasoning_effort",
+          value: "high"
+        }
+      );
+      expect(changedReasoning.configOptions[1]).toMatchObject({ currentValue: "high" });
+      const modelSwitchSession = await clientConnection.agent.request(
+        acp.methods.agent.session.new,
+        { cwd: root, mcpServers: [] }
+      );
+      const changedModel = await clientConnection.agent.request(
+        acp.methods.agent.session.setConfigOption,
+        {
+          sessionId: modelSwitchSession.sessionId,
           configId: "sigma.model",
           value: "glm/glm-5.2"
         }
       );
       expect(changedModel.configOptions[0]).toMatchObject({ currentValue: "glm/glm-5.2" });
+      expect(changedModel.configOptions[1]).toMatchObject({
+        id: "sigma.reasoning_effort",
+        currentValue: "medium",
+        options: [
+          { value: "none", name: "None" },
+          { value: "minimal", name: "Minimal" },
+          { value: "low", name: "Low" },
+          { value: "medium", name: "Medium" },
+          { value: "high", name: "High" }
+        ]
+      });
+      expect(changedModel.configOptions).toHaveLength(2);
 
       const prompt = await clientConnection.agent.request(acp.methods.agent.session.prompt, {
         sessionId: created.sessionId,
@@ -585,6 +623,17 @@ describe("Sigma ACP v1 contract", () => {
         && notification.update.status === "completed"
       )).toBe(true);
 
+      const changedReasoningAfterPrompt = await clientConnection.agent.request(
+        acp.methods.agent.session.setConfigOption,
+        {
+          sessionId: created.sessionId,
+          configId: "sigma.reasoning_effort",
+          value: "max"
+        }
+      );
+      expect(changedReasoningAfterPrompt.configOptions[1]).toMatchObject({
+        currentValue: "max"
+      });
       const secondPrompt = await clientConnection.agent.request(acp.methods.agent.session.prompt, {
         sessionId: created.sessionId,
         prompt: [{ type: "text", text: "Check the result" }]
