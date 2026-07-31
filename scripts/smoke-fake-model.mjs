@@ -84,7 +84,17 @@ export function smokeRuntimeConfig(workspace) {
     mcpServers: [],
     mcpSource: "none",
     sandboxMode: "required",
-    networkMode: "none"
+    networkMode: "none",
+    budget: {
+      maxInputTokens: 8_000_000,
+      maxOutputTokens: 1_000_000,
+      maxCostMicroUsd: 50_000_000,
+      allowUnpricedCosts: true,
+      maxModelTurns: 256,
+      maxToolCalls: 2_048,
+      maxChildren: 32,
+      maxDepth: 4
+    }
   };
 }
 

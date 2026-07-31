@@ -20,11 +20,16 @@ import {
   logoutPiProvider,
   openAICodexAuthStatus,
   piAuthStatus,
+  createPiModels,
+  hydratePiModelCache,
+  refreshPiProviderModels,
   sanitizePiModelError,
   type Credential,
   type CredentialInfo,
   type CredentialStore,
-  type OAuthCredential
+  type ModelsStore,
+  type OAuthCredential,
+  type Provider
 } from "../packages/agent-pi/src/index.js";
 import type { JsonValue, ModelMessage } from "../packages/agent-protocol/src/index.js";
 
@@ -124,6 +129,47 @@ function oauth(overrides: Partial<OAuthCredential> = {}): OAuthCredential {
     expires: Date.now() + 60 * 60 * 1_000,
     accountId: "acct_test",
     ...overrides
+  };
+}
+
+function genericCredentialStore(initial?: Credential): CredentialStore & {
+  current(): Credential | undefined;
+} {
+  let credential = initial;
+  return {
+    current: () => credential,
+    async read() { return credential; },
+    async list() { return credential ? [{ providerId: "dynamic", type: credential.type }] : []; },
+    async modify(_providerId, update) {
+      const replacement = await update(credential);
+      if (replacement) credential = replacement;
+      return replacement;
+    },
+    async delete() { credential = undefined; }
+  };
+}
+
+type RefreshContext = Parameters<NonNullable<Provider["refreshModels"]>>[0];
+
+function dynamicProvider(input: {
+  id?: string;
+  auth: Provider["auth"];
+  refresh(context: RefreshContext): Promise<void>;
+}): Provider {
+  return {
+    id: input.id ?? "dynamic",
+    name: "Dynamic provider",
+    auth: input.auth,
+    getModels: () => [],
+    refreshModels: input.refresh
+  } as unknown as Provider;
+}
+
+function memoryModelsStore(): ModelsStore {
+  return {
+    read: vi.fn(async () => undefined),
+    write: vi.fn(async () => undefined),
+    delete: vi.fn(async () => undefined)
   };
 }
 
@@ -765,6 +811,157 @@ describe("OpenAI Codex OAuth adapter", () => {
       accountId: "device-account",
       email: "device@example.test"
     });
+  });
+});
+
+describe("dynamic Pi model refresh", () => {
+  const oauthAuth = (refresh: (credential: OAuthCredential) => Promise<OAuthCredential>) => ({
+    name: "Test OAuth",
+    login: async () => oauth(),
+    refresh,
+    toAuth: async (credential: OAuthCredential) => ({
+      auth: { apiKey: credential.access },
+      source: "OAuth"
+    })
+  });
+
+  it("refreshes expired OAuth and passes the replacement token to the provider", async () => {
+    const old = oauth({ access: "expired-access", expires: Date.now() - 1 });
+    const replacement = oauth({ access: "refreshed-access", expires: Date.now() + 60_000 });
+    const credentials = genericCredentialStore(old);
+    const received: Credential[] = [];
+    const models = createPiModels(credentials, memoryModelsStore());
+    models.setProvider(dynamicProvider({
+      auth: { oauth: oauthAuth(async () => replacement) },
+      refresh: async (context) => { if (context.credential) received.push(context.credential); }
+    }));
+
+    await refreshPiProviderModels(models, "dynamic", {
+      credentials,
+      modelsStore: memoryModelsStore()
+    });
+
+    expect(received).toEqual([replacement]);
+    expect(credentials.current()).toEqual(replacement);
+  });
+
+  it("resolves an environment-only API key for online refresh", async () => {
+    vi.stubEnv("SIGMA_DYNAMIC_PROVIDER_KEY", "environment-key");
+    const received: Credential[] = [];
+    const credentials = genericCredentialStore();
+    const models = createPiModels(credentials, memoryModelsStore());
+    models.setProvider(dynamicProvider({
+      auth: {
+        apiKey: {
+          name: "Test API key",
+          resolve: async ({ ctx }) => {
+            const key = await ctx.env("SIGMA_DYNAMIC_PROVIDER_KEY");
+            return key ? { auth: { apiKey: key }, source: "SIGMA_DYNAMIC_PROVIDER_KEY" } : undefined;
+          }
+        }
+      },
+      refresh: async (context) => { if (context.credential) received.push(context.credential); }
+    }));
+
+    await refreshPiProviderModels(models, "dynamic", {
+      credentials,
+      modelsStore: memoryModelsStore()
+    });
+
+    expect(received).toEqual([{
+      type: "api_key",
+      key: "environment-key",
+      env: undefined
+    }]);
+  });
+
+  it("preserves an expired OAuth credential and emits a safe refresh error", async () => {
+    const old = oauth({ access: "old-sensitive-access", expires: Date.now() - 1 });
+    const credentials = genericCredentialStore(old);
+    const models = createPiModels(credentials, memoryModelsStore());
+    models.setProvider(dynamicProvider({
+      auth: {
+        oauth: oauthAuth(async () => {
+          throw new Error("identity endpoint rejected old-sensitive-access");
+        })
+      },
+      refresh: async () => undefined
+    }));
+
+    const failure = await refreshPiProviderModels(models, "dynamic", {
+      credentials,
+      modelsStore: memoryModelsStore()
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toContain("OAuth refresh failed");
+    expect((failure as Error).message).not.toContain("old-sensitive-access");
+    expect(credentials.current()).toEqual(old);
+  });
+
+  it("hydrates an offline cache without auth, network access, or OAuth refresh", async () => {
+    const refreshOAuth = vi.fn(async () => oauth());
+    const providerRefresh = vi.fn(async (context: RefreshContext) => {
+      expect(context.allowNetwork).toBe(false);
+      expect(context.credential).toBeUndefined();
+      await context.store.read();
+    });
+    const credentials = genericCredentialStore();
+    const store = memoryModelsStore();
+    const models = createPiModels(credentials, store);
+    models.clearProviders();
+    models.setProvider(dynamicProvider({
+      auth: { oauth: oauthAuth(refreshOAuth) },
+      refresh: providerRefresh
+    }));
+
+    await hydratePiModelCache(models, credentials, store);
+
+    expect(providerRefresh).toHaveBeenCalledOnce();
+    expect(store.read).toHaveBeenCalledWith("dynamic");
+    expect(refreshOAuth).not.toHaveBeenCalled();
+  });
+
+  it("rejects online refresh without auth instead of silently succeeding", async () => {
+    const providerRefresh = vi.fn(async () => undefined);
+    const credentials = genericCredentialStore();
+    const models = createPiModels(credentials, memoryModelsStore());
+    models.setProvider(dynamicProvider({
+      auth: { apiKey: { name: "Missing", resolve: async () => undefined } },
+      refresh: providerRefresh
+    }));
+
+    await expect(refreshPiProviderModels(models, "dynamic", {
+      credentials,
+      modelsStore: memoryModelsStore()
+    })).rejects.toThrow("no configured authentication");
+    expect(providerRefresh).not.toHaveBeenCalled();
+  });
+
+  it("refreshes only the selected provider", async () => {
+    const firstRefresh = vi.fn(async () => undefined);
+    const secondRefresh = vi.fn(async () => undefined);
+    const credentials = genericCredentialStore({ type: "api_key", key: "configured" });
+    const models = createPiModels(credentials, memoryModelsStore());
+    models.clearProviders();
+    const auth = {
+      apiKey: {
+        name: "Configured",
+        resolve: async ({ credential }: { credential?: { key?: string } }) => credential?.key
+          ? { auth: { apiKey: credential.key }, source: "stored" }
+          : undefined
+      }
+    };
+    models.setProvider(dynamicProvider({ id: "first", auth, refresh: firstRefresh }));
+    models.setProvider(dynamicProvider({ id: "second", auth, refresh: secondRefresh }));
+
+    await refreshPiProviderModels(models, "first", {
+      credentials,
+      modelsStore: memoryModelsStore()
+    });
+
+    expect(firstRefresh).toHaveBeenCalledOnce();
+    expect(secondRefresh).not.toHaveBeenCalled();
   });
 });
 

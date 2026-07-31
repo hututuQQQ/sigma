@@ -333,6 +333,63 @@ describe("sensitive per-call approvals", () => {
       .toMatchObject({ deadlineAt: expect.any(String) });
   });
 
+  it("does not let an immediate approval overtake the durable deadline suspension", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-approval-race-"));
+    fixtures.push(root);
+    const store = new SegmentedJsonlStore({ rootDir: path.join(root, "state") });
+    const append = store.append.bind(store);
+    let suspendedAppendStarted!: () => void;
+    let allowSuspendedAppend!: () => void;
+    const suspendedStarted = new Promise<void>((resolve) => { suspendedAppendStarted = resolve; });
+    const suspendedGate = new Promise<void>((resolve) => { allowSuspendedAppend = resolve; });
+    store.append = async (event, expectedSeq) => {
+      if (event.type === "run.suspended") {
+        suspendedAppendStarted();
+        await suspendedGate;
+      }
+      return await append(event, expectedSeq);
+    };
+    const runtime = createRuntime({
+      gateway: new SmokeFakeGateway([networkTurn("approval-race"), fakeFinalTurn()]),
+      tools: registerBuiltinTools(new EffectToolRegistry(), {
+        broker: broker([]), runtimeCommands: fixtureRuntimeCommands
+      }),
+      store,
+      storeRootDir: path.join(root, "state"),
+      permissionMode: "ask",
+      runDeadlineMs: 60_000
+    });
+    const session = await runtime.createSession({ workspacePath: root, mode: "analyze" });
+    try {
+      const requested = nextEventAfter(
+        runtime, session.sessionId, 0, ["tool.approval_requested"]
+      );
+      await runtime.command({
+        type: "submit", sessionId: session.sessionId, text: "Approve immediately."
+      });
+      await Promise.all([requested, suspendedStarted]);
+      const approval = runtime.command({
+        type: "approve",
+        sessionId: session.sessionId,
+        requestId: "approval-race",
+        decision: "allow"
+      });
+      allowSuspendedAppend();
+      await approval;
+      await expect(runtime.waitForOutcome(session.sessionId))
+        .resolves.toMatchObject({ kind: "completed" });
+
+      const stored = await events(store, session.sessionId);
+      expect(stored.find((event) => event.type === "tool.approval_resolved")?.payload)
+        .toMatchObject({ deadlineAt: expect.any(String) });
+      expect(stored.findIndex((event) => event.type === "run.suspended"))
+        .toBeLessThan(stored.findIndex((event) => event.type === "tool.approval_resolved"));
+    } finally {
+      allowSuspendedAppend();
+      await runtime.releaseSession(session.sessionId);
+    }
+  });
+
   it("deny mode blocks sensitive calls without producing a grant", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-network-deny-"));
     fixtures.push(root);

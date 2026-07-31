@@ -44,12 +44,19 @@ export function retryDelay(
   currentIndex: number,
   nextIndex: number,
   baseDelayMs: number,
-  maxDelayMs: number
+  maxDelayMs: number,
+  jitterRatio = 0
 ): number {
   if (baseDelayMs === 0 || attempts[currentIndex]?.id !== attempts[nextIndex]?.id) return 0;
   const ordinal = sameCandidateRetryOrdinal(attempts, nextIndex);
   if (ordinal < 1) return 0;
-  return Math.min(maxDelayMs, baseDelayMs * (2 ** Math.min(ordinal - 1, 30)));
+  const exponential = Math.min(
+    maxDelayMs,
+    baseDelayMs * (2 ** Math.min(ordinal - 1, 30))
+  );
+  if (jitterRatio === 0) return exponential;
+  const jitter = 1 - jitterRatio + (Math.random() * jitterRatio * 2);
+  return Math.min(maxDelayMs, Math.max(0, Math.round(exponential * jitter)));
 }
 
 export function executionCandidates(

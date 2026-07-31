@@ -214,12 +214,12 @@ export class SigmaAcpAgent {
   }
 
   private async closeSession(params: acp.CloseSessionRequest): Promise<void> {
-    const resolved = await this.sessions.resolveSession(params.sessionId);
+    const resolved = this.activeRuntimeSessions.get(params.sessionId)
+      ?? await this.sessions.resolveSession(params.sessionId);
     const controller = this.activePrompts.get(params.sessionId);
-    if (controller) {
-      controller.abort(new Error("ACP session closed."));
-      await cancelResolvedSession(resolved, "ACP session closed.");
-    }
+    controller?.abort(new Error("ACP session closed."));
+    await this.sessions.ensureAttached(resolved);
+    await cancelResolvedSession(resolved, "ACP session closed.");
     await resolved.handle.runtime.releaseSession?.(resolved.record.runtimeSessionId);
     this.sessions.detach(resolved.record);
   }
@@ -375,7 +375,9 @@ export class SigmaAcpAgent {
 
   private async cancel(params: acp.CancelNotification): Promise<void> {
     this.activePrompts.get(params.sessionId)?.abort(new Error("Cancelled by ACP client."));
-    const resolved = await this.sessions.resolveSession(params.sessionId);
+    const resolved = this.activeRuntimeSessions.get(params.sessionId)
+      ?? await this.sessions.resolveSession(params.sessionId);
+    await this.sessions.ensureAttached(resolved);
     await cancelResolvedSession(resolved, "Cancelled by ACP client.");
   }
 

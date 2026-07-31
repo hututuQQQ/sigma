@@ -13,6 +13,7 @@ import {
   listPiProviders,
   type Credential,
   type CredentialStore,
+  type Models,
   type ModelsStore
 } from "../packages/agent-pi/src/index.js";
 import {
@@ -21,6 +22,7 @@ import {
   ModelRouter,
   RoutedModelGateway,
   approximateTokenCount,
+  checkProviderHealth,
   classifyModelFailure,
   createModelGatewayForSpec,
   loadPiRuntimeModelCatalog,
@@ -120,6 +122,143 @@ function gateway(id: string, complete: () => Promise<ModelResponse>): ModelGatew
     async countTokens() { return 1; }
   };
 }
+
+function credentialStore(providerId: string, credential: Credential): CredentialStore {
+  return {
+    async read(id) { return id === providerId ? credential : undefined; },
+    async list() { return [{ providerId, type: credential.type }]; },
+    async modify(id, update) {
+      if (id !== providerId) return undefined;
+      const replacement = await update(credential);
+      if (replacement) credential = replacement;
+      return replacement;
+    },
+    async delete() { /* test-only in-memory store */ }
+  };
+}
+
+describe("provider health probe", () => {
+  it("probes the same configured default model used by runtime auto selection", async () => {
+    vi.stubEnv("DEEPSEEK_MODEL", "configured-default-model");
+    const fetchImpl = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      expect(JSON.parse(String(init?.body))).toMatchObject({
+        model: "configured-default-model"
+      });
+      return new Response(JSON.stringify({
+        choices: [{ message: { role: "assistant", content: "OK" } }]
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+
+    const report = await checkProviderHealth({
+      provider: "deepseek",
+      model: "auto",
+      signal: new AbortController().signal,
+      credentials: credentialStore("deepseek", {
+        type: "api_key",
+        key: "persisted-health-key"
+      }),
+      fetchImpl
+    });
+
+    expect(report).toMatchObject({ ok: true, model: "configured-default-model" });
+    vi.unstubAllEnvs();
+  });
+
+  it("uses a persisted credential and only the injected fetch implementation", async () => {
+    vi.stubEnv("DEEPSEEK_API_KEY", "");
+    const globalFetch = vi.fn(() => Promise.reject(new Error("global fetch must not run")));
+    vi.stubGlobal("fetch", globalFetch);
+    const fetchImpl = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      expect(new Headers(init?.headers).get("authorization"))
+        .toBe("Bearer persisted-health-key");
+      return new Response(JSON.stringify({
+        choices: [{ message: { role: "assistant", content: "OK" } }]
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+
+    const report = await checkProviderHealth({
+      provider: "deepseek",
+      model: "deepseek-chat",
+      signal: new AbortController().signal,
+      credentials: credentialStore("deepseek", {
+        type: "api_key",
+        key: "persisted-health-key"
+      }),
+      fetchImpl
+    });
+
+    expect(report).toMatchObject({ ok: true, provider: "deepseek", message: "OK" });
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    expect(globalFetch).not.toHaveBeenCalled();
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it("safely classifies an injected network failure without exposing credentials", async () => {
+    const secret = "health-secret-that-must-not-leak";
+    const report = await checkProviderHealth({
+      provider: "deepseek",
+      model: "deepseek-chat",
+      signal: new AbortController().signal,
+      credentials: credentialStore("deepseek", { type: "api_key", key: secret }),
+      fetchImpl: vi.fn(async () => { throw new Error(`socket failed Bearer ${secret}`); })
+    });
+
+    expect(report).toMatchObject({ ok: false, failureKind: "network_error" });
+    expect(report.message).not.toContain(secret);
+    expect(report.message).toContain("[redacted]");
+  });
+
+  it("sanitizes authentication failures that happen before credentials resolve", async () => {
+    const secret = "oauth-refresh-secret-that-must-not-leak";
+    const report = await checkProviderHealth({
+      provider: "deepseek",
+      model: "deepseek-chat",
+      signal: new AbortController().signal,
+      piModels: {
+        getAuth: async () => {
+          throw new Error(`OAuth refresh rejected ${secret}`);
+        },
+        getProvider: () => undefined
+      } as unknown as Models,
+      fetchImpl: vi.fn()
+    });
+
+    expect(report).toMatchObject({
+      ok: false,
+      failureKind: "api_error",
+      errorCategory: "auth"
+    });
+    expect(report.message).not.toContain(secret);
+    expect(report.message).toContain("authentication is required");
+  });
+
+  it("enforces the configured request timeout for an injected fetch implementation", async () => {
+    const fetchImpl = vi.fn(async (_input: string | URL | Request, init?: RequestInit) =>
+      await new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+      }));
+
+    const report = await checkProviderHealth({
+      provider: "deepseek",
+      model: "deepseek-chat",
+      signal: new AbortController().signal,
+      requestTimeoutMs: 10,
+      credentials: credentialStore("deepseek", {
+        type: "api_key",
+        key: "persisted-health-key"
+      }),
+      fetchImpl
+    });
+
+    expect(report).toMatchObject({
+      ok: false,
+      failureKind: "network_error",
+      errorCategory: "timeout"
+    });
+    expect(report.message).toContain("timed out after 10 ms");
+  });
+});
 
 describe("capability-aware model routing", () => {
   it("classifies transport codes without treating configuration failures as retryable", () => {
@@ -265,7 +404,7 @@ describe("capability-aware model routing", () => {
     ).map((item) => item.id)).toEqual(["openai-codex/gpt-5.6-terra"]);
   });
 
-  it("never routes subscription auth, allowance, rate-limit, or server failures to paid providers", async () => {
+  it("retries transient subscription failures without routing them to paid providers", async () => {
     vi.useFakeTimers();
     try {
       const profile = freezeAgentProfile({
@@ -284,7 +423,7 @@ describe("capability-aware model routing", () => {
         },
         allowedChildProfiles: []
       });
-      for (const category of ["auth", "capacity", "rate_limit", "server"] as const) {
+      for (const category of ["auth", "capacity", "rate_limit", "server", "network"] as const) {
         const calls: string[] = [];
         const gateways = createRoleGateways({
           provider: "openai-codex",
@@ -310,7 +449,7 @@ describe("capability-aware model routing", () => {
         await vi.runAllTimersAsync();
         await failed;
         expect(new Set(calls)).toEqual(new Set(["openai-codex"]));
-        expect(calls).toHaveLength(category === "rate_limit" || category === "server" ? 3 : 1);
+        expect(calls).toHaveLength(category === "auth" || category === "capacity" ? 1 : 6);
       }
     } finally {
       vi.useRealTimers();

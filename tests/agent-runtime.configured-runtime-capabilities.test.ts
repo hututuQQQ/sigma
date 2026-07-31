@@ -302,6 +302,39 @@ afterEach(async () => {
 });
 
 describe("configured runtime execution capabilities", () => {
+  it("executes a model request through the gatewayFactory of a configured runtime", async () => {
+    const root = await workspace();
+    const stateRoot = await mkdtemp(path.join(os.tmpdir(), "sigma-runtime-gateway-request-"));
+    fixtures.push(stateRoot);
+    const gateway = new CapturingGateway();
+    const configuredRuntime = await createConfiguredRuntime(configured(root), {
+      stateRootDir: stateRoot,
+      executionBroker: fixtureBroker(doctorReport([])),
+      gatewayFactory: () => gateway
+    }, { connectMcp: false });
+    try {
+      const session = await configuredRuntime.runtime.createSession({
+        workspacePath: root,
+        mode: "analyze"
+      });
+      await configuredRuntime.runtime.command({
+        type: "submit",
+        sessionId: session.sessionId,
+        text: "Inspect the runtime capabilities.",
+        mode: "analyze"
+      });
+      await configuredRuntime.runtime.waitForOutcome(session.sessionId);
+
+      expect(gateway.requests).toHaveLength(1);
+      expect(gateway.requests[0]?.messages).toContainEqual({
+        role: "user",
+        content: "Inspect the runtime capabilities."
+      });
+    } finally {
+      await configuredRuntime.close();
+    }
+  });
+
   it("carries broker-attested external mounts into every environment write policy", async () => {
     const root = await workspace();
     const report = doctorReport([], [], {

@@ -468,20 +468,31 @@ pub(crate) fn validate_topology(
     Ok(())
 }
 
+fn path_search_candidates(directory: PathBuf, requested: &Path) -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        let direct = directory.join(requested);
+        if requested.extension().is_some() {
+            vec![direct]
+        } else {
+            let mut executable = requested.as_os_str().to_os_string();
+            executable.push(".exe");
+            vec![direct, directory.join(executable)]
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        vec![directory.join(requested)]
+    }
+}
+
 pub(crate) fn trusted_git_executable(requested: &str) -> Result<PathBuf, RpcError> {
     let path = Path::new(requested);
     let candidates = if path.is_absolute() {
         vec![path.to_owned()]
     } else if !requested.contains('/') && !requested.contains('\\') {
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .flat_map(|directory| {
-                let mut values = vec![directory.join(requested)];
-                #[cfg(windows)]
-                if path.extension().is_none() {
-                    values.push(directory.join(format!("{requested}.exe")));
-                }
-                values
-            })
+            .flat_map(|directory| path_search_candidates(directory, path))
             .collect()
     } else {
         Vec::new()
@@ -534,14 +545,7 @@ fn resolve_command_executable(params: &ProcessParams) -> Result<PathBuf, RpcErro
             .map(String::as_str)
             .unwrap_or("");
         std::env::split_paths(search)
-            .flat_map(|directory| {
-                let mut values = vec![directory.join(requested)];
-                #[cfg(windows)]
-                if requested.extension().is_none() {
-                    values.push(directory.join(format!("{}.exe", params.command.executable)));
-                }
-                values
-            })
+            .flat_map(|directory| path_search_candidates(directory, requested))
             .collect()
     };
     candidates

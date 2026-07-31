@@ -102,14 +102,93 @@ function descriptor(): ToolDescriptor {
     possibleEffects: ["filesystem.read", "filesystem.write", "process.spawn.readonly"],
     maximumEffects: ["filesystem.read", "filesystem.write", "process.spawn.readonly"],
     availableModes: ["analyze", "change"],
-    executionMode: "exclusive",
-    resourceKeys: ["workspace:lsp"],
+    executionMode: "parallel",
+    resourceKeys: [],
     contextPathArguments: ["file"],
     approval: "prompt",
     idempotent: false,
     timeoutMs: 120_000,
     prepare: (value, context) => callPlan(value, context.runMode)
   };
+}
+
+interface PooledLspClient {
+  client: LspClient;
+  users: number;
+  discard: boolean;
+  idleTimer?: ReturnType<typeof setTimeout>;
+}
+
+interface LspClientLease {
+  client: LspClient;
+  release(discard?: boolean): void;
+}
+
+const LSP_CLIENT_IDLE_TIMEOUT_MS = 1_000;
+
+class LspClientPool {
+  private readonly clients = new Map<string, PooledLspClient>();
+
+  constructor(private readonly options: CodeIntelToolOptions) {}
+
+  acquire(workspacePath: string, preset: LanguageServerPreset): LspClientLease {
+    const key = [
+      path.resolve(workspacePath),
+      preset.id,
+      path.resolve(preset.executable),
+      ...preset.args
+    ].join("\0");
+    let entry = this.clients.get(key);
+    if (!entry) {
+      entry = {
+        client: new LspClient({
+          rootPath: workspacePath,
+          transport: new BrokerLspTransport({
+            broker: this.options.broker,
+            preset,
+            workspacePath,
+            additionalReadRoots: this.options.additionalReadRoots
+          })
+        }),
+        users: 0,
+        discard: false
+      };
+      this.clients.set(key, entry);
+    }
+    if (entry.idleTimer) {
+      clearTimeout(entry.idleTimer);
+      entry.idleTimer = undefined;
+    }
+    entry.users += 1;
+    let released = false;
+    return {
+      client: entry.client,
+      release: (discard = false) => {
+        if (released) return;
+        released = true;
+        entry!.users -= 1;
+        if (discard) {
+          entry!.discard = true;
+          if (this.clients.get(key) === entry) this.clients.delete(key);
+        }
+        if (entry!.users > 0) return;
+        if (entry!.discard) {
+          this.close(entry!.client);
+          return;
+        }
+        entry!.idleTimer = setTimeout(() => {
+          if (entry!.users > 0 || this.clients.get(key) !== entry) return;
+          this.clients.delete(key);
+          this.close(entry!.client);
+        }, LSP_CLIENT_IDLE_TIMEOUT_MS);
+        entry!.idleTimer.unref();
+      }
+    };
+  }
+
+  private close(client: LspClient): void {
+    void client.close().catch(() => undefined);
+  }
 }
 
 function offsetAt(content: string, value: LspPosition): number {
@@ -254,6 +333,7 @@ function receipt(
 }
 
 export function codeIntelTool(options: CodeIntelToolOptions): RegisteredEffectTool {
+  const clients = new LspClientPool(options);
   return {
     descriptor: descriptor(),
     async execute(request, context) {
@@ -261,22 +341,19 @@ export function codeIntelTool(options: CodeIntelToolOptions): RegisteredEffectTo
       const input = object(request.arguments);
       const op = operation(input);
       const preset = selectPreset(options.presets, string(input, "file"));
-      const client = new LspClient({
-        rootPath: context.workspacePath,
-        transport: new BrokerLspTransport({
-          broker: options.broker, preset, workspacePath: context.workspacePath,
-          additionalReadRoots: options.additionalReadRoots
-        })
-      });
+      const lease = clients.acquire(context.workspacePath, preset);
+      let discard = true;
       try {
-        const result = await query(client, op, input, context.signal);
+        const result = await query(lease.client, op, input, context.signal);
         if (op !== "rename") {
+          discard = false;
           return receipt(request, startedAt, op, result, { sessionId: context.sessionId, runId: context.runId });
         }
         if (!result) throw new Error("Language server declined the rename.");
         const applied = await applyRename(context.workspacePath, result as LspWorkspaceEdit);
         const completedAt = new Date().toISOString();
         const output = JSON.stringify(applied);
+        discard = false;
         return {
           callId: request.callId, ok: true, output,
           outcome: { status: "succeeded", output, diagnosticCodes: [] },
@@ -286,7 +363,7 @@ export function codeIntelTool(options: CodeIntelToolOptions): RegisteredEffectTo
           evidence: []
         };
       } finally {
-        await client.close();
+        lease.release(discard);
       }
     }
   };

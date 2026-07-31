@@ -47,6 +47,7 @@ export class SigmaAcpSessionRegistry {
   private readonly indexWrites = new Map<string, Promise<void>>();
   private readonly sessionRoots = new Map<string, string>();
   private readonly attached = new Set<string>();
+  private readonly attaching = new Map<string, Promise<void>>();
 
   constructor(private readonly options: SigmaAcpAgentOptions) {}
 
@@ -56,6 +57,7 @@ export class SigmaAcpSessionRegistry {
       result.status === "fulfilled" ? [result.value.close()] : []
     ));
     this.handles.clear();
+    this.attaching.clear();
   }
 
   markAttached(record: PersistedAcpSession): void {
@@ -169,11 +171,21 @@ export class SigmaAcpSessionRegistry {
   async ensureAttached(resolved: ResolvedSession): Promise<void> {
     const key = this.attachmentKey(resolved.record);
     if (this.attached.has(key)) return;
-    await resolved.handle.runtime.command({
-      type: "resume",
-      sessionId: resolved.record.runtimeSessionId
-    });
-    this.attached.add(key);
+    let attaching = this.attaching.get(key);
+    if (!attaching) {
+      attaching = resolved.handle.runtime.command({
+        type: "resume",
+        sessionId: resolved.record.runtimeSessionId
+      }).then(() => {
+        this.attached.add(key);
+      });
+      this.attaching.set(key, attaching);
+    }
+    try {
+      await attaching;
+    } finally {
+      if (this.attaching.get(key) === attaching) this.attaching.delete(key);
+    }
   }
 
   private attachmentKey(record: PersistedAcpSession): string {

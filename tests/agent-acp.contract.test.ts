@@ -14,6 +14,7 @@ import type {
 } from "agent-protocol";
 import { afterEach, describe, expect, it } from "vitest";
 import { runAcpCommand } from "../packages/agent-cli/src/commands/acp.js";
+import { SigmaAcpSessionRegistry } from "../packages/agent-cli/src/acp/sigma-acp-session-registry.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -47,6 +48,9 @@ class FakeRuntime implements RuntimeClient {
   readonly commands: RunCommand[] = [];
   readonly releasedSessions: string[] = [];
   cancelSettlement?: { started(): void; wait: Promise<void> };
+  resumeSettlement?: { started(): void; wait: Promise<void> };
+  private readonly attached = new Set<string>();
+  private readonly requireAttachmentForCancel = new Set<string>();
   private readonly events: AgentEventEnvelope[] = [];
   private readonly eventWaiters = new Set<() => void>();
   private readonly outcomes = new Map<string, RunOutcome>();
@@ -71,6 +75,12 @@ class FakeRuntime implements RuntimeClient {
 
   async command(command: RunCommand): Promise<void> {
     this.commands.push(command);
+    if (command.type === "resume") {
+      this.resumeSettlement?.started();
+      await this.resumeSettlement?.wait;
+      this.attached.add(command.sessionId);
+      return;
+    }
     if (command.type === "submit" || command.type === "follow_up") {
       const overview = this.required(command.sessionId);
       overview.status = "running";
@@ -97,6 +107,10 @@ class FakeRuntime implements RuntimeClient {
       return;
     }
     if (command.type === "cancel") {
+      if (this.requireAttachmentForCancel.has(command.sessionId)
+        && !this.attached.has(command.sessionId)) {
+        throw new Error(`Unknown fake session '${command.sessionId}' until resume.`);
+      }
       this.cancelSettlement?.started();
       await this.cancelSettlement?.wait;
       this.finish(command.sessionId, { kind: "cancelled", reason: command.reason ?? "cancelled" });
@@ -168,6 +182,10 @@ class FakeRuntime implements RuntimeClient {
     overview.status = "completed";
     overview.lastMessage = text;
     this.outcomes.set(sessionId, { kind: "completed", message: "Stored response.", evidence: [] });
+  }
+
+  requireResumeBeforeCancel(sessionId: string): void {
+    this.requireAttachmentForCancel.add(sessionId);
   }
 
   private async completeTurn(sessionId: string): Promise<void> {
@@ -321,12 +339,68 @@ class FakeRuntime implements RuntimeClient {
 }
 
 describe("Sigma ACP v1 contract", () => {
+  it("coalesces concurrent cold-session attachments into one runtime resume", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-acp-attach-"));
+    temporaryDirectories.push(root);
+    const runtime = new FakeRuntime();
+    const session = await runtime.createSession({ workspacePath: root, mode: "change" });
+    let resumeStarted!: () => void;
+    let allowResume!: () => void;
+    let resumeStarts = 0;
+    const started = new Promise<void>((resolve) => { resumeStarted = resolve; });
+    const gate = new Promise<void>((resolve) => { allowResume = resolve; });
+    runtime.resumeSettlement = {
+      started() {
+        resumeStarts += 1;
+        resumeStarted();
+      },
+      wait: gate
+    };
+    const handle = {
+      runtime,
+      workspace: root,
+      storeRootDir: path.join(root, "state"),
+      close: async () => undefined
+    };
+    const registry = new SigmaAcpSessionRegistry({
+      agentVersion: "test",
+      runtimeFactory: async () => handle,
+      modelCatalog: async () => ({ currentModelId: "test/model", options: [] })
+    });
+    const now = new Date().toISOString();
+    const resolved = {
+      handle,
+      record: {
+        sessionId: session.sessionId,
+        runtimeSessionId: session.sessionId,
+        cwd: root,
+        modelId: "test/model",
+        mode: "change" as const,
+        createdAt: now,
+        updatedAt: now,
+        started: true,
+        lastSeq: 1
+      }
+    };
+
+    const first = registry.ensureAttached(resolved);
+    await started;
+    const second = registry.ensureAttached(resolved);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(resumeStarts).toBe(1);
+    allowResume();
+    await Promise.all([first, second]);
+    expect(runtime.commands.filter((command) => command.type === "resume")).toHaveLength(1);
+  });
+
   it("speaks NDJSON JSON-RPC and maps streaming, plans, tools, approvals, cancellation, load and resume", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-acp-contract-"));
     temporaryDirectories.push(root);
     const runtime = new FakeRuntime();
     const nativeSession = await runtime.createSession({ workspacePath: root, mode: "change" });
     runtime.seedHistory(nativeSession.sessionId, "Existing native Sigma session");
+    const coldSession = await runtime.createSession({ workspacePath: root, mode: "change" });
+    runtime.requireResumeBeforeCancel(coldSession.sessionId);
     const updates: acp.SessionNotification[] = [];
     const permissionRequests: acp.RequestPermissionRequest[] = [];
     let permissionOptionId = "allow";
@@ -379,6 +453,24 @@ describe("Sigma ACP v1 contract", () => {
         cwd: root
       });
       expect(nativeList.sessions.map((session) => session.sessionId)).toContain(nativeSession.sessionId);
+      const beforeColdCancel = runtime.commands.length;
+      let coldCancelStarted!: () => void;
+      const coldCancellation = new Promise<void>((resolve) => { coldCancelStarted = resolve; });
+      runtime.cancelSettlement = { started: coldCancelStarted, wait: Promise.resolve() };
+      const coldNotification = clientConnection.agent.notify(acp.methods.agent.session.cancel, {
+        sessionId: coldSession.sessionId
+      });
+      await coldCancellation;
+      await coldNotification;
+      expect(runtime.commands.slice(beforeColdCancel)).toEqual([
+        { type: "resume", sessionId: coldSession.sessionId },
+        {
+          type: "cancel",
+          sessionId: coldSession.sessionId,
+          reason: "Cancelled by ACP client."
+        }
+      ]);
+      delete runtime.cancelSettlement;
       const beforeNativeReplay = updates.length;
       await clientConnection.agent.request(acp.methods.agent.session.load, {
         sessionId: nativeSession.sessionId,
