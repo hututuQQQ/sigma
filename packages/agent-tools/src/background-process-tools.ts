@@ -117,70 +117,6 @@ function spawnTargetProperties(
   } : {};
 }
 
-function environmentProcessTool(
-  options: ExecutionToolOptions,
-  executeBackground: BackgroundProcessExecutor
-): RegisteredEffectTool | undefined {
-  if (!environmentProcessAvailable(options)) return undefined;
-  const lifecycle: Record<string, JsonValue> = options.handoff === true ? {
-    lifecycle: {
-      type: "string",
-      enum: ["session", "deliverable"],
-      description: "Use session for temporary work. Use deliverable only when the verified service must survive task completion, then explicitly call process_handoff."
-    }
-  } : {};
-  return {
-    // Keep the legacy name registered for durable recovery. New model turns
-    // use process_spawn(target=environment), so they see one spawn surface.
-    modelVisible: false,
-    descriptor: {
-      ...executionToolSchema(
-        "environment_process_spawn",
-        "Start a background process inside the broker-attested disposable outer environment. External writes are granted by the runtime while the workspace and Sigma runtime stay read-only. Use this for services that need external runtime files; use process_spawn for readonly or explicitly scoped processes.",
-        {
-          executable: executableCapabilitySchema(options),
-          args: { type: "array", items: { type: "string" } },
-          cwd: { type: "string" },
-          network: networkProperty(options),
-          env: { type: "object", additionalProperties: { type: "string" } },
-          ...(options.pty === false ? {} : { pty: { type: "boolean" } }),
-          ...lifecycle
-        },
-        ["executable"],
-        [
-          "process.spawn",
-          "filesystem.read",
-          "filesystem.read.external",
-          "filesystem.write",
-          "network",
-          "open_world"
-        ],
-        ["change"]
-      ),
-      brokerMutationAuthority: "disposable_enclosing_container",
-      prepare(value, context) {
-        return prepareExecutionCallPlan(
-          environmentProcessArguments(value, context.workspacePath),
-          context,
-          options,
-          false,
-          true,
-          true
-        );
-      }
-    },
-    async execute(request, context) {
-      return await executeBackground(options, {
-        ...request,
-        arguments: environmentProcessArguments(
-          request.arguments,
-          context.workspacePath
-        )
-      }, context, true);
-    }
-  };
-}
-
 function spawnTool(
   options: ExecutionToolOptions,
   executeBackground: BackgroundProcessExecutor
@@ -197,10 +133,6 @@ function spawnTool(
     "open_world"
   ];
   return {
-    // A verified shell exposes background=true on the primary shell tool.
-    // Keep this legacy direct-spawn name registered only for durable recovery
-    // and for execution targets that have no verified shell.
-    modelVisible: availableShells(options).length === 0 ? undefined : false,
     descriptor: {
       ...executionToolSchema(
         "process_spawn",
@@ -387,10 +319,10 @@ export function backgroundProcessTools(
     handleId: { type: "string" },
     brokerInstanceId: { type: "string" }
   };
-  const environmentProcess = environmentProcessTool(options, executeBackground);
   return [
-    spawnTool(options, executeBackground),
+    ...(availableShells(options).length === 0
+      ? [spawnTool(options, executeBackground)]
+      : []),
     ...processControlTools(options, handleProperties),
-    ...(environmentProcess ? [environmentProcess] : [])
   ];
 }

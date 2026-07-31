@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough, Readable, Writable } from "node:stream";
@@ -339,6 +339,49 @@ class FakeRuntime implements RuntimeClient {
 }
 
 describe("Sigma ACP v1 contract", () => {
+  it("rejects unsupported and malformed session indexes without rewriting them", async () => {
+    const options = {
+      agentVersion: "test",
+      runtimeFactory: async (): Promise<never> => {
+        throw new Error("Runtime must not start while reading an invalid index.");
+      },
+      modelCatalog: async () => ({ currentModelId: "test/model", options: [] })
+    };
+    const unsupportedRoot = await mkdtemp(path.join(os.tmpdir(), "sigma-acp-index-version-"));
+    temporaryDirectories.push(unsupportedRoot);
+    await mkdir(unsupportedRoot, { recursive: true });
+    const unsupportedPath = path.join(unsupportedRoot, "acp-sessions.json");
+    const unsupported = `${JSON.stringify({
+      version: 2,
+      sessions: [{ secret: "unsupported-session-record" }]
+    })}\n`;
+    await writeFile(unsupportedPath, unsupported, "utf8");
+
+    await expect(new SigmaAcpSessionRegistry(options).index(unsupportedRoot))
+      .rejects.toMatchObject({
+        code: "unsupported_schema_version",
+        path: unsupportedPath,
+        expected: 1,
+        actual: 2
+      });
+    expect(await readFile(unsupportedPath, "utf8")).toBe(unsupported);
+
+    const malformedRoot = await mkdtemp(path.join(os.tmpdir(), "sigma-acp-index-shape-"));
+    temporaryDirectories.push(malformedRoot);
+    const malformedPath = path.join(malformedRoot, "acp-sessions.json");
+    const malformed = `${JSON.stringify({
+      version: 1,
+      sessions: [{ sessionId: "incomplete" }]
+    })}\n`;
+    await writeFile(malformedPath, malformed, "utf8");
+    await expect(new SigmaAcpSessionRegistry(options).index(malformedRoot))
+      .rejects.toMatchObject({
+        code: "persisted_state_invalid",
+        path: malformedPath
+      });
+    expect(await readFile(malformedPath, "utf8")).toBe(malformed);
+  });
+
   it("coalesces concurrent cold-session attachments into one runtime resume", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-acp-attach-"));
     temporaryDirectories.push(root);

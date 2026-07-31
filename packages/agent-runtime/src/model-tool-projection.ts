@@ -3,9 +3,6 @@ import type { RuntimeSession } from "./types.js";
 
 export interface ModelToolProjectionCapabilities {
   skillsAvailable: boolean;
-  /** Retained for schema-1 recovery compatibility. Loading a skill no longer
-   * swaps the foreground tool surface within a session. */
-  executableSkillResourcesLoaded: boolean;
   environmentMutationAvailable?: boolean;
   processControlsAvailable?: boolean;
   childControlsAvailable?: boolean;
@@ -15,23 +12,12 @@ export interface ModelToolProjectionCapabilities {
 /** Frozen sessions never acquire capabilities from changed live state. */
 export function sessionSkillProjectionCapabilities(input: {
   frozenCustomization: { readonly skills: readonly { qualifiedName: string }[] };
-  loadedSkills: readonly {
-    qualifiedName: string;
-    executionManifestArtifactId?: string;
-    executionManifestDigest?: string;
-  }[];
   profileSkillNames?: readonly string[];
 }): ModelToolProjectionCapabilities {
   const allowed = input.profileSkillNames ? new Set(input.profileSkillNames) : undefined;
   const candidates = input.frozenCustomization.skills.map((skill) => skill.qualifiedName);
   const available = new Set(candidates.filter((name) => !allowed || allowed.has(name)));
-  return {
-    skillsAvailable: available.size > 0,
-    executableSkillResourcesLoaded: input.loadedSkills.some((skill) =>
-      available.has(skill.qualifiedName)
-      && Boolean(skill.executionManifestArtifactId && skill.executionManifestDigest)
-    )
-  };
+  return { skillsAvailable: available.size > 0 };
 }
 
 /** Derive one durable capability projection for both model preparation and
@@ -42,10 +28,9 @@ export function sessionModelToolProjectionCapabilities(
   const skillCapabilities = session.durable.frozenCustomization
     ? sessionSkillProjectionCapabilities({
         frozenCustomization: session.durable.frozenCustomization,
-        loadedSkills: session.durable.state.frozenSkills,
         profileSkillNames: session.services.profile?.profile.skills
       })
-    : { skillsAvailable: false, executableSkillResourcesLoaded: false };
+    : { skillsAvailable: false };
   const state = session.durable.state;
   const childControlsAvailable = state.childIds.length > 0
     || state.plan.nodes.some((node) => node.owner.kind === "child")
@@ -70,24 +55,11 @@ const CHILD_CONTROL_TOOLS = new Set([
 const WORKSPACE_WRITE_GUIDANCE =
   " Workspace commands are read-only by default; to create, modify, or delete workspace paths, provide expectedChanges with exact files or narrow directories.";
 
-function hiddenByUnifiedShell(
-  toolName: string,
-  shellAvailable: boolean,
-  unifiedShell: Record<string, JsonValue> | undefined
-): boolean {
-  if (toolName === "exec") return shellAvailable;
-  if (toolName === "validate") return Boolean(unifiedShell?.validation);
-  return toolName === "process_spawn" && Boolean(unifiedShell?.background);
-}
-
 function projectedDescriptorVisible(
   descriptor: ToolDescriptor,
-  capabilities: ModelToolProjectionCapabilities,
-  shellAvailable: boolean,
-  unifiedShell: Record<string, JsonValue> | undefined
+  capabilities: ModelToolProjectionCapabilities
 ): boolean {
   if (!capabilities.skillsAvailable && descriptor.name === "load_skill") return false;
-  if (hiddenByUnifiedShell(descriptor.name, shellAvailable, unifiedShell)) return false;
   if (PROCESS_CONTROL_TOOLS.has(descriptor.name)
     && capabilities.processControlsAvailable === false) return false;
   if (CHILD_CONTROL_TOOLS.has(descriptor.name)
@@ -117,14 +89,6 @@ function projectedInputSchema(
   }
   if (presentation.environmentUnavailable) delete properties.target;
   if (presentation.unifiedShell) {
-    // expectedChanges is sufficient for ordinary workspace writes. Runtime
-    // descriptors retain lower-level write and validation-intent fields for
-    // durable-call compatibility.
-    delete properties.access;
-    delete properties.writeRoots;
-    delete properties.purpose;
-    delete properties.subjects;
-    delete properties.criterionIds;
     if (capabilities.environmentMutationAvailable === false) {
       delete properties.expectedChanges;
     }
@@ -180,25 +144,13 @@ function projectDescriptorPresentation(
   };
 }
 
-/** Present only session-real capabilities to the model while leaving the
- * authoritative registry unchanged for durable recovery and stale-call denial. */
+/** Present only session-real capabilities to the model. */
 export function projectModelToolDescriptors(
   descriptors: readonly ToolDescriptor[],
   capabilities: ModelToolProjectionCapabilities
 ): ToolDescriptor[] {
-  const shellDescriptor = descriptors.find((descriptor) =>
-    descriptor.name === "shell");
-  const shellProperties = shellDescriptor?.inputSchema.properties;
-  const unifiedShell = shellProperties
-    && typeof shellProperties === "object"
-    && !Array.isArray(shellProperties)
-    ? shellProperties as Record<string, JsonValue>
-    : undefined;
-  const shellAvailable = Boolean(shellDescriptor);
   const visible = descriptors.filter((descriptor) =>
-    projectedDescriptorVisible(
-      descriptor, capabilities, shellAvailable, unifiedShell
-    ));
+    projectedDescriptorVisible(descriptor, capabilities));
   return visible.map((descriptor) =>
     projectDescriptorPresentation(descriptor, capabilities));
 }

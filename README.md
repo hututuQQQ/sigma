@@ -244,10 +244,16 @@ writer worktree keeps the parent open.
 ### Current serialized and tool contracts
 
 - Every Sigma-owned serialized boundary uses strict `schemaVersion: 1` (or
-  `schema_version = 1` in TOML). Unknown schemas, another store layout, and old
-  checkpoint journals fail with `unsupported_schema_version` or
+  `schema_version = 1` in TOML and `version: 1` for local provider, workspace
+  trust, and ACP indexes). Unknown schemas, malformed current documents,
+  another store layout, and old checkpoint journals fail with
+  `unsupported_schema_version`, `persisted_state_invalid`, or
   `unsupported_store_layout`; the rejected files are never rewritten,
   migrated, or deleted.
+- A verified shell exposes one `shell` contract for foreground, validation,
+  background, and disposable-environment execution. Direct `exec`, `validate`,
+  and `process_spawn` contracts exist only when no verified shell is available;
+  retired tool names and argument shapes are not registered for replay.
 - Active review is read-only and runs checks in a disposable overlay. It can
   inspect the authenticated current frontier and durable process lifecycle
   evidence without writing the parent workspace.

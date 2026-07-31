@@ -301,6 +301,7 @@ describe("context, platform, and repository tool capabilities", () => {
     await mkdir(path.join(workspace, ".agent"), { recursive: true });
     const tools = registerBuiltinTools(new EffectToolRegistry(), {
       broker: execution,
+      shells: [],
       repositoryList: repositoryListJsonLines,
       repositoryStatistics: repositoryStatisticsJson,
       repositoryTextSearch: repositoryTextSearchJsonLines

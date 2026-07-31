@@ -99,8 +99,7 @@ export function sessionReceiptSummaries(
   session: RuntimeSession
 ): ReviewerReceiptSummary[] {
   return receiptSummaries(session, session.durable.state.receipts)
-    .filter((receipt) => receipt.toolName.startsWith("process_")
-      || receipt.toolName === "environment_process_spawn")
+    .filter((receipt) => receipt.toolName.startsWith("process_"))
     .slice(-MAX_SESSION_RECEIPTS);
 }
 

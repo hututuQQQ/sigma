@@ -404,36 +404,6 @@ describe("durable process lifecycle events", () => {
     }]);
   });
 
-  it("tracks disposable-environment processes under the same lifecycle", async () => {
-    const target = runtimeSessionFixture();
-    const recorded = recorder();
-    await recordProcessReceipt(
-      target,
-      call("environment_process_spawn", { lifecycle: "deliverable" }),
-      plan("background"),
-      receipt({
-        id: "environment-service",
-        brokerInstanceId: "broker-1",
-        lifecycle: "deliverable"
-      }),
-      recorded.emit
-    );
-    expect(target.execution.processHandles.get("environment-service")).toMatchObject({
-      lifecycle: "deliverable",
-      brokerInstanceId: "broker-1"
-    });
-    expect(recorded.events).toEqual([{
-      type: "process.spawned",
-      payload: {
-        processId: "environment-service",
-        executionId: "call-environment_process_spawn",
-        mode: "background",
-        lifecycle: "deliverable",
-        brokerInstanceId: "broker-1"
-      }
-    }]);
-  });
-
   it("records unified shell background startup and immediate terminal state", async () => {
     const target = runtimeSessionFixture();
     const recorded = recorder();

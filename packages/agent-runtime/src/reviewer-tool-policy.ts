@@ -92,8 +92,6 @@ export function catalogAllowed(descriptor: ToolDescriptor): boolean {
   if (descriptor.possibleEffects.some((effect) =>
     CATALOG_FORBIDDEN_EFFECTS.has(effect))) return false;
   if ([
-    "environment_shell",
-    "environment_process_spawn",
     "process_spawn",
     "process_poll",
     "process_write",
@@ -166,13 +164,11 @@ export function reviewerExecutionCall(
 ): ModelToolCall {
   if (!["exec", "shell", "validate"].includes(descriptor.name)) return call;
   const input = jsonObject(call.arguments);
-  if (input.access !== undefined) return call;
+  if (input.access !== undefined || input.expectedChanges !== undefined) return call;
   return {
     ...call,
     arguments: {
       ...input,
-      access: "write",
-      writeRoots: ["."],
       expectedChanges: ["."]
     }
   };

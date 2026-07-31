@@ -204,7 +204,8 @@ describe("typed workspace mutation contracts", () => {
     const fixture = brokerFixture();
     const tools = registerBuiltinTools(new EffectToolRegistry(), {
       broker: fixture.broker,
-      networkMode: "none"
+      networkMode: "none",
+      shells: []
     });
     const call = request("write-process", "exec", {
       executable: process.execPath,
@@ -245,29 +246,48 @@ describe("typed workspace mutation contracts", () => {
     await mkdir(path.join(workspace, "work"));
     await mkdir(path.join(workspace, "inputs"));
     const fixture = brokerFixture();
-    const tools = registerBuiltinTools(new EffectToolRegistry(), {
+    const shared = {
       broker: fixture.broker,
-      shells: ["powershell"],
       executionBackend: "oci",
       executionPlatform: "linux"
+    } as const;
+    const directTools = registerBuiltinTools(new EffectToolRegistry(), {
+      ...shared,
+      shells: []
+    });
+    const shellTools = registerBuiltinTools(new EffectToolRegistry(), {
+      ...shared,
+      shells: ["powershell"]
     });
     const targetExecutable = "/usr/bin/node";
     const calls = [
-      request("read-exec", "exec", {
-        executable: targetExecutable, cwd: "work"
-      }),
-      request("read-shell", "shell", {
-        shell: "powershell", command: "Get-Location", cwd: "work"
-      }),
-      request("read-validate", "validate", {
-        executable: targetExecutable, cwd: "work"
-      }),
-      request("read-spawn", "process_spawn", {
-        executable: targetExecutable, cwd: "work"
-      })
+      {
+        tools: directTools,
+        call: request("read-exec", "exec", {
+          executable: targetExecutable, cwd: "work"
+        })
+      },
+      {
+        tools: shellTools,
+        call: request("read-shell", "shell", {
+          shell: "powershell", command: "Get-Location", cwd: "work"
+        })
+      },
+      {
+        tools: directTools,
+        call: request("read-validate", "validate", {
+          executable: targetExecutable, cwd: "work"
+        })
+      },
+      {
+        tools: directTools,
+        call: request("read-spawn", "process_spawn", {
+          executable: targetExecutable, cwd: "work"
+        })
+      }
     ];
 
-    for (const call of calls) {
+    for (const { tools, call } of calls) {
       await expect(tools.prepare(call, preparation(workspace))).resolves.toMatchObject({
         readPaths: ["."]
       });
@@ -289,10 +309,12 @@ describe("typed workspace mutation contracts", () => {
     expect(fixture.spawns[0]?.policy.readRoots).toEqual(expected);
     expect(fixture.spawns[0]?.policy.protectedPaths).not.toContain(path.join(workspace, ".git"));
     expect(fixture.spawns[0]?.policy.protectedPaths).not.toContain(path.join(workspace, ".agent"));
-    for (const name of ["exec", "shell", "validate", "process_spawn"]) {
-      const properties = tools.descriptor(name)?.inputSchema.properties as Record<string, unknown>;
+    for (const name of ["exec", "validate", "process_spawn"]) {
+      const properties = directTools.descriptor(name)?.inputSchema.properties as Record<string, unknown>;
       expect(properties).toHaveProperty("readRoots");
     }
+    expect(shellTools.descriptor("shell")?.inputSchema.properties)
+      .toHaveProperty("readRoots");
   });
 
   it("plans model-supplied external read roots but requires a fresh execution grant", async () => {
@@ -301,7 +323,8 @@ describe("typed workspace mutation contracts", () => {
     const tools = registerBuiltinTools(new EffectToolRegistry(), {
       broker: fixture.broker,
       readScope: "host",
-      networkMode: "none"
+      networkMode: "none",
+      shells: []
     });
     const call = request("external-read-exec", "exec", {
       executable: process.execPath,
@@ -331,7 +354,8 @@ describe("typed workspace mutation contracts", () => {
         enclosingContainerRoot: true,
         enclosingContainerAttestationDigest: `sha256:${"a".repeat(64)}`,
         protectedPaths: [protectedState],
-        networkMode: "none"
+        networkMode: "none",
+        shells: []
       });
       const target = path.join(external, "generated.conf");
       const call = request("external-write", "exec", {
@@ -400,18 +424,17 @@ describe("typed workspace mutation contracts", () => {
       networkMode: "none",
       shells: [process.platform === "win32" ? "cmd" : "bash"]
     });
-    const environmentShell = tools.descriptor("environment_shell");
-    expect(environmentShell).toMatchObject({
-      availableModes: ["change"],
+    const shell = tools.descriptor("shell");
+    expect(tools.descriptor("environment_shell")).toBeUndefined();
+    expect(shell).toMatchObject({
+      availableModes: ["analyze", "change"],
       brokerMutationAuthority: "disposable_enclosing_container"
     });
-    const schema = JSON.stringify(environmentShell?.inputSchema);
+    const schema = JSON.stringify(shell?.inputSchema);
     expect(schema).not.toContain("writeRoots");
-    expect(schema).not.toContain("expectedChanges");
     expect(schema).not.toContain("\"access\"");
-    expect(tools.modelDescriptors().map((item) => item.name))
-      .not.toContain("environment_shell");
-    expect(tools.descriptor("shell")?.inputSchema.properties).toMatchObject({
+    expect(schema).toContain("expectedChanges");
+    expect(shell?.inputSchema.properties).toMatchObject({
       target: {
         enum: ["workspace", "environment"]
       }
@@ -499,7 +522,7 @@ describe("typed workspace mutation contracts", () => {
     }), preparation(workspace))).rejects.toMatchObject({ code: "policy_denied" });
   });
 
-  it("does not expose environment_shell without the complete attested boundary", () => {
+  it("does not expose the environment target without the complete attested boundary", () => {
     const base = {
       broker: brokerFixture().broker,
       sandboxMode: "required" as const,
@@ -508,17 +531,27 @@ describe("typed workspace mutation contracts", () => {
       networkMode: "none" as const,
       shells: [process.platform === "win32" ? "cmd" as const : "bash" as const]
     };
-    expect(executionTools({
+    const missingAttestation = executionTools({
       ...base,
       writeScope: "enclosing-container",
       enclosingContainerRoot: true
-    }).find((tool) => tool.descriptor.name === "environment_shell")).toBeUndefined();
-    expect(executionTools({
+    });
+    expect(missingAttestation.find((tool) =>
+      tool.descriptor.name === "environment_shell")).toBeUndefined();
+    expect(missingAttestation.find((tool) =>
+      tool.descriptor.name === "shell")?.descriptor.inputSchema.properties)
+      .not.toHaveProperty("target");
+    const wrongScope = executionTools({
       ...base,
       writeScope: "workspace",
       enclosingContainerRoot: true,
       enclosingContainerAttestationDigest: `sha256:${"a".repeat(64)}`
-    }).find((tool) => tool.descriptor.name === "environment_shell")).toBeUndefined();
+    });
+    expect(wrongScope.find((tool) =>
+      tool.descriptor.name === "environment_shell")).toBeUndefined();
+    expect(wrongScope.find((tool) =>
+      tool.descriptor.name === "shell")?.descriptor.inputSchema.properties)
+      .not.toHaveProperty("target");
   });
 
   it("rejects linked cwd ancestors even though cwd is not a read grant", async () => {
@@ -586,7 +619,10 @@ describe("typed workspace mutation contracts", () => {
     await mkdir(path.join(workspace, ".git"));
     await writeFile(path.join(workspace, "root-file.txt"), "root", "utf8");
     const fixture = brokerFixture();
-    const tools = registerBuiltinTools(new EffectToolRegistry(), { broker: fixture.broker });
+    const tools = registerBuiltinTools(new EffectToolRegistry(), {
+      broker: fixture.broker,
+      shells: []
+    });
     const prepareExec = async (callId: string, args: Record<string, JsonValue>, mode: "analyze" | "change" = "change") =>
       await tools.prepare(request(callId, "exec", { executable: process.execPath, ...args }), preparation(workspace, mode));
 
@@ -645,7 +681,10 @@ describe("typed workspace mutation contracts", () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-inferred-write-"));
     await mkdir(path.join(workspace, "src"));
     const fixture = brokerFixture();
-    const tools = registerBuiltinTools(new EffectToolRegistry(), { broker: fixture.broker });
+    const tools = registerBuiltinTools(new EffectToolRegistry(), {
+      broker: fixture.broker,
+      shells: []
+    });
     const plan = await tools.prepare(request("inferred-write", "exec", {
       executable: process.execPath,
       expectedChanges: ["src/generated/nested/file.ts"]
@@ -688,7 +727,10 @@ describe("typed workspace mutation contracts", () => {
     await mkdir(authorized);
     await mkdir(other);
     const fixture = brokerFixture();
-    const tools = registerBuiltinTools(new EffectToolRegistry(), { broker: fixture.broker });
+    const tools = registerBuiltinTools(new EffectToolRegistry(), {
+      broker: fixture.broker,
+      shells: []
+    });
     const call = request("drifting-plan", "exec", {
       executable: process.execPath,
       access: "write",
@@ -722,7 +764,10 @@ describe("typed workspace mutation contracts", () => {
         }
         return exited;
       };
-      const tools = registerBuiltinTools(new EffectToolRegistry(), { broker: fixture.broker });
+      const tools = registerBuiltinTools(new EffectToolRegistry(), {
+        broker: fixture.broker,
+        shells: []
+      });
       const call = request("pinned-plan", "exec", {
         executable: process.execPath,
         access: "write",
@@ -758,7 +803,10 @@ describe("typed workspace mutation contracts", () => {
         catch (error) { renameFailures.push((error as NodeJS.ErrnoException).code); }
         return { id: "process", brokerInstanceId: "broker" };
       };
-      const tools = registerBuiltinTools(new EffectToolRegistry(), { broker: fixture.broker });
+      const tools = registerBuiltinTools(new EffectToolRegistry(), {
+        broker: fixture.broker,
+        shells: []
+      });
       const foregroundCall = request("pinned-read-exec", "exec", {
         executable: process.execPath, cwd: "foreground"
       });
@@ -786,8 +834,7 @@ describe("typed workspace mutation contracts", () => {
     const tools = registerBuiltinTools(new EffectToolRegistry(), { broker: fixture.broker });
     const call = request("cmd", "shell", {
       shell: "cmd",
-      command: "echo 中文",
-      access: "readonly"
+      command: "echo 中文"
     });
 
     await tools.prepare(call, preparation(workspace));

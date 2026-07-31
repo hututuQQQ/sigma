@@ -261,7 +261,6 @@ function unifiedExecutionProperties(
       description:
         "Set true only for a completed foreground check. Validation runs in a disposable workspace view, so it must not create or update deliverables."
     },
-    ...validationIntentProperties(),
     ...(options.background === false ? {} : {
       background: {
         type: "boolean",
@@ -336,6 +335,7 @@ export function foregroundExecutionSchema(
 ): { schema: ToolDescriptor; validation: boolean } {
   const validation = kind === "validate";
   const unified = kind === "shell";
+  const writeProperties = writeContractProperties(options);
   const properties = {
     ...invocationProperties(kind, options),
     cwd: { type: "string" },
@@ -356,7 +356,15 @@ export function foregroundExecutionSchema(
     },
     ...(validation ? validationIntentProperties() : {}),
     ...(unified ? unifiedExecutionProperties(options) : {}),
-    ...writeContractProperties(options)
+    ...(unified
+      ? {
+          expectedChanges: {
+            ...(writeProperties.expectedChanges as Record<string, JsonValue>),
+            description:
+              "Exact workspace files or narrow directories this command may create, modify, or delete. With target=environment, these paths remain checkpointed while the same command changes the broker-attested disposable outer environment."
+          }
+        }
+      : writeProperties)
   };
   const required = validation || kind === "shell" ? [] : ["executable"];
   const base = executionToolSchema(

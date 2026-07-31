@@ -18,7 +18,7 @@ import type {
   ModelStreamEvent,
   ModelToolCall
 } from "agent-protocol";
-import { OPENAI_CODEX_PROVIDER_ID, type PiBillingMode } from "./models.js";
+import type { PiBillingMode } from "./models.js";
 
 interface ReplayState {
   responseId?: string;
@@ -50,9 +50,7 @@ function replayState(
   const data = state.data as Record<string, JsonValue>;
   if (!Array.isArray(data.content)) return undefined;
   if (data.model !== model.id) return undefined;
-  const apiMatches = data.api === model.api
-    || (data.api === undefined && model.provider === OPENAI_CODEX_PROVIDER_ID);
-  if (!apiMatches) return undefined;
+  if (data.api !== model.api) return undefined;
   return {
     ...(typeof data.responseId === "string" ? { responseId: data.responseId } : {}),
     content: data.content as unknown as AssistantMessage["content"]

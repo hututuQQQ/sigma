@@ -51,7 +51,8 @@ function planFor(
   const input = argumentsValue && typeof argumentsValue === "object"
     && !Array.isArray(argumentsValue) ? argumentsValue : {};
   if (name === "shell") {
-    const writes = input.access === "write";
+    const writes = Array.isArray(input.expectedChanges)
+      && input.expectedChanges.length > 0;
     const readsExternal = Array.isArray(input.readRoots)
       && input.readRoots.some((item) =>
         typeof item === "string" && item.startsWith("/etc/"));
@@ -130,20 +131,8 @@ function fakeTools(parentWorkspace: string): ToolExecutor & {
         args: { type: "array", items: { type: "string" } },
         cwd: { type: "string" },
         env: { type: "object", additionalProperties: { type: "string" } },
-        access: { type: "string", enum: ["readonly", "write"] },
         readRoots: { type: "array", items: { type: "string" } },
-        writeRoots: { type: "array", items: { type: "string" } },
         expectedChanges: { type: "array", items: { type: "string" } }
-      }),
-      descriptor("environment_shell", [
-        "process.spawn",
-        "filesystem.read",
-        "filesystem.read.external",
-        "filesystem.write",
-        "network",
-        "open_world"
-      ], {
-        command: { type: "string" }
       }),
       descriptor("edit", ["filesystem.write"], {
         path: { type: "string" }
@@ -555,9 +544,7 @@ describe("active read-only reviewer tools", () => {
             REVIEW_INPUT: logicalSource,
             UNRELATED: `${workspace}-suffix`
           },
-          access: "write",
           readRoots: [workspace],
-          writeRoots: [workspace],
           expectedChanges: [path.join(workspace, "verification.tmp")]
         }
       }, new AbortController().signal);
@@ -575,7 +562,6 @@ describe("active read-only reviewer tools", () => {
         UNRELATED: `${workspace}-suffix`
       });
       expect(projected.readRoots).toEqual([overlay]);
-      expect(projected.writeRoots).toEqual([overlay]);
       expect(projected.expectedChanges).toEqual([
         path.join(overlay, "verification.tmp")
       ]);

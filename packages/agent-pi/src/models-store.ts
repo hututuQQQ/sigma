@@ -34,6 +34,26 @@ function emptyDocument(): ModelsDocument {
   return { version: 1, providers: {} };
 }
 
+function unsupportedSchemaVersion(filePath: string, actual: unknown): Error {
+  return Object.assign(new Error(
+    `unsupported_schema_version: Sigma model catalog file expected 1, received ${String(actual)} at ${filePath}; existing data was not modified`
+  ), {
+    code: "unsupported_schema_version" as const,
+    path: filePath,
+    expected: 1,
+    actual
+  });
+}
+
+function invalidPersistedState(filePath: string): Error {
+  return Object.assign(new Error(
+    `persisted_state_invalid: Sigma model catalog file at ${filePath} does not match schema 1; existing data was not modified`
+  ), {
+    code: "persisted_state_invalid" as const,
+    path: filePath
+  });
+}
+
 function isNonNegativeFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
@@ -90,21 +110,24 @@ function isEntry(value: unknown): value is ModelsStoreEntry {
     && (entry.etag === undefined || typeof entry.etag === "string");
 }
 
-function parseDocument(value: unknown): ModelsDocument {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return emptyDocument();
-  const candidate = value as { version?: unknown; providers?: unknown };
-  if (candidate.version !== 1 || !candidate.providers
-    || typeof candidate.providers !== "object" || Array.isArray(candidate.providers)) {
-    return emptyDocument();
+function parseDocument(value: unknown, filePath: string): ModelsDocument {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw invalidPersistedState(filePath);
   }
-  return {
-    version: 1,
-    providers: Object.fromEntries(
-      Object.entries(candidate.providers).filter(
-        (entry): entry is [string, ModelsStoreEntry] => Boolean(entry[0]) && isEntry(entry[1])
-      )
-    )
-  };
+  const candidate = value as { version?: unknown; providers?: unknown };
+  if (candidate.version !== 1) {
+    throw unsupportedSchemaVersion(filePath, candidate.version);
+  }
+  if (!candidate.providers || typeof candidate.providers !== "object"
+    || Array.isArray(candidate.providers)) {
+    throw invalidPersistedState(filePath);
+  }
+  const entries = Object.entries(candidate.providers);
+  if (!entries.every((entry): entry is [string, ModelsStoreEntry] =>
+    Boolean(entry[0]) && isEntry(entry[1]))) {
+    throw invalidPersistedState(filePath);
+  }
+  return { version: 1, providers: Object.fromEntries(entries) };
 }
 
 async function readPrivateJson(filePath: string): Promise<ModelsDocument> {
@@ -123,11 +146,13 @@ async function readPrivateJson(filePath: string): Promise<ModelsDocument> {
   const handle = await open(filePath, constants.O_RDONLY | noFollow);
   try {
     const content = await handle.readFile("utf8");
+    let value: unknown;
     try {
-      return parseDocument(JSON.parse(content) as unknown);
+      value = JSON.parse(content) as unknown;
     } catch {
       throw new Error("Sigma model catalog file contains invalid JSON.");
     }
+    return parseDocument(value, filePath);
   } finally {
     await handle.close();
   }

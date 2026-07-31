@@ -2,7 +2,6 @@ import type {
   JsonValue,
   LoadedSkillResourceAccess,
   ToolCallPlan,
-  ToolDescriptor,
   ToolReceipt,
   ToolRequest
 } from "agent-protocol";
@@ -45,8 +44,7 @@ import {
 } from "./execution-process-support.js";
 import {
   environmentShellArguments,
-  environmentShellAvailable,
-  environmentShellTools
+  environmentShellAvailable
 } from "./environment-shell-tool.js";
 export type { ExecutionToolOptions } from "./execution-tool-types.js";
 export { unavailableExecutionBroker } from "./execution-tool-receipts.js";
@@ -82,38 +80,6 @@ function foregroundArguments(
   }
   const { target: _target, ...workspaceInput } = input;
   return workspaceInput;
-}
-
-function modelForegroundInputSchema(
-  kind: "exec" | "shell" | "validate",
-  schema: ToolDescriptor["inputSchema"]
-): ToolDescriptor["inputSchema"] | undefined {
-  if (kind !== "shell") return undefined;
-  const rawProperties = schema.properties;
-  if (!rawProperties || typeof rawProperties !== "object" || Array.isArray(rawProperties)) {
-    return schema;
-  }
-  const properties = { ...(rawProperties as Record<string, JsonValue>) };
-  // expectedChanges is the complete ordinary workspace-write declaration.
-  // Keep the lower-level access/writeRoots fields in the runtime descriptor
-  // for durable recovery, but do not ask the model to coordinate all three.
-  delete properties.access;
-  delete properties.writeRoots;
-  // Validation intent metadata belongs to the hidden legacy validate contract.
-  // The unified shell uses one unambiguous validation boolean.
-  delete properties.purpose;
-  delete properties.subjects;
-  delete properties.criterionIds;
-  if (properties.expectedChanges
-    && typeof properties.expectedChanges === "object"
-    && !Array.isArray(properties.expectedChanges)) {
-    properties.expectedChanges = {
-      ...properties.expectedChanges,
-      description:
-        "Exact workspace files or narrow directories this command may create, modify, or delete. With target=environment, these paths remain checkpointed while the same command changes the broker-attested disposable outer environment."
-    };
-  }
-  return { ...schema, properties };
 }
 
 interface ForegroundExecution {
@@ -221,12 +187,7 @@ export async function executeForegroundCommand(
   const input = executionArgs(request.arguments);
   const invocationMode = assertForegroundInvocation(kind, input, options);
   const { shellCommand, background } = invocationMode;
-  // A durable plan is the authority for an already-approved call. Preserve
-  // recovery of older shell calls whose intent metadata used to imply
-  // validation, while new preparations require validation=true explicitly.
-  const validation = invocationMode.validation
-    || (kind === "shell"
-      && context.callPlan?.exactEffects.includes("validation") === true);
+  const validation = invocationMode.validation;
   if (background) {
     return await executeBackgroundProcess(
       options,
@@ -265,14 +226,7 @@ export async function executeForegroundCommand(
 
 function foregroundTool(kind: "exec" | "shell" | "validate", options: ExecutionToolOptions): RegisteredEffectTool {
   const { schema, validation } = foregroundExecutionSchema(kind, options, networkProperty(options));
-  const modelInputSchema = modelForegroundInputSchema(kind, schema.inputSchema);
   return {
-    // When a verified shell exists it is the single model-visible execution
-    // surface. Legacy exec/validate names remain registered for durable
-    // recovery and for direct-only environments without a verified shell.
-    modelVisible: kind !== "shell" && availableShells(options).length > 0
-      ? false : undefined,
-    ...(modelInputSchema ? { modelInputSchema } : {}),
     descriptor: {
       ...schema,
       ...(options.writeScope === "enclosing-container"
@@ -321,13 +275,13 @@ function foregroundTool(kind: "exec" | "shell" | "validate", options: ExecutionT
 
 export function executionTools(options: ExecutionToolOptions): RegisteredEffectTool[] {
   if (availableNetworkModes(options).length === 0) return [];
+  const shellAvailable = availableShells(options).length > 0;
   return [
-    ...(options.foreground === false ? [] : [
-      foregroundTool("exec", options),
-      ...(availableShells(options).length > 0 ? [foregroundTool("shell", options)] : []),
-      foregroundTool("validate", options),
-      ...environmentShellTools(options, executeForegroundCommand)
-    ]),
+    ...(options.foreground === false
+      ? []
+      : shellAvailable
+        ? [foregroundTool("shell", options)]
+        : [foregroundTool("exec", options), foregroundTool("validate", options)]),
     ...(options.background === false
       ? []
       : backgroundProcessTools(options, executeBackgroundProcess))

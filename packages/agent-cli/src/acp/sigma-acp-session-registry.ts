@@ -16,29 +16,53 @@ interface PersistedAcpIndex {
   sessions: PersistedAcpSession[];
 }
 
-function normalizeIndex(value: unknown): PersistedAcpIndex {
+function unsupportedSchemaVersion(filePath: string, actual: unknown): Error {
+  return Object.assign(new Error(
+    `unsupported_schema_version: Sigma ACP session index expected ${INDEX_VERSION}, received ${String(actual)} at ${filePath}; existing data was not modified`
+  ), {
+    code: "unsupported_schema_version" as const,
+    path: filePath,
+    expected: INDEX_VERSION,
+    actual
+  });
+}
+
+function invalidPersistedState(filePath: string): Error {
+  return Object.assign(new Error(
+    `persisted_state_invalid: Sigma ACP session index at ${filePath} does not match schema ${INDEX_VERSION}; existing data was not modified`
+  ), {
+    code: "persisted_state_invalid" as const,
+    path: filePath
+  });
+}
+
+function isPersistedSession(item: unknown): item is PersistedAcpSession {
+  if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+  const record = item as Record<string, unknown>;
+  return typeof record.sessionId === "string"
+    && typeof record.runtimeSessionId === "string"
+    && typeof record.cwd === "string"
+    && typeof record.modelId === "string"
+    && (record.mode === "analyze" || record.mode === "change")
+    && typeof record.createdAt === "string"
+    && typeof record.updatedAt === "string"
+    && typeof record.started === "boolean"
+    && Number.isSafeInteger(record.lastSeq)
+    && Number(record.lastSeq) >= 0;
+}
+
+function parseIndex(value: unknown, filePath: string): PersistedAcpIndex {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return { version: INDEX_VERSION, sessions: [] };
+    throw invalidPersistedState(filePath);
   }
   const input = value as Record<string, unknown>;
-  if (input.version !== INDEX_VERSION || !Array.isArray(input.sessions)) {
-    return { version: INDEX_VERSION, sessions: [] };
+  if (input.version !== INDEX_VERSION) {
+    throw unsupportedSchemaVersion(filePath, input.version);
   }
-  const sessions = input.sessions.filter((item): item is PersistedAcpSession => {
-    if (!item || typeof item !== "object" || Array.isArray(item)) return false;
-    const record = item as Record<string, unknown>;
-    return typeof record.sessionId === "string"
-      && typeof record.runtimeSessionId === "string"
-      && typeof record.cwd === "string"
-      && typeof record.modelId === "string"
-      && (record.mode === "analyze" || record.mode === "change")
-      && typeof record.createdAt === "string"
-      && typeof record.updatedAt === "string"
-      && typeof record.started === "boolean"
-      && Number.isSafeInteger(record.lastSeq)
-      && Number(record.lastSeq) >= 0;
-  });
-  return { version: INDEX_VERSION, sessions };
+  if (!Array.isArray(input.sessions) || !input.sessions.every(isPersistedSession)) {
+    throw invalidPersistedState(filePath);
+  }
+  return { version: INDEX_VERSION, sessions: [...input.sessions] };
 }
 
 export class SigmaAcpSessionRegistry {
@@ -83,13 +107,25 @@ export class SigmaAcpSessionRegistry {
     const key = path.resolve(storeRootDir);
     const cached = this.indexes.get(key);
     if (cached) return cached;
+    const filePath = path.join(key, SESSION_INDEX_FILE);
+    let content: string;
+    try {
+      content = await readFile(filePath, "utf8");
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+        const empty: PersistedAcpIndex = { version: INDEX_VERSION, sessions: [] };
+        this.indexes.set(key, empty);
+        return empty;
+      }
+      throw error;
+    }
     let value: unknown;
     try {
-      value = JSON.parse(await readFile(path.join(key, SESSION_INDEX_FILE), "utf8")) as unknown;
-    } catch (error) {
-      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+      value = JSON.parse(content) as unknown;
+    } catch {
+      throw invalidPersistedState(filePath);
     }
-    const index = normalizeIndex(value);
+    const index = parseIndex(value, filePath);
     this.indexes.set(key, index);
     for (const record of index.sessions) this.sessionRoots.set(record.sessionId, key);
     return index;

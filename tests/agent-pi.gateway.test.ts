@@ -390,6 +390,21 @@ describe("OpenAI Codex subscription gateway", () => {
           data: { opaque: "cross-provider-state-must-be-discarded" }
         }
       },
+      {
+        role: "assistant",
+        content: "A prior answer with an obsolete replay shape.",
+        providerState: {
+          provider: OPENAI_CODEX_PROVIDER_ID,
+          version: 1,
+          data: {
+            model: OPENAI_CODEX_DEFAULT_MODEL,
+            content: [{
+              type: "text",
+              text: "api-less-provider-state-must-be-discarded"
+            }]
+          }
+        }
+      },
       { role: "user", content: "Inspect this repository." }
     ];
     const first = await gateway.complete({
@@ -469,6 +484,10 @@ describe("OpenAI Codex subscription gateway", () => {
     expect(captured[0]!.body.parallel_tool_calls).toBe(true);
     expect(JSON.stringify(captured[0]!.body.input))
       .not.toContain("cross-provider-state-must-be-discarded");
+    expect(JSON.stringify(captured[0]!.body.input))
+      .not.toContain("api-less-provider-state-must-be-discarded");
+    expect(JSON.stringify(captured[0]!.body.input))
+      .toContain("A prior answer with an obsolete replay shape.");
     expect(JSON.stringify(captured[1]!.body.input)).toContain("opaque-reasoning-signature");
     expect(JSON.stringify(captured[1]!.body.input)).toContain("README contents");
   });
@@ -1046,6 +1065,73 @@ describe("OpenAI Codex credential persistence", () => {
       .rejects.toThrow("Sigma credential file contains invalid JSON.");
     await expect(new FileModelsStore({ filePath: modelsPath }).read("radius"))
       .rejects.toThrow("Sigma model catalog file contains invalid JSON.");
+  });
+
+  it("rejects unsupported and malformed persisted provider state without rewriting it", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "sigma-current-provider-state-"));
+    temporaryDirectories.push(directory);
+    const stateDirectory = path.join(directory, ".sigma");
+    await mkdir(stateDirectory, { recursive: true, mode: 0o700 });
+    const credentialPath = path.join(stateDirectory, "auth.json");
+    const modelsPath = path.join(stateDirectory, "models.json");
+    const unsupportedCredential = `${JSON.stringify({
+      version: 2,
+      credentials: {
+        provider: { type: "api_key", key: "unsupported-secret-key" }
+      }
+    })}\n`;
+    const unsupportedModels = `${JSON.stringify({
+      version: 2,
+      providers: {
+        provider: { secret: "unsupported-provider-payload" }
+      }
+    })}\n`;
+    await writeFile(credentialPath, unsupportedCredential, {
+      encoding: "utf8",
+      mode: 0o600
+    });
+    await writeFile(modelsPath, unsupportedModels, {
+      encoding: "utf8",
+      mode: 0o600
+    });
+
+    const credentialError = await new FileCredentialStore({ filePath: credentialPath })
+      .list().then(() => undefined, (error: unknown) => error);
+    expect(credentialError).toMatchObject({
+      code: "unsupported_schema_version",
+      path: credentialPath,
+      expected: 1,
+      actual: 2
+    });
+    expect(String(credentialError)).not.toContain("unsupported-secret-key");
+    expect(await readFile(credentialPath, "utf8")).toBe(unsupportedCredential);
+
+    const modelsError = await new FileModelsStore({ filePath: modelsPath })
+      .read("provider").then(() => undefined, (error: unknown) => error);
+    expect(modelsError).toMatchObject({
+      code: "unsupported_schema_version",
+      path: modelsPath,
+      expected: 1,
+      actual: 2
+    });
+    expect(String(modelsError)).not.toContain("unsupported-provider-payload");
+    expect(await readFile(modelsPath, "utf8")).toBe(unsupportedModels);
+
+    await writeFile(credentialPath, `${JSON.stringify({
+      version: 1,
+      credentials: {
+        provider: { type: "oauth", access: "incomplete-secret" }
+      }
+    })}\n`, { encoding: "utf8", mode: 0o600 });
+    await expect(new FileCredentialStore({ filePath: credentialPath }).list())
+      .rejects.toMatchObject({ code: "persisted_state_invalid", path: credentialPath });
+
+    await writeFile(modelsPath, `${JSON.stringify({
+      version: 1,
+      providers: { provider: { models: [{}] } }
+    })}\n`, { encoding: "utf8", mode: 0o600 });
+    await expect(new FileModelsStore({ filePath: modelsPath }).read("provider"))
+      .rejects.toMatchObject({ code: "persisted_state_invalid", path: modelsPath });
   });
 
   it("atomically persists a validated dynamic model catalog", async () => {

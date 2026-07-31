@@ -156,9 +156,7 @@ function validationRequest(): ModelResponse {
           command: "npm run build",
           cwd: ".",
           network: "none",
-          validation: true,
-          purpose: "Validate the requested CLI test change.",
-          subjects: ["approval-result.md"]
+          validation: true
         }
       }]
     },
