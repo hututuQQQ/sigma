@@ -7,6 +7,7 @@ import {
   BUILTIN_MODEL_SPECS,
   defaultModel,
   loadPiRuntimeModelCatalog,
+  type ModelReasoningEffort,
   type ModelSpec
 } from "agent-model";
 import type { RuntimeClient } from "agent-protocol";
@@ -81,7 +82,13 @@ function catalogFor(
             : spec.capabilities.reasoning
             ? "reasoning"
             : "standard"
-      }`
+      }`,
+      ...(spec.supportedReasoningEfforts
+        ? { supportedReasoningEfforts: spec.supportedReasoningEfforts }
+        : {}),
+      ...(spec.defaultReasoningEffort
+        ? { defaultReasoningEffort: spec.defaultReasoningEffort }
+        : {})
     })),
     ...config.modelSpecs.map((spec) => ({
       id: modelId(spec.providerId, spec.upstreamModel),
@@ -120,7 +127,11 @@ export async function runAcpCommand(
   const catalogSpecs = deps.runtime || deps.runtimeFactoryDeps?.gatewayFactory
     ? BUILTIN_MODEL_SPECS
     : (await loadPiRuntimeModelCatalog()).specs;
-  const runtimeFactory = async (cwd: string, selectedId: string): Promise<SigmaAcpRuntimeHandle> => {
+  const runtimeFactory = async (
+    cwd: string,
+    selectedId: string,
+    reasoningEffort?: ModelReasoningEffort
+  ): Promise<SigmaAcpRuntimeHandle> => {
     const trustMessage = trustFailure(baseFlags, cwd);
     if (trustMessage) throw new Error(trustMessage);
     if (deps.runtime) {
@@ -139,7 +150,10 @@ export async function runAcpCommand(
       provider: selection.provider,
       model: selection.model
     });
-    return await createConfiguredRuntime(config, deps.runtimeFactoryDeps, {
+    return await createConfiguredRuntime({
+      ...config,
+      ...(reasoningEffort ? { reasoningEffort } : {})
+    }, deps.runtimeFactoryDeps, {
       surface: "acp",
       interactiveApprovals: true
     });

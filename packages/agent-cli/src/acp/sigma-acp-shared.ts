@@ -1,7 +1,9 @@
 import * as acp from "@agentclientprotocol/sdk";
+import type { ModelReasoningEffort } from "agent-model";
 import type { RunMode, RunOutcome, RuntimeClient } from "agent-protocol";
 
 export const MODEL_CONFIG_ID = "sigma.model";
+export const REASONING_EFFORT_CONFIG_ID = "sigma.reasoning_effort";
 export const SIGMA_RUNTIME_REQUEST_ERROR = -32001;
 
 export interface SigmaAcpRuntimeHandle {
@@ -15,6 +17,8 @@ export interface SigmaAcpModelOption {
   id: string;
   name: string;
   description?: string;
+  supportedReasoningEfforts?: readonly ModelReasoningEffort[];
+  defaultReasoningEffort?: ModelReasoningEffort;
 }
 
 export interface SigmaAcpModelCatalog {
@@ -24,7 +28,11 @@ export interface SigmaAcpModelCatalog {
 
 export interface SigmaAcpAgentOptions {
   agentVersion: string;
-  runtimeFactory(cwd: string, modelId: string): Promise<SigmaAcpRuntimeHandle>;
+  runtimeFactory(
+    cwd: string,
+    modelId: string,
+    reasoningEffort?: ModelReasoningEffort
+  ): Promise<SigmaAcpRuntimeHandle>;
   modelCatalog(cwd: string): Promise<SigmaAcpModelCatalog>;
   stderr?: NodeJS.WritableStream;
 }
@@ -34,6 +42,7 @@ export interface PersistedAcpSession {
   runtimeSessionId: string;
   cwd: string;
   modelId: string;
+  reasoningEffort?: ModelReasoningEffort;
   mode: RunMode;
   title?: string;
   createdAt: string;
@@ -91,9 +100,10 @@ export function sessionModes(mode: RunMode): acp.SessionModeState {
 
 export function modelConfig(
   catalog: SigmaAcpModelCatalog,
-  currentModelId: string
+  currentModelId: string,
+  currentReasoningEffort?: ModelReasoningEffort
 ): acp.SessionConfigOption[] {
-  return [{
+  const options: acp.SessionConfigOption[] = [{
     id: MODEL_CONFIG_ID,
     name: "Model",
     description: "Model used by Sigma Runtime.",
@@ -106,6 +116,51 @@ export function modelConfig(
       ...(option.description ? { description: option.description } : {})
     }))
   }];
+  const model = catalog.options.find((option) => option.id === currentModelId);
+  const supported = model?.supportedReasoningEfforts ?? [];
+  const reasoningEffort = reasoningEffortForModel(
+    catalog,
+    currentModelId,
+    currentReasoningEffort
+  );
+  if (supported.length > 0 && reasoningEffort) {
+    const labels: Record<ModelReasoningEffort, string> = {
+      none: "None",
+      minimal: "Minimal",
+      low: "Low",
+      medium: "Medium",
+      high: "High",
+      xhigh: "Extra High",
+      max: "Max"
+    };
+    options.push({
+      id: REASONING_EFFORT_CONFIG_ID,
+      name: "Reasoning",
+      description: "Reasoning effort used by Sigma Runtime for this model.",
+      category: "thought_level",
+      type: "select",
+      currentValue: reasoningEffort,
+      options: supported.map((effort) => ({
+        value: effort,
+        name: labels[effort]
+      }))
+    });
+  }
+  return options;
+}
+
+export function reasoningEffortForModel(
+  catalog: SigmaAcpModelCatalog,
+  modelId: string,
+  requested?: ModelReasoningEffort
+): ModelReasoningEffort | undefined {
+  const model = catalog.options.find((option) => option.id === modelId);
+  const supported = model?.supportedReasoningEfforts ?? [];
+  if (requested && supported.includes(requested)) return requested;
+  if (model?.defaultReasoningEffort && supported.includes(model.defaultReasoningEffort)) {
+    return model.defaultReasoningEffort;
+  }
+  return supported[0];
 }
 
 export function promptText(prompt: acp.ContentBlock[]): string {

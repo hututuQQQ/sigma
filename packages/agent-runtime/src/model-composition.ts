@@ -8,6 +8,7 @@ import {
   RoutedModelGateway,
   type ModelRoute,
   type ModelRouteConstraints,
+  type ModelReasoningEffort,
   type ModelSpec
 } from "agent-model";
 import type { ModelExecutionRole, ModelGateway } from "agent-protocol";
@@ -27,6 +28,7 @@ export interface ModelCompositionConfig {
   explicitSingleModelRoute?: boolean;
   modelSpecs?: readonly ModelSpecConfigValue[];
   modelRoutes?: readonly ModelRouteConfigValue[];
+  reasoningEffort?: ModelReasoningEffort;
   budget?: { maxCostMicroUsd: number; allowUnpricedCosts?: boolean };
 }
 
@@ -37,6 +39,7 @@ interface ModelGatewayFactoryOptions {
   requestTimeoutMs: number;
   idleTimeoutMs: number;
   activeStreamTimeoutMs?: number;
+  reasoningEffort?: ModelReasoningEffort;
 }
 
 export interface ModelCompositionDeps {
@@ -225,7 +228,8 @@ function gatewayOptions(config: ModelCompositionConfig): Omit<
     idleTimeoutMs: config.streamIdleSec * 1_000,
     ...(config.streamActiveSec && config.streamActiveSec > 0
       ? { activeStreamTimeoutMs: config.streamActiveSec * 1_000 }
-      : {})
+      : {}),
+    ...(config.reasoningEffort ? { reasoningEffort: config.reasoningEffort } : {})
   };
 }
 

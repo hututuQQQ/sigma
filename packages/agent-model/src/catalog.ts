@@ -1,4 +1,8 @@
-import { listPiModels, type PiModelDescriptor } from "agent-pi";
+import {
+  listPiModels,
+  type PiModelDescriptor,
+  type PiReasoningEffort
+} from "agent-pi";
 import type {
   ModelBillingMode,
   ModelCapabilities,
@@ -104,7 +108,11 @@ export interface ModelSpec {
   capabilities: ModelCapabilities;
   tokenizer: TokenizerMetadata;
   pricing?: ModelPricing;
+  supportedReasoningEfforts?: readonly PiReasoningEffort[];
+  defaultReasoningEffort?: PiReasoningEffort;
 }
+
+export type ModelReasoningEffort = PiReasoningEffort;
 
 export interface ModelRoute {
   id: string;
@@ -145,6 +153,12 @@ export function modelSpecsForPiCatalog(
       billingModes: model.billingModes,
       capabilities: model.capabilities,
       tokenizer: approximateTokenizer,
+      ...(model.supportedReasoningEfforts.length > 0
+        ? { supportedReasoningEfforts: model.supportedReasoningEfforts }
+        : {}),
+      ...(model.defaultReasoningEffort
+        ? { defaultReasoningEffort: model.defaultReasoningEffort }
+        : {}),
       ...(billingMode === "metered" && model.pricing
         ? { pricing: model.pricing }
         : {})

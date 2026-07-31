@@ -7,7 +7,8 @@ import {
   PiModelGateway,
   type CredentialStore,
   type Models,
-  type ModelsStore
+  type ModelsStore,
+  type PiReasoningEffort
 } from "agent-pi";
 import type { ModelCapabilities, ModelGateway } from "agent-protocol";
 import {
@@ -31,6 +32,7 @@ export interface CreateGatewayOptions {
   idleTimeoutMs?: number;
   activeStreamTimeoutMs?: number;
   capabilities?: ModelCapabilities;
+  reasoningEffort?: PiReasoningEffort;
 }
 
 export type CreateCatalogGatewayOptions = Omit<CreateGatewayOptions, "provider" | "model">;
@@ -110,6 +112,7 @@ export interface PiRuntimeModelCatalog {
     requestTimeoutMs: number;
     idleTimeoutMs: number;
     activeStreamTimeoutMs?: number;
+    reasoningEffort?: PiReasoningEffort;
   }): ModelGateway;
 }
 

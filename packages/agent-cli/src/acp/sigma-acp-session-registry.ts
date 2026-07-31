@@ -1,15 +1,18 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import type { ModelReasoningEffort } from "agent-model";
 import type {
   PersistedAcpSession,
   ResolvedSession,
   SigmaAcpAgentOptions,
   SigmaAcpRuntimeHandle
 } from "./sigma-acp-shared.js";
+import { reasoningEffortForModel } from "./sigma-acp-shared.js";
 
 const SESSION_INDEX_FILE = "acp-sessions.json";
 const INDEX_VERSION = 1;
+const REASONING_EFFORTS = new Set(["none", "low", "medium", "high", "xhigh", "max"]);
 
 interface PersistedAcpIndex {
   version: typeof INDEX_VERSION;
@@ -36,6 +39,11 @@ function invalidPersistedState(filePath: string): Error {
   });
 }
 
+function isPersistedReasoningEffort(value: unknown): boolean {
+  return value === undefined
+    || (typeof value === "string" && REASONING_EFFORTS.has(value));
+}
+
 function isPersistedSession(item: unknown): item is PersistedAcpSession {
   if (!item || typeof item !== "object" || Array.isArray(item)) return false;
   const record = item as Record<string, unknown>;
@@ -43,6 +51,7 @@ function isPersistedSession(item: unknown): item is PersistedAcpSession {
     && typeof record.runtimeSessionId === "string"
     && typeof record.cwd === "string"
     && typeof record.modelId === "string"
+    && isPersistedReasoningEffort(record.reasoningEffort)
     && (record.mode === "analyze" || record.mode === "change")
     && typeof record.createdAt === "string"
     && typeof record.updatedAt === "string"
@@ -92,11 +101,15 @@ export class SigmaAcpSessionRegistry {
     this.attached.delete(this.attachmentKey(record));
   }
 
-  handle(cwd: string, modelId: string): Promise<SigmaAcpRuntimeHandle> {
-    const key = `${path.resolve(cwd)}\0${modelId}`;
+  handle(
+    cwd: string,
+    modelId: string,
+    reasoningEffort?: ModelReasoningEffort
+  ): Promise<SigmaAcpRuntimeHandle> {
+    const key = `${path.resolve(cwd)}\0${modelId}\0${reasoningEffort ?? ""}`;
     let handle = this.handles.get(key);
     if (!handle) {
-      handle = this.options.runtimeFactory(path.resolve(cwd), modelId);
+      handle = this.options.runtimeFactory(path.resolve(cwd), modelId, reasoningEffort);
       this.handles.set(key, handle);
       void handle.catch(() => this.handles.delete(key));
     }
@@ -164,15 +177,22 @@ export class SigmaAcpSessionRegistry {
       const knownIndex = await this.index(knownRoot);
       const knownRecord = knownIndex.sessions.find((candidate) => candidate.sessionId === sessionId);
       if (knownRecord) {
+        const catalog = await this.options.modelCatalog(knownRecord.cwd);
+        const reasoningEffort = reasoningEffortForModel(
+          catalog,
+          knownRecord.modelId,
+          knownRecord.reasoningEffort
+        );
         return {
           record: knownRecord,
-          handle: await this.handle(knownRecord.cwd, knownRecord.modelId)
+          handle: await this.handle(knownRecord.cwd, knownRecord.modelId, reasoningEffort)
         };
       }
     }
     const cwd = path.resolve(cwdHint ?? process.cwd());
     const catalog = await this.options.modelCatalog(cwd);
-    const defaultHandle = await this.handle(cwd, catalog.currentModelId);
+    const defaultReasoningEffort = reasoningEffortForModel(catalog, catalog.currentModelId);
+    const defaultHandle = await this.handle(cwd, catalog.currentModelId, defaultReasoningEffort);
     const index = await this.index(defaultHandle.storeRootDir);
     let record = index.sessions.find((candidate) => candidate.sessionId === sessionId);
     if (!record) {
@@ -184,6 +204,7 @@ export class SigmaAcpSessionRegistry {
         runtimeSessionId: sessionId,
         cwd: native.workspacePath,
         modelId: catalog.currentModelId,
+        ...(defaultReasoningEffort ? { reasoningEffort: defaultReasoningEffort } : {}),
         mode: native.mode,
         ...(native.lastMessage ? { title: native.lastMessage.slice(0, 96) } : {}),
         createdAt: native.updatedAt,
@@ -199,8 +220,14 @@ export class SigmaAcpSessionRegistry {
     return {
       record,
       handle: record.modelId === catalog.currentModelId
+        && reasoningEffortForModel(catalog, record.modelId, record.reasoningEffort)
+          === defaultReasoningEffort
         ? defaultHandle
-        : await this.handle(record.cwd, record.modelId)
+        : await this.handle(
+            record.cwd,
+            record.modelId,
+            reasoningEffortForModel(catalog, record.modelId, record.reasoningEffort)
+          )
     };
   }
 
@@ -225,6 +252,6 @@ export class SigmaAcpSessionRegistry {
   }
 
   private attachmentKey(record: PersistedAcpSession): string {
-    return `${record.modelId}\0${record.runtimeSessionId}`;
+    return `${record.modelId}\0${record.reasoningEffort ?? ""}\0${record.runtimeSessionId}`;
   }
 }

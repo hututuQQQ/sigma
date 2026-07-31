@@ -7,6 +7,7 @@ import type {
 } from "agent-config";
 import type { ModelGateway, RuntimeClient } from "agent-protocol";
 import { loadPiRuntimeModelCatalog } from "agent-model";
+import type { ModelReasoningEffort } from "agent-model";
 import type {
   BrokerDoctorReport,
   ContainerEngine,
@@ -72,6 +73,7 @@ export interface RuntimeCompositionConfig {
   explicitSingleModelRoute?: boolean;
   modelSpecs?: readonly ModelSpecConfigValue[];
   modelRoutes?: readonly ModelRouteConfigValue[];
+  reasoningEffort?: ModelReasoningEffort;
   budget?: {
     maxInputTokens: number; maxOutputTokens: number; maxCostMicroUsd: number;
     allowUnpricedCosts?: boolean;
@@ -81,7 +83,8 @@ export interface RuntimeCompositionConfig {
 }
 export interface RuntimeFactoryDeps {
   gatewayFactory?: (options: { provider: string; model: string; maxRetries: number;
-    requestTimeoutMs: number; idleTimeoutMs: number; activeStreamTimeoutMs?: number }) => ModelGateway;
+    requestTimeoutMs: number; idleTimeoutMs: number; activeStreamTimeoutMs?: number;
+    reasoningEffort?: ModelReasoningEffort }) => ModelGateway;
   stateRootDir?: string;
   executionBroker?: ExecutionBroker;
   /** Trusted product launcher input. Never derive this from workspace, model,

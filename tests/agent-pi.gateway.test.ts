@@ -352,6 +352,20 @@ describe("OpenAI Codex subscription gateway", () => {
       "gpt-5.6-sol",
       "gpt-5.6-terra"
     ]);
+    expect(models.find((model) =>
+      model.providerId === OPENAI_CODEX_PROVIDER_ID
+      && model.id === "gpt-5.6-sol"
+    )).toMatchObject({
+      supportedReasoningEfforts: ["none", "low", "medium", "high", "xhigh", "max"],
+      defaultReasoningEffort: "medium"
+    });
+    expect(models.find((model) =>
+      model.providerId === "google"
+      && model.id === "gemini-3-pro-preview"
+    )).toMatchObject({
+      supportedReasoningEfforts: ["low", "high"],
+      defaultReasoningEffort: "low"
+    });
   });
 
   it("uses only the ChatGPT Codex SSE endpoint and durably replays opaque state", async () => {
@@ -374,7 +388,8 @@ describe("OpenAI Codex subscription gateway", () => {
     const gateway = new PiModelGateway({
       provider: OPENAI_CODEX_PROVIDER_ID,
       model: OPENAI_CODEX_DEFAULT_MODEL,
-      credentials: new MemoryCredentialStore(oauth())
+      credentials: new MemoryCredentialStore(oauth()),
+      reasoningEffort: "max"
     });
     const sessionId = "sigma-session-affinity";
     const controller = new AbortController();
@@ -478,6 +493,11 @@ describe("OpenAI Codex subscription gateway", () => {
       request.headers.get("x-client-request-id") === sessionId)).toBe(true);
     expect(captured.every((request) =>
       request.body.prompt_cache_key === sessionId)).toBe(true);
+    expect(captured.every((request) =>
+      JSON.stringify(request.body.reasoning) === JSON.stringify({
+        effort: "max",
+        summary: "auto"
+      }))).toBe(true);
     expect(captured[0]!.body.instructions).toBe(
       "<system>\nSystem first.\n</system>\n\n<developer>\nDeveloper second.\n</developer>"
     );
