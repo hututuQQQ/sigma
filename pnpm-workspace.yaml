@@ -22,7 +22,11 @@ onlyBuiltDependencies:
   - tree-sitter-rust
   - tree-sitter-typescript
 allowBuilds:
+  # Published Pi dependencies already include their generated runtime assets.
+  # These install hooks are informational/no-op and are not required at runtime.
+  '@google/genai': false
   esbuild: true
+  protobufjs: false
   # The package's only install hook prints an OpenCollective message; OCR uses
   # its already-published JavaScript/WASM assets and needs no build step.
   tesseract.js: false

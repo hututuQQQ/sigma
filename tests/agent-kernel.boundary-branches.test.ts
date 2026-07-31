@@ -147,14 +147,35 @@ describe("agent-kernel boundary contracts", () => {
       content: 1,
       reasoningContent: "reason",
       toolCallId: "result",
-      toolCalls: [{ id: "call", name: "read" }]
+      toolCalls: [{ id: "call", name: "read" }],
+      providerState: {
+        provider: "openai-codex",
+        version: 1,
+        data: {
+          responseId: "response-1",
+          replaySignatures: ["opaque-signature"]
+        }
+      }
     })).toEqual({
       role: "assistant",
       content: "",
       reasoningContent: "reason",
       toolCallId: "result",
-      toolCalls: [{ id: "call", name: "read", arguments: null }]
+      toolCalls: [{ id: "call", name: "read", arguments: null }],
+      providerState: {
+        provider: "openai-codex",
+        version: 1,
+        data: {
+          responseId: "response-1",
+          replaySignatures: ["opaque-signature"]
+        }
+      }
     });
+    expect(modelMessage({
+      role: "assistant",
+      content: "done",
+      providerState: { provider: "", version: 1, data: null }
+    })).toEqual({ role: "assistant", content: "done" });
     expect(modelTurn({})).toBeNull();
     expect(modelTurn({ turnId: 1, effectRevision: 0 })).toEqual({ turnId: 1, effectRevision: 0 });
     const state = initial();

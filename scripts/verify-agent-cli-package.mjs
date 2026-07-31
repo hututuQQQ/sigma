@@ -62,7 +62,7 @@ function assertContains(label, content, expected) {
 }
 
 function runHostCliVersion(bundleDir, spawn = spawnSync) {
-  const cliEntry = path.join(bundleDir, "packages", "agent-cli", "dist", "index.js");
+  const cliEntry = path.join(bundleDir, "packages", "agent-cli", "dist", "bin.js");
   const result = spawn(process.execPath, [cliEntry, "version", "--json"], {
     cwd: bundleDir,
     encoding: "utf8",
@@ -1199,6 +1199,7 @@ export async function verifyAgentCliPackage(options = {}) {
     `${bundleName}/LICENSE`,
     `${bundleName}/package.json`,
     `${bundleName}/package-metadata.json`,
+    `${bundleName}/packages/agent-cli/dist/bin.js`,
     ...baseWorkspacePackages.map((name) => `${bundleName}/packages/${name}/dist/index.js`),
     ...baseWorkspacePackages.filter((name) => name !== "agent-cli")
       .map((name) => `${bundleName}/node_modules/${name}/package.json`)
@@ -1249,13 +1250,13 @@ export async function verifyAgentCliPackage(options = {}) {
     requireEntries(entries, requiredEntries);
 
     if (targetPlatform === "win32") {
-      assertContains("bin/agent.cmd", wrapper, '"%NODE_EXE%" "%SCRIPT_DIR%..\\packages\\agent-cli\\dist\\index.js" %*');
+      assertContains("bin/agent.cmd", wrapper, '"%NODE_EXE%" "%SCRIPT_DIR%..\\packages\\agent-cli\\dist\\bin.js" %*');
       assertContains("bin/agent.cmd", wrapper, 'set "PATH=%SCRIPT_DIR%;%PATH%"');
       assertContains("bin/agent.cmd", wrapper, 'set "NODE_OPTIONS=--preserve-symlinks-main"');
       assertContains("bin/agent.cmd", wrapper, 'set "NODE_PATH="');
       if (wrapper.toLowerCase().includes("where node")) throw new Error("bin/agent.cmd must not fall back to a system Node runtime.");
     } else {
-      assertContains("bin/agent", wrapper, 'exec "$NODE" "$SCRIPT_DIR/../packages/agent-cli/dist/index.js" "$@"');
+      assertContains("bin/agent", wrapper, 'exec "$NODE" "$SCRIPT_DIR/../packages/agent-cli/dist/bin.js" "$@"');
       assertContains("bin/agent", wrapper, 'export PATH="$SCRIPT_DIR${PATH:+:$PATH}"');
       assertContains("bin/agent", wrapper, "unset NODE_OPTIONS NODE_PATH");
       if (wrapper.includes("command -v node")) throw new Error("bin/agent must not fall back to a system Node runtime.");

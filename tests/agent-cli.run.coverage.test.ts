@@ -12,7 +12,6 @@ import type {
   ModelToolDefinition
 } from "../packages/agent-protocol/src/index.js";
 import { runCommand, runResult } from "../packages/agent-cli/src/commands/run.js";
-import { createModelGateway } from "../packages/agent-model/src/index.js";
 import { describe, expect, it } from "vitest";
 import { typedCompletion } from "./helpers/typed-evidence.js";
 import { createHostExecutionBroker } from "./helpers/host-execution-broker.js";
@@ -80,6 +79,33 @@ class ScriptedGateway implements ModelGateway {
 
   async countTokens(messages: ModelMessage[], tools: ModelToolDefinition[] = []): Promise<number> {
     return JSON.stringify({ messages, tools }).length / 4;
+  }
+}
+
+class IncompleteStreamGateway implements ModelGateway {
+  readonly provider = "deepseek";
+  readonly model = "deepseek-v4-pro";
+  readonly capabilities: ModelCapabilities = {
+    contextWindowTokens: 16_000,
+    maxOutputTokens: 2_000,
+    tools: true,
+    parallelTools: true,
+    reasoning: true,
+    structuredOutput: false,
+    promptCache: true,
+    tokenizer: "approximate"
+  };
+
+  async complete(_request: ModelRequest): Promise<ModelResponse> {
+    throw new Error("not used");
+  }
+
+  async *stream(_request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    yield { type: "reasoning", delta: "unfinished" };
+  }
+
+  async countTokens(messages: ModelMessage[], tools: ModelToolDefinition[] = []): Promise<number> {
+    return Math.ceil(JSON.stringify({ messages, tools }).length / 4);
   }
 }
 
@@ -437,6 +463,8 @@ describe("run command branch coverage", () => {
     const code = await runCommand([
       "fail safely",
       "--workspace", root,
+      "--provider", "deepseek",
+      "--model", "deepseek-v4-pro",
       "--permission-mode", "auto",
       "--output-format", "json"
     ], { stdin, stdout, stderr, ...runDeps([new Error("provider unavailable")]) });
@@ -456,30 +484,18 @@ describe("run command branch coverage", () => {
     const stderr = new Capture();
     const stdin = Object.assign(new PassThrough(), { isTTY: true });
     stdout.isTTY = true;
-    let requestBody: Record<string, unknown> | undefined;
     const code = await runCommand([
       "fail an incomplete stream safely",
       "--workspace", root,
+      "--provider", "deepseek",
+      "--model", "deepseek-v4-pro",
       "--permission-mode", "auto",
       "--output-format", "stream-json"
     ], {
       stdin,
       stdout,
       stderr,
-      gatewayFactory: () => createModelGateway({
-        provider: "deepseek",
-        apiKey: "secret",
-        maxRetries: 0,
-        fetchImpl: (async (_url, init) => {
-          requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
-          return new Response(
-            `data: ${JSON.stringify({
-              choices: [{ delta: { reasoning_content: "unfinished" }, finish_reason: null }]
-            })}\n\n`,
-            { status: 200, headers: { "content-type": "text/event-stream" } }
-          );
-        }) as typeof fetch
-      }),
+      gatewayFactory: () => new IncompleteStreamGateway(),
       executionBroker: createHostExecutionBroker()
     });
     const records = stdout.text().trim().split(/\r?\n/).map((line) => JSON.parse(line) as {
@@ -492,33 +508,21 @@ describe("run command branch coverage", () => {
 
     expect(code).toBe(1);
     expect(records.find((record) => record.type === "model.failed")?.payload?.code)
-      .toBe("model_stream_protocol_error");
+      .toBe("model_stream_incomplete");
     expect(records.find((record) => record.type === "model.failed")?.payload?.diagnostics).toMatchObject({
       provider: "deepseek",
       model: "deepseek-v4-pro",
       category: "protocol",
-      httpStatus: 200,
       doneReceived: false,
-      transportEnded: true,
       lastEventType: "reasoning",
       hasContent: false,
       hasReasoning: true,
-      hasToolCall: false,
-      retryAttempts: 1,
-      sseFrames: 1,
-      ssePayloads: 1,
-      sseTrailingBytes: 0
+      hasToolCall: false
     });
     expect(records.find((record) => record.type === "budget.committed")?.payload?.mutation?.totals?.reserved)
       .toMatchObject({ inputTokens: 0, outputTokens: 0, costMicroUsd: 0, modelTurns: 0 });
     expect(records.some((record) => record.type === "run.failed")).toBe(true);
     expect(records.at(-1)).toMatchObject({ type: "result", status: "error" });
-    expect(requestBody).toMatchObject({
-      stream: true,
-      thinking: { type: "enabled" },
-      tools: expect.any(Array)
-    });
-    expect((requestBody?.tools as unknown[]).length).toBeGreaterThan(0);
   });
 
   it("reports prompt-file read failures through stderr", async () => {

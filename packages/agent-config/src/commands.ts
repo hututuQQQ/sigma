@@ -5,7 +5,7 @@ export interface CommandDefinition {
   aliases?: string[];
   summary: string;
   mode?: RunMode;
-  handler: "run" | "tui" | "acp" | "session" | "replay" | "doctor" | "sandbox" | "version" | "init" | "completion";
+  handler: "run" | "tui" | "acp" | "auth" | "models" | "session" | "replay" | "doctor" | "sandbox" | "version" | "init" | "completion";
   sessionAction?: "list" | "cancel" | "resume" | "approve";
 }
 
@@ -14,6 +14,8 @@ export const SIGMA_COMMANDS: readonly CommandDefinition[] = [
   { name: "inspect", summary: "Analyze a workspace without writes", mode: "analyze", handler: "run" },
   { name: "tui", summary: "Open the interactive terminal UI", handler: "tui" },
   { name: "acp", summary: "Serve ACP v1 over JSON-RPC stdio", handler: "acp" },
+  { name: "auth", summary: "Manage model-provider authentication", handler: "auth" },
+  { name: "models", summary: "List or refresh model catalogs", handler: "models" },
   { name: "session", summary: "Inspect or resume sessions", handler: "session" },
   { name: "sessions", summary: "List sessions", handler: "session", sessionAction: "list" },
   { name: "cancel", summary: "Cancel an active session", handler: "session", sessionAction: "cancel" },

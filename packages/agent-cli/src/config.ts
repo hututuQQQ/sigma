@@ -23,7 +23,7 @@ export interface ParsedArgs {
 
 export interface CliConfig {
   workspace: string;
-  provider: "deepseek" | "glm";
+  provider: string;
   model: string;
   agentProfile: string;
   permissionMode: "workspace-auto" | "ask" | "auto" | "deny";
@@ -52,6 +52,7 @@ export interface CliConfig {
     maxInputTokens: number;
     maxOutputTokens: number;
     maxCostMicroUsd: number;
+    allowUnpricedCosts: boolean;
     maxModelTurns: number;
     maxToolCalls: number;
     maxChildren: number;
@@ -231,7 +232,9 @@ function cliConfig(
     maxParallelAgents: Number(values.maxParallelAgents),
     budget: {
       maxInputTokens: Number(values.maxInputTokens), maxOutputTokens: Number(values.maxOutputTokens),
-      maxCostMicroUsd: Number(values.maxCostMicroUsd), maxModelTurns: Number(values.maxModelTurns),
+      maxCostMicroUsd: Number(values.maxCostMicroUsd),
+      allowUnpricedCosts: values.allowUnpricedCosts === true,
+      maxModelTurns: Number(values.maxModelTurns),
       maxToolCalls: Number(values.maxToolCalls), maxChildren: Number(values.maxChildren), maxDepth: Number(values.maxDepth)
     },
     checkpoint: { maxFiles: Number(values.checkpointMaxFiles), maxBytes: Number(values.checkpointMaxBytes) },

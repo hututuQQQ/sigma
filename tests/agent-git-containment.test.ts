@@ -151,39 +151,37 @@ describe("Git workspace containment", () => {
     await allocation.release();
   });
 
-  it("does not misreport a sandbox launch failure as a non-Git workspace", async () => {
-    const workspace = await fixture("launch-failure");
+  it("discovers a workspace-root repository without launching an unleased Git probe", async () => {
+    const workspace = await fixture("filesystem-root");
     initializeRepository(workspace);
-    const failure: ExecutionResult = {
-      state: "exited",
-      exitCode: null,
-      signal: null,
-      durationMs: 0,
-      timedOut: false,
-      idleTimedOut: false,
-      cancelled: false,
-      stdout: "",
-      stderr: "",
-      stdoutDroppedBytes: 0,
-      stderrDroppedBytes: 0,
-      outputTruncated: false,
-      outputArtifacts: [],
-      failure: {
-        phase: "sandbox_launch",
-        code: "git_probe_failed",
-        message: "sandbox ACL plan exceeds durable recovery limits"
+    let launches = 0;
+    const broker: ProcessExecutionPort = {
+      execute: async (): Promise<ExecutionResult> => {
+        launches += 1;
+        throw new Error("an unleased Git probe must not launch");
       }
     };
-    const broker: ProcessExecutionPort = { execute: async () => failure };
 
     await expect(selfContainedGitRoot(workspace, new AbortController().signal, broker))
-      .rejects.toMatchObject({
-        code: "git_probe_failed",
-        message: expect.stringContaining("sandbox ACL plan exceeds durable recovery limits"),
-        sandboxFailure: expect.objectContaining({
-          phase: "sandbox_launch",
-          message: "sandbox ACL plan exceeds durable recovery limits"
-        })
+      .resolves.toBe(await realpath(workspace));
+    expect(launches).toBe(0);
+  });
+
+  it("does not mistake an arbitrary .git directory for a repository", async () => {
+    const workspace = await fixture("empty-git-marker");
+    await mkdir(path.join(workspace, ".git"));
+    const broker: ProcessExecutionPort = {
+      execute: async (): Promise<ExecutionResult> => {
+        throw new Error("an invalid filesystem marker must not launch Git");
+      }
+    };
+
+    await expect(selfContainedGitRoot(workspace, new AbortController().signal, broker))
+      .resolves.toBeNull();
+    await expect(gitPorcelain(workspace, new AbortController().signal, broker))
+      .resolves.toMatchObject({
+        exitCode: 128,
+        stderr: "Workspace is not a self-contained Git repository."
       });
   });
 

@@ -8,12 +8,19 @@ export interface ModelToolCall {
   arguments: JsonValue;
 }
 
+export interface ModelProviderState {
+  provider: string;
+  version: 1;
+  data: JsonValue;
+}
+
 export interface ModelMessage {
   role: ModelRole;
   content: string;
   reasoningContent?: string;
   toolCallId?: string;
   toolCalls?: ModelToolCall[];
+  providerState?: ModelProviderState;
 }
 
 export interface ModelToolDefinition {
@@ -47,6 +54,7 @@ export interface ModelCapabilities {
 }
 
 export type ModelFinishReason = "stop" | "length" | "tool_calls" | "content_filter" | "protocol_error";
+export type ModelBillingMode = "metered" | "subscription" | "unpriced";
 
 export interface ModelResponseUsage {
   inputTokens: number;
@@ -56,12 +64,18 @@ export interface ModelResponseUsage {
   cacheWriteTokens: number;
   providerReported: boolean;
   costMicroUsd: number | null;
+  billingMode?: ModelBillingMode;
   latencyMs: number;
   /** Zero-based retry index within the selected provider/model. */
   retryAttempt: number;
 }
 
 export interface ModelRequest {
+  /**
+   * Stable, opaque conversation identity used only for provider-side cache
+   * affinity. It must not contain credentials or user-visible prompt text.
+   */
+  sessionId?: string;
   messages: ModelMessage[];
   tools?: ModelToolDefinition[];
   toolChoice?: "auto" | "required" | "none";

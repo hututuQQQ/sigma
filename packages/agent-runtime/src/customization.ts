@@ -30,6 +30,7 @@ export interface CustomizationConfig {
     maxInputTokens: number;
     maxOutputTokens: number;
     maxCostMicroUsd: number;
+    allowUnpricedCosts?: boolean;
     maxModelTurns: number;
     maxToolCalls: number;
     maxChildren: number;

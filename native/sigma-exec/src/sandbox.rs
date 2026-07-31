@@ -95,6 +95,10 @@ pub struct ExecutionPolicy {
     /** Broker-populated exact metadata roots authorized by the consumed lease. */
     #[serde(default)]
     pub repository_metadata_roots: Vec<PathBuf>,
+    /** Broker-populated worktree root retained when Windows launches Git from
+     * its pre-authorized system runtime directory. */
+    #[serde(default)]
+    pub repository_workspace_root: Option<PathBuf>,
     /** Broker-populated scratch roots. Request payloads are cleared before use. */
     #[serde(default)]
     pub session_scratch_roots: Vec<PathBuf>,
@@ -515,6 +519,7 @@ fn linux_verified_bash() -> Option<PathBuf> {
                     session_scratch_roots: Vec::new(),
                     repository_metadata_lease_id: None,
                     repository_metadata_roots: Vec::new(),
+                    repository_workspace_root: None,
                     #[cfg(test)]
                     unsafe_host_exec_approved: false,
                 },
@@ -2390,6 +2395,7 @@ mod tests {
                 session_scratch_roots: Vec::new(),
                 repository_metadata_lease_id: None,
                 repository_metadata_roots: Vec::new(),
+                repository_workspace_root: None,
                 #[cfg(test)]
                 unsafe_host_exec_approved: false,
             },

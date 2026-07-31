@@ -93,7 +93,100 @@ function nextFinalNewline(
   return current;
 }
 
-function applyHunks(original: PatchOriginalFile, hunks: readonly PatchHunk[]): string {
+type ContextReplacement = {
+  start: number;
+  oldCount: number;
+  lines: string[];
+};
+
+function sequenceMatches(
+  input: readonly string[],
+  pattern: readonly string[],
+  start: number,
+  normalize: (value: string) => string
+): boolean {
+  return pattern.every((line, offset) =>
+    normalize(input[start + offset]!) === normalize(line));
+}
+
+function seekSequence(
+  input: readonly string[],
+  pattern: readonly string[],
+  start: number,
+  endOfFile = false
+): number | undefined {
+  if (pattern.length === 0) return start;
+  if (pattern.length > input.length) return undefined;
+  const last = input.length - pattern.length;
+  const first = endOfFile ? last : start;
+  if (first < 0 || first > last) return undefined;
+  const normalizers = [
+    (value: string): string => value,
+    (value: string): string => value.trimEnd(),
+    (value: string): string => value.trim()
+  ];
+  for (const normalize of normalizers) {
+    for (let index = first; index <= last; index += 1) {
+      if (sequenceMatches(input, pattern, index, normalize)) return index;
+    }
+  }
+  return undefined;
+}
+
+function contextSide(hunk: PatchHunk, side: "old" | "new"): string[] {
+  return hunk.lines
+    .filter((line) => side === "old" ? line.kind !== "add" : line.kind !== "delete")
+    .map((line) => line.text);
+}
+
+function contextReplacements(
+  input: readonly string[],
+  hunks: readonly PatchHunk[]
+): ContextReplacement[] {
+  const replacements: ContextReplacement[] = [];
+  let cursor = 0;
+  for (const hunk of hunks) {
+    const search = hunk.search!;
+    if (search.changeContext !== undefined) {
+      const contextIndex = seekSequence(input, [search.changeContext], cursor);
+      if (contextIndex === undefined) {
+        throw new AtomicPatchError(`Failed to find patch context '${search.changeContext}'.`);
+      }
+      cursor = contextIndex + 1;
+    }
+    const oldLines = contextSide(hunk, "old");
+    const newLines = contextSide(hunk, "new");
+    if (oldLines.length === 0) {
+      replacements.push({ start: input.length, oldCount: 0, lines: newLines });
+      continue;
+    }
+    const start = seekSequence(input, oldLines, cursor, search.endOfFile === true);
+    if (start === undefined) {
+      throw new AtomicPatchError(`Failed to find expected patch lines:\n${oldLines.join("\n")}`);
+    }
+    replacements.push({ start, oldCount: oldLines.length, lines: newLines });
+    cursor = start + oldLines.length;
+  }
+  return replacements;
+}
+
+function applyContextHunks(original: PatchOriginalFile, hunks: readonly PatchHunk[]): string {
+  const normalized = original.content.replaceAll("\r\n", "\n");
+  const input = normalized === "" ? [] : normalized.replace(/\n$/u, "").split("\n");
+  const output = [...input];
+  const replacements = contextReplacements(input, hunks)
+    .map((replacement, order) => ({ ...replacement, order }))
+    .sort((left, right) => left.start - right.start || left.order - right.order)
+    .reverse();
+  for (const replacement of replacements) {
+    output.splice(replacement.start, replacement.oldCount, ...replacement.lines);
+  }
+  // Codex apply_patch defines line-oriented text and terminates a non-empty
+  // result with a newline. Preserve the source file's EOL convention.
+  return output.length === 0 ? "" : `${output.join(original.eol)}${original.eol}`;
+}
+
+function applyPositionHunks(original: PatchOriginalFile, hunks: readonly PatchHunk[]): string {
   if (hunks.length === 0) return original.content;
   const normalized = original.content.replaceAll("\r\n", "\n");
   const input = normalized === "" ? [] : normalized.replace(/\n$/u, "").split("\n");
@@ -123,6 +216,14 @@ function applyHunks(original: PatchOriginalFile, hunks: readonly PatchHunk[]): s
   }
   output.push(...input.slice(cursor));
   return output.join(original.eol) + (finalNewline && output.length > 0 ? original.eol : "");
+}
+
+function applyHunks(original: PatchOriginalFile, hunks: readonly PatchHunk[]): string {
+  if (hunks.length === 0) return original.content;
+  const searched = hunks.filter((hunk) => hunk.search !== undefined);
+  if (searched.length === hunks.length) return applyContextHunks(original, hunks);
+  if (searched.length > 0) throw new AtomicPatchError("A file patch cannot mix positioned and context-located hunks.");
+  return applyPositionHunks(original, hunks);
 }
 
 export async function verifyPatchParentContainment(workspace: string, relative: string): Promise<void> {

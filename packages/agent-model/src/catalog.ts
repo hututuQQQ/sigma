@@ -1,4 +1,9 @@
-import type { ModelCapabilities, ModelExecutionRole } from "agent-protocol";
+import { listPiModels, type PiModelDescriptor } from "agent-pi";
+import type {
+  ModelBillingMode,
+  ModelCapabilities,
+  ModelExecutionRole
+} from "agent-protocol";
 
 export type ModelRole = ModelExecutionRole;
 
@@ -79,13 +84,23 @@ export interface ModelPricing {
   cacheWriteMicroUsdPerMillion?: number;
   effectiveAt: string;
   sourceUrl?: string;
+  tiers?: readonly ModelPricingTier[];
+}
+
+export interface ModelPricingTier {
+  inputTokensAbove: number;
+  inputMicroUsdPerMillion: number;
+  outputMicroUsdPerMillion: number;
+  cacheReadMicroUsdPerMillion: number;
+  cacheWriteMicroUsdPerMillion?: number;
 }
 
 export interface ModelSpec {
   id: string;
-  providerId: "deepseek" | "glm";
-  wireProtocol: "openai_chat";
+  providerId: string;
   upstreamModel: string;
+  billingMode: ModelBillingMode;
+  billingModes?: readonly ModelBillingMode[];
   capabilities: ModelCapabilities;
   tokenizer: TokenizerMetadata;
   pricing?: ModelPricing;
@@ -106,58 +121,40 @@ const approximateTokenizer: TokenizerMetadata = {
   assetDigest: "d80956868f0d3660b3963e24f16475e592c67cebfe71dc2836cd8403e461f760"
 };
 
-export const BUILTIN_MODEL_SPECS: readonly ModelSpec[] = [
-  {
-    id: "deepseek/deepseek-v4-pro",
-    providerId: "deepseek",
-    wireProtocol: "openai_chat",
-    upstreamModel: "deepseek-v4-pro",
-    capabilities: {
-      contextWindowTokens: 1_000_000,
-      maxOutputTokens: 384_000,
-      tools: true,
-      parallelTools: true,
-      reasoning: true,
-      structuredOutput: true,
-      promptCache: true,
-      tokenizer: "approximate"
-    },
-    tokenizer: approximateTokenizer,
-    pricing: {
-      inputMicroUsdPerMillion: 435_000,
-      outputMicroUsdPerMillion: 870_000,
-      cacheReadMicroUsdPerMillion: 3_625,
-      effectiveAt: "2026-07-11",
-      sourceUrl: "https://api-docs.deepseek.com/quick_start/pricing"
-    }
-  },
-  {
-    id: "glm/glm-5.2",
-    providerId: "glm",
-    wireProtocol: "openai_chat",
-    upstreamModel: "glm-5.2",
-    capabilities: {
-      contextWindowTokens: 1_000_000,
-      maxOutputTokens: 128_000,
-      tools: true,
-      parallelTools: true,
-      reasoning: true,
-      structuredOutput: true,
-      promptCache: true,
-      tokenizer: "approximate"
-    },
-    tokenizer: approximateTokenizer,
-    pricing: {
-      // The provider publishes CNY prices. Sigma uses a deliberately pinned
-      // accounting rate (1 CNY = 0.14 USD) so historical sessions stay stable.
-      inputMicroUsdPerMillion: 1_120_000,
-      outputMicroUsdPerMillion: 3_920_000,
-      cacheReadMicroUsdPerMillion: 280_000,
-      effectiveAt: "2026-07-11",
-      sourceUrl: "https://open.bigmodel.cn/pricing"
-    }
-  }
-] as const;
+function catalogBillingMode(model: PiModelDescriptor): ModelBillingMode {
+  if (model.billingModes.length === 1) return model.billingModes[0]!;
+  if (model.billingModes.includes("metered") && model.pricing) return "metered";
+  if (model.billingModes.includes("subscription")) return "subscription";
+  return "unpriced";
+}
+
+export function modelSpecsForPiCatalog(
+  models: readonly PiModelDescriptor[],
+  activeBillingModes: ReadonlyMap<string, ModelBillingMode> = new Map()
+): readonly ModelSpec[] {
+  return models.map((model): ModelSpec => {
+    const configuredMode = activeBillingModes.get(model.providerId);
+    const billingMode = configuredMode && model.billingModes.includes(configuredMode)
+      ? configuredMode
+      : catalogBillingMode(model);
+    return {
+      id: `${model.providerId}/${model.id}`,
+      providerId: model.providerId,
+      upstreamModel: model.id,
+      billingMode,
+      billingModes: model.billingModes,
+      capabilities: model.capabilities,
+      tokenizer: approximateTokenizer,
+      ...(billingMode === "metered" && model.pricing
+        ? { pricing: model.pricing }
+        : {})
+    };
+  });
+}
+
+export const BUILTIN_MODEL_SPECS: readonly ModelSpec[] = modelSpecsForPiCatalog(
+  listPiModels()
+);
 
 export function builtinModelSpec(provider: ModelSpec["providerId"], model?: string): ModelSpec | undefined {
   return BUILTIN_MODEL_SPECS.find((spec) => spec.providerId === provider && (!model || spec.upstreamModel === model));
@@ -166,8 +163,8 @@ export function builtinModelSpec(provider: ModelSpec["providerId"], model?: stri
 export const DEFAULT_MODEL_ROUTES: readonly ModelRoute[] = [
   {
     id: "default",
-    candidates: ["deepseek/deepseek-v4-pro", "glm/glm-5.2"],
+    candidates: ["openai-codex/gpt-5.6-terra"],
     fallbackOn: ["rate_limit", "capacity", "network", "server", "timeout"],
-    maxAttempts: 2
+    maxAttempts: 1
   }
 ] as const;

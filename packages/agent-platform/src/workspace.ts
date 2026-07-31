@@ -1,6 +1,7 @@
 import { lstat, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
-import { runProcess, type ProcessExecutionPort, type ProcessResult } from "./process.js";
+import { runLeasedRepositoryGit } from "./repository-git.js";
+import type { ProcessExecutionPort, ProcessResult } from "./process.js";
 
 export interface RepositoryTopology {
   kind: "worktree" | "linked_worktree" | "submodule" | "bare";
@@ -86,7 +87,7 @@ export async function resolveWorkspacePath(workspace: string, requested: string)
 export async function selfContainedGitRoot(
   workspace: string,
   signal: AbortSignal | undefined,
-  execution: ProcessExecutionPort
+  _execution: ProcessExecutionPort
 ): Promise<string | null> {
   signal?.throwIfAborted();
   const root = await realpath(path.resolve(workspace));
@@ -95,41 +96,13 @@ export async function selfContainedGitRoot(
     throw error;
   });
   if (!marker || marker.isSymbolicLink()) return null;
-  const processSignal = signal ?? new AbortController().signal;
-  const result = await runProcess({
-    execution,
-    executable: "git", args: ["rev-parse", "--show-toplevel"], cwd: root,
-    timeoutMs: 10_000, maxOutputBytes: 16_384, signal: processSignal
-  }).catch((error) => {
-    processSignal.throwIfAborted();
-    throw Object.assign(new Error(
-      `Git root probe could not execute: ${error instanceof Error ? error.message : String(error)}`,
-      { cause: error }
-    ), { code: "git_probe_failed" });
-  });
-  processSignal.throwIfAborted();
-  if (result.failure) {
-    throw Object.assign(new Error(
-      `Git root probe failed before process start [${result.failure.code}]: ${result.failure.message}`
-    ), {
-      code: "git_probe_failed",
-      cause: result.failure,
-      sandboxFailure: result.failure
-    });
+  if (marker.isDirectory()) {
+    return await directoryRepositoryTopology(root, path.join(root, ".git")) ? root : null;
   }
-  if (result.exitCode !== 0) {
-    throw Object.assign(new Error(
-      `Git root probe exited with ${String(result.exitCode)}: ${result.stderr.trim() || "no stderr"}`
-    ), {
-      code: "git_probe_failed",
-      exitCode: result.exitCode,
-      stderr: result.stderr
-    });
-  }
-  const reported = result.stdout.trim();
-  if (!reported) return null;
-  const canonical = await realpath(path.resolve(root, reported)).catch(() => path.resolve(root, reported));
-  return path.relative(root, canonical) === "" ? root : null;
+  if (!marker.isFile()) return null;
+  const topology = await indirectRepositoryTopology(root, path.join(root, ".git"), false);
+  signal?.throwIfAborted();
+  return topology?.trust === "workspace" ? root : null;
 }
 
 async function gitFileTarget(root: string, marker: string): Promise<string> {
@@ -145,10 +118,25 @@ async function gitFileTarget(root: string, marker: string): Promise<string> {
 }
 
 async function commonGitDirectory(gitDir: string): Promise<string> {
-  const commondir = await readFile(path.join(gitDir, "commondir"), "utf8").catch(() => "");
+  const commondir = await readFile(path.join(gitDir, "commondir"), "utf8")
+    .catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return "";
+      throw Object.assign(new Error(`Git common-directory indirection cannot be read: ${error.message}`), {
+        code: "git_probe_failed",
+        cause: error
+      });
+    });
   if (!commondir.trim()) return gitDir;
   return await realpath(path.resolve(gitDir, commondir.trim())).catch(() =>
     path.resolve(gitDir, commondir.trim()));
+}
+
+async function validGitDirectory(gitDir: string, commonDir: string): Promise<boolean> {
+  const [head, objects] = await Promise.all([
+    lstat(path.join(gitDir, "HEAD")).catch(() => null),
+    lstat(path.join(commonDir, "objects")).catch(() => null)
+  ]);
+  return head?.isFile() === true && objects?.isDirectory() === true;
 }
 
 async function bareRepositoryTopology(root: string): Promise<RepositoryTopology | null> {
@@ -165,15 +153,19 @@ async function bareRepositoryTopology(root: string): Promise<RepositoryTopology 
 
 async function directoryRepositoryTopology(
   root: string,
-  markerPath: string,
-  signal: AbortSignal | undefined,
-  execution: ProcessExecutionPort
+  markerPath: string
 ): Promise<RepositoryTopology | null> {
-  const worktreeRoot = await selfContainedGitRoot(root, signal, execution);
-  if (!worktreeRoot) return null;
+  const gitDir = await realpath(markerPath);
+  const commonDir = await commonGitDirectory(gitDir);
+  if (!await validGitDirectory(gitDir, commonDir)) return null;
   return {
-    kind: "worktree", worktreeRoot, gitDir: markerPath, commonDir: markerPath,
-    objectDirs: [path.join(markerPath, "objects")], trust: "workspace"
+    kind: "worktree",
+    worktreeRoot: root,
+    gitDir,
+    commonDir,
+    objectDirs: [path.join(commonDir, "objects")],
+    trust: isInside(root, gitDir) && isInside(root, commonDir)
+      ? "workspace" : "external_untrusted"
   };
 }
 
@@ -185,7 +177,7 @@ async function indirectRepositoryTopology(
   root: string,
   markerPath: string,
   allowExternalMetadata: boolean
-): Promise<RepositoryTopology> {
+): Promise<RepositoryTopology | null> {
   const lexicalGitDir = await gitFileTarget(root, markerPath);
   if (!isInside(root, lexicalGitDir) && !allowExternalMetadata) {
     return {
@@ -196,6 +188,7 @@ async function indirectRepositoryTopology(
   }
   const gitDir = await realpath(lexicalGitDir).catch(() => lexicalGitDir);
   const commonDir = await commonGitDirectory(gitDir);
+  if (!await validGitDirectory(gitDir, commonDir)) return null;
   const trust = isInside(root, gitDir) && isInside(root, commonDir)
     ? "workspace" as const : "external_untrusted" as const;
   return {
@@ -210,7 +203,7 @@ async function indirectRepositoryTopology(
 export async function repositoryTopology(
   workspace: string,
   signal: AbortSignal | undefined,
-  execution: ProcessExecutionPort,
+  _execution: ProcessExecutionPort,
   options: { allowExternalMetadata?: boolean } = {}
 ): Promise<RepositoryTopology | null> {
   signal?.throwIfAborted();
@@ -226,7 +219,7 @@ export async function repositoryTopology(
       code: "git_probe_failed"
     });
   }
-  if (marker.isDirectory()) return await directoryRepositoryTopology(root, markerPath, signal, execution);
+  if (marker.isDirectory()) return await directoryRepositoryTopology(root, markerPath);
   return await indirectRepositoryTopology(root, markerPath, options.allowExternalMetadata === true);
 }
 
@@ -235,23 +228,24 @@ export async function gitPorcelain(
   signal: AbortSignal,
   execution: ProcessExecutionPort
 ): Promise<ProcessResult> {
-  const root = await selfContainedGitRoot(workspace, signal, execution);
-  if (!root) return {
+  const topology = await repositoryTopology(workspace, signal, execution);
+  if (!topology?.worktreeRoot || topology.trust === "external_untrusted") return {
     exitCode: 128,
     stdout: "",
-    stderr: "Workspace is not a self-contained Git repository.",
+    stderr: topology?.trust === "external_untrusted"
+      ? "Git metadata is outside the trusted workspace."
+      : "Workspace is not a self-contained Git repository.",
     timedOut: false,
     cancelled: false,
     durationMs: 0,
     stdoutLimitReached: false,
     outputTruncated: false
   };
-  return await runProcess({
+  return await runLeasedRepositoryGit(
     execution,
-    executable: "git",
-    args: ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-    cwd: root,
-    timeoutMs: 30_000,
-    signal
-  });
+    { ...topology, worktreeRoot: topology.worktreeRoot },
+    ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    signal,
+    2_000_000
+  );
 }

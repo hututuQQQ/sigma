@@ -589,6 +589,7 @@ impl BrokerState {
         // These fields cross the launcher bootstrap for convenience, but are
         // broker-issued only. A process request can never populate them.
         params.policy.repository_metadata_roots.clear();
+        params.policy.repository_workspace_root = None;
         params.policy.session_scratch_roots.clear();
         self.repository_metadata_leases.consume(&mut params)?;
         let scratch = self.scratch.resolve(
@@ -1070,6 +1071,7 @@ mod tests {
                 session_scratch_roots: Vec::new(),
                 repository_metadata_lease_id: None,
                 repository_metadata_roots: Vec::new(),
+                repository_workspace_root: None,
                 #[cfg(test)]
                 unsafe_host_exec_approved: true,
             },

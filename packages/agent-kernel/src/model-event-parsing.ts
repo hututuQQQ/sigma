@@ -1,4 +1,9 @@
-import type { JsonValue, ModelMessage, ModelToolCall } from "agent-protocol";
+import type {
+  JsonValue,
+  ModelMessage,
+  ModelProviderState,
+  ModelToolCall
+} from "agent-protocol";
 import type { ActiveModelTurn, KernelState } from "./state.js";
 
 function text(value: JsonValue | undefined): string {
@@ -16,18 +21,31 @@ export function modelToolCalls(value: JsonValue | undefined): ModelToolCall[] {
   });
 }
 
+function modelProviderState(value: JsonValue | undefined): ModelProviderState | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const state = value as Record<string, JsonValue>;
+  return typeof state.provider === "string"
+    && state.provider.length > 0
+    && state.version === 1
+    && state.data !== undefined
+    ? { provider: state.provider, version: 1, data: state.data }
+    : undefined;
+}
+
 export function modelMessage(value: JsonValue | undefined): ModelMessage | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const item = value as Record<string, JsonValue>;
   const role = item.role;
   if (role !== "system" && role !== "developer" && role !== "user" && role !== "assistant" && role !== "tool") return null;
   const toolCalls = modelToolCalls(item.toolCalls);
+  const providerState = modelProviderState(item.providerState);
   return {
     role,
     content: text(item.content),
     ...(typeof item.reasoningContent === "string" ? { reasoningContent: item.reasoningContent } : {}),
     ...(typeof item.toolCallId === "string" ? { toolCallId: item.toolCallId } : {}),
-    ...(toolCalls.length > 0 ? { toolCalls } : {})
+    ...(toolCalls.length > 0 ? { toolCalls } : {}),
+    ...(providerState ? { providerState } : {})
   };
 }
 

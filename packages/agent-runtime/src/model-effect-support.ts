@@ -230,6 +230,7 @@ export async function streamModelResponse(
     ): AsyncIterable<ModelStreamEvent>;
   };
   const request = {
+    sessionId: session.identity.sessionId,
     messages,
     tools,
     ...(toolChoice ? { toolChoice } : {}),

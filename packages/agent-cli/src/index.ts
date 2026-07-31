@@ -18,10 +18,13 @@ import { runCommand } from "./commands/run.js";
 import { runSessionCommand, runSessionsCommand } from "./commands/session.js";
 import { runVersionCommand } from "./commands/version.js";
 import { runAcpCommand } from "./commands/acp.js";
+import { runAuthCommand } from "./commands/auth.js";
+import { runModelsCommand } from "./commands/models.js";
 import {
   loadCliConfig, parseArgs, workspaceCustomizationTrustMessage, workspaceMcpTrustMessage
 } from "./config.js";
 import { createConfiguredRuntime, type RuntimeFactoryDeps } from "agent-runtime";
+import { configureOutboundProxy } from "agent-pi";
 
 export interface AgentCliMainOptions {
   tuiRunner?: (options: TuiAppOptions) => Promise<void>;
@@ -79,6 +82,18 @@ async function runTuiCommand(argv: string[], options: AgentCliMainOptions): Prom
   return 0;
 }
 
+async function runSessionDefinition(
+  definition: CommandDefinition,
+  argv: string[],
+  options: AgentCliMainOptions
+): Promise<number> {
+  if (definition.sessionAction === "list") {
+    return await runSessionsCommand(argv, { runtime: options.runtime });
+  }
+  const sessionArgv = definition.sessionAction ? [definition.sessionAction, ...argv] : argv;
+  return await runSessionCommand(sessionArgv, { runtime: options.runtime });
+}
+
 async function dispatchCommand(
   definition: CommandDefinition,
   argv: string[],
@@ -92,11 +107,9 @@ async function dispatchCommand(
       runtime: options.runtime,
       stderr: options.stderr
     });
-    case "session": return definition.sessionAction === "list"
-      ? await runSessionsCommand(argv, { runtime: options.runtime })
-      : await runSessionCommand(definition.sessionAction ? [definition.sessionAction, ...argv] : argv, {
-        runtime: options.runtime
-      });
+    case "auth": return await runAuthCommand(argv);
+    case "models": return await runModelsCommand(argv);
+    case "session": return await runSessionDefinition(definition, argv, options);
     case "replay": return await runReplayCommand(argv, { runtime: options.runtime });
     case "doctor": return await runDoctorCommand(argv, { runtimeFactoryDeps: options.runtimeFactoryDeps });
     case "sandbox": return await runSandboxCommand(argv);
@@ -126,6 +139,7 @@ export async function runAgentCommand(args = process.argv.slice(2), options: Age
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  configureOutboundProxy();
   try {
     process.exitCode = await runAgentCommand();
   } catch (error) {

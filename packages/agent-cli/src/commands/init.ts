@@ -12,7 +12,7 @@ export async function runInitCommand(argv: string[], deps: InitDeps = {}): Promi
   const stdout = deps.stdout ?? process.stdout;
   const stderr = deps.stderr ?? process.stderr;
   if (argv.includes("--help") || argv.includes("-h")) {
-    stdout.write("agent init [--workspace <path>] [--init-profile local|team|ci] [--provider deepseek|glm] [--model <name>] [--permission-mode ask|auto|deny] [--force] [--json]\n");
+    stdout.write("agent init [--workspace <path>] [--init-profile local|team|ci] [--provider <pi-provider-id>] [--model <name>] [--permission-mode ask|auto|deny] [--force] [--json]\n");
     return 0;
   }
   try {

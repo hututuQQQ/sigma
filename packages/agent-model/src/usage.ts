@@ -1,5 +1,6 @@
 import type { ModelRequest, ModelResponse, ModelResponseUsage, UsageRecord } from "agent-protocol";
 import type { ModelPricing, ModelRole, ModelSpec, TokenizerMetadata } from "./catalog.js";
+import { modelPricingRates } from "./pricing.js";
 
 export type NormalizedModelUsage = ModelResponseUsage;
 
@@ -59,12 +60,13 @@ export function estimatedResponseTokens(response: Pick<UnnormalizedModelResponse
 
 export function usageCostMicroUsd(usage: Omit<NormalizedModelUsage, "costMicroUsd">, pricing?: ModelPricing): number | null {
   if (!pricing) return null;
+  const rates = modelPricingRates(pricing, usage.inputTokens);
   const uncachedInput = Math.max(0, usage.inputTokens - usage.cacheReadTokens - usage.cacheWriteTokens);
   const numerator =
-    uncachedInput * pricing.inputMicroUsdPerMillion
-    + usage.outputTokens * pricing.outputMicroUsdPerMillion
-    + usage.cacheReadTokens * pricing.cacheReadMicroUsdPerMillion
-    + usage.cacheWriteTokens * (pricing.cacheWriteMicroUsdPerMillion ?? pricing.inputMicroUsdPerMillion);
+    uncachedInput * rates.inputMicroUsdPerMillion
+    + usage.outputTokens * rates.outputMicroUsdPerMillion
+    + usage.cacheReadTokens * rates.cacheReadMicroUsdPerMillion
+    + usage.cacheWriteTokens * (rates.cacheWriteMicroUsdPerMillion ?? rates.inputMicroUsdPerMillion);
   return Math.ceil(numerator / 1_000_000);
 }
 
@@ -99,7 +101,7 @@ export function normalizeUsage(options: {
 }
 
 export function normalizeModelResponse(options: {
-  spec: Pick<ModelSpec, "pricing">;
+  spec: Pick<ModelSpec, "pricing" | "billingMode">;
   request: Pick<ModelRequest, "messages" | "tools">;
   response: UnnormalizedModelResponse;
   rawUsage?: RawUsage;
@@ -110,23 +112,32 @@ export function normalizeModelResponse(options: {
   const usage = existing
     ? {
         ...existing,
-        costMicroUsd: existing.costMicroUsd ?? usageCostMicroUsd(existing, options.spec.pricing),
+        costMicroUsd: options.spec.billingMode !== "metered"
+          ? null
+          : existing.costMicroUsd ?? usageCostMicroUsd(existing, options.spec.pricing),
+        billingMode: options.spec.billingMode,
         latencyMs: Math.max(0, Math.round(options.latencyMs)),
         retryAttempt: options.retryAttempt
       }
-    : normalizeUsage({
+    : {
+        ...normalizeUsage({
         request: options.request,
         response: options.response,
         raw: options.rawUsage,
         pricing: options.spec.pricing,
         latencyMs: options.latencyMs,
         retryAttempt: options.retryAttempt
-      });
+        }),
+        billingMode: options.spec.billingMode,
+        ...(options.spec.billingMode !== "metered" ? { costMicroUsd: null } : {})
+      };
   return { ...options.response, usage };
 }
 
 export function toUsageRecord(usage: NormalizedModelUsage, identity: UsageRecordIdentity): UsageRecord {
-  if (usage.costMicroUsd === null) {
+  if (usage.costMicroUsd === null
+    && usage.billingMode !== "subscription"
+    && usage.billingMode !== "unpriced") {
     throw Object.assign(new Error(`Model '${identity.modelId}' has no pricing for cost accounting.`), {
       code: "model_pricing_unavailable"
     });
@@ -150,6 +161,7 @@ export function toUsageRecord(usage: NormalizedModelUsage, identity: UsageRecord
     cacheReadTokens: usage.cacheReadTokens,
     cacheWriteTokens: usage.cacheWriteTokens,
     costMicroUsd: usage.costMicroUsd,
+    ...(usage.billingMode ? { billingMode: usage.billingMode } : {}),
     latencyMs: usage.latencyMs,
     attempt: usage.retryAttempt + 1,
     occurredAt: identity.occurredAt

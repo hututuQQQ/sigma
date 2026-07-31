@@ -293,6 +293,7 @@ export class ModelAgentProfileHookRunner implements HookRunnerPort {
     try {
       signal.throwIfAborted();
       response = await complete(gateway, {
+        sessionId: session.identity.sessionId,
         messages: hookMessages,
         tools: [],
         maxOutputTokens,

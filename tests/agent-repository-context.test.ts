@@ -94,6 +94,15 @@ function exited(stdout: string) {
   };
 }
 
+async function writeSyntheticGitDirectory(workspace: string): Promise<void> {
+  await mkdir(path.join(workspace, ".git", "objects"), { recursive: true });
+  await writeFile(path.join(workspace, ".git", "HEAD"), "ref: refs/heads/main\n", "utf8");
+}
+
+function gitSubcommand(args: readonly string[]): string | undefined {
+  return args.find((argument) => ["rev-parse", "status", "diff"].includes(argument));
+}
+
 describe("host repository context", () => {
   it("does not reinterpret a host filename separator as repository structure", () => {
     expect(safeAutomaticFileName("literal\\nested.ts")).toBe(false);
@@ -837,7 +846,7 @@ describe("host repository context", () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-git-context-policy-"));
     try {
       await Promise.all([
-        mkdir(path.join(workspace, ".git"), { recursive: true }),
+        writeSyntheticGitDirectory(workspace),
         mkdir(path.join(workspace, ".hidden"), { recursive: true }),
         mkdir(path.join(workspace, "dist"), { recursive: true }),
         mkdir(path.join(workspace, "generated"), { recursive: true }),
@@ -855,11 +864,20 @@ describe("host repository context", () => {
         writeFile(path.join(workspace, "AGENTS.md"), "control\n", "utf8")
       ]);
       const execution: ProcessExecutionPort = {
+        async acquireRepositoryMetadataLease(request) {
+          return {
+            ...request,
+            leaseId: "repository-context-policy",
+            executableSha256: "0".repeat(64),
+            uses: 1 as const
+          };
+        },
         async execute(request) {
           const args = request.command.args ?? [];
-          if (args[0] === "rev-parse") return exited(workspace);
-          if (args[0] === "status") return exited("## main");
-          if (args[0] === "diff") {
+          const command = gitSubcommand(args);
+          if (command === "rev-parse") return exited(workspace);
+          if (command === "status") return exited("## main");
+          if (command === "diff") {
             throw new Error("Automatic repository context must not request Git diff content.");
           }
           throw new Error(`Unexpected synthetic Git command: ${args.join(" ")}`);
@@ -887,14 +905,23 @@ describe("host repository context", () => {
   it("falls back to the host snapshot when Git status is truncated", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-git-status-truncated-"));
     try {
-      await mkdir(path.join(workspace, ".git"), { recursive: true });
+      await writeSyntheticGitDirectory(workspace);
       await mkdir(path.join(workspace, "src"), { recursive: true });
       await writeFile(path.join(workspace, "src", "safe.ts"), "safe\n", "utf8");
       const execution: ProcessExecutionPort = {
+        async acquireRepositoryMetadataLease(request) {
+          return {
+            ...request,
+            leaseId: "repository-context-truncated",
+            executableSha256: "0".repeat(64),
+            uses: 1 as const
+          };
+        },
         async execute(request) {
           const args = request.command.args ?? [];
-          if (args[0] === "rev-parse") return exited(workspace);
-          if (args[0] === "status") {
+          const command = gitSubcommand(args);
+          if (command === "rev-parse") return exited(workspace);
+          if (command === "status") {
             return { ...exited("## main\n?? partial"), outputTruncated: true };
           }
           throw new Error(`Unexpected command after truncated Git status: ${args.join(" ")}`);
@@ -918,15 +945,24 @@ describe("host repository context", () => {
   it("refreshes the safe snapshot immediately when Git-visible ignore rules change", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-git-ignore-refresh-"));
     try {
-      await mkdir(path.join(workspace, ".git"), { recursive: true });
+      await writeSyntheticGitDirectory(workspace);
       await mkdir(path.join(workspace, "src"), { recursive: true });
       await writeFile(path.join(workspace, "src", "value.ts"), "value\n", "utf8");
       let status = "## main";
       const execution: ProcessExecutionPort = {
+        async acquireRepositoryMetadataLease(request) {
+          return {
+            ...request,
+            leaseId: "repository-context-ignore-refresh",
+            executableSha256: "0".repeat(64),
+            uses: 1 as const
+          };
+        },
         async execute(request) {
           const args = request.command.args ?? [];
-          if (args[0] === "rev-parse") return exited(workspace);
-          if (args[0] === "status") return exited(status);
+          const command = gitSubcommand(args);
+          if (command === "rev-parse") return exited(workspace);
+          if (command === "status") return exited(status);
           throw new Error(`Unexpected synthetic Git command: ${args.join(" ")}`);
         }
       };

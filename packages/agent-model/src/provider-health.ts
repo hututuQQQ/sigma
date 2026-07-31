@@ -53,11 +53,8 @@ export async function checkProviderHealth(input: {
     provider: input.provider,
     model: selectedModel,
     baseUrl: endpoint,
-    maxRetries: 0,
     requestTimeoutMs: input.requestTimeoutMs ?? 10_000,
-    idleTimeoutMs: Math.min(input.requestTimeoutMs ?? 10_000, 5_000),
-    fetchImpl: input.fetchImpl,
-    wireProfile: { thinking: "disabled" }
+    idleTimeoutMs: Math.min(input.requestTimeoutMs ?? 10_000, 5_000)
   });
   const model = gateway.model;
   try {

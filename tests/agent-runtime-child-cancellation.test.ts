@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -102,6 +102,68 @@ async function within<T>(promise: Promise<T>, timeoutMs = 10_000): Promise<T> {
 }
 
 describe("child cancellation cleanup ordering", () => {
+  it("does not acknowledge root cancellation until an in-flight writer settles", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-root-cancel-settlement-"));
+    const storeRootDir = path.join(root, ".agent");
+    const slowStarted = deferred<void>();
+    const slowRelease = deferred<void>();
+    let writes = 0;
+    const tools = registerBuiltinTools(new EffectToolRegistry());
+    tools.register({
+      descriptor: {
+        name: "late_writer",
+        description: "A non-cooperative writer used to verify cancellation acknowledgement ordering.",
+        inputSchema: { type: "object" },
+        possibleEffects: ["filesystem.write"],
+        executionMode: "exclusive",
+        resourceKeys: ["workspace:write"],
+        approval: "auto",
+        idempotent: false,
+        timeoutMs: 10_000
+      },
+      async execute(request, context) {
+        slowStarted.resolve();
+        await slowRelease.promise;
+        writes += 1;
+        await writeFile(path.join(context.workspacePath, "late.txt"), "settled\n", "utf8");
+        return receipt(request, "writer settled");
+      }
+    });
+    const runtime = createRuntime({
+      gateway: new ChildGateway([
+        toolTurn("late-call", "late_writer", {})
+      ]),
+      store: new SegmentedJsonlStore({ rootDir: storeRootDir }),
+      storeRootDir,
+      tools,
+      permissionMode: "auto",
+      runDeadlineMs: 60_000
+    });
+    const session = await runtime.createSession({ workspacePath: root, mode: "change" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "start writer" });
+    await within(slowStarted.promise);
+
+    let acknowledged = false;
+    const cancellation = runtime.command({
+      type: "cancel",
+      sessionId: session.sessionId,
+      reason: "stop root writer"
+    }).then(() => { acknowledged = true; });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(acknowledged).toBe(false);
+
+    slowRelease.resolve();
+    await within(cancellation);
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "cancelled",
+      reason: "stop root writer"
+    });
+    expect(writes).toBe(1);
+    await expect(readFile(path.join(root, "late.txt"), "utf8")).resolves.toBe("settled\n");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(writes).toBe(1);
+  });
+
   it("holds an exclusive writer lease until an abort-ignoring tool actually settles", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-child-cleanup-"));
     const workspace = path.join(root, "workspace");

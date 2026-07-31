@@ -282,6 +282,7 @@ export class LongHorizonCoordinator {
     try {
       signal.throwIfAborted();
       const request: ModelRequest = {
+        sessionId: session.identity.sessionId,
         signal,
         tools: [],
         toolChoice: "none",

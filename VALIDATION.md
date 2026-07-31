@@ -105,7 +105,7 @@ The key is optional unless the hosted Exa MCP endpoint returns 429.
 
 The automated suites cover:
 
-- DeepSeek/GLM request serialization, retryable HTTP failures, `Retry-After`, stream aggregation/divergence, partial-stream restart, finish reasons, idle timeout, hard deadline, and cancellation;
+- Pi OpenAI Completions/Responses/Codex, Anthropic, Google, Bedrock, Mistral, and Pi Messages request/stream contracts; DeepSeek/GLM compatibility payloads; retryable failures, finish reasons, idle timeout, hard deadline, and cancellation;
 - kernel reducer decisions and the completion acceptance/evidence protocol;
 - checksummed segment rotation, concurrent append serialization, corrupt/torn tails, snapshots, artifacts, and stale append locks;
 - multi-run restore, durable deadlines, outcome-pending recovery, active-session ownership, command inboxes, pending approvals, and interrupted idempotent/non-idempotent tools;

@@ -212,6 +212,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
       message: "Hello. What would you like me to work on?"
     });
     expect(gateway.requests).toHaveLength(1);
+    expect(gateway.requests[0]?.sessionId).toBe(session.sessionId);
     const events = await storedEvents(store, session.sessionId);
     expect(events.filter((event) => event.type === "model.started")).toHaveLength(1);
     expect(events.filter((event) => event.type === "run.completed")).toHaveLength(1);

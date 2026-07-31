@@ -3,7 +3,12 @@ import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
 import { SIGMA_PROJECT_FACTS } from "agent-config";
-import { BUILTIN_MODEL_SPECS, defaultModel } from "agent-model";
+import {
+  BUILTIN_MODEL_SPECS,
+  defaultModel,
+  loadPiRuntimeModelCatalog,
+  type ModelSpec
+} from "agent-model";
 import type { RuntimeClient } from "agent-protocol";
 import {
   createConfiguredRuntime,
@@ -30,7 +35,7 @@ export interface AcpCommandDeps {
 }
 
 interface SelectedModel {
-  provider: "deepseek" | "glm";
+  provider: string;
   model: string;
 }
 
@@ -38,11 +43,11 @@ function modelId(provider: string, model: string): string {
   return `${provider}/${model}`;
 }
 
-function selectedModel(value: string): SelectedModel {
+function selectedModel(value: string, catalog: SigmaAcpModelCatalog): SelectedModel {
   const separator = value.indexOf("/");
   const provider = value.slice(0, separator);
   const model = value.slice(separator + 1);
-  if ((provider !== "deepseek" && provider !== "glm") || separator < 1 || !model) {
+  if (separator < 1 || !model || !catalog.options.some((option) => option.id === value)) {
     throw new Error(`Invalid Sigma ACP model identifier '${value}'.`);
   }
   return { provider, model };
@@ -50,17 +55,33 @@ function selectedModel(value: string): SelectedModel {
 
 function catalogFor(
   flags: Record<string, unknown>,
-  cwd: string
+  cwd: string,
+  catalogSpecs: readonly ModelSpec[]
 ): SigmaAcpModelCatalog {
   const config = loadCliConfig({ ...flags, workspace: cwd });
-  const currentModel = config.model === "auto"
-    ? defaultModel(config.provider)
-    : config.model;
+  let currentModel = config.model;
+  if (currentModel === "auto") {
+    try {
+      currentModel = defaultModel(config.provider);
+    } catch (error) {
+      const cached = catalogSpecs.find((spec) => spec.providerId === config.provider);
+      if (!cached) throw error;
+      currentModel = cached.upstreamModel;
+    }
+  }
   const options = [
-    ...BUILTIN_MODEL_SPECS.map((spec) => ({
+    ...catalogSpecs.map((spec) => ({
       id: modelId(spec.providerId, spec.upstreamModel),
       name: spec.upstreamModel,
-      description: `${spec.providerId} · ${spec.capabilities.reasoning ? "reasoning" : "standard"}`
+      description: `${spec.providerId} · ${
+        spec.billingMode === "subscription"
+          ? "subscription"
+          : spec.billingMode === "unpriced"
+            ? "price unknown"
+            : spec.capabilities.reasoning
+            ? "reasoning"
+            : "standard"
+      }`
     })),
     ...config.modelSpecs.map((spec) => ({
       id: modelId(spec.providerId, spec.upstreamModel),
@@ -96,6 +117,9 @@ export async function runAcpCommand(
     throw new Error(`Unexpected sigma acp argument '${parsed.positionals[0]}'.`);
   }
   const baseFlags = parsed.flags;
+  const catalogSpecs = deps.runtime || deps.runtimeFactoryDeps?.gatewayFactory
+    ? BUILTIN_MODEL_SPECS
+    : (await loadPiRuntimeModelCatalog()).specs;
   const runtimeFactory = async (cwd: string, selectedId: string): Promise<SigmaAcpRuntimeHandle> => {
     const trustMessage = trustFailure(baseFlags, cwd);
     if (trustMessage) throw new Error(trustMessage);
@@ -108,7 +132,7 @@ export async function runAcpCommand(
         close: async () => undefined
       };
     }
-    const selection = selectedModel(selectedId);
+    const selection = selectedModel(selectedId, catalogFor(baseFlags, cwd, catalogSpecs));
     const config = loadCliConfig({
       ...baseFlags,
       workspace: cwd,
@@ -123,7 +147,7 @@ export async function runAcpCommand(
   const sigma = new SigmaAcpAgent({
     agentVersion: SIGMA_PROJECT_FACTS.productVersion,
     runtimeFactory,
-    modelCatalog: async (cwd) => catalogFor(baseFlags, cwd),
+    modelCatalog: async (cwd) => catalogFor(baseFlags, cwd, catalogSpecs),
     stderr: deps.stderr
   });
   const input = deps.stdin ?? process.stdin;
@@ -140,4 +164,3 @@ export async function runAcpCommand(
   }
   return 0;
 }
-

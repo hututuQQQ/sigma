@@ -4,15 +4,20 @@ import * as acp from "@agentclientprotocol/sdk";
 import { SigmaAcpEventForwarder } from "./sigma-acp-events.js";
 import { SigmaAcpSessionRegistry } from "./sigma-acp-session-registry.js";
 import {
+  cancellationReason,
+  cancelResolvedSession
+} from "./sigma-acp-cancellation.js";
+import {
   MODEL_CONFIG_ID,
+  SIGMA_RUNTIME_REQUEST_ERROR,
   expectedAbort,
   listOffset,
   modelConfig,
   parseHealthRequest,
   parseSigmaTextCommand,
+  promptResponseForOutcome,
   promptText,
   sessionModes,
-  stopReason,
   titleFromPrompt,
   type ForwardState,
   type PersistedAcpSession,
@@ -68,11 +73,7 @@ export class SigmaAcpAgent {
     }
     const cancellations = await Promise.allSettled(
       [...this.activeRuntimeSessions.values()].map(async (resolved) =>
-        await resolved.handle.runtime.command({
-          type: "cancel",
-          sessionId: resolved.record.runtimeSessionId,
-          reason: "ACP connection closed."
-        }))
+        await cancelResolvedSession(resolved, "ACP connection closed."))
     );
     for (const result of cancellations) {
       if (result.status === "rejected") this.log(result.reason);
@@ -217,11 +218,7 @@ export class SigmaAcpAgent {
     const controller = this.activePrompts.get(params.sessionId);
     if (controller) {
       controller.abort(new Error("ACP session closed."));
-      await resolved.handle.runtime.command({
-        type: "cancel",
-        sessionId: resolved.record.runtimeSessionId,
-        reason: "ACP session closed."
-      });
+      await cancelResolvedSession(resolved, "ACP session closed.");
     }
     await resolved.handle.runtime.releaseSession?.(resolved.record.runtimeSessionId);
     this.sessions.detach(resolved.record);
@@ -318,11 +315,8 @@ export class SigmaAcpAgent {
     const onRequestAbort = (): void => {
       controller.abort(signal.reason ?? new Error("ACP prompt request cancelled."));
       if (resolved) {
-        void resolved.handle.runtime.command({
-          type: "cancel",
-          sessionId: resolved.record.runtimeSessionId,
-          reason: "ACP prompt request cancelled."
-        }).catch((error: unknown) => this.log(error));
+        void cancelResolvedSession(resolved, "ACP prompt request cancelled.")
+          .catch((error: unknown) => this.log(error));
       }
     };
     if (signal.aborted) onRequestAbort();
@@ -347,15 +341,22 @@ export class SigmaAcpAgent {
       });
       resolved.record.updatedAt = new Date().toISOString();
       await this.sessions.upsert(resolved.handle.storeRootDir, resolved.record);
-      return {
-        stopReason: stopReason(outcome),
-        _meta: {
-          "sigma.outcome": outcome.kind,
-          ...("message" in outcome ? { "sigma.message": outcome.message } : {})
-        }
-      };
+      return promptResponseForOutcome(outcome);
     } catch (error) {
-      if (expectedAbort(error, controller.signal)) return { stopReason: "cancelled" };
+      if (error instanceof acp.RequestError && error.code === SIGMA_RUNTIME_REQUEST_ERROR) throw error;
+      if (expectedAbort(error, controller.signal)) {
+        // Do not expose the cancelled prompt response until the runtime has
+        // settled any in-flight mutation. The ACP cancel notification and the
+        // prompt waiter run concurrently, so relying on the notification
+        // handler alone leaves an acknowledgement/write race.
+        if (resolved) {
+          await cancelResolvedSession(
+            resolved,
+            cancellationReason(controller.signal, "ACP prompt request cancelled.")
+          );
+        }
+        return { stopReason: "cancelled" };
+      }
       throw error;
     } finally {
       signal.removeEventListener("abort", onRequestAbort);
@@ -375,11 +376,7 @@ export class SigmaAcpAgent {
   private async cancel(params: acp.CancelNotification): Promise<void> {
     this.activePrompts.get(params.sessionId)?.abort(new Error("Cancelled by ACP client."));
     const resolved = await this.sessions.resolveSession(params.sessionId);
-    await resolved.handle.runtime.command({
-      type: "cancel",
-      sessionId: resolved.record.runtimeSessionId,
-      reason: "Cancelled by ACP client."
-    });
+    await cancelResolvedSession(resolved, "Cancelled by ACP client.");
   }
 
   private async steer(params: SigmaTextCommand): Promise<object> {

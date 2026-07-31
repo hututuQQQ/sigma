@@ -4,18 +4,26 @@ import type {
   ModelGateway,
   ModelRequest,
   ModelResponse,
-  ModelStreamEvent
+  ModelStreamEvent,
+  UsageRecord
 } from "../packages/agent-protocol/src/index.js";
 import type { ModelSpecConfigValue } from "../packages/agent-config/src/index.js";
+import {
+  listPiAuthStatuses,
+  listPiProviders,
+  type Credential,
+  type CredentialStore,
+  type ModelsStore
+} from "../packages/agent-pi/src/index.js";
 import {
   BUILTIN_MODEL_SPECS,
   ModelRouteExecutionError,
   ModelRouter,
-  OpenAIModelGateway,
   RoutedModelGateway,
   approximateTokenCount,
   classifyModelFailure,
   createModelGatewayForSpec,
+  loadPiRuntimeModelCatalog,
   normalizeUsage,
   modelReservationEstimate,
   toUsageRecord,
@@ -27,7 +35,14 @@ import {
   createRoleGateways,
   productionModelCandidates
 } from "../packages/agent-runtime/src/model-composition.js";
+import {
+  consumedBudget,
+  failedModelUsage,
+  prepareModelBudget,
+  successfulModelUsage
+} from "../packages/agent-runtime/src/model-accounting.js";
 import type { RuntimeCustomization } from "../packages/agent-runtime/src/customization.js";
+import { aggregateReviewerUsage } from "../packages/agent-runtime/src/reviewer-accounting.js";
 
 const capabilities: ModelCapabilities = {
   contextWindowTokens: 10_000,
@@ -44,8 +59,8 @@ function spec(id: string, overrides: Partial<ModelSpec> = {}): ModelSpec {
   return {
     id,
     providerId: id.startsWith("glm") ? "glm" : "deepseek",
-    wireProtocol: "openai_chat",
     upstreamModel: id,
+    billingMode: "metered",
     capabilities,
     tokenizer: { id: "test", accuracy: "approximate" },
     pricing: {
@@ -69,6 +84,7 @@ function specConfig(
     id,
     providerId: "deepseek",
     upstreamModel,
+    billingMode: "metered",
     capabilities,
     tokenizer: { id: `${id}-tokenizer`, accuracy },
     ...(priced ? { pricing: {
@@ -111,17 +127,123 @@ describe("capability-aware model routing", () => {
     expect(classifyModelFailure(Object.assign(new Error("slow"), { code: "ETIMEDOUT" }))).toBe("timeout");
     expect(classifyModelFailure(Object.assign(new Error("bad config"), { category: "configuration" }))).toBe("configuration");
   });
-  it("ships deterministic DeepSeek and GLM catalog entries", () => {
-    expect(BUILTIN_MODEL_SPECS.map((item) => item.id)).toEqual([
-      "deepseek/deepseek-v4-pro",
-      "glm/glm-5.2"
-    ]);
-    expect(BUILTIN_MODEL_SPECS.every((item) => item.pricing && item.tokenizer.accuracy === "approximate")).toBe(true);
+  it("ships deterministic metered and ChatGPT subscription catalog entries", () => {
+    expect(BUILTIN_MODEL_SPECS).toHaveLength(1_110);
+    // Radius has no static models until its cache is hydrated, while the
+    // provider registry still exposes it as a connection.
+    expect(new Set(BUILTIN_MODEL_SPECS.map((item) => item.providerId)).size).toBe(38);
+    expect(BUILTIN_MODEL_SPECS.map((item) => item.id)).toContain("openai-codex/gpt-5.6-terra");
+    expect(BUILTIN_MODEL_SPECS.map((item) => item.id)).toContain("glm/glm-5.2");
+    expect(BUILTIN_MODEL_SPECS.filter((item) => item.billingMode === "metered")
+      .every((item) => item.pricing && item.tokenizer.accuracy === "approximate")).toBe(true);
+    expect(BUILTIN_MODEL_SPECS.filter((item) => item.billingMode !== "metered")
+      .every((item) => item.pricing === undefined)).toBe(true);
+    const terra = BUILTIN_MODEL_SPECS.find((item) => item.id === "openai-codex/gpt-5.6-terra");
+    expect(terra).toMatchObject({ billingMode: "subscription" });
+    expect(terra?.pricing).toBeUndefined();
+    expect(BUILTIN_MODEL_SPECS.find((item) => item.id === "openai/gpt-5.4")?.pricing)
+      .toMatchObject({
+        tiers: [expect.objectContaining({
+          inputTokensAbove: 272_000,
+          inputMicroUsdPerMillion: 5_000_000
+        })]
+      });
     const gateway = createModelGatewayForSpec(spec("deepseek/custom", {
       capabilities: { ...capabilities, contextWindowTokens: 42_000 }
-    }), { apiKey: "secret" });
+    }));
     expect(gateway).toMatchObject({ provider: "deepseek", model: "deepseek/custom" });
     expect(gateway.capabilities.contextWindowTokens).toBe(42_000);
+  });
+
+  it("hydrates Radius models from the local cache without network access", async () => {
+    const storedCredentials = new Map<string, Credential>([
+      ["anthropic", {
+        type: "oauth" as const,
+        access: "local-oauth-access",
+        refresh: "local-oauth-refresh",
+        expires: Date.now() + 60_000
+      }]
+    ]);
+    const credentials: CredentialStore = {
+      async read(providerId) { return storedCredentials.get(providerId); },
+      async list() {
+        return [...storedCredentials].map(([providerId, credential]) => ({
+          providerId,
+          type: credential.type
+        }));
+      },
+      async modify(providerId, update) {
+        const replacement = await update(storedCredentials.get(providerId));
+        if (replacement) storedCredentials.set(providerId, replacement);
+        return replacement;
+      },
+      async delete(providerId) { storedCredentials.delete(providerId); }
+    };
+    type ModelsEntry = NonNullable<Awaited<ReturnType<ModelsStore["read"]>>>;
+    const entries = new Map<string, ModelsEntry>([
+      ["radius", {
+        checkedAt: 1_753_804_800_000,
+        models: [{
+          id: "cached-model",
+          name: "Cached Radius Model",
+          api: "pi-messages",
+          provider: "radius",
+          baseUrl: "https://radius.example.test",
+          reasoning: true,
+          input: ["text"],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: 32_000,
+          maxTokens: 4_096
+        }]
+      }]
+    ]);
+    const modelsStore: ModelsStore = {
+      async read(providerId) { return entries.get(providerId); },
+      async write(providerId, entry) { entries.set(providerId, entry); },
+      async delete(providerId) { entries.delete(providerId); }
+    };
+    const fetchSpy = vi.fn(() => {
+      throw new Error("offline catalog hydration must not access the network");
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+    try {
+      expect((await listPiAuthStatuses(credentials)).find(
+        (status) => status.provider === "anthropic"
+      )).toMatchObject({ status: "authenticated", authType: "oauth" });
+      expect(listPiProviders().find((provider) => provider.id === "anthropic")?.authMethods)
+        .toContainEqual(expect.objectContaining({
+          kind: "oauth",
+          billingMode: "subscription"
+        }));
+      const catalog = await loadPiRuntimeModelCatalog({ credentials, modelsStore });
+      expect(catalog.specs).toContainEqual(expect.objectContaining({
+        id: "radius/cached-model",
+        providerId: "radius",
+        upstreamModel: "cached-model",
+        billingMode: "unpriced"
+      }));
+      const anthropicSubscription = catalog.specs.find((candidate) =>
+        candidate.id === "anthropic/claude-fable-5");
+      expect(anthropicSubscription).toMatchObject({
+        id: "anthropic/claude-fable-5",
+        providerId: "anthropic",
+        billingMode: "subscription"
+      });
+      expect(anthropicSubscription?.pricing).toBeUndefined();
+      expect(catalog.gatewayFactory({
+        provider: "radius",
+        model: "cached-model",
+        maxRetries: 7,
+        requestTimeoutMs: 10_000,
+        idleTimeoutMs: 5_000
+      })).toMatchObject({
+        provider: "radius",
+        model: "cached-model"
+      });
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("composes production fallback candidates and honors an explicit single-model route", () => {
@@ -137,6 +259,62 @@ describe("capability-aware model routing", () => {
       { provider: "deepseek", model: "auto" },
       { DEEPSEEK_API_KEY: "primary" }
     ).map((item) => item.id)).toEqual(["deepseek/deepseek-v4-pro"]);
+    expect(productionModelCandidates(
+      { provider: "openai-codex", model: "gpt-5.6-terra" },
+      { OPENAI_API_KEY: "must-not-be-used", DEEPSEEK_API_KEY: "must-not-fallback" }
+    ).map((item) => item.id)).toEqual(["openai-codex/gpt-5.6-terra"]);
+  });
+
+  it("never routes subscription auth, allowance, rate-limit, or server failures to paid providers", async () => {
+    vi.useFakeTimers();
+    try {
+      const profile = freezeAgentProfile({
+        id: "subscription-route",
+        roleRoutes: {},
+        toolAllow: null,
+        toolDeny: [],
+        skills: [],
+        hooks: [],
+        permissionMode: "deny",
+        budget: { ...DEFAULT_PROFILE_BUDGET },
+        mutationPolicy: {
+          requirePlanBeforeMutation: true,
+          checkpointBeforeMutation: true,
+          reviewMode: "advisory"
+        },
+        allowedChildProfiles: []
+      });
+      for (const category of ["auth", "capacity", "rate_limit", "server"] as const) {
+        const calls: string[] = [];
+        const gateways = createRoleGateways({
+          provider: "openai-codex",
+          model: "gpt-5.6-terra",
+          modelDeadlineSec: 10,
+          streamIdleSec: 5
+        }, {
+          gatewayFactory: ({ provider, model }) => gateway(`${provider}/${model}`, async () => {
+            calls.push(provider);
+            throw Object.assign(new Error(category), { category });
+          })
+        }, {
+          profile,
+          profileSource: "builtin",
+          availableProfiles: [{ profile, source: "builtin" }]
+        } as unknown as RuntimeCustomization, {
+          OPENAI_API_KEY: "must-not-be-used",
+          DEEPSEEK_API_KEY: "must-not-fallback",
+          GLM_API_KEY: "must-not-fallback"
+        });
+
+        const failed = expect(gateways.orchestrator.complete(request())).rejects.toThrow(category);
+        await vi.runAllTimersAsync();
+        await failed;
+        expect(new Set(calls)).toEqual(new Set(["openai-codex"]));
+        expect(calls).toHaveLength(category === "rate_limit" || category === "server" ? 3 : 1);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("uses explicit profile route ids as distinct production policies", async () => {
@@ -251,11 +429,31 @@ describe("capability-aware model routing", () => {
     ]);
 
     const unpriced = new ModelRouter(
-      [spec("deepseek/a", { pricing: undefined })],
+      [spec("deepseek/a", { billingMode: "unpriced", pricing: undefined })],
       [route({ candidates: ["deepseek/a"], maxAttempts: 1 })],
       (item) => gateway(item.id, async () => response("ok"))
     );
     expect(() => unpriced.resolve("main", { remainingBudgetMicroUsd: 10_000 })).toThrow("no eligible candidates");
+    expect(unpriced.resolve("main", {
+      remainingBudgetMicroUsd: 10_000,
+      allowUnpricedCosts: true
+    }).candidates.map((item) => item.id)).toEqual(["deepseek/a"]);
+    const subscriptionSpec = spec("openai-codex/subscription", {
+      providerId: "openai-codex",
+      billingMode: "subscription",
+      pricing: undefined
+    });
+    const subscription = new ModelRouter(
+      [subscriptionSpec],
+      [route({ candidates: [subscriptionSpec.id], maxAttempts: 1 })],
+      (item) => gateway(item.id, async () => response("ok"))
+    );
+    expect(subscription.resolve("main", {
+      remainingBudgetMicroUsd: 0
+    }).candidates.map((item) => item.id)).toEqual([subscriptionSpec.id]);
+    expect(modelReservationEstimate(subscriptionSpec, {})).toMatchObject({
+      costMicroUsd: null
+    });
     expect(modelReservationEstimate(first, { estimatedInputTokens: 100, maxOutputTokens: 50 })).toMatchObject({
       inputTokens: 150,
       outputTokens: 75
@@ -316,6 +514,142 @@ describe("capability-aware model routing", () => {
       retryAttempt: 1,
       costMicroUsd: expect.any(Number)
     });
+  });
+
+  it("keeps transport retries in the Sigma policy layer and reserves them", async () => {
+    let calls = 0;
+    const only = spec("deepseek/a");
+    const representative = gateway(only.id, async () => response("unused"));
+    const retrying = gateway(only.id, async () => {
+      calls += 1;
+      if (calls < 3) {
+        throw Object.assign(new Error("temporary network failure"), { category: "network" });
+      }
+      return response("recovered");
+    });
+    const router = new ModelRouter(
+      [only],
+      [route({ candidates: [only.id], maxAttempts: 1 })],
+      () => retrying,
+      { maxRetriesPerCandidate: 2 }
+    );
+    const result = await router.complete("orchestrator", "main", request());
+    expect(calls).toBe(3);
+    expect(result).toMatchObject({ modelSpecId: only.id, attempt: 2 });
+
+    const routed = new RoutedModelGateway({
+      router,
+      role: "orchestrator",
+      routeId: "main",
+      representative
+    });
+    const plan = await routed.budgetPlan([{ role: "user", content: "hello" }], [], 100, 10_000);
+    expect(plan.reservedModelTurns).toBe(3);
+    expect(plan.attemptReservations).toHaveLength(3);
+
+    let resourceCalls = 0;
+    const resourceRetry = new ModelRouter(
+      [only],
+      [route({ candidates: [only.id], maxAttempts: 1 })],
+      () => gateway(only.id, async () => {
+        resourceCalls += 1;
+        if (resourceCalls < 3) {
+          throw Object.assign(new Error("provider resources are insufficient"), {
+            category: "capacity"
+          });
+        }
+        return response("resource recovered");
+      }),
+      { maxRetriesPerCandidate: 2 }
+    );
+    await expect(resourceRetry.complete("orchestrator", "main", request()))
+      .resolves.toMatchObject({ modelSpecId: only.id, attempt: 2 });
+    expect(resourceCalls).toBe(3);
+
+    let capacityCalls = 0;
+    const subscriptionOnly = spec("openai-codex/gpt-5.6-terra", {
+      providerId: "openai-codex",
+      upstreamModel: "gpt-5.6-terra",
+      billingMode: "subscription",
+      pricing: undefined
+    });
+    const exhausted = new ModelRouter(
+      [subscriptionOnly],
+      [route({ candidates: [subscriptionOnly.id], maxAttempts: 1 })],
+      () => gateway(subscriptionOnly.id, async () => {
+        capacityCalls += 1;
+        throw Object.assign(new Error("allowance exhausted"), { category: "capacity" });
+      }),
+      { maxRetriesPerCandidate: 2 }
+    );
+    await expect(exhausted.complete("orchestrator", "main", request())).rejects.toMatchObject({
+      category: "capacity",
+      attempts: 1
+    });
+    expect(capacityCalls).toBe(1);
+  });
+
+  it("uses abortable exponential backoff only between same-provider retries", async () => {
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      const only = spec("deepseek/a");
+      const router = new ModelRouter(
+        [only],
+        [route({ candidates: [only.id], maxAttempts: 1 })],
+        () => gateway(only.id, async () => {
+          calls += 1;
+          if (calls < 3) {
+            throw Object.assign(new Error("temporary server failure"), { category: "server" });
+          }
+          return response("recovered after backoff");
+        }),
+        {
+          maxRetriesPerCandidate: 2,
+          retryBaseDelayMs: 2_000,
+          retryMaxDelayMs: 60_000
+        }
+      );
+
+      const pending = router.complete("orchestrator", "main", request());
+      await vi.advanceTimersByTimeAsync(0);
+      expect(calls).toBe(1);
+      await vi.advanceTimersByTimeAsync(1_999);
+      expect(calls).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(calls).toBe(2);
+      await vi.advanceTimersByTimeAsync(3_999);
+      expect(calls).toBe(2);
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(pending).resolves.toMatchObject({
+        modelSpecId: only.id,
+        attempt: 2
+      });
+      expect(calls).toBe(3);
+
+      const controller = new AbortController();
+      const cancellation = new Error("cancel retry backoff");
+      let cancelledCalls = 0;
+      const cancelledRouter = new ModelRouter(
+        [only],
+        [route({ candidates: [only.id], maxAttempts: 1 })],
+        () => gateway(only.id, async () => {
+          cancelledCalls += 1;
+          throw Object.assign(new Error("temporary server failure"), { category: "server" });
+        }),
+        { maxRetriesPerCandidate: 2, retryBaseDelayMs: 2_000 }
+      );
+      const cancelled = cancelledRouter.complete("orchestrator", "main", {
+        ...request(),
+        signal: controller.signal
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      controller.abort(cancellation);
+      await expect(cancelled).rejects.toBe(cancellation);
+      expect(cancelledCalls).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not fall back on protocol failures or after streamed semantic output", async () => {
@@ -439,6 +773,43 @@ describe("capability-aware model routing", () => {
 });
 
 describe("normalized model usage", () => {
+  it("uses the highest matching request-wide pricing tier for usage and reservation", () => {
+    const tiered = spec("deepseek/tiered", {
+      tokenizer: { id: "exact", accuracy: "exact" },
+      pricing: {
+        inputMicroUsdPerMillion: 1_000_000,
+        outputMicroUsdPerMillion: 2_000_000,
+        cacheReadMicroUsdPerMillion: 100_000,
+        cacheWriteMicroUsdPerMillion: 1_000_000,
+        effectiveAt: "2026-01-01",
+        tiers: [{
+          inputTokensAbove: 999,
+          inputMicroUsdPerMillion: 3_000_000,
+          outputMicroUsdPerMillion: 4_000_000,
+          cacheReadMicroUsdPerMillion: 200_000,
+          cacheWriteMicroUsdPerMillion: 5_000_000
+        }]
+      }
+    });
+    expect(normalizeUsage({
+      request: request(),
+      response: response("answer"),
+      raw: {
+        inputTokens: 1_000,
+        outputTokens: 100,
+        cacheReadTokens: 250,
+        cacheWriteTokens: 50
+      },
+      pricing: tiered.pricing,
+      latencyMs: 1,
+      retryAttempt: 0
+    }).costMicroUsd).toBe(2_800);
+    expect(modelReservationEstimate(tiered, {
+      estimatedInputTokens: 1_000,
+      maxOutputTokens: 100
+    }).costMicroUsd).toBe(3_400);
+  });
+
   it("always supplies token, cost, latency, and reporting fields", () => {
     const usage = normalizeUsage({
       request: request(),
@@ -479,65 +850,132 @@ describe("normalized model usage", () => {
     });
   });
 
-  it("normalizes detailed provider usage on streaming gateway responses", async () => {
-    const frames = [
-      {
-        usage: {
-          prompt_tokens: 10,
-          completion_tokens: 3,
-          prompt_tokens_details: { cached_tokens: 4 },
-          completion_tokens_details: { reasoning_tokens: 2 }
-        },
-        choices: [{ delta: { content: "ok" }, finish_reason: "stop" }]
-      }
-    ];
-    const body = `${frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join("")}data: [DONE]\n\n`;
-    const model = new OpenAIModelGateway({
-      provider: "fake",
-      model: "fake",
-      baseUrl: "https://example.invalid",
-      apiKey: "secret",
-      apiKeyName: "FAKE_KEY",
-      pricing: spec("deepseek/a").pricing,
-      fetchImpl: (async () => new Response(body, { headers: { "content-type": "text/event-stream" } })) as typeof fetch
-    });
-    const events: ModelStreamEvent[] = [];
-    for await (const event of model.stream(request())) events.push(event);
-    const done = events.at(-1);
-    expect(done).toMatchObject({
-      type: "done",
-      response: {
-        usage: {
-          inputTokens: 10,
-          outputTokens: 3,
-          cacheReadTokens: 4,
-          reasoningTokens: 2,
-          providerReported: true,
-          costMicroUsd: 13
-        }
-      }
-    });
-  });
-
-  it("normalizes DeepSeek top-level cache-hit usage on streaming responses", async () => {
-    const frame = {
-      usage: { prompt_tokens: 10, completion_tokens: 2, prompt_cache_hit_tokens: 7 },
-      choices: [{ delta: { content: "ok" }, finish_reason: "stop" }]
+  it("persists subscription usage as null cost while charging zero to the budget ledger", async () => {
+    const subscriptionGateway: ModelGateway = {
+      ...gateway("subscription", async () => response("ok")),
+      provider: "openai-codex",
+      model: "gpt-5.6-terra",
+      async countTokens() { return 4; }
     };
-    const body = `data: ${JSON.stringify(frame)}\n\ndata: [DONE]\n\n`;
-    const model = new OpenAIModelGateway({
-      provider: "fake", model: "fake", baseUrl: "https://example.invalid", apiKey: "secret",
-      apiKeyName: "FAKE_KEY", pricing: spec("deepseek/a").pricing,
-      fetchImpl: (async () => new Response(body, { headers: { "content-type": "text/event-stream" } })) as typeof fetch
+    const prepared = await prepareModelBudget(
+      subscriptionGateway,
+      request().messages,
+      [],
+      10,
+      10_000
+    );
+    expect(prepared.spec).toMatchObject({
+      providerId: "openai-codex",
+      billingMode: "subscription"
     });
-    const events: ModelStreamEvent[] = [];
-    for await (const event of model.stream(request())) events.push(event);
+    expect(prepared.reserved.costMicroUsd).toBe(0);
 
-    expect(events.at(-1)).toMatchObject({
-      type: "done",
-      response: { usage: { cacheReadTokens: 7, providerReported: true } }
+    const result = response("ok");
+    result.usage = {
+      ...result.usage,
+      inputTokens: 4,
+      outputTokens: 2,
+      costMicroUsd: null,
+      billingMode: "subscription"
+    };
+    const usage = successfulModelUsage(
+      { sessionId: "session", runId: "run" },
+      subscriptionGateway,
+      "request",
+      { messages: request().messages, tools: [] },
+      result,
+      prepared,
+      5
+    );
+    expect(usage).toMatchObject({
+      providerId: "openai-codex",
+      costMicroUsd: null,
+      billingMode: "subscription"
+    });
+    expect(consumedBudget(usage).costMicroUsd).toBe(0);
+    expect(failedModelUsage(
+      { sessionId: "session", runId: "run" },
+      subscriptionGateway,
+      "failed-request",
+      prepared,
+      5
+    )).toMatchObject({
+      costMicroUsd: null,
+      billingMode: "subscription"
     });
   });
+
+  it("allows null persisted cost only when usage is explicitly subscription billed", () => {
+    const unpriced = normalizeUsage({
+      request: request(),
+      response: response("answer"),
+      latencyMs: 1,
+      retryAttempt: 0
+    });
+    const identity = {
+      usageId: "usage-subscription",
+      requestId: "request-subscription",
+      sessionId: "session",
+      runId: "run",
+      role: "orchestrator" as const,
+      routeId: "default",
+      providerId: "openai-codex",
+      modelId: "openai-codex/gpt-5.6-terra",
+      tokenizer: { id: "test", accuracy: "approximate" as const },
+      occurredAt: "2026-07-29T00:00:00.000Z"
+    };
+
+    expect(() => toUsageRecord(unpriced, identity)).toThrow(
+      "has no pricing for cost accounting"
+    );
+    expect(toUsageRecord({
+      ...unpriced,
+      billingMode: "subscription"
+    }, identity)).toMatchObject({
+      costMicroUsd: null,
+      billingMode: "subscription"
+    });
+  });
+
+  it("keeps aggregated reviewer subscription usage distinct from zero API cost", () => {
+    const base: UsageRecord = {
+      usageId: "usage-1",
+      requestId: "review-1",
+      sessionId: "session",
+      runId: "run",
+      role: "reviewer",
+      routeId: "default",
+      providerId: "openai-codex",
+      modelId: "openai-codex/gpt-5.6-terra",
+      tokenizerId: "test",
+      tokenizerAccuracy: "approximate",
+      providerReported: true,
+      inputTokens: 4,
+      outputTokens: 2,
+      reasoningTokens: 1,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      costMicroUsd: null,
+      billingMode: "subscription",
+      latencyMs: 2,
+      attempt: 1,
+      occurredAt: "2026-07-29T00:00:00.000Z"
+    };
+    const aggregated = aggregateReviewerUsage(
+      {} as never,
+      "review-aggregate",
+      [base, { ...base, usageId: "usage-2" }],
+      {} as never,
+      {} as never
+    );
+    expect(aggregated).toMatchObject({
+      billingMode: "subscription",
+      costMicroUsd: null,
+      inputTokens: 8,
+      outputTokens: 4
+    });
+  });
+
 });
 
 function response(content: string): ModelResponse {

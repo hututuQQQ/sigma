@@ -8,6 +8,7 @@
   },
   "include": ["src/**/*.ts"],
   "references": [
+    { "path": "../agent-pi" },
     { "path": "../agent-code-intel" },
     { "path": "../agent-config" },
     { "path": "../agent-execution" },

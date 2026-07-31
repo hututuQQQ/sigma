@@ -13,7 +13,8 @@
     "agent-platform": ["agent-execution"],
     "agent-checkpoint": ["agent-platform"],
     "agent-context": ["agent-platform", "agent-protocol"],
-    "agent-model": ["agent-protocol"],
+    "agent-pi": ["agent-platform", "agent-protocol"],
+    "agent-model": ["agent-pi", "agent-protocol"],
     "agent-extensions": ["agent-model"],
     "agent-kernel": ["agent-protocol"],
     "agent-mcp": ["agent-execution", "agent-protocol"],
@@ -29,7 +30,7 @@
     ],
     "agent-tui": ["agent-presentation", "agent-protocol"],
     "agent-cli": [
-      "agent-code-intel", "agent-config", "agent-execution", "agent-extensions", "agent-presentation",
+      "agent-pi", "agent-code-intel", "agent-config", "agent-execution", "agent-extensions", "agent-presentation",
       "agent-model", "agent-protocol", "agent-runtime", "agent-store", "agent-tui"
     ]
   }

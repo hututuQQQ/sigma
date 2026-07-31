@@ -7,8 +7,8 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "bin": {
-    "agent": "./dist/index.js",
-    "sigma": "./dist/index.js"
+    "agent": "./dist/bin.js",
+    "sigma": "./dist/bin.js"
   },
   "exports": {
     ".": {
@@ -18,12 +18,13 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/index.js",
-    "start:tui": "node --experimental-ffi --disable-warning=ExperimentalWarning dist/index.js tui",
+    "start": "node dist/bin.js",
+    "start:tui": "node --experimental-ffi --disable-warning=ExperimentalWarning dist/bin.js tui",
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\""
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "1.3.0",
+    "agent-pi": "workspace:*",
     "agent-code-intel": "workspace:*",
     "agent-config": "workspace:*",
     "agent-execution": "workspace:*",

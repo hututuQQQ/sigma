@@ -16,7 +16,10 @@ export interface RunCommandDeps extends RuntimeFactoryDeps {
   stdin?: NodeJS.ReadableStream & { isTTY?: boolean };
   stdout?: NodeJS.WritableStream & { isTTY?: boolean };
   stderr?: NodeJS.WritableStream;
-  gatewayFactory?: (options: { provider: "deepseek" | "glm"; model: string }) => ModelGateway;
+  gatewayFactory?: (options: {
+    provider: string;
+    model: string;
+  }) => ModelGateway;
   mode?: RunMode;
 }
 

@@ -29,6 +29,7 @@ export interface AtomicPatchTransactionOptions extends AtomicPatchTransactionHoo
   workspace: string;
   transaction: string;
   changes: readonly PreparedPatchChange[];
+  signal?: AbortSignal;
   beforeCommit?: () => Promise<void>;
   verifyTransaction?: () => Promise<void>;
   validators: AtomicPatchTransactionValidators;
@@ -78,11 +79,17 @@ function relativeFrom(workspace: string, absolute: string): string {
   return path.relative(workspace, absolute).split(path.sep).join("/");
 }
 
+function throwIfCancelled(options: AtomicPatchTransactionOptions): void {
+  options.signal?.throwIfAborted();
+}
+
 async function runHook(
-  hook: AtomicPatchTransactionHooks["beforeMutation"],
+  options: AtomicPatchTransactionOptions,
   operation: AtomicPatchMutation
 ): Promise<void> {
-  await hook?.(operation);
+  throwIfCancelled(options);
+  await options.beforeMutation?.(operation);
+  throwIfCancelled(options);
 }
 
 async function syncFile(target: string): Promise<void> {
@@ -90,8 +97,9 @@ async function syncFile(target: string): Promise<void> {
   try { await handle.sync(); } finally { await handle.close(); }
 }
 
-async function stageChanges(staged: string, changes: readonly PreparedPatchChange[]): Promise<void> {
-  for (const [index, change] of changes.entries()) {
+async function stageChanges(options: AtomicPatchTransactionOptions, staged: string): Promise<void> {
+  for (const [index, change] of options.changes.entries()) {
+    throwIfCancelled(options);
     if (!change.target) continue;
     const candidate = path.join(staged, String(index));
     if (change.kind === "symlink") {
@@ -125,10 +133,12 @@ function journalOperation(journal: AtomicPatchJournal, changeIndex: number): Ato
 }
 
 async function persistApplying(options: AtomicPatchTransactionOptions, journal: AtomicPatchJournal): Promise<void> {
+  throwIfCancelled(options);
   await options.verifyTransaction?.();
   journal.phase = "applying";
   await writePatchJournal(options.transaction, journal);
   await options.verifyTransaction?.();
+  throwIfCancelled(options);
 }
 
 async function ensureTargetParents(
@@ -146,14 +156,16 @@ async function ensureTargetParents(
     const parent = { relativePath: relativeParent, changeIndex, createIntent: true, created: false };
     journal.parents.push(parent);
     await persistApplying(options, journal);
-    await runHook(options.beforeMutation, {
+    await runHook(options, {
       direction: "commit", phase: "create_parent", changeIndex, relativePath: relativeParent
     });
     const pinned = await pinPatchParent(options.workspace, relativeParent);
     try {
       await pinned.verify();
       try {
+        throwIfCancelled(options);
         await mkdir(pinned.targetPath, { mode: 0o700 });
+        throwIfCancelled(options);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "EEXIST"
           && await existingDirectory(current, relative)) {
@@ -168,7 +180,7 @@ async function ensureTargetParents(
         throw error;
       }
       await syncDirectory(path.dirname(pinned.targetPath));
-      await runHook(options.beforeMutation, {
+      await runHook(options, {
         direction: "commit", phase: "create_parent_created", changeIndex, relativePath: relativeParent
       });
       parent.created = true;
@@ -187,7 +199,7 @@ async function moveSource(
   changeIndex: number,
   journal: AtomicPatchJournal
 ): Promise<void> {
-  await runHook(options.beforeMutation, {
+  await runHook(options, {
     direction: "commit", phase: "backup_source", changeIndex, relativePath: change.source!
   });
   await options.validators.assertSourceUnchanged(change);
@@ -198,14 +210,16 @@ async function moveSource(
     await pinned.verify();
     operation.backupIntent = true;
     await persistApplying(options, journal);
-    await runHook(options.beforeMutation, {
+    await runHook(options, {
       direction: "commit", phase: "backup_source_pinned", changeIndex, relativePath: change.source!
     });
     await options.verifyTransaction?.();
+    throwIfCancelled(options);
     await rename(pinned.targetPath, saved);
+    throwIfCancelled(options);
     await syncDirectory(path.dirname(pinned.targetPath));
     await syncDirectory(path.dirname(saved));
-    await runHook(options.beforeMutation, {
+    await runHook(options, {
       direction: "commit", phase: "backup_source_moved", changeIndex, relativePath: change.source!
     });
     operation.backupMoved = true;
@@ -240,7 +254,7 @@ async function installTarget(
   journal: AtomicPatchJournal
 ): Promise<void> {
   await ensureTargetParents(options, change.target!, changeIndex, journal);
-  await runHook(options.beforeMutation, {
+  await runHook(options, {
     direction: "commit", phase: "install_target", changeIndex, relativePath: change.target!
   });
   await options.validators.assertTargetAbsent(change);
@@ -252,14 +266,16 @@ async function installTarget(
     await pinned.verify();
     operation.installIntent = true;
     await persistApplying(options, journal);
-    await runHook(options.beforeMutation, {
+    await runHook(options, {
       direction: "commit", phase: "install_target_pinned", changeIndex, relativePath: change.target!
     });
     await options.verifyTransaction?.();
+    throwIfCancelled(options);
     await rename(candidate, pinned.targetPath);
+    throwIfCancelled(options);
     await syncDirectory(path.dirname(candidate));
     await syncDirectory(path.dirname(pinned.targetPath));
-    await runHook(options.beforeMutation, {
+    await runHook(options, {
       direction: "commit", phase: "install_target_moved", changeIndex, relativePath: change.target!
     });
     operation.installed = true;
@@ -277,6 +293,7 @@ async function installChanges(
   journal: AtomicPatchJournal
 ): Promise<void> {
   for (const [index, change] of options.changes.entries()) {
+    throwIfCancelled(options);
     if (change.source) await moveSource(options, backup, change, index, journal);
     if (change.target) await installTarget(options, staged, change, index, journal);
   }
@@ -297,11 +314,15 @@ async function initializeTransaction(
   backup: string,
   journal: AtomicPatchJournal
 ): Promise<void> {
+  throwIfCancelled(options);
   await mkdir(staged, { mode: 0o700 });
   await mkdir(backup, { mode: 0o700 });
-  await stageChanges(staged, options.changes);
+  await stageChanges(options, staged);
+  throwIfCancelled(options);
   await options.beforeCommit?.();
+  throwIfCancelled(options);
   await options.validators.assertAllUnchanged();
+  throwIfCancelled(options);
   journal.phase = "prepared";
   await writePatchJournal(options.transaction, journal);
 }
@@ -315,6 +336,7 @@ async function throwAfterCleanup(primary: unknown, transaction: string): Promise
 export async function commitPreparedPatch(
   options: AtomicPatchTransactionOptions
 ): Promise<AtomicPatchCleanupWarning | undefined> {
+  throwIfCancelled(options);
   const staged = path.join(options.transaction, "staged");
   const backup = path.join(options.transaction, "backup");
   try {
@@ -343,8 +365,10 @@ export async function commitPreparedPatch(
     await options.verifyTransaction();
     await installChanges(options, staged, backup, journal);
     for (const change of options.changes) {
+      throwIfCancelled(options);
       if (change.target) await options.validators.assertInstalled(change);
     }
+    throwIfCancelled(options);
     journal.phase = "committed";
     await writePatchJournal(options.transaction, journal);
     await options.verifyTransaction();

@@ -46,6 +46,7 @@ function envelope(
 class FakeRuntime implements RuntimeClient {
   readonly commands: RunCommand[] = [];
   readonly releasedSessions: string[] = [];
+  cancelSettlement?: { started(): void; wait: Promise<void> };
   private readonly events: AgentEventEnvelope[] = [];
   private readonly eventWaiters = new Set<() => void>();
   private readonly outcomes = new Map<string, RunOutcome>();
@@ -80,6 +81,14 @@ class FakeRuntime implements RuntimeClient {
         this.emit(command.sessionId, "model.reasoning_delta", { turnId: 2, delta: "Waiting." });
         return;
       }
+      if (command.text === "fail provider") {
+        this.finish(command.sessionId, {
+          kind: "recoverable_failure",
+          code: "server",
+          message: "The model provider is temporarily unavailable."
+        });
+        return;
+      }
       void this.completeTurn(command.sessionId);
       return;
     }
@@ -88,6 +97,8 @@ class FakeRuntime implements RuntimeClient {
       return;
     }
     if (command.type === "cancel") {
+      this.cancelSettlement?.started();
+      await this.cancelSettlement?.wait;
       this.finish(command.sessionId, { kind: "cancelled", reason: command.reason ?? "cancelled" });
     }
   }
@@ -358,6 +369,7 @@ describe("Sigma ACP v1 contract", () => {
       expect(initialized.protocolVersion).toBe(1);
       expect(initialized.agentCapabilities?.loadSession).toBe(true);
       expect(initialized.agentCapabilities?.sessionCapabilities?.resume).toEqual({});
+      expect(Object.hasOwn(initialized as object, "authMethods")).toBe(false);
       const health = await clientConnection.agent.request<SigmaHealthForTest, Record<string, never>>(
         "_sigma/health",
         {}
@@ -399,6 +411,12 @@ describe("Sigma ACP v1 contract", () => {
       });
       expect(created.sessionId).toMatch(/^sigma-/u);
       expect(created.configOptions?.[0]?.category).toBe("model");
+      expect(created.configOptions?.[0]?.options).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          value: "openai-codex/gpt-5.6-terra",
+          description: "openai-codex · subscription"
+        })
+      ]));
       const changedModel = await clientConnection.agent.request(
         acp.methods.agent.session.setConfigOption,
         {
@@ -484,10 +502,39 @@ describe("Sigma ACP v1 contract", () => {
         prompt: [{ type: "text", text: "wait for cancellation" }]
       });
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
-      await clientConnection.agent.notify(acp.methods.agent.session.cancel, {
+      let cancelStarted!: () => void;
+      let releaseCancel!: () => void;
+      const cancelStartedPromise = new Promise<void>((resolve) => { cancelStarted = resolve; });
+      const cancelGate = new Promise<void>((resolve) => { releaseCancel = resolve; });
+      runtime.cancelSettlement = { started: cancelStarted, wait: cancelGate };
+      const notification = clientConnection.agent.notify(acp.methods.agent.session.cancel, {
         sessionId: cancellable.sessionId
       });
+      await cancelStartedPromise;
+      let promptSettled = false;
+      void pendingPrompt.then(() => { promptSettled = true; });
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      expect(promptSettled).toBe(false);
+      releaseCancel();
+      await notification;
       expect((await pendingPrompt).stopReason).toBe("cancelled");
+      delete runtime.cancelSettlement;
+
+      const failing = await clientConnection.agent.request(acp.methods.agent.session.new, {
+        cwd: root,
+        mcpServers: []
+      });
+      await expect(clientConnection.agent.request(acp.methods.agent.session.prompt, {
+        sessionId: failing.sessionId,
+        prompt: [{ type: "text", text: "fail provider" }]
+      })).rejects.toMatchObject({
+        code: -32001,
+        message: "The model provider is temporarily unavailable.",
+        data: {
+          "sigma.outcome": "recoverable_failure",
+          "sigma.code": "server"
+        }
+      });
 
       await clientConnection.agent.request(acp.methods.agent.session.close, {
         sessionId: created.sessionId

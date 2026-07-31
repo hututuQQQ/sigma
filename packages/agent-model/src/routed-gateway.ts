@@ -130,9 +130,7 @@ export class RoutedModelGateway implements ModelGateway {
       maxOutputTokens,
       remainingBudgetMicroUsd
     };
-    const resolution = this.router.resolve(this.routeId, constraints);
-    const estimates = resolution.candidates
-      .slice(0, resolution.route.maxAttempts)
+    const estimates = this.router.plannedAttempts(this.routeId, constraints)
       .map((spec) => modelReservationEstimate(spec, constraints));
     return {
       estimatedInputTokens,

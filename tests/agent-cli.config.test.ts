@@ -13,6 +13,8 @@ describe("Sigma config", () => {
   it("defaults to workspace-auto, required sandbox, workspace reads, full network, and hard shared budgets", () => {
     const config = loadCliConfig({}, { env: {}, cwd: process.cwd(), homeDir: path.join(process.cwd(), ".missing-home") });
     expect(config).toMatchObject({
+      provider: "openai-codex",
+      model: "auto",
       sandboxMode: "required",
       executionMode: "sandboxed",
       managedEnvironmentMode: "disabled",

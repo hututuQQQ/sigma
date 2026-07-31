@@ -2,6 +2,7 @@ import * as acp from "@agentclientprotocol/sdk";
 import type { RunMode, RunOutcome, RuntimeClient } from "agent-protocol";
 
 export const MODEL_CONFIG_ID = "sigma.model";
+export const SIGMA_RUNTIME_REQUEST_ERROR = -32001;
 
 export interface SigmaAcpRuntimeHandle {
   runtime: RuntimeClient;
@@ -130,10 +131,22 @@ export function listOffset(cursor: string | null | undefined): number {
   return offset;
 }
 
-export function stopReason(outcome: RunOutcome): acp.StopReason {
-  if (outcome.kind === "cancelled") return "cancelled";
-  if (outcome.kind === "fatal" || outcome.kind === "recoverable_failure") return "refusal";
-  return "end_turn";
+export function promptResponseForOutcome(outcome: RunOutcome): acp.PromptResponse {
+  if (outcome.kind === "fatal" || outcome.kind === "recoverable_failure") {
+    throw new acp.RequestError(SIGMA_RUNTIME_REQUEST_ERROR, outcome.message, {
+      "sigma.outcome": outcome.kind,
+      "sigma.code": outcome.code
+    });
+  }
+  return {
+    stopReason: outcome.kind === "cancelled" ? "cancelled" : "end_turn",
+    _meta: {
+      "sigma.outcome": outcome.kind,
+      ...(outcome.kind === "cancelled"
+        ? { "sigma.message": outcome.reason }
+        : { "sigma.message": outcome.message })
+    }
+  };
 }
 
 export function expectedAbort(error: unknown, signal: AbortSignal): boolean {
