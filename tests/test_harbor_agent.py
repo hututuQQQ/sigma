@@ -20,6 +20,7 @@ PORTABLE_AGENT_ENV_KEYS = (
     "DEEPSEEK_BASE_URL",
     "GLM_BASE_URL",
     "ZAI_BASE_URL",
+    "SIGMA_HOST_CREDENTIAL_FILE",
 )
 
 
@@ -184,6 +185,91 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "NUL"):
             module.SigmaCliHarborAgent._private_env_script({"SAFE_NAME": "bad\0value"})
 
+    async def test_provider_credential_is_filtered_uploaded_privately_and_removed(self):
+        module = import_portable_agent_module()
+
+        class RecordingEnvironment:
+            def __init__(self):
+                self.exec_calls = []
+                self.uploads = []
+
+            async def exec(self, command, **kwargs):
+                self.exec_calls.append((command, kwargs))
+                return SimpleNamespace(return_code=0, stdout="ok", stderr="")
+
+            async def upload_file(self, source, target):
+                source_path = Path(source)
+                self.uploads.append({
+                    "target": target,
+                    "content": source_path.read_text(encoding="utf-8"),
+                    "source": source_path,
+                })
+
+        with TemporaryDirectory() as tmp:
+            credential_path = Path(tmp) / "auth.json"
+            selected_access = "selected-access-secret"
+            selected_refresh = "selected-refresh-secret"
+            unrelated_secret = "unrelated-provider-secret"
+            credential_path.write_text(json.dumps({
+                "version": 1,
+                "credentials": {
+                    "openai-codex": {
+                        "type": "oauth",
+                        "access": selected_access,
+                        "refresh": selected_refresh,
+                        "expires": 9_999_999_999_999,
+                    },
+                    "deepseek": {
+                        "type": "api_key",
+                        "key": unrelated_secret,
+                    },
+                },
+            }), encoding="utf-8")
+            env = RecordingEnvironment()
+            agent = module.SigmaCliHarborAgent(
+                provider="openai-codex",
+                credential_file=credential_path,
+                extra_env={},
+            )
+
+            result = await agent._exec_with_private_env(
+                env,
+                "printf command-completed",
+                {},
+                timeout_sec=30,
+            )
+
+        self.assertEqual(result.return_code, 0)
+        json_upload = next(item for item in env.uploads if item["target"].endswith(".json"))
+        env_upload = next(item for item in env.uploads if item["target"].endswith(".sh"))
+        uploaded_document = json.loads(json_upload["content"])
+        self.assertEqual(
+            list(uploaded_document["credentials"]),
+            ["openai-codex"],
+        )
+        self.assertEqual(
+            uploaded_document["credentials"]["openai-codex"]["access"],
+            selected_access,
+        )
+        self.assertNotIn(
+            unrelated_secret,
+            "\n".join(item["content"] for item in env.uploads),
+        )
+        self.assertIn("SIGMA_CREDENTIAL_FILE", env_upload["content"])
+        self.assertIn(json_upload["target"], env_upload["content"])
+        self.assertFalse(json_upload["source"].exists())
+        self.assertFalse(env_upload["source"].exists())
+
+        serialized_calls = json.dumps(env.exec_calls)
+        self.assertNotIn(selected_access, serialized_calls)
+        self.assertNotIn(selected_refresh, serialized_calls)
+        removal_commands = [
+            command for command, _ in env.exec_calls
+            if command.startswith("rm -f ")
+        ]
+        self.assertTrue(any(json_upload["target"] in command for command in removal_commands))
+        self.assertTrue(any(env_upload["target"] in command for command in removal_commands))
+
     async def test_model_name_is_used_unless_model_is_explicit(self):
         module = import_portable_agent_module()
 
@@ -232,6 +318,8 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             module.SigmaCliHarborAgent(max_turns=0)
         with self.assertRaisesRegex(ValueError, "command_timeout_sec"):
             module.SigmaCliHarborAgent(command_timeout_sec=601)
+        with self.assertRaisesRegex(ValueError, "reasoning_effort"):
+            module.SigmaCliHarborAgent(reasoning_effort="extreme")
 
     async def test_container_execution_mode_is_forwarded_without_host_opt_in(self):
         module = import_portable_agent_module()
@@ -242,6 +330,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                 network_mode="full",
                 managed_environment_mode="required",
                 harbor_topology="managed_three_role",
+                reasoning_effort="max",
                 max_turns=73,
                 command_timeout_sec=41,
             )
@@ -257,6 +346,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("required", command)
             self.assertIn("--agent-profile", command)
             self.assertIn("standard", command)
+            self.assertEqual(command[command.index("--reasoning-effort") + 1], "max")
             self.assertEqual(command[command.index("--max-model-turns") + 1], "73")
             self.assertEqual(command[command.index("--command-timeout-sec") + 1], "41")
             self.assertEqual(session_command[0], "/usr/local/bin/agent")
@@ -266,6 +356,10 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("required", session_command)
             self.assertIn("--agent-profile", session_command)
             self.assertIn("standard", session_command)
+            self.assertEqual(
+                session_command[session_command.index("--reasoning-effort") + 1],
+                "max",
+            )
             self.assertEqual(
                 session_command[session_command.index("--max-model-turns") + 1],
                 "73",
@@ -511,7 +605,8 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                     "/usr/local/bin/agent doctor --workspace /app --json --strict "
                     "--execution-mode sandboxed --network full --read-scope host "
                     "--write-scope workspace "
-                    "--managed-environment-mode disabled --max-model-turns 200 "
+                    "--managed-environment-mode disabled --reasoning-effort auto "
+                    "--max-model-turns 200 "
                     "--command-timeout-sec 180 --check-api",
                 ],
             )

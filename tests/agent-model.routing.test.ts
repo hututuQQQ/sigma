@@ -479,13 +479,15 @@ describe("capability-aware model routing", () => {
       requestTimeoutMs: number;
       idleTimeoutMs: number;
       activeStreamTimeoutMs?: number;
+      reasoningEffort?: string;
     }> = [];
     const configuredSpecs = [
       specConfig("deepseek/approx", "approx", "approximate", 100),
       specConfig("deepseek/exact", "exact", "exact", 300)
     ];
     const gateways = createRoleGateways({
-      provider: "deepseek", model: "approx", modelDeadlineSec: 10, streamIdleSec: 5, streamActiveSec: 7,
+      provider: "deepseek", model: "approx", modelDeadlineSec: 10, streamIdleSec: 5,
+      streamActiveSec: 7, reasoningEffort: "max",
       modelSpecs: configuredSpecs,
       modelRoutes: [
         {
@@ -512,7 +514,8 @@ describe("capability-aware model routing", () => {
     await gateways.reviewer.complete(request());
     expect(calls).toEqual(["exact", "approx"]);
     expect(timeoutPolicies.every((policy) => policy.requestTimeoutMs === 10_000
-      && policy.idleTimeoutMs === 5_000 && policy.activeStreamTimeoutMs === 7_000)).toBe(true);
+      && policy.idleTimeoutMs === 5_000 && policy.activeStreamTimeoutMs === 7_000
+      && policy.reasoningEffort === "max")).toBe(true);
     expect(gateways.orchestrator.routingIdentity()).toEqual({ role: "orchestrator", routeId: "exact-tools" });
     expect(gateways.reviewer.routingIdentity()).toEqual({ role: "reviewer", routeId: "cheap-review" });
   });
@@ -726,6 +729,57 @@ describe("capability-aware model routing", () => {
       attempts: 1
     });
     expect(capacityCalls).toBe(1);
+  });
+
+  it("retries only the same model after a reasoning-only transient stream failure", async () => {
+    const only = spec("deepseek/a");
+    let reasoningAttempts = 0;
+    const reasoningOnly: ModelGateway = {
+      ...gateway(only.id, async () => response("unused")),
+      async *stream() {
+        reasoningAttempts += 1;
+        yield { type: "reasoning", delta: `attempt-${reasoningAttempts}` } as const;
+        if (reasoningAttempts === 1) {
+          throw Object.assign(new Error("transient stream failure"), { category: "server" });
+        }
+        yield { type: "done", response: response("recovered") } as const;
+      }
+    };
+    const retrying = new ModelRouter(
+      [only],
+      [route({ candidates: [only.id], maxAttempts: 1 })],
+      () => reasoningOnly,
+      { maxRetriesPerCandidate: 1 }
+    );
+    const events = [];
+    for await (const event of retrying.stream("orchestrator", "main", request())) events.push(event);
+    expect(reasoningAttempts).toBe(2);
+    expect(events.map((event) => event.type)).toEqual(["reasoning", "reasoning", "done"]);
+    expect(events.at(-1)).toMatchObject({
+      type: "done",
+      response: { message: { content: "recovered" }, attempt: 1 }
+    });
+
+    let contentAttempts = 0;
+    const partialContent: ModelGateway = {
+      ...gateway(only.id, async () => response("unused")),
+      async *stream() {
+        contentAttempts += 1;
+        yield { type: "content", delta: "partial" } as const;
+        throw Object.assign(new Error("transient stream failure"), { category: "server" });
+      }
+    };
+    const blocked = new ModelRouter(
+      [only],
+      [route({ candidates: [only.id], maxAttempts: 1 })],
+      () => partialContent,
+      { maxRetriesPerCandidate: 1 }
+    );
+    const consume = async (): Promise<void> => {
+      for await (const _event of blocked.stream("orchestrator", "main", request())) { /* consume */ }
+    };
+    await expect(consume()).rejects.toMatchObject({ semanticDelta: true, attempts: 1 });
+    expect(contentAttempts).toBe(1);
   });
 
   it("uses abortable exponential backoff only between same-provider retries", async () => {

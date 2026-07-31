@@ -6,6 +6,7 @@ import path from "node:path";
 import { zstdDecompressSync } from "node:zlib";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  defaultSigmaCredentialPath,
   FileCredentialStore,
   FileModelsStore,
   PiModelGateway,
@@ -592,8 +593,93 @@ describe("OpenAI Codex subscription gateway", () => {
       code: "rate_limited",
       category: "rate_limit"
     });
+    expect(sanitizePiModelError(Object.assign(new Error("opaque provider failure"), {
+      providerErrorCode: "invalid_prompt",
+      providerEventType: "response_failed"
+    }))).toMatchObject({ code: "protocol", category: "protocol" });
+    expect(sanitizePiModelError(Object.assign(new Error("opaque provider failure"), {
+      providerErrorCode: "unrecognized_transient",
+      providerEventType: "response_failed"
+    }))).toMatchObject({ code: "server", category: "server" });
+    expect(sanitizePiModelError(Object.assign(new Error("opaque provider failure"), {
+      providerErrorCode: "slow_down",
+      providerEventType: "response_failed"
+    }))).toMatchObject({ code: "server", category: "server" });
     expect(sanitizePiModelError(new Error("Provider is not configured: openai-codex")))
       .toMatchObject({ code: "auth_required", category: "auth" });
+  });
+
+  it("preserves and classifies Codex response.failed codes without exposing provider text", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => sse([
+      { type: "response.created", response: { id: "resp_failed", status: "in_progress" } },
+      {
+        type: "response.failed",
+        response: {
+          id: "resp_failed",
+          status: "failed",
+          error: { code: "server_error", message: "transient secret-token" }
+        }
+      }
+    ])));
+    const gateway = new PiModelGateway({
+      provider: OPENAI_CODEX_PROVIDER_ID,
+      model: OPENAI_CODEX_DEFAULT_MODEL,
+      credentials: new MemoryCredentialStore(oauth())
+    });
+
+    let failure: unknown;
+    try {
+      await gateway.complete({
+        messages: [{ role: "user", content: "wait" }],
+        signal: new AbortController().signal
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toMatchObject({
+      code: "server",
+      category: "server",
+      message: "The model provider returned a server error.",
+      providerErrorCode: "server_error",
+      providerEventType: "response_failed",
+      diagnostics: {
+        providerErrorCode: "server_error",
+        providerEventType: "response_failed"
+      }
+    });
+    expect(JSON.stringify(failure)).not.toContain("secret-token");
+  });
+
+  it("preserves Codex stream error codes through structured diagnostics", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => sse([{
+      type: "error",
+      code: "rate_limit_exceeded",
+      message: "rate-limit secret-token"
+    }])));
+    const gateway = new PiModelGateway({
+      provider: OPENAI_CODEX_PROVIDER_ID,
+      model: OPENAI_CODEX_DEFAULT_MODEL,
+      credentials: new MemoryCredentialStore(oauth())
+    });
+
+    let failure: unknown;
+    try {
+      await gateway.complete({
+        messages: [{ role: "user", content: "wait" }],
+        signal: new AbortController().signal
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toMatchObject({
+      code: "rate_limited",
+      category: "rate_limit",
+      providerErrorCode: "rate_limit_exceeded",
+      providerEventType: "error"
+    });
+    expect(JSON.stringify(failure)).not.toContain("secret-token");
   });
 
   it("bounds an SSE stream that stops producing events", async () => {
@@ -1005,6 +1091,24 @@ describe("dynamic Pi model refresh", () => {
 });
 
 describe("OpenAI Codex credential persistence", () => {
+  it("supports an isolated absolute credential-file override", () => {
+    const credentialPath = path.join(os.tmpdir(), "sigma-remote-auth.json");
+
+    expect(defaultSigmaCredentialPath("unused-home", {
+      SIGMA_CREDENTIAL_FILE: credentialPath
+    })).toBe(path.resolve(credentialPath));
+    expect(new FileCredentialStore({
+      env: { SIGMA_CREDENTIAL_FILE: credentialPath }
+    }).filePath).toBe(path.resolve(credentialPath));
+    expect(() => defaultSigmaCredentialPath("unused-home", {
+      SIGMA_CREDENTIAL_FILE: "relative/auth.json"
+    })).toThrow("credential_path_invalid");
+    expect(new FileCredentialStore({
+      filePath: credentialPath,
+      env: { SIGMA_CREDENTIAL_FILE: "relative/auth.json" }
+    }).filePath).toBe(path.resolve(credentialPath));
+  });
+
   it("lists every provider's local auth state without network access", async () => {
     const fetchMock = vi.fn(async () => {
       throw new Error("offline status must not call fetch");

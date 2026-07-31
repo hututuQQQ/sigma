@@ -114,10 +114,15 @@ function normalizedSource(value) {
 
 function normalizedModel(value) {
   const model = record(value, "model");
-  exactKeys(model, ["provider", "name"], "model");
+  exactKeys(model, ["provider", "name", "reasoning_effort"], "model");
   return {
     provider: requiredString(model.provider, "model.provider"),
-    name: requiredString(model.name, "model.name")
+    name: requiredString(model.name, "model.name"),
+    reasoning_effort: enumValue(
+      model.reasoning_effort,
+      ["auto", "none", "low", "medium", "high", "xhigh", "max"],
+      "model.reasoning_effort"
+    )
   };
 }
 
@@ -490,6 +495,7 @@ export function assertFrozenBatchControls(manifest, batch, context) {
   const { execution, model, solver_controls: solver } = manifest;
   const options = context?.options;
   if (!options || options.provider !== model.provider || options.model !== model.name
+    || options.reasoningEffort !== model.reasoning_effort
     || options.dataset !== manifest.task_selection.dataset
     || options.benchmarkClass !== solver.benchmark_class
     || options.agentProfile !== solver.agent_profile || options.maxTurns !== solver.max_turns
@@ -517,7 +523,8 @@ export function assertFrozenBatchControls(manifest, batch, context) {
     }
     const agentKwargs = slot.jobConfig?.agents?.[0]?.kwargs;
     if (!agentKwargs || agentKwargs.max_turns !== solver.max_turns
-      || agentKwargs.command_timeout_sec !== solver.command_timeout_sec) {
+      || agentKwargs.command_timeout_sec !== solver.command_timeout_sec
+      || agentKwargs.reasoning_effort !== model.reasoning_effort) {
       throw new Error(
         "Resolved Harbor agent controls drifted from the formal preregistration."
       );

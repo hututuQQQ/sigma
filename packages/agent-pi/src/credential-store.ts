@@ -24,9 +24,24 @@ interface CredentialDocument {
 export interface FileCredentialStoreOptions {
   filePath?: string;
   homeDir?: string;
+  env?: NodeJS.ProcessEnv;
 }
 
-export function defaultSigmaCredentialPath(homeDir = os.homedir()): string {
+export function defaultSigmaCredentialPath(
+  homeDir = os.homedir(),
+  env: NodeJS.ProcessEnv = process.env
+): string {
+  const configured = env.SIGMA_CREDENTIAL_FILE?.trim();
+  if (configured) {
+    if (!path.isAbsolute(configured)) {
+      throw Object.assign(new Error(
+        "credential_path_invalid: SIGMA_CREDENTIAL_FILE must be an absolute path"
+      ), {
+        code: "credential_path_invalid" as const
+      });
+    }
+    return path.resolve(configured);
+  }
   return path.join(homeDir, ".sigma", "auth.json");
 }
 
@@ -141,7 +156,7 @@ export class FileCredentialStore implements CredentialStore {
 
   constructor(options: FileCredentialStoreOptions = {}) {
     this.filePath = path.resolve(
-      options.filePath ?? defaultSigmaCredentialPath(options.homeDir)
+      options.filePath ?? defaultSigmaCredentialPath(options.homeDir, options.env)
     );
   }
 

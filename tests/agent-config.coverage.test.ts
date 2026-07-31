@@ -137,6 +137,8 @@ describe("agent-config single-source schema", () => {
     expect(field("writeScope").parse("enclosing-container")).toBe("enclosing-container");
     expect(() => field("writeScope").parse("host")).toThrow("must be one of");
     expect(field("provider").parse("other")).toBe("other");
+    expect(field("reasoningEffort").parse("max")).toBe("max");
+    expect(() => field("reasoningEffort").parse("extreme")).toThrow("must be one of");
     expect(() => field("workspace").parse(1)).toThrow("string");
     expect(() => field("workspace").parse(" ")).toThrow("non-empty");
     expect(() => field("runDeadlineSec").parse("nan")).toThrow("number");
@@ -240,6 +242,7 @@ describe("agent-config single-source schema", () => {
   it("renders help, commands, and TOML from the same declarations", () => {
     const help = configHelp();
     expect(help.some((line) => line.includes("--provider"))).toBe(true);
+    expect(help.some((line) => line.includes("--reasoning-effort"))).toBe(true);
     expect(help.some((line) => line.includes("--trust-workspace-mcp"))).toBe(true);
     expect(help.some((line) => line.includes("--prompt"))).toBe(false);
     const registry = new CommandRegistry();

@@ -11,6 +11,7 @@ import pathlib
 import re
 import shlex
 import shutil
+import stat
 import tempfile
 import threading
 import time
@@ -34,6 +35,7 @@ ENV_KEYS = [
 ]
 
 CHECKPOINT_RECOVERY_POLICIES = {"restore", "keep", "ask"}
+REASONING_EFFORTS = {"auto", "none", "low", "medium", "high", "xhigh", "max"}
 MAX_EXTERNAL_RECOVERIES = 8
 RECOVERY_POLL_INTERVAL_SEC = 0.25
 MIN_CHECKPOINT_RECOVERY_TIMEOUT_SEC = 600
@@ -691,8 +693,10 @@ class SigmaCliHarborAgent(BaseAgent):
         self,
         logs_dir: pathlib.Path | str | None = None,
         agent_cli_tarball: pathlib.Path | str | None = None,
+        credential_file: pathlib.Path | str | None = None,
         provider: str = "deepseek",
         model: str | None = None,
+        reasoning_effort: str = "auto",
         agent_profile: str = "standard",
         permission_mode: str = "auto",
         network_mode: str = "full",
@@ -725,8 +729,23 @@ class SigmaCliHarborAgent(BaseAgent):
         resolved_model = model or harbor_model_name or _default_model(provider)
         super().__init__(logs_dir=resolved_logs_dir, model_name=resolved_model, **kwargs)
         self.agent_cli_tarball = pathlib.Path(agent_cli_tarball) if agent_cli_tarball is not None else None
+        configured_credential_file = (
+            credential_file or os.environ.get("SIGMA_HOST_CREDENTIAL_FILE")
+        )
+        if configured_credential_file is not None:
+            candidate_credential_file = pathlib.Path(configured_credential_file)
+            if not candidate_credential_file.is_absolute():
+                raise ValueError("credential_file must be an absolute path")
+            self.credential_file = candidate_credential_file
+        else:
+            self.credential_file = None
         self.provider = provider
         self.model = resolved_model
+        if reasoning_effort not in REASONING_EFFORTS:
+            raise ValueError(
+                "reasoning_effort must be one of: auto, none, low, medium, high, xhigh, max"
+            )
+        self.reasoning_effort = reasoning_effort
         if agent_profile not in {"standard", "strict"}:
             raise ValueError("agent_profile must be one of: standard, strict")
         self.agent_profile = agent_profile
@@ -1086,6 +1105,7 @@ class SigmaCliHarborAgent(BaseAgent):
         summary["harbor_topology"] = self.harbor_topology
         summary["permission_mode_effective"] = self._permission_mode()
         summary["agent_profile"] = self.agent_profile
+        summary["reasoning_effort"] = self.reasoning_effort
         summary["max_model_turns"] = self.max_turns
         summary["command_timeout_sec"] = self.command_timeout_sec
         summary["read_scope_effective"] = self.effective_read_scope
@@ -1147,6 +1167,8 @@ class SigmaCliHarborAgent(BaseAgent):
             self.provider,
             "--model",
             self.model,
+            "--reasoning-effort",
+            self.reasoning_effort,
             "--agent-profile",
             self.agent_profile,
             "--max-model-turns",
@@ -1599,6 +1621,8 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             self.provider,
             "--model",
             self.model,
+            "--reasoning-effort",
+            self.reasoning_effort,
             "--agent-profile",
             self.agent_profile,
             "--max-model-turns",
@@ -1793,6 +1817,7 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "managed_environment_mode": self.managed_environment_mode,
             "harbor_topology": self.harbor_topology,
             "agent_profile": self.agent_profile,
+            "reasoning_effort": self.reasoning_effort,
             "max_model_turns": self.max_turns,
             "command_timeout_sec": self.command_timeout_sec,
             "harbor_deadline_sec": self.outer_trial_deadline_sec,
@@ -1853,6 +1878,7 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "termination_source": "adapter_timeout",
             "harbor_deadline_sec": self.outer_trial_deadline_sec,
             "sigma_deadline_sec": self.max_wall_time_sec,
+            "reasoning_effort": self.reasoning_effort,
             "max_model_turns": self.max_turns,
             "command_timeout_sec": self.command_timeout_sec,
             "stdout": _text_artifact_summary(stdout),
@@ -1886,6 +1912,7 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "termination_source": state["termination_source"],
             "harbor_deadline_sec": state["harbor_deadline_sec"],
             "sigma_deadline_sec": state["sigma_deadline_sec"],
+            "reasoning_effort": state["reasoning_effort"],
             "max_model_turns": state["max_model_turns"],
             "command_timeout_sec": state["command_timeout_sec"],
             "process_cleanup": process_cleanup,
@@ -2102,6 +2129,8 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
                 shlex.quote(doctor_write_scope),
                 "--managed-environment-mode",
                 shlex.quote(self.managed_environment_mode),
+                "--reasoning-effort",
+                shlex.quote(self.reasoning_effort),
                 "--max-model-turns",
                 str(self.max_turns),
                 "--command-timeout-sec",
@@ -2255,6 +2284,7 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             "permission_mode_effective": self._permission_mode(),
             "managed_broker_bootstrap": self._managed_broker_bootstrap,
             "agent_profile": self.agent_profile,
+            "reasoning_effort": self.reasoning_effort,
             "max_model_turns": self.max_turns,
             "command_timeout_sec": self.command_timeout_sec,
             "available_network_modes": list(self.available_network_modes),
@@ -2342,6 +2372,110 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             )
         return remote_path
 
+    def _provider_credential_document(self) -> bytes | None:
+        if self.credential_file is None:
+            return None
+        try:
+            info = self.credential_file.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise RuntimeError(
+                "agent_credential_transport_failed: could not inspect the host "
+                "credential file"
+            ) from error
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise RuntimeError(
+                "agent_credential_transport_failed: the host credential path must "
+                "be a regular, non-symlink file"
+            )
+        try:
+            document = json.loads(self.credential_file.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise RuntimeError(
+                "agent_credential_transport_failed: the host credential file is "
+                "not valid UTF-8 JSON"
+            ) from error
+        if (
+            not isinstance(document, dict)
+            or document.get("version") != 1
+            or not isinstance(document.get("credentials"), dict)
+        ):
+            raise RuntimeError(
+                "agent_credential_transport_failed: the host credential file does "
+                "not match schema 1"
+            )
+        credential = document["credentials"].get(self.provider)
+        if credential is None:
+            return None
+        if not isinstance(credential, dict) or credential.get("type") not in {"api_key", "oauth"}:
+            raise RuntimeError(
+                "agent_credential_transport_failed: the selected provider credential "
+                "is invalid"
+            )
+        if credential["type"] == "oauth" and not (
+            isinstance(credential.get("access"), str)
+            and isinstance(credential.get("refresh"), str)
+            and isinstance(credential.get("expires"), (int, float))
+            and not isinstance(credential.get("expires"), bool)
+        ):
+            raise RuntimeError(
+                "agent_credential_transport_failed: the selected OAuth credential "
+                "is invalid"
+            )
+        if credential["type"] == "api_key" and not (
+            credential.get("key") is None or isinstance(credential.get("key"), str)
+        ):
+            raise RuntimeError(
+                "agent_credential_transport_failed: the selected API-key credential "
+                "is invalid"
+            )
+        filtered = {
+            "version": 1,
+            "credentials": {self.provider: credential},
+        }
+        return (
+            json.dumps(filtered, ensure_ascii=False, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+
+    async def _upload_provider_credential(
+        self,
+        environment: BaseEnvironment,
+        content: bytes,
+    ) -> str:
+        remote_path = f"{PRIVATE_ENV_DIR}/{uuid.uuid4().hex}.json"
+        prepared = await environment.exec(
+            f"umask 077; mkdir -p {shlex.quote(PRIVATE_ENV_DIR)}; "
+            f"chmod 700 {shlex.quote(PRIVATE_ENV_DIR)}",
+            timeout_sec=30,
+        )
+        if _return_code(prepared) != 0:
+            raise RuntimeError(
+                "agent_credential_transport_failed: could not prepare the private "
+                "credential directory"
+            )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            local_path = pathlib.Path(tmp_dir) / "auth.json"
+            local_path.write_bytes(content)
+            try:
+                os.chmod(local_path, 0o600)
+            except OSError:
+                pass
+            await environment.upload_file(local_path, remote_path)
+
+        protected = await environment.exec(
+            f"chmod 600 {shlex.quote(remote_path)}",
+            timeout_sec=30,
+        )
+        if _return_code(protected) != 0:
+            await self._remove_private_env(environment, remote_path)
+            raise RuntimeError(
+                "agent_credential_transport_failed: could not protect the uploaded "
+                "provider credential"
+            )
+        return remote_path
+
     @staticmethod
     def _command_with_private_env(command: str, remote_path: str) -> str:
         quoted_path = shlex.quote(remote_path)
@@ -2389,14 +2523,28 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
                     return await environment.exec(command_text, timeout_sec=timeout_sec)
             return await environment.exec(command_text, timeout_sec=timeout_sec)
 
-        if not env_vars:
-            return await execute(command)
-
-        remote_path = await self._upload_private_env(environment, env_vars)
+        private_env = dict(env_vars)
+        remote_credential_path: str | None = None
+        remote_env_path: str | None = None
         try:
-            return await execute(self._command_with_private_env(command, remote_path))
+            credential_document = self._provider_credential_document()
+            if credential_document is not None:
+                remote_credential_path = await self._upload_provider_credential(
+                    environment,
+                    credential_document,
+                )
+                private_env["SIGMA_CREDENTIAL_FILE"] = remote_credential_path
+            if not private_env:
+                return await execute(command)
+            remote_env_path = await self._upload_private_env(environment, private_env)
+            return await execute(
+                self._command_with_private_env(command, remote_env_path)
+            )
         finally:
-            await self._remove_private_env(environment, remote_path)
+            if remote_env_path is not None:
+                await self._remove_private_env(environment, remote_env_path)
+            if remote_credential_path is not None:
+                await self._remove_private_env(environment, remote_credential_path)
 
     def _agent_env(self) -> dict[str, str]:
         env_vars: dict[str, str] = {}
@@ -2530,6 +2678,7 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             ),
             "harbor_topology": summary.get("harbor_topology", self.harbor_topology),
             "agent_profile": summary.get("agent_profile", self.agent_profile),
+            "reasoning_effort": summary.get("reasoning_effort", self.reasoning_effort),
             "max_model_turns": summary.get("max_model_turns", self.max_turns),
             "command_timeout_sec": summary.get(
                 "command_timeout_sec", self.command_timeout_sec
@@ -2663,6 +2812,9 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             ),
             "harbor_topology": getattr(context, "harbor_topology", self.harbor_topology),
             "agent_profile": getattr(context, "agent_profile", self.agent_profile),
+            "reasoning_effort": getattr(
+                context, "reasoning_effort", self.reasoning_effort
+            ),
             "max_model_turns": getattr(context, "max_model_turns", self.max_turns),
             "command_timeout_sec": getattr(
                 context, "command_timeout_sec", self.command_timeout_sec

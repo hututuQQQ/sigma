@@ -315,6 +315,7 @@ schema_version = 1
 [model]
 provider = "deepseek"
 name = "auto"
+reasoning_effort = "auto"
 
 [permissions]
 mode = "workspace-auto"
@@ -374,6 +375,7 @@ subscription:
 [model]
 provider = "openai-codex"
 name = "gpt-5.6-terra"
+reasoning_effort = "max"
 ```
 
 This route uses ChatGPT OAuth and
@@ -385,6 +387,9 @@ API cost. Authentication, allowance, rate-limit, network, timeout, and server
 failures are returned directly. The built-in subscription route has one
 candidate and cannot silently fall back to DeepSeek, GLM, or
 `api.openai.com/v1`.
+
+`reasoning_effort` accepts `auto`, `none`, `low`, `medium`, `high`, `xhigh`,
+or `max`; the equivalent CLI flag is `--reasoning-effort`.
 
 The JSONL login interface is intended for trusted desktop clients:
 

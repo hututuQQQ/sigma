@@ -132,6 +132,8 @@ const modelFailureDiagnosticsSchema = z.object({
   sseFrames: z.number().int().nonnegative().optional(),
   ssePayloads: z.number().int().nonnegative().optional(),
   sseTrailingBytes: z.number().int().nonnegative().optional(),
+  providerErrorCode: z.string().regex(/^[a-z0-9_.-]{1,128}$/iu).optional(),
+  providerEventType: z.enum(["error", "response_failed"]).optional(),
   abortReason: z.string().min(1).max(800).optional(),
   timeoutReason: z.string().min(1).max(800).optional()
 }).strict();

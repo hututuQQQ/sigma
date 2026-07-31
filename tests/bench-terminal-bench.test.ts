@@ -232,7 +232,11 @@ describe("Terminal-Bench CLI verifier result handling", () => {
     let harborRuns = 0;
 
     const result = await runTerminalBenchCli(
-      ["--mode", "task", "--task-id", "selected-task", "--provider", "deepseek", "--model", "retry-test-model"],
+      [
+        "--mode", "task", "--task-id", "selected-task",
+        "--provider", "deepseek", "--model", "retry-test-model",
+        "--reasoning-effort", "max"
+      ],
       {
         resolveHarborCommand: () => ({ command: "harbor", source: "test", exists: true }),
         packageAgentCli: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
@@ -270,6 +274,7 @@ describe("Terminal-Bench CLI verifier result handling", () => {
       expect(result.exitCode).toBe(1);
       expect(result.report.status).toBe("failed");
       expect(result.report.score_mode).toBe("standard_benchmark");
+      expect(result.report.reasoning_effort).toBe("max");
       expect(harborRuns).toBe(1);
       const runConfig = JSON.parse(await readFile(path.join(result.runDir, "config.json"), "utf8"));
       const firstConfig = JSON.parse(await readFile(
@@ -277,6 +282,7 @@ describe("Terminal-Bench CLI verifier result handling", () => {
         "utf8"
       ));
       expect(Object.keys(firstConfig.agents[0].kwargs).some((key) => key.includes("feedback"))).toBe(false);
+      expect(firstConfig.agents[0].kwargs.reasoning_effort).toBe("max");
       expect(runConfig.resolved_job_config_paths).toHaveLength(1);
       expect(runConfig.run_slots).toHaveLength(1);
     } finally {

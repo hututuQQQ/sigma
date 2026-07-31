@@ -138,9 +138,7 @@ function mcpServersValue(raw: unknown): McpServerConfigValue[] {
     };
   });
 }
-const booleanField = (key: string, flag: string, description: string, shortFlag?: string): ConfigField<boolean> => ({
-  key, flag, shortFlag, kind: "boolean", description, defaultValue: false, parse: (raw) => booleanValue(raw, key), hidden: true
-});
+const booleanField = (key: string, flag: string, description: string, shortFlag?: string): ConfigField<boolean> => ({ key, flag, shortFlag, kind: "boolean", description, defaultValue: false, parse: (raw) => booleanValue(raw, key), hidden: true });
 export const SIGMA_CONFIG_SCHEMA: readonly ConfigField[] = [
   { key: "configSchemaVersion", toml: "schema_version", description: "Configuration schema version", defaultValue: CONFIG_SCHEMA_VERSION, parse: (raw) => {
     const value = numberValue(raw, "configSchemaVersion");
@@ -151,6 +149,7 @@ export const SIGMA_CONFIG_SCHEMA: readonly ConfigField[] = [
   }, hidden: true },
   { key: "provider", flag: "provider", env: "SIGMA_PROVIDER", toml: "model.provider", description: "Model provider", defaultValue: "openai-codex", parse: (raw) => stringValue(raw, "provider") },
   { key: "model", flag: "model", env: "SIGMA_MODEL", toml: "model.name", description: "Model name (auto selects provider default)", defaultValue: "auto", parse: (raw) => stringValue(raw, "model") },
+  { key: "reasoningEffort", flag: "reasoning-effort", env: "SIGMA_REASONING_EFFORT", toml: "model.reasoning_effort", description: "Model reasoning effort (auto uses the provider/model default)", defaultValue: "auto", parse: (raw) => enumValue(raw, "reasoningEffort", ["auto", "none", "low", "medium", "high", "xhigh", "max"] as const) },
   {
     key: "modelSpecs", flag: "model-spec", kind: "repeatable", env: "SIGMA_MODEL_SPECS", toml: "model.specs",
     description: "Model catalog spec JSON (repeatable)", defaultValue: [], parse: modelSpecsValue, hidden: true

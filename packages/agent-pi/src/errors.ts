@@ -16,6 +16,22 @@ export type PiModelFailureCategory =
   | "server"
   | "protocol";
 
+export type PiProviderEventType = "error" | "response_failed";
+
+export interface PiModelErrorDiagnostics {
+  provider?: string;
+  model?: string;
+  httpStatus?: number;
+  providerErrorCode?: string;
+  providerEventType?: PiProviderEventType;
+}
+
+interface PiModelErrorDetails extends ErrorOptions {
+  providerErrorCode?: string;
+  providerEventType?: PiProviderEventType;
+  diagnostics?: PiModelErrorDiagnostics;
+}
+
 const SAFE_MESSAGES: Readonly<Record<PiModelErrorCode, string>> = {
   auth_required: "Model provider authentication is required. Sign in or configure credentials and retry.",
   allowance_exhausted: "The model provider allowance is currently exhausted.",
@@ -32,10 +48,18 @@ export class PiModelError extends Error {
   constructor(
     readonly code: PiModelErrorCode,
     readonly category: PiModelFailureCategory,
-    readonly status?: number
+    readonly status?: number,
+    details: PiModelErrorDetails = {}
   ) {
-    super(SAFE_MESSAGES[code]);
+    super(SAFE_MESSAGES[code], details);
+    this.providerErrorCode = details.providerErrorCode;
+    this.providerEventType = details.providerEventType;
+    this.diagnostics = details.diagnostics;
   }
+
+  readonly providerErrorCode?: string;
+  readonly providerEventType?: PiProviderEventType;
+  readonly diagnostics?: PiModelErrorDiagnostics;
 }
 
 function errorText(error: unknown): string {
@@ -51,6 +75,23 @@ function errorStatus(error: unknown): number | undefined {
   }
   const match = /\b(?:http|status|failed \()\s*(\d{3})\b/u.exec(errorText(error));
   return match?.[1] ? Number(match[1]) : undefined;
+}
+
+function providerFailureMetadata(error: unknown): {
+  providerErrorCode?: string;
+  providerEventType?: PiProviderEventType;
+} {
+  if (!error || typeof error !== "object") return {};
+  const providerErrorCode = (error as { providerErrorCode?: unknown }).providerErrorCode;
+  const providerEventType = (error as { providerEventType?: unknown }).providerEventType;
+  return {
+    ...(typeof providerErrorCode === "string" && /^[a-z0-9_.-]{1,128}$/iu.test(providerErrorCode)
+      ? { providerErrorCode }
+      : {}),
+    ...(providerEventType === "error" || providerEventType === "response_failed"
+      ? { providerEventType }
+      : {})
+  };
 }
 
 const AUTH_MARKERS = [
@@ -73,6 +114,46 @@ const ALLOWANCE_MARKERS = [
   "out of budget",
   "billing"
 ] as const;
+
+const AUTH_CODES = new Set([
+  "authentication_error",
+  "invalid_api_key",
+  "unauthorized"
+]);
+const ALLOWANCE_CODES = new Set([
+  "insufficient_quota",
+  "usage_not_included"
+]);
+const RATE_LIMIT_CODES = new Set([
+  "rate_limit",
+  "rate_limit_exceeded"
+]);
+const NON_RETRYABLE_RESPONSE_CODES = new Set([
+  "bio_policy",
+  "content_filter",
+  "context_length_exceeded",
+  "cyber_policy",
+  "invalid_prompt"
+]);
+const SERVER_CODES = new Set([
+  "internal_error",
+  "model_error",
+  "server_error",
+  "server_is_overloaded",
+  "slow_down"
+]);
+
+type PiFailureClassification = readonly [PiModelErrorCode, PiModelFailureCategory];
+
+function codeFailure(providerCode: string | undefined): PiFailureClassification | undefined {
+  if (providerCode === undefined) return undefined;
+  if (ALLOWANCE_CODES.has(providerCode)) return ["allowance_exhausted", "capacity"];
+  if (AUTH_CODES.has(providerCode)) return ["auth_required", "auth"];
+  if (RATE_LIMIT_CODES.has(providerCode)) return ["rate_limited", "rate_limit"];
+  if (SERVER_CODES.has(providerCode)) return ["server", "server"];
+  if (NON_RETRYABLE_RESPONSE_CODES.has(providerCode)) return ["protocol", "protocol"];
+  return undefined;
+}
 
 function containsAny(text: string, markers: readonly string[]): boolean {
   return markers.some((marker) => text.includes(marker));
@@ -100,29 +181,39 @@ function isNetworkFailure(error: unknown, text: string): boolean {
     || containsAny(text, ["fetch failed", "network", "econn", "enotfound"]);
 }
 
+function fallbackFailure(
+  error: unknown,
+  text: string,
+  status: number | undefined,
+  providerEventType: PiProviderEventType | undefined
+): PiFailureClassification {
+  if (containsAny(text, ALLOWANCE_MARKERS)) return ["allowance_exhausted", "capacity"];
+  if (isAuthFailure(status, text)) return ["auth_required", "auth"];
+  if (isRateLimitFailure(status, text)) return ["rate_limited", "rate_limit"];
+  if (isTimeoutFailure(text)) return ["timeout", "timeout"];
+  if (isServerFailure(status, text)) return ["server", "server"];
+  if (isNetworkFailure(error, text)) return ["network", "network"];
+  if (providerEventType === "response_failed") return ["server", "server"];
+  return ["protocol", "protocol"];
+}
+
 export function sanitizePiModelError(error: unknown): PiModelError {
   if (error instanceof PiModelError) return error;
   const text = errorText(error);
   const status = errorStatus(error);
-  // Subscription exhaustion can be returned as either 403 or 429. Prefer the
-  // explicit allowance signal over the generic status-code classification.
-  if (containsAny(text, ALLOWANCE_MARKERS)) {
-    return new PiModelError("allowance_exhausted", "capacity", status);
-  }
-  if (isAuthFailure(status, text)) {
-    return new PiModelError("auth_required", "auth", status);
-  }
-  if (isRateLimitFailure(status, text)) {
-    return new PiModelError("rate_limited", "rate_limit", status);
-  }
-  if (isTimeoutFailure(text)) {
-    return new PiModelError("timeout", "timeout", status);
-  }
-  if (isServerFailure(status, text)) {
-    return new PiModelError("server", "server", status);
-  }
-  if (isNetworkFailure(error, text)) {
-    return new PiModelError("network", "network", status);
-  }
-  return new PiModelError("protocol", "protocol", status);
+  const metadata = providerFailureMetadata(error);
+  const providerCode = metadata.providerErrorCode?.toLowerCase();
+  const details = {
+    ...metadata,
+    diagnostics: {
+      ...(status !== undefined && status >= 400 ? { httpStatus: status } : {}),
+      ...(metadata.providerErrorCode ? { providerErrorCode: metadata.providerErrorCode } : {}),
+      ...(metadata.providerEventType ? { providerEventType: metadata.providerEventType } : {})
+    }
+  };
+  // Subscription exhaustion can arrive as either 403 or 429. Structured
+  // provider codes take precedence over generic status or message markers.
+  const [code, category] = codeFailure(providerCode)
+    ?? fallbackFailure(error, text, status, metadata.providerEventType);
+  return new PiModelError(code, category, status, details);
 }

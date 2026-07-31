@@ -48,6 +48,8 @@ export interface ModelFailureDiagnostics {
   sseFrames?: number;
   ssePayloads?: number;
   sseTrailingBytes?: number;
+  providerErrorCode?: string;
+  providerEventType?: "error" | "response_failed";
   abortReason?: string;
   timeoutReason?: string;
 }

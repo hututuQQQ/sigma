@@ -32,7 +32,7 @@ function preregistration(tasks: Array<ReturnType<typeof task>>) {
     formal_run_id: "archive-fixture",
     source: { revision: "c".repeat(40), dirty: false, diff_sha256: null },
     archive_sha256: "b".repeat(64),
-    model: { provider: "provider", name: "model" },
+    model: { provider: "provider", name: "model", reasoning_effort: "auto" },
     task_selection: {
       dataset: "generic",
       terminal_bench_revision: commit,

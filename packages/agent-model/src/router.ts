@@ -109,6 +109,21 @@ function routedStreamEvent(
   return event;
 }
 
+function blocksStreamRetry(
+  lifecycle: RoutedStreamLifecycle,
+  current: ModelSpec,
+  next: ModelSpec | undefined
+): boolean {
+  if (!lifecycle.semanticDelta) return false;
+  // Reasoning deltas are observable but are not committed to conversation
+  // history and cannot execute tools. A transient retry is therefore safe only
+  // on the same provider/model before content, tool calls, or a terminal event.
+  return next?.id !== current.id
+    || lifecycle.hasContent
+    || lifecycle.hasToolCall
+    || lifecycle.completed;
+}
+
 export class ModelRoutingError extends Error {
   readonly code = "model_route_unavailable";
   constructor(readonly routeId: string, readonly rejected: readonly ModelRejection[]) {
@@ -294,7 +309,8 @@ export class ModelRouter {
         const category = classifyModelFailure(error);
         lifecycle.semanticDelta ||= errorSemanticDelta(error);
         const nextIndex = nextExecutionIndex(planned, index, category);
-        if (!canFallback(resolution.route, category, lifecycle.semanticDelta)
+        const next = nextIndex === undefined ? undefined : planned[nextIndex];
+        if (!canFallback(resolution.route, category, blocksStreamRetry(lifecycle, spec, next))
           || nextIndex === undefined) {
           throw new ModelRouteExecutionError(
             routeId,

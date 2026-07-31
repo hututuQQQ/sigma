@@ -36,6 +36,25 @@ describe("Sigma config", () => {
     expect(loadCliConfig({ model: "glm-5.2" }, options).explicitSingleModelRoute).toBe(true);
   });
 
+  it("resolves an explicit reasoning effort from CLI, environment, or TOML", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-config-reasoning-"));
+    const home = path.join(root, "home");
+    const options = { env: {}, cwd: root, homeDir: home };
+    expect(loadCliConfig({}, options).reasoningEffort).toBeUndefined();
+    expect(loadCliConfig({ "reasoning-effort": "max" }, options).reasoningEffort).toBe("max");
+    expect(loadCliConfig({}, { ...options, env: { SIGMA_REASONING_EFFORT: "high" } }).reasoningEffort)
+      .toBe("high");
+    await mkdir(path.join(root, ".agent"));
+    await writeFile(path.join(root, ".agent", "config.toml"), [
+      "schema_version = 1",
+      "[model]",
+      "reasoning_effort = \"xhigh\""
+    ].join("\n"), "utf8");
+    expect(loadCliConfig({ workspace: root }, options).reasoningEffort).toBe("xhigh");
+    expect(() => loadCliConfig({ "reasoning-effort": "extreme" }, options))
+      .toThrow(/reasoningEffort/u);
+  });
+
   it("passes an explicit model catalog into production composition config", () => {
     const options = { env: {}, cwd: process.cwd(), homeDir: path.join(process.cwd(), ".missing-home") };
     const rawSpec = {

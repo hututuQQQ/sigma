@@ -18,6 +18,7 @@ import type {
   ModelStreamEvent,
   ModelToolCall
 } from "agent-protocol";
+import type { PiProviderEventType } from "./errors.js";
 import type { PiBillingMode } from "./models.js";
 
 interface ReplayState {
@@ -257,13 +258,34 @@ export function deepSeekPayload(payload: unknown, request: ModelRequest): unknow
   };
 }
 
+function codexProviderFailure(
+  event: Extract<AssistantMessageEvent, { type: "error" }>
+): { providerErrorCode?: string; providerEventType?: PiProviderEventType } {
+  for (const diagnostic of [...(event.error.diagnostics ?? [])].reverse()) {
+    if (diagnostic.type !== "codex_provider_failure") continue;
+    const providerErrorCode = diagnostic.details?.providerErrorCode;
+    const providerEventType = diagnostic.details?.providerEventType;
+    return {
+      ...(typeof providerErrorCode === "string" && /^[a-z0-9_.-]{1,128}$/iu.test(providerErrorCode)
+        ? { providerErrorCode }
+        : {}),
+      ...(providerEventType === "error" || providerEventType === "response_failed"
+        ? { providerEventType }
+        : {})
+    };
+  }
+  return {};
+}
+
 function providerEventError(
   event: Extract<AssistantMessageEvent, { type: "error" }>,
   responseStatus: number | undefined
 ): Error {
+  const message = event.error.errorMessage ?? event.reason;
   return Object.assign(
-    new Error(event.error.errorMessage ?? event.reason),
-    responseStatus === undefined ? {} : { status: responseStatus }
+    new Error(message),
+    responseStatus === undefined ? {} : { status: responseStatus },
+    codexProviderFailure(event)
   );
 }
 
