@@ -13,5 +13,7 @@ describe("runtime behavior context", () => {
     expect(behavior).toContain("multiple tool calls are independent");
     expect(behavior).toContain("Keep dependent calls sequential");
     expect(behavior).toContain("never guess missing arguments or use placeholders");
+    expect(behavior).toContain("Keep the user oriented during longer work");
+    expect(behavior).toContain("Do not narrate every command");
   });
 });

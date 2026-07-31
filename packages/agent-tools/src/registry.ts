@@ -17,13 +17,6 @@ import {
 
 export interface RegisteredEffectTool {
   descriptor: ToolDescriptor;
-  /** Runtime-only protocol action. It remains executable by the coordinator
-   * but is never exposed in the model tool catalog. */
-  modelVisible?: boolean;
-  /** Optional narrower presentation schema for the model. The authoritative
-   * runtime descriptor remains unchanged so durable calls and older clients
-   * can still be validated and recovered against their original contract. */
-  modelInputSchema?: ToolDescriptor["inputSchema"];
   /** Trusted, read-only execution probe. It runs only after runtime policy,
    * approval, and workspace locks are held, but before a mutation checkpoint
    * is created. Returning a receipt certifies that this exact call requires no
@@ -169,12 +162,6 @@ export class EffectToolRegistry implements ToolExecutor {
     });
     const descriptor = { ...tool.descriptor, maximumEffects, availableModes };
     compileDescriptorArguments(descriptor);
-    if (tool.modelInputSchema) {
-      compileDescriptorArguments({
-        ...descriptor,
-        inputSchema: tool.modelInputSchema
-      });
-    }
     this.tools.set(tool.descriptor.name, {
       ...tool,
       descriptor
@@ -187,10 +174,7 @@ export class EffectToolRegistry implements ToolExecutor {
   }
 
   modelDescriptors(): readonly ToolDescriptor[] {
-    return [...this.tools.values()].filter((tool) => tool.modelVisible !== false)
-      .map((tool) => tool.modelInputSchema
-        ? { ...tool.descriptor, inputSchema: tool.modelInputSchema }
-        : tool.descriptor)
+    return [...this.tools.values()].map((tool) => tool.descriptor)
       .sort((left, right) => left.name.localeCompare(right.name));
   }
 

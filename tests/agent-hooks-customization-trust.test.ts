@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -242,6 +242,43 @@ checkpoint_before_mutation = false
     loadCliConfig({ workspace, "trust-workspace-customization": true }, options);
     await writeFile(scriptPath, "process.stdout.write('{\"changed\":true}');\n");
     expect(loadCliConfig({ workspace }, options).workspaceCustomizationTrust?.trusted).toBe(false);
+  });
+
+  it("rejects old and malformed customization trust stores without rewriting them", async () => {
+    const root = await tempRoot();
+    const home = path.join(root, "home");
+    const workspace = path.join(root, "workspace");
+    const trustStore = path.join(home, ".sigma", "customization-trust.json");
+    await mkdir(path.join(workspace, ".agent", "hooks"), { recursive: true });
+    await mkdir(path.join(workspace, "scripts"), { recursive: true });
+    await writeFile(path.join(workspace, ".agent", "hooks", "policy.toml"), executableWorkspaceHook);
+    await writeFile(path.join(workspace, "scripts", "policy.js"), "process.stdout.write('{}');\n");
+    await mkdir(path.dirname(trustStore), { recursive: true });
+    const options = { env: {}, homeDir: home, customizationTrustStorePath: trustStore };
+    const unsupported = `${JSON.stringify({
+      version: 0,
+      workspaces: [{ secret: "old-customization-record" }]
+    })}\n`;
+    await writeFile(trustStore, unsupported, "utf8");
+
+    expect(() => loadCliConfig({ workspace }, options)).toThrow(expect.objectContaining({
+      code: "unsupported_schema_version",
+      path: trustStore,
+      expected: 1,
+      actual: 0
+    }));
+    expect(await readFile(trustStore, "utf8")).toBe(unsupported);
+
+    const malformed = `${JSON.stringify({
+      version: 1,
+      workspaces: [{ canonicalWorkspacePath: workspace }]
+    })}\n`;
+    await writeFile(trustStore, malformed, "utf8");
+    expect(() => loadCliConfig({ workspace }, options)).toThrow(expect.objectContaining({
+      code: "persisted_state_invalid",
+      path: trustStore
+    }));
+    expect(await readFile(trustStore, "utf8")).toBe(malformed);
   });
 
   it("rejects meaningless trust grants when no workspace hook exists", async () => {

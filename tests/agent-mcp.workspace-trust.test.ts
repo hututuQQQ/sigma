@@ -76,6 +76,39 @@ describe("workspace MCP trust boundary", () => {
     expect(loadCliConfig({ workspace }, options).workspaceMcpTrust?.trusted).toBe(true);
   });
 
+  it("rejects old and malformed trust stores without rewriting them", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-mcp-current-trust-"));
+    const home = await mkdtemp(path.join(os.tmpdir(), "sigma-mcp-current-home-"));
+    const trustStorePath = path.join(home, ".sigma", "trust.json");
+    await writeWorkspaceConfig(workspace, mcpServer());
+    await mkdir(path.dirname(trustStorePath), { recursive: true });
+    const options = { env: {}, homeDir: home, trustStorePath };
+    const unsupported = `${JSON.stringify({
+      version: 0,
+      workspaces: [{ secret: "old-trust-record" }]
+    })}\n`;
+    await writeFile(trustStorePath, unsupported, "utf8");
+
+    expect(() => loadCliConfig({ workspace }, options)).toThrow(expect.objectContaining({
+      code: "unsupported_schema_version",
+      path: trustStorePath,
+      expected: 1,
+      actual: 0
+    }));
+    expect(await readFile(trustStorePath, "utf8")).toBe(unsupported);
+
+    const malformed = `${JSON.stringify({
+      version: 1,
+      workspaces: [{ canonicalWorkspacePath: workspace }]
+    })}\n`;
+    await writeFile(trustStorePath, malformed, "utf8");
+    expect(() => loadCliConfig({ workspace }, options)).toThrow(expect.objectContaining({
+      code: "persisted_state_invalid",
+      path: trustStorePath
+    }));
+    expect(await readFile(trustStorePath, "utf8")).toBe(malformed);
+  });
+
   it("does not execute malicious repository MCP config from inspect or TUI before trust", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-mcp-malicious-"));
     const home = await mkdtemp(path.join(os.tmpdir(), "sigma-mcp-malicious-home-"));

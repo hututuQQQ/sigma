@@ -46,6 +46,26 @@ function emptyStore(): WorkspaceMcpTrustStore {
   return { version: 1, workspaces: [] };
 }
 
+function unsupportedSchemaVersion(filePath: string, actual: unknown): Error {
+  return Object.assign(new Error(
+    `unsupported_schema_version: workspace MCP trust store expected 1, received ${String(actual)} at ${filePath}; existing data was not modified`
+  ), {
+    code: "unsupported_schema_version" as const,
+    path: filePath,
+    expected: 1,
+    actual
+  });
+}
+
+function invalidPersistedState(filePath: string): Error {
+  return Object.assign(new Error(
+    `persisted_state_invalid: workspace MCP trust store at ${filePath} does not match schema 1; existing data was not modified`
+  ), {
+    code: "persisted_state_invalid" as const,
+    path: filePath
+  });
+}
+
 function validRecord(value: unknown): value is WorkspaceMcpTrustRecord {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
@@ -56,13 +76,24 @@ function validRecord(value: unknown): value is WorkspaceMcpTrustRecord {
 
 function readStore(filePath: string): WorkspaceMcpTrustStore {
   if (!existsSync(filePath)) return emptyStore();
+  const content = readFileSync(filePath, "utf8");
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(readFileSync(filePath, "utf8")) as Record<string, unknown>;
-    if (parsed.version !== 1 || !Array.isArray(parsed.workspaces)) return emptyStore();
-    return { version: 1, workspaces: parsed.workspaces.filter(validRecord) };
+    parsed = JSON.parse(content) as unknown;
   } catch {
-    return emptyStore();
+    throw invalidPersistedState(filePath);
   }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw invalidPersistedState(filePath);
+  }
+  const candidate = parsed as Record<string, unknown>;
+  if (candidate.version !== 1) {
+    throw unsupportedSchemaVersion(filePath, candidate.version);
+  }
+  if (!Array.isArray(candidate.workspaces) || !candidate.workspaces.every(validRecord)) {
+    throw invalidPersistedState(filePath);
+  }
+  return { version: 1, workspaces: [...candidate.workspaces] };
 }
 
 function syncDirectory(directory: string): void {

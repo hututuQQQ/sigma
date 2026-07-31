@@ -490,8 +490,8 @@ fn eligible_workspace_read_lease_root(
     declared.extend(params.policy.execution_roots.iter().cloned());
     let roots = session_scratch_filtered(
         params,
-        repository_runtime_filtered(params, canonical_unique(&declared)?),
-    );
+        repository_runtime_filtered(params, canonical_unique(&declared)?)?,
+    )?;
     Ok(roots
         .iter()
         .all(|root| windows_path_within(&workspace.path, root))
@@ -676,8 +676,8 @@ fn ensure_workspace_read_lease(
     declared.extend(params.policy.execution_roots.iter().cloned());
     let roots = minimal_windows_roots(&session_scratch_filtered(
         params,
-        repository_runtime_filtered(params, canonical_unique(&declared)?),
-    ));
+        repository_runtime_filtered(params, canonical_unique(&declared)?)?,
+    )?);
     for path in policy_ancestor_paths(params, user_profile)? {
         ensure_persistent_acl(
             &path,
@@ -937,7 +937,7 @@ fn grant_root_lease_access(
 ) -> Result<(), RpcError> {
     let mut readable = params.policy.read_roots.clone();
     readable.extend(params.policy.execution_roots.iter().cloned());
-    let declared_read = repository_runtime_filtered(params, canonical_unique(&readable)?);
+    let declared_read = repository_runtime_filtered(params, canonical_unique(&readable)?)?;
     let read = minimal_windows_roots(&declared_read);
     let write = minimal_windows_roots(&canonical_unique(&params.policy.write_roots)?);
     let scratch = canonical_unique(&params.policy.session_scratch_roots)?;
@@ -1031,7 +1031,7 @@ fn grant_policy_access(
     let workspace_read = canonical_unique(&params.policy.read_roots)?;
     let mut read_and_execute = params.policy.read_roots.clone();
     read_and_execute.extend(params.policy.execution_roots.iter().cloned());
-    let declared_read = repository_runtime_filtered(params, canonical_unique(&read_and_execute)?);
+    let declared_read = repository_runtime_filtered(params, canonical_unique(&read_and_execute)?)?;
     let read = minimal_windows_roots(&declared_read);
     let write = minimal_windows_roots(&canonical_unique(&params.policy.write_roots)?);
     let mut plan = Vec::new();
@@ -1087,7 +1087,7 @@ fn policy_ancestor_paths(
     // to the effective roots (for example workspace + external runtime), not
     // to every executable and dependency path inside the workspace.
     let roots =
-        repository_runtime_filtered(params, minimal_windows_roots(&canonical_unique(&declared)?));
+        repository_runtime_filtered(params, minimal_windows_roots(&canonical_unique(&declared)?))?;
     let root_keys = roots
         .iter()
         .map(|path| path.to_string_lossy().to_lowercase())
@@ -1433,30 +1433,35 @@ fn repository_filtered_protected(params: &ProcessParams, paths: Vec<PathBuf>) ->
         .collect()
 }
 
-fn repository_runtime_filtered(params: &ProcessParams, paths: Vec<PathBuf>) -> Vec<PathBuf> {
+fn repository_runtime_filtered(
+    params: &ProcessParams,
+    paths: Vec<PathBuf>,
+) -> Result<Vec<PathBuf>, RpcError> {
     if params.policy.repository_metadata_roots.is_empty()
         || params.policy.executable_sha256.is_none()
     {
-        return paths;
+        return Ok(paths);
     }
-    let runtime_root = &params.command.cwd;
-    paths
+    let runtime_root = canonicalize_policy_root(&params.command.cwd)?;
+    Ok(paths
         .into_iter()
-        .filter(|path| !windows_path_within(runtime_root, path))
-        .collect()
+        .filter(|path| !windows_path_within(&runtime_root, path))
+        .collect())
 }
 
-fn session_scratch_filtered(params: &ProcessParams, paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    paths
+fn session_scratch_filtered(
+    params: &ProcessParams,
+    paths: Vec<PathBuf>,
+) -> Result<Vec<PathBuf>, RpcError> {
+    let scratch_roots = canonical_unique(&params.policy.session_scratch_roots)?;
+    Ok(paths
         .into_iter()
         .filter(|path| {
-            !params
-                .policy
-                .session_scratch_roots
+            !scratch_roots
                 .iter()
                 .any(|scratch| windows_path_within(scratch, path))
         })
-        .collect()
+        .collect())
 }
 
 fn scratch_only_writes(params: &ProcessParams) -> bool {
@@ -6831,15 +6836,25 @@ mod tests {
             .expect("evaluate external execution root")
             .is_none()
         );
-        let scratch = fixture.join("scratch");
+        let scratch = fixture.join("scratch-real");
+        let scratch_junction = fixture.join("scratch-junction");
         std::fs::create_dir_all(&scratch).expect("create broker scratch root");
+        create_test_junction(&scratch_junction, &scratch);
         let mut repository_read = params(
             vec![workspace.clone(), external.clone(), scratch.clone()],
             vec![external.clone()],
         );
         repository_read.command.cwd = external;
-        repository_read.policy.write_roots = vec![scratch.clone()];
-        repository_read.policy.session_scratch_roots = vec![scratch];
+        repository_read.command.env.insert(
+            "TEMP".into(),
+            scratch_junction.to_string_lossy().into_owned(),
+        );
+        repository_read.command.env.insert(
+            "TMP".into(),
+            scratch_junction.to_string_lossy().into_owned(),
+        );
+        repository_read.policy.write_roots = vec![scratch_junction.clone()];
+        repository_read.policy.session_scratch_roots = vec![scratch_junction.clone()];
         repository_read.policy.repository_metadata_roots = vec![workspace.join(".git")];
         repository_read.policy.repository_workspace_root = Some(workspace.clone());
         repository_read.policy.executable_sha256 = Some("0".repeat(64));
@@ -6850,6 +6865,7 @@ mod tests {
                 .is_some()
         );
 
+        std::fs::remove_dir(&scratch_junction).expect("remove scratch junction");
         std::fs::remove_dir_all(&fixture).expect("remove read lease selection fixture");
     }
 

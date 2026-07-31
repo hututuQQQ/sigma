@@ -32,6 +32,15 @@ export interface ApprovalRequest {
   plan: ToolCallPlan;
 }
 
+function approvalRequestReadiness(): {
+  requestReady: Promise<void>;
+  markRequestReady(): void;
+} {
+  let markRequestReady!: () => void;
+  const requestReady = new Promise<void>((accept) => { markRequestReady = accept; });
+  return { requestReady, markRequestReady };
+}
+
 async function cleanUpFailedApprovalRequest(
   options: Pick<EffectRunnerOptions, "emit">,
   session: RuntimeSession,
@@ -144,8 +153,7 @@ export class ToolApprovalCoordinator {
     modelTurn: ActiveModelTurn,
     plan: ToolCallPlan,
     signal: AbortSignal,
-    forcePrompt: boolean
-  ): Promise<"allow" | "deny" | "always_allow"> {
+    forcePrompt: boolean): Promise<"allow" | "deny" | "always_allow"> {
     const requestId = request.id;
     const permissionMode = profilePermissionMode(this.options.runtime, session);
     const immediate = forcePrompt
@@ -165,12 +173,14 @@ export class ToolApprovalCoordinator {
     }
     let resolve!: (value: "allow" | "deny" | "always_allow") => void;
     const pending = new Promise<"allow" | "deny" | "always_allow">((accept) => { resolve = accept; });
+    const { requestReady, markRequestReady } = approvalRequestReadiness();
     if (session.interaction.approvals.has(requestId)) throw new Error(`Duplicate approval '${requestId}'.`);
     const waiter: ApprovalWaiter = {
       effects,
       binding: createApprovalBinding(session.identity.sessionId, session.durable.runId, request, plan, effects),
       ...(descriptor.sessionApprovalGrant
         ? { sessionApprovalGrant: descriptor.sessionApprovalGrant } : {}),
+      requestReady,
       resolve
     };
     session.interaction.approvals.set(requestId, waiter);
@@ -199,14 +209,19 @@ export class ToolApprovalCoordinator {
         remainingDeadlineMs,
         ...turnPayload(modelTurn)
       });
+      markRequestReady();
       const decision = await abortable(pending, signal);
       completed = true;
       return decision;
     } finally {
       if (!completed) {
-        await cleanUpFailedApprovalRequest(
-          this.options, session, requestId, modelTurn, waiter, requestWasDurable, signal
-        );
+        try {
+          await cleanUpFailedApprovalRequest(
+            this.options, session, requestId, modelTurn, waiter, requestWasDurable, signal
+          );
+        } finally {
+          markRequestReady();
+        }
       }
     }
   }

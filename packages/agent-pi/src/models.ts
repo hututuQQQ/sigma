@@ -4,10 +4,12 @@ import {
   envApiKeyAuth,
   type Api,
   type AuthType,
+  type Credential,
   type CredentialStore,
   type Model,
   type Models,
   type ModelsStore,
+  type MutableModels,
   type Provider
 } from "@earendil-works/pi-ai";
 import * as openAICompletionsApi from "@earendil-works/pi-ai/api/openai-completions";
@@ -22,6 +24,7 @@ import {
   piModelPricing,
   type PiModelPricing
 } from "./model-pricing.js";
+import { sanitizePiModelError } from "./errors.js";
 import { FileModelsStore } from "./models-store.js";
 
 export type { PiModelPricing, PiModelPricingTier } from "./model-pricing.js";
@@ -220,7 +223,7 @@ function capabilities(model: Model<Api>): ModelCapabilities {
 export function createPiModels(
   credentials: CredentialStore = new FileCredentialStore(),
   modelsStore: ModelsStore = new FileModelsStore()
-): Models {
+): MutableModels {
   const models = createModels({ credentials, modelsStore });
   for (const provider of freshProviders()) models.setProvider(provider);
   return models;
@@ -255,6 +258,12 @@ export async function hydratePiModelCache(
   }
 }
 
+function safeOAuthRefreshError(error: unknown, providerId: string): Error {
+  const safe = sanitizePiModelError(error);
+  safe.message = `OAuth refresh failed for provider '${providerId}'. Sign in again and retry.`;
+  return safe;
+}
+
 export async function refreshPiProviderModels(
   models: Models,
   providerId: string,
@@ -270,18 +279,33 @@ export async function refreshPiProviderModels(
   if (!provider.refreshModels) return;
   const credentials = options.credentials ?? new FileCredentialStore();
   const modelsStore = options.modelsStore ?? new FileModelsStore();
-  const scopedStore = {
-    read: () => modelsStore.read(provider.id),
-    write: (entry: Parameters<ModelsStore["write"]>[1]) => modelsStore.write(provider.id, entry),
-    delete: () => modelsStore.delete(provider.id)
-  };
-  await provider.refreshModels({
-    credential: await credentials.read(provider.id),
-    store: scopedStore,
+  let storedCredential: Credential | undefined;
+  try {
+    storedCredential = await credentials.read(providerId);
+  } catch (error) {
+    throw sanitizePiModelError(error);
+  }
+  const targeted = createModels({ credentials, modelsStore });
+  targeted.setProvider(provider);
+  let auth: Awaited<ReturnType<Models["getAuth"]>>;
+  try {
+    auth = await targeted.getAuth(providerId);
+  } catch (error) {
+    if (storedCredential?.type === "oauth") {
+      throw safeOAuthRefreshError(error, providerId);
+    }
+    throw sanitizePiModelError(error);
+  }
+  if (!auth) {
+    throw new Error(`Provider '${providerId}' has no configured authentication.`);
+  }
+  const result = await targeted.refresh({
     allowNetwork: true,
     force: options.force ?? true,
     ...(options.signal ? { signal: options.signal } : {})
   });
+  const error = result.errors.get(providerId);
+  if (error) throw sanitizePiModelError(error);
 }
 
 export function listPiProviders(models: Models = createPiModels()): readonly PiProviderDescriptor[] {

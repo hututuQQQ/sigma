@@ -25,6 +25,7 @@ describe("agent-config single-source schema", () => {
   });
 
   it("applies source precedence and rejects unknown TOML keys", () => {
+    expect(resolveConfig({}).maxModelRetries).toBe(5);
     const values = resolveConfig({
       flags: { provider: "glm" },
       env: {

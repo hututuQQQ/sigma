@@ -57,7 +57,7 @@ function preparation(session = runtimeSessionFixture()) {
     session,
     turnId: 1,
     descriptors,
-    capabilities: { skillsAvailable: false, executableSkillResourcesLoaded: false },
+    capabilities: { skillsAvailable: false },
     dynamic: [],
     hookContext: [],
     ledger: {

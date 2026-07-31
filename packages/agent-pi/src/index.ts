@@ -19,6 +19,7 @@ export type {
   Model,
   Models,
   ModelsStore,
+  MutableModels,
   OAuthCredential,
   Provider
 } from "@earendil-works/pi-ai";

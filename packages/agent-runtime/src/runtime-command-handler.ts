@@ -171,9 +171,14 @@ export class RuntimeCommandHandler {
     session: RuntimeSession,
     command: Extract<RunCommand, { type: "approve" }>
   ): Promise<void> {
+    const candidate = session.interaction.approvals.get(command.requestId);
+    if (!candidate || candidate.resolving) {
+      throw new Error(`Unknown approval '${command.requestId}'.`);
+    }
+    await candidate.requestReady;
     const approval = session.interaction.approvals.get(command.requestId);
     const pendingTool = session.durable.state.pendingTools.find((item) => item.request.callId === command.requestId);
-    if (!approval || approval.resolving || (!pendingTool && !approval.external)) {
+    if (approval !== candidate || approval.resolving || (!pendingTool && !approval.external)) {
       throw new Error(`Unknown approval '${command.requestId}'.`);
     }
     const decision = approvalDecision(approval, command.decision);

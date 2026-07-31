@@ -34,6 +34,26 @@ function emptyDocument(): CredentialDocument {
   return { version: 1, credentials: {} };
 }
 
+function unsupportedSchemaVersion(filePath: string, actual: unknown): Error {
+  return Object.assign(new Error(
+    `unsupported_schema_version: Sigma credential file expected 1, received ${String(actual)} at ${filePath}; existing data was not modified`
+  ), {
+    code: "unsupported_schema_version" as const,
+    path: filePath,
+    expected: 1,
+    actual
+  });
+}
+
+function invalidPersistedState(filePath: string): Error {
+  return Object.assign(new Error(
+    `persisted_state_invalid: Sigma credential file at ${filePath} does not match schema 1; existing data was not modified`
+  ), {
+    code: "persisted_state_invalid" as const,
+    path: filePath
+  });
+}
+
 function isCredential(value: unknown): value is Credential {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const candidate = value as Record<string, unknown>;
@@ -47,17 +67,24 @@ function isCredential(value: unknown): value is Credential {
     && typeof candidate.expires === "number";
 }
 
-function parseDocument(value: unknown): CredentialDocument {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return emptyDocument();
-  const candidate = value as { version?: unknown; credentials?: unknown };
-  if (candidate.version !== 1 || !candidate.credentials
-    || typeof candidate.credentials !== "object" || Array.isArray(candidate.credentials)) {
-    return emptyDocument();
+function parseDocument(value: unknown, filePath: string): CredentialDocument {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw invalidPersistedState(filePath);
   }
-  const credentials = Object.fromEntries(
-    Object.entries(candidate.credentials).filter((entry): entry is [string, Credential] =>
-      entry[0].length > 0 && isCredential(entry[1]))
-  );
+  const candidate = value as { version?: unknown; credentials?: unknown };
+  if (candidate.version !== 1) {
+    throw unsupportedSchemaVersion(filePath, candidate.version);
+  }
+  if (!candidate.credentials || typeof candidate.credentials !== "object"
+    || Array.isArray(candidate.credentials)) {
+    throw invalidPersistedState(filePath);
+  }
+  const entries = Object.entries(candidate.credentials);
+  if (!entries.every((entry): entry is [string, Credential] =>
+    entry[0].length > 0 && isCredential(entry[1]))) {
+    throw invalidPersistedState(filePath);
+  }
+  const credentials = Object.fromEntries(entries);
   return { version: 1, credentials };
 }
 
@@ -77,11 +104,13 @@ async function readPrivateJson(filePath: string): Promise<CredentialDocument> {
   const handle = await open(filePath, constants.O_RDONLY | noFollow);
   try {
     const content = await handle.readFile("utf8");
+    let value: unknown;
     try {
-      return parseDocument(JSON.parse(content) as unknown);
+      value = JSON.parse(content) as unknown;
     } catch {
       throw new Error("Sigma credential file contains invalid JSON.");
     }
+    return parseDocument(value, filePath);
   } finally {
     await handle.close();
   }

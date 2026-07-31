@@ -123,7 +123,6 @@ function processLifecycleCall(
 ): boolean {
   return unifiedSpawn || [
     "process_spawn",
-    "environment_process_spawn",
     "process_poll",
     "process_terminate",
     "process_handoff"
@@ -156,8 +155,7 @@ export async function recordProcessReceipt(
   if (!processLifecycleCall(call, unifiedSpawn)) return;
   const value = receiptOutput(receipt);
   const id = processId(value);
-  if (call.name === "process_spawn" || call.name === "environment_process_spawn"
-    || unifiedSpawn) {
+  if (call.name === "process_spawn" || unifiedSpawn) {
     await recordSpawnReceipt(
       session, call, plan, value, id, unifiedSpawn, emit
     );

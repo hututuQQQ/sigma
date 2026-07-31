@@ -151,8 +151,6 @@ describe("effect-plan recovery", () => {
       gateway: new SmokeFakeGateway([
         fakeToolTurn([fakeToolCall("write", "shell", {
           executable: "fixture",
-          access: "write",
-          writeRoots: ["src"],
           expectedChanges: ["src/expected.txt"]
         })]),
         fakeToolTurn([fakeToolCall("done", "request_user_input", { message: "Violation handled." })])
@@ -294,8 +292,6 @@ describe("effect-plan recovery", () => {
       gateway: new SmokeFakeGateway([
         fakeToolTurn([fakeToolCall("write", "shell", {
           executable: "fixture",
-          access: "write",
-          writeRoots: ["src"],
           expectedChanges: ["src/generated/nested/file.ts"]
         })]),
         fakeToolTurn([fakeToolCall("done", "request_user_input", { message: "Nested write handled." })])
@@ -344,8 +340,6 @@ describe("effect-plan recovery", () => {
     const gateway = new SmokeFakeGateway([
       fakeToolTurn([fakeToolCall("write", "shell", {
         executable: "fixture",
-        access: "write",
-        writeRoots: ["src"],
         expectedChanges: ["src/expected.txt"]
       })]),
       fakeToolTurn([fakeToolCall("must-not-run", "request_user_input", {

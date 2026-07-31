@@ -78,7 +78,20 @@ function assertMandatoryMutationPolicy(profile: ResolvedAgentProfile): void {
 }
 
 function configuredBudget(config: CustomizationConfig): ResolvedAgentProfile["budget"] {
-  return config.budget ? { ...config.budget } : { ...DEFAULT_PROFILE_BUDGET };
+  const budget = config.budget ?? DEFAULT_PROFILE_BUDGET;
+  // Runtime configuration also carries routing-only switches such as
+  // allowUnpricedCosts. Project only the versioned Agent Profile fields so a
+  // session snapshot never gains configuration keys that strict restore does
+  // not understand.
+  return {
+    maxInputTokens: budget.maxInputTokens,
+    maxOutputTokens: budget.maxOutputTokens,
+    maxCostMicroUsd: budget.maxCostMicroUsd,
+    maxModelTurns: budget.maxModelTurns,
+    maxToolCalls: budget.maxToolCalls,
+    maxChildren: budget.maxChildren,
+    maxDepth: budget.maxDepth
+  };
 }
 
 function builtinProfile(

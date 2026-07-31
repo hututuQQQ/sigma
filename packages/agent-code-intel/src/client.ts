@@ -24,6 +24,11 @@ interface RpcError {
   data?: unknown;
 }
 
+interface OpenDocument {
+  text: string;
+  version: number;
+}
+
 function languageId(filePath: string): string {
   const extension = path.extname(filePath).toLowerCase();
   return ({
@@ -45,9 +50,11 @@ export class LspClient {
   private readonly onNotification?: (method: string, params: unknown) => void;
   private readonly pending = new Map<number, PendingRequest>();
   private readonly diagnostics = new Map<string, LspDiagnostic[]>();
-  private readonly opened = new Set<string>();
+  private readonly opened = new Map<string, OpenDocument>();
+  private readonly opening = new Map<string, Promise<void>>();
   private nextId = 1;
   private pump?: Promise<void>;
+  private starting?: Promise<void>;
   private initialized = false;
   private closed = false;
 
@@ -62,7 +69,20 @@ export class LspClient {
   async start(signal?: AbortSignal): Promise<void> {
     if (this.initialized) return;
     if (this.closed) throw new Error("LSP client is closed.");
-    this.pump = this.readLoop(signal);
+    let starting = this.starting;
+    if (!starting) {
+      starting = this.initialize(signal);
+      this.starting = starting;
+    }
+    try {
+      await starting;
+    } finally {
+      if (this.starting === starting) this.starting = undefined;
+    }
+  }
+
+  private async initialize(signal?: AbortSignal): Promise<void> {
+    this.pump ??= this.readLoop();
     await this.request("initialize", {
       processId: process.pid,
       clientInfo: { name: this.clientName, version: SIGMA_PROJECT_FACTS.productVersion },
@@ -149,13 +169,36 @@ export class LspClient {
     const target = await realpath(requested);
     if (!isContained(root, target)) throw new Error(`LSP path resolves outside workspace: ${filePath}`);
     const uri = pathToFileURL(target).href;
-    if (this.opened.has(uri)) return uri;
-    const text = await readFile(target, "utf8");
-    await this.notify("textDocument/didOpen", {
-      textDocument: { uri, languageId: languageId(target), version: 1, text }
-    }, signal);
-    this.opened.add(uri);
+    let opening = this.opening.get(uri);
+    if (!opening) {
+      opening = this.syncDocument(target, uri, signal);
+      this.opening.set(uri, opening);
+    }
+    try {
+      await opening;
+    } finally {
+      if (this.opening.get(uri) === opening) this.opening.delete(uri);
+    }
     return uri;
+  }
+
+  private async syncDocument(target: string, uri: string, signal?: AbortSignal): Promise<void> {
+    const text = await readFile(target, "utf8");
+    const opened = this.opened.get(uri);
+    if (!opened) {
+      await this.notify("textDocument/didOpen", {
+        textDocument: { uri, languageId: languageId(target), version: 1, text }
+      }, signal);
+      this.opened.set(uri, { text, version: 1 });
+      return;
+    }
+    if (opened.text === text) return;
+    const version = opened.version + 1;
+    await this.notify("textDocument/didChange", {
+      textDocument: { uri, version },
+      contentChanges: [{ text }]
+    }, signal);
+    this.opened.set(uri, { text, version });
   }
 
   private async request(method: string, params: unknown, signal?: AbortSignal): Promise<unknown> {

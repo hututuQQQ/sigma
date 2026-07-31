@@ -21,6 +21,7 @@ import type {
 import { codeIntelTool } from "../packages/agent-tools/src/index.js";
 
 class FakeTransport implements LspTransport {
+  readonly methods: string[] = [];
   private readonly decoder = new LspFrameDecoder();
   private readonly queued: Uint8Array[] = [];
   private readonly waiters: Array<(value: IteratorResult<Uint8Array>) => void> = [];
@@ -29,6 +30,7 @@ class FakeTransport implements LspTransport {
   async write(data: Uint8Array): Promise<void> {
     for (const body of this.decoder.push(data)) {
       const message = JSON.parse(body) as { id?: number; method?: string; params?: unknown };
+      if (message.method) this.methods.push(message.method);
       if (message.method === "initialize") this.push({ jsonrpc: "2.0", id: message.id, result: { capabilities: {} } });
       if (message.method === "textDocument/documentSymbol") {
         this.push({ jsonrpc: "2.0", id: message.id, result: [{ name: "answer", kind: 12 }] });
@@ -143,6 +145,7 @@ class FakeLspBroker implements ExecutionBroker {
   readonly lostProcessHandles: readonly ProcessHandle[] = [];
   readonly decoder = new LspFrameDecoder();
   readonly output: string[] = [];
+  readonly spawnRequests: ProcessSpawnRequest[] = [];
   spawnRequest?: ProcessSpawnRequest;
 
   async connect() { return this.report(); }
@@ -150,6 +153,7 @@ class FakeLspBroker implements ExecutionBroker {
   async execute(): Promise<never> { throw new Error("not used"); }
   async spawn(request: ProcessSpawnRequest): Promise<ProcessHandle> {
     this.spawnRequest = request;
+    this.spawnRequests.push(request);
     return { id: "lsp", brokerInstanceId: "fixture" };
   }
   async poll(handle: ProcessHandle): Promise<ProcessPollResult> {
@@ -215,13 +219,17 @@ describe("agent-code-intel", () => {
   it("initializes, opens a document and consumes symbols and diagnostics", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-lsp-"));
     await writeFile(path.join(workspace, "fixture.ts"), "const answer = 42;", "utf8");
-    const client = new LspClient({ rootPath: workspace, transport: new FakeTransport() });
+    const transport = new FakeTransport();
+    const client = new LspClient({ rootPath: workspace, transport });
     await expect(client.symbols("fixture.ts")).resolves.toEqual([{ name: "answer", kind: 12 }]);
     await expect(client.definition("fixture.ts", { line: 0, character: 7 })).resolves.toMatchObject({ uri: "file:///fixture.ts" });
     await expect(client.references("fixture.ts", { line: 0, character: 7 })).resolves.toHaveLength(1);
     await expect(client.hover("fixture.ts", { line: 0, character: 7 })).resolves.toMatchObject({ contents: "fixture hover" });
     await expect(client.rename("fixture.ts", { line: 0, character: 7 }, "renamed")).resolves.toEqual({ changes: {} });
     await expect(client.documentDiagnostics("fixture.ts")).resolves.toMatchObject([{ message: "fixture" }]);
+    await writeFile(path.join(workspace, "fixture.ts"), "const answer = 43;", "utf8");
+    await expect(client.symbols("fixture.ts")).resolves.toEqual([{ name: "answer", kind: 12 }]);
+    expect(transport.methods.filter((method) => method === "textDocument/didChange")).toHaveLength(1);
     await client.close();
   });
 
@@ -374,6 +382,39 @@ describe("agent-code-intel", () => {
       path.resolve(workspace), path.dirname(process.execPath)
     ]));
     await client.close();
+  });
+
+  it("reuses one brokered language server for concurrent read-only tool queries", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-lsp-pool-"));
+    await writeFile(path.join(workspace, "first.ts"), "const first = true;", "utf8");
+    await writeFile(path.join(workspace, "second.ts"), "const second = true;", "utf8");
+    const broker = new FakeLspBroker();
+    const tool = codeIntelTool({
+      broker,
+      presets: [{
+        id: "typescript", languages: ["typescript"], executable: process.execPath,
+        args: ["server.mjs", "--stdio"], source: "configured", available: true
+      }]
+    });
+    const execute = async (callId: string, file: string) => await tool.execute({
+      callId,
+      name: "lsp",
+      arguments: { operation: "symbols", file }
+    }, {
+      sessionId: "session", runId: "run", workspacePath: workspace, runMode: "analyze",
+      signal: new AbortController().signal, heartbeat() {}, progress: async () => undefined,
+      createArtifact: async () => "artifact"
+    });
+
+    await expect(Promise.all([
+      execute("first-symbols", "first.ts"),
+      execute("second-symbols", "second.ts")
+    ])).resolves.toEqual([
+      expect.objectContaining({ ok: true }),
+      expect.objectContaining({ ok: true })
+    ]);
+    expect(tool.descriptor).toMatchObject({ executionMode: "parallel", resourceKeys: [] });
+    expect(broker.spawnRequests).toHaveLength(1);
   });
 
   it("uses the writable in-sandbox temp directory on POSIX", () => {

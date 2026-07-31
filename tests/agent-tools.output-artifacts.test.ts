@@ -158,7 +158,7 @@ describe("execution output artifact receipts", () => {
     expect(receipt.diagnostics).toContain("model_output_truncated:stdout:5000");
   });
 
-  it("runs shell validation directly and records the target command exit code", async () => {
+  it("runs unified shell validation and records the target command exit code", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-shell-validation-"));
     const execution: ExecutionResult = {
       state: "exited", exitCode: 7, signal: null, durationMs: 2,
@@ -172,13 +172,13 @@ describe("execution output artifact receipts", () => {
     const tools = executionTools({
       broker: broker(execution, poll), sandboxMode: "required", networkMode: "none", shells: ["bash"]
     });
-    const validate = tools.find((tool) => tool.descriptor.name === "validate")!;
+    const shell = tools.find((tool) => tool.descriptor.name === "shell")!;
     const { context } = await fixtureContext(workspace);
-    const receipt = await validate.execute(request("shell-validation", "validate", {
-      shell: "bash", command: "run-the-real-tests --strict"
+    const receipt = await shell.execute(request("shell-validation", "shell", {
+      shell: "bash", command: "run-the-real-tests --strict", validation: true
     }), context);
 
-    expect(validate.descriptor.inputSchema).toMatchObject({ oneOf: expect.any(Array) });
+    expect(shell.descriptor.inputSchema).toMatchObject({ oneOf: expect.any(Array) });
     expect(receipt).toMatchObject({ ok: false });
     expect(receipt.evidence).toEqual([expect.objectContaining({
       kind: "validation",

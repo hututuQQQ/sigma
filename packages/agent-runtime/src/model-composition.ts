@@ -13,6 +13,10 @@ import {
 import type { ModelExecutionRole, ModelGateway } from "agent-protocol";
 import type { RuntimeCustomization } from "./customization.js";
 
+const DEFAULT_MODEL_RETRIES = 5;
+const DEFAULT_MODEL_RETRY_BASE_DELAY_MS = 200;
+const DEFAULT_MODEL_RETRY_JITTER_RATIO = 0.1;
+
 export interface ModelCompositionConfig {
   provider: string;
   model: string;
@@ -216,7 +220,7 @@ function gatewayOptions(config: ModelCompositionConfig): Omit<
   "provider" | "model"
 > {
   return {
-    maxRetries: config.maxModelRetries ?? 2,
+    maxRetries: config.maxModelRetries ?? DEFAULT_MODEL_RETRIES,
     requestTimeoutMs: config.modelDeadlineSec * 1_000,
     idleTimeoutMs: config.streamIdleSec * 1_000,
     ...(config.streamActiveSec && config.streamActiveSec > 0
@@ -288,9 +292,10 @@ export function createRoleGateways(
     resolved.routes,
     (spec) => gateways.get(spec.id) as ModelGateway,
     {
-      maxRetriesPerCandidate: config.maxModelRetries ?? 2,
-      retryBaseDelayMs: 2_000,
-      retryMaxDelayMs: 60_000
+      maxRetriesPerCandidate: config.maxModelRetries ?? DEFAULT_MODEL_RETRIES,
+      retryBaseDelayMs: DEFAULT_MODEL_RETRY_BASE_DELAY_MS,
+      retryMaxDelayMs: 60_000,
+      retryJitterRatio: DEFAULT_MODEL_RETRY_JITTER_RATIO
     }
   );
   const allowUnpricedCosts = config.budget?.allowUnpricedCosts === true;

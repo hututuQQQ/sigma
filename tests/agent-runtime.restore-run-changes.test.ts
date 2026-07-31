@@ -336,8 +336,7 @@ describe("restore_run_changes transaction control", () => {
       gateway: new SmokeFakeGateway([
         fakeToolTurn([fakeToolCall("invalid-write-plan", "shell", {
           executable: "fixture",
-          access: "write",
-          writeRoots: ["src"]
+          expectedChanges: ["../outside.txt"]
         })]),
         fakeToolTurn([fakeToolCall("done", "request_user_input", { message: "Prepare failure observed." })])
       ]),
@@ -355,8 +354,8 @@ describe("restore_run_changes transaction control", () => {
       type: "tool.failed",
       payload: expect.objectContaining({
         callId: "invalid-write-plan",
-        diagnostics: ["write_scope_required"],
-        outcome: expect.objectContaining({ diagnosticCodes: ["write_scope_required"] })
+        diagnostics: ["write_plan_invalid"],
+        outcome: expect.objectContaining({ diagnosticCodes: ["write_plan_invalid"] })
       })
     }));
   });

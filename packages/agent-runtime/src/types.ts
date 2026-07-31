@@ -88,6 +88,8 @@ export interface ApprovalWaiter {
   sessionApprovalGrant?: "web.read";
   /** Marks an approval reconstructed from the current durable event log. */
   recovered?: boolean;
+  /** Resolves after the live approval suspension is durable and safe to resolve. */
+  requestReady?: Promise<void>;
   resolving?: boolean;
   external?: {
     callId: string;

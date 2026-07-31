@@ -79,6 +79,16 @@ export interface ModelRouterOptions {
   retryBaseDelayMs?: number;
   /** Maximum delay between same-provider retries. */
   retryMaxDelayMs?: number;
+  /** Symmetric randomization ratio applied to same-provider retry delays. */
+  retryJitterRatio?: number;
+}
+
+function validatedRetryJitterRatio(value: number | undefined): number {
+  const ratio = value ?? 0;
+  if (!Number.isFinite(ratio) || ratio < 0 || ratio > 1) {
+    throw new Error("Model router retry jitter ratio must be between 0 and 1.");
+  }
+  return ratio;
 }
 
 function routedStreamEvent(
@@ -135,6 +145,7 @@ export class ModelRouter {
   private readonly maxRetriesPerCandidate: number;
   private readonly retryBaseDelayMs: number;
   private readonly retryMaxDelayMs: number;
+  private readonly retryJitterRatio: number;
 
   constructor(
     specs: readonly ModelSpec[],
@@ -151,6 +162,7 @@ export class ModelRouter {
     }
     const retryBaseDelayMs = options.retryBaseDelayMs ?? 0;
     const retryMaxDelayMs = options.retryMaxDelayMs ?? 60_000;
+    const retryJitterRatio = validatedRetryJitterRatio(options.retryJitterRatio);
     if (!Number.isSafeInteger(retryBaseDelayMs) || retryBaseDelayMs < 0) {
       throw new Error("Model router retry base delay must be a non-negative safe integer.");
     }
@@ -160,6 +172,7 @@ export class ModelRouter {
     this.maxRetriesPerCandidate = retries;
     this.retryBaseDelayMs = retryBaseDelayMs;
     this.retryMaxDelayMs = retryMaxDelayMs;
+    this.retryJitterRatio = retryJitterRatio;
     validateDistinctRoutes(routes);
     for (const route of routes) validateRoute(route, this.specs);
   }
@@ -236,7 +249,8 @@ export class ModelRouter {
             index,
             nextIndex,
             this.retryBaseDelayMs,
-            this.retryMaxDelayMs
+            this.retryMaxDelayMs,
+            this.retryJitterRatio
           ),
           request.signal
         );
@@ -297,7 +311,8 @@ export class ModelRouter {
             index,
             nextIndex,
             this.retryBaseDelayMs,
-            this.retryMaxDelayMs
+            this.retryMaxDelayMs,
+            this.retryJitterRatio
           ),
           request.signal
         );

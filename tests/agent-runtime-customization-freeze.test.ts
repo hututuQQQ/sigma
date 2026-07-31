@@ -8,6 +8,7 @@ import {
   defaultSkillRoots,
   discoverSkills,
   freezeAgentProfile,
+  restoreFrozenAgentProfile,
   restoreSessionCustomization,
   type HookDefinition,
   type HookRunnerRequest,
@@ -22,7 +23,10 @@ import type {
   ModelStreamEvent,
   ModelToolDefinition
 } from "../packages/agent-protocol/src/index.js";
-import { createRuntime } from "../packages/agent-runtime/src/testing.js";
+import {
+  createRuntime,
+  resolveRuntimeCustomization
+} from "../packages/agent-runtime/src/testing.js";
 import { ContentAddressedArtifactStore, SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
 
@@ -108,6 +112,31 @@ async function events(store: SegmentedJsonlStore, sessionId: string): Promise<Ag
 }
 
 describe("durable session customization", () => {
+  it("keeps routing-only budget configuration out of the frozen Agent Profile", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-profile-budget-"));
+    const workspace = path.join(root, "workspace");
+    const home = path.join(root, "home");
+    await mkdir(workspace, { recursive: true });
+    await mkdir(home, { recursive: true });
+    try {
+      const customization = await resolveRuntimeCustomization({
+        permissionMode: "auto",
+        budget: {
+          ...DEFAULT_PROFILE_BUDGET,
+          allowUnpricedCosts: true
+        }
+      }, workspace, home);
+
+      expect(customization.profile.profile.budget).not.toHaveProperty("allowUnpricedCosts");
+      expect(() => restoreFrozenAgentProfile(
+        customization.profile.canonicalJson,
+        customization.profile.digest
+      )).not.toThrow();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("loads frozen skill text and hook definitions after live customization is deleted or changed", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-frozen-customization-"));
     const workspace = path.join(root, "workspace");

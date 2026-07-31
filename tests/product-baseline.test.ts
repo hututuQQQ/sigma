@@ -13,6 +13,12 @@ const externalVersionedDeclarations = new Set([
   "ACCESS_WRITE_HANDLED_V1",
   "TokenSecurityAttributeV1"
 ]);
+const retiredCompatibilityIdentifiers = [
+  "environment_shell",
+  "environment_process_spawn",
+  "executableSkillResourcesLoaded",
+  "modelInputSchema"
+];
 
 class MemoryWritable extends Writable {
   readonly chunks: string[] = [];
@@ -94,6 +100,11 @@ describe("Sigma Code single baseline", () => {
       }
       const source = await readFile(file, "utf8");
       if (/\bLEGACY_[A-Z0-9_]+\b/u.test(source)) violations.push(`${relative}: LEGACY_ constant`);
+      for (const identifier of retiredCompatibilityIdentifiers) {
+        if (source.includes(identifier)) {
+          violations.push(`${relative}: retired compatibility identifier ${identifier}`);
+        }
+      }
       if (/\b(?:export\s+)?(?:async\s+)?function\s+migrat[A-Za-z0-9_]*\b/iu.test(source)) {
         violations.push(`${relative}: migration entry point`);
       }

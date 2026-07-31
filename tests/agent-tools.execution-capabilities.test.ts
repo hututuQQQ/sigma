@@ -118,7 +118,8 @@ describe("execution tool capability closure", () => {
       pty: false,
       networkMode: "none",
       networkModes: ["none"],
-      runtimeCommands: ["runtime"]
+      runtimeCommands: ["runtime"],
+      shells: []
     });
 
     expect(tools.descriptor("exec")?.inputSchema).toMatchObject({
@@ -165,7 +166,8 @@ describe("execution tool capability closure", () => {
       background: true,
       networkMode: "none",
       networkModes: ["none"],
-      runtimeCommands: ["runtime"]
+      runtimeCommands: ["runtime"],
+      shells: []
     });
 
     try {
@@ -209,7 +211,8 @@ describe("execution tool capability closure", () => {
       processHandoff: "allow",
       networkMode: "none",
       networkModes: ["none"],
-      runtimeCommands: ["runtime"]
+      runtimeCommands: ["runtime"],
+      shells: []
     });
     expect(tools.descriptor("process_spawn")?.inputSchema).toMatchObject({
       properties: { lifecycle: { enum: ["session", "deliverable"] } }
@@ -236,7 +239,8 @@ describe("execution tool capability closure", () => {
 
     const denied = registerBuiltinTools(new EffectToolRegistry(), {
       handoff: true,
-      processHandoff: "deny"
+      processHandoff: "deny",
+      shells: []
     });
     expect(denied.descriptor("process_handoff")).toBeUndefined();
     expect(denied.descriptor("process_spawn")?.inputSchema).not.toMatchObject({
@@ -244,7 +248,7 @@ describe("execution tool capability closure", () => {
     });
   });
 
-  it("offers a low-friction disposable-environment process without weakening ordinary spawn scope", async () => {
+  it("routes disposable-environment processes through the current shell contract", async () => {
     const root = await workspace();
     const fixture = brokerFixture();
     const tools = registerBuiltinTools(new EffectToolRegistry(), {
@@ -260,40 +264,40 @@ describe("execution tool capability closure", () => {
       networkMode: "none",
       networkModes: ["none"],
       runtimeCommands: ["runtime"],
+      shells: ["bash"],
       protectedPaths: [path.join(root, ".runtime")]
     });
-    const environment = tools.descriptor("environment_process_spawn");
-    expect(tools.modelDescriptors().find((descriptor) =>
-      descriptor.name === "environment_process_spawn")).toBeUndefined();
-    expect(tools.descriptor("process_spawn")?.inputSchema).toMatchObject({
+    expect(tools.descriptor("environment_process_spawn")).toBeUndefined();
+    expect(tools.descriptor("environment_shell")).toBeUndefined();
+    expect(tools.descriptor("process_spawn")).toBeUndefined();
+    const shell = tools.descriptor("shell");
+    expect(shell?.inputSchema).toMatchObject({
       properties: {
-        target: { enum: ["workspace", "environment"] }
+        target: { enum: ["workspace", "environment"] },
+        background: { type: "boolean" },
+        lifecycle: { enum: ["session", "deliverable"] }
       }
     });
     expect(JSON.stringify(
-      tools.descriptor("process_spawn")?.inputSchema.properties?.target
+      shell?.inputSchema.properties?.target
     )).toContain("only to later calls that also use target=environment");
-    expect(tools.modelDescriptors().find((descriptor) =>
-      descriptor.name === "shell")?.description
+    expect(shell?.description
     ).toContain("workspace-target calls use a separate sandbox view");
-    expect(environment).toMatchObject({
-      brokerMutationAuthority: "disposable_enclosing_container",
-      inputSchema: {
-        properties: {
-          lifecycle: { enum: ["session", "deliverable"] }
-        }
-      }
+    expect(shell).toMatchObject({
+      brokerMutationAuthority: "disposable_enclosing_container"
     });
-    expect(environment?.inputSchema).not.toMatchObject({
+    expect(shell?.inputSchema).not.toMatchObject({
       properties: {
         access: expect.anything(),
-        writeRoots: expect.anything(),
-        expectedChanges: expect.anything()
+        writeRoots: expect.anything()
       }
     });
 
-    const call = request("environment_process_spawn", {
+    const call = request("shell", {
       executable: "runtime",
+      target: "environment",
+      background: true,
+      yieldMs: 0,
       lifecycle: "deliverable"
     });
     const plan = await tools.prepare(call, preparation(root));
@@ -326,38 +330,12 @@ describe("execution tool capability closure", () => {
       })
     }), expect.anything());
 
-    const unified = request("process_spawn", {
-      executable: "runtime",
-      target: "environment",
-      lifecycle: "deliverable"
-    });
-    const unifiedPlan = await tools.prepare(unified, preparation(root));
-    expect(unifiedPlan).toMatchObject({
-      mutationAuthority: "disposable_enclosing_container",
-      checkpointScope: [path.parse(path.resolve(root)).root]
-    });
-    await expect(tools.execute(unified, {
-      ...execution(root),
-      callPlan: unifiedPlan,
-      approval: {
-        callId: unified.callId,
-        authority: "runtime",
-        networkApproved: false,
-        externalReadApproved: true,
-        processHandoffApproved: false,
-        openWorldApproved: true
-      }
-    })).resolves.toMatchObject({ ok: true });
-
-    const ordinary = request("process_spawn", {
-      executable: "runtime",
-      lifecycle: "deliverable",
-      access: "write",
-      writeRoots: [path.parse(path.resolve(root)).root],
-      expectedChanges: [path.parse(path.resolve(root)).root]
-    });
-    await expect(tools.prepare(ordinary, preparation(root)))
-      .rejects.toMatchObject({ code: "policy_denied" });
+    for (const retired of ["environment_process_spawn", "environment_shell", "process_spawn"]) {
+      await expect(tools.prepare(
+        request(retired, { executable: "runtime" }),
+        preparation(root)
+      )).rejects.toThrow(`Unknown tool '${retired}'.`);
+    }
 
     const unattested = registerBuiltinTools(new EffectToolRegistry(), {
       broker: fixture.broker,
@@ -368,9 +346,14 @@ describe("execution tool capability closure", () => {
       enclosingContainerRoot: true,
       networkMode: "none",
       networkModes: ["none"],
-      runtimeCommands: ["runtime"]
+      runtimeCommands: ["runtime"],
+      shells: ["bash"]
     });
     expect(unattested.descriptor("environment_process_spawn")).toBeUndefined();
+    expect(unattested.descriptor("environment_shell")).toBeUndefined();
+    expect(unattested.descriptor("process_spawn")).toBeUndefined();
+    expect(unattested.descriptor("shell")?.inputSchema.properties)
+      .not.toHaveProperty("target");
   });
 
   it("keeps the shell schema aligned with verified capabilities and rejects unsupported arguments", async () => {
@@ -435,10 +418,15 @@ describe("execution tool capability closure", () => {
       shells: ["bash"]
     });
     const modelNames = tools.modelDescriptors().map((item) => item.name);
+    const runtimeNames = tools.descriptors().map((item) => item.name);
     expect(modelNames).toContain("shell");
-    expect(modelNames).not.toContain("exec");
-    expect(modelNames).not.toContain("validate");
-    expect(modelNames).not.toContain("process_spawn");
+    for (const retired of [
+      "exec", "validate", "process_spawn",
+      "environment_shell", "environment_process_spawn"
+    ]) {
+      expect(modelNames).not.toContain(retired);
+      expect(runtimeNames).not.toContain(retired);
+    }
 
     const inferredWriteCall = request("shell", {
       executable: "runtime",
@@ -451,32 +439,22 @@ describe("execution tool capability closure", () => {
       exactEffects: expect.arrayContaining(["filesystem.write"])
     });
 
-    const legacyWriteCall = request("shell", {
-      executable: "runtime",
-      access: "write",
-      writeRoots: ["."],
-      expectedChanges: ["legacy-generated.txt"]
-    });
-    await expect(tools.prepare(legacyWriteCall, preparation(root))).resolves.toMatchObject({
-      writePaths: ["legacy-generated.txt"],
-      checkpointScope: ["."],
-      exactEffects: expect.arrayContaining(["filesystem.write"])
-    });
-
-    const descriptiveWriteCall = request("shell", {
-      executable: "runtime",
-      expectedChanges: ["described-output.txt"],
-      purpose: "Create the requested output"
-    });
-    await expect(tools.prepare(descriptiveWriteCall, preparation(root))).resolves.toMatchObject({
-      writePaths: ["described-output.txt"],
-      exactEffects: expect.not.arrayContaining(["validation"])
-    });
+    for (const oldArguments of [
+      { executable: "runtime", access: "write" },
+      { executable: "runtime", writeRoots: ["."] },
+      { executable: "runtime", purpose: "Old validation metadata" },
+      { executable: "runtime", subjects: ["generated.txt"] },
+      { executable: "runtime", criterionIds: ["criterion-1"] }
+    ]) {
+      await expect(tools.prepare(
+        request("shell", oldArguments),
+        preparation(root)
+      )).rejects.toMatchObject({ code: "tool_arguments_invalid" });
+    }
 
     const validationCall = request("shell", {
       executable: "runtime",
-      validation: true,
-      purpose: "Check the current result"
+      validation: true
     });
     const validationPlan = await tools.prepare(validationCall, preparation(root));
     expect(validationPlan).toMatchObject({
@@ -492,35 +470,16 @@ describe("execution tool capability closure", () => {
     });
     await expect(tools.prepare(request("shell", {
       executable: "runtime",
-      validation: false,
-      purpose: "A description does not imply validation"
+      validation: false
     }), preparation(root))).resolves.toMatchObject({
       exactEffects: expect.not.arrayContaining(["validation"])
     });
     await expect(tools.prepare(request("shell", {
       executable: "runtime",
-      background: true,
-      purpose: "Describe a background process"
+      background: true
     }), preparation(root))).resolves.toMatchObject({
       processMode: "background",
       exactEffects: expect.not.arrayContaining(["validation"])
-    });
-
-    const legacyValidationPlan = await tools.prepare(request("shell", {
-      executable: "runtime",
-      validation: true,
-      purpose: "Legacy validation"
-    }), preparation(root));
-    const legacyValidationCall = request("shell", {
-      executable: "runtime",
-      purpose: "Legacy validation"
-    });
-    await expect(tools.execute(legacyValidationCall, {
-      ...execution(root),
-      callPlan: legacyValidationPlan
-    })).resolves.toMatchObject({
-      ok: true,
-      evidence: [expect.objectContaining({ kind: "validation" })]
     });
 
     const backgroundCall = request("shell", {
