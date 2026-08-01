@@ -212,6 +212,14 @@ describe("Terminal-Bench command construction", () => {
       { agent_profile: "standard", evaluation_lane: "solving", reasoning_effort: "high" },
       { agent_profile: "standard", evaluation_lane: "solving", reasoning_effort: "max" }
     )).toThrow(/different reasoning efforts/iu);
+    expect(() => assertComparableBenchmarkReports(
+      { agent_profile: "standard", evaluation_lane: "solving" },
+      { agent_profile: "standard", evaluation_lane: "solving", reasoning_effort: "max" }
+    )).toThrow(/different reasoning efforts/iu);
+    expect(() => assertComparableBenchmarkReports(
+      { agent_profile: "standard", evaluation_lane: "solving" },
+      { agent_profile: "standard", evaluation_lane: "solving", reasoning_effort: "auto" }
+    )).not.toThrow();
   });
 
   it("propagates the run-level network mode into Harbor agent configuration", () => {

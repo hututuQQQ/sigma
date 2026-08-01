@@ -2506,7 +2506,7 @@ export function assertComparableBenchmarkReports(...reports) {
     ), { code: "benchmark_lane_mismatch" });
   }
   const reasoningEfforts = [...new Set(
-    reports.map((report) => report?.reasoning_effort).filter(Boolean)
+    reports.map((report) => report?.reasoning_effort ?? "auto")
   )];
   if (reasoningEfforts.length > 1) {
     throw Object.assign(new Error(
