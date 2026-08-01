@@ -95,6 +95,8 @@ class PortableCodexTest(unittest.IsolatedAsyncioTestCase):
             [(archive, "/tmp/codex-runtime/codex-cli.tgz")],
         )
         commands = "\n".join(command for command, _kwargs in environment.exec_calls)
+        self.assertIn("sha256sum -c -", commands)
+        self.assertIn(digest, commands)
         self.assertIn("tar -xzf", commands)
         self.assertIn("ln -sf /opt/codex-cli/bin/codex /usr/local/bin/codex", commands)
         self.assertIn("codex --version", commands)
@@ -129,7 +131,7 @@ class PortableCodexTest(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(RuntimeError, "version mismatch"):
                 await agent.install(RecordingEnvironment("codex-cli 0.145.0"))
 
-    async def test_preserves_stock_fast_path_when_exact_version_is_present(self):
+    async def test_replaces_preinstalled_binary_even_when_version_matches(self):
         module, _stub = import_portable_codex_module()
         with TemporaryDirectory() as tmp:
             archive = Path(tmp) / "codex-cli.tgz"
@@ -146,8 +148,33 @@ class PortableCodexTest(unittest.IsolatedAsyncioTestCase):
 
             await agent.install(environment)
 
+        self.assertEqual(
+            environment.uploads,
+            [(archive, "/tmp/codex-runtime/codex-cli.tgz")],
+        )
+        commands = "\n".join(command for command, _kwargs in environment.exec_calls)
+        self.assertIn("sha256sum -c -", commands)
+        self.assertIn("tar -xzf", commands)
+
+    async def test_rechecks_local_archive_identity_immediately_before_upload(self):
+        module, _stub = import_portable_codex_module()
+        with TemporaryDirectory() as tmp:
+            archive = Path(tmp) / "codex-cli.tgz"
+            archive.write_bytes(b"runtime")
+            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            agent = module.PortableCodex(
+                logs_dir=Path(tmp) / "logs",
+                version="0.146.0",
+                codex_cli_tarball=archive,
+                codex_cli_sha256=digest,
+            )
+            archive.write_bytes(b"replaced-after-construction")
+            environment = RecordingEnvironment()
+
+            with self.assertRaisesRegex(RuntimeError, "changed after initialization"):
+                await agent.install(environment)
+
         self.assertEqual(environment.uploads, [])
-        self.assertEqual(environment.exec_calls, [])
 
 
 if __name__ == "__main__":

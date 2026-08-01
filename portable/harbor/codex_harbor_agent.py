@@ -64,9 +64,15 @@ class PortableCodex(Codex):
         self.codex_cli_sha256 = expected_sha256
 
     async def install(self, environment: BaseEnvironment) -> None:
-        if await self._installed_codex_satisfies_version(environment):
-            self.logger.debug("Codex is already available at the requested version")
-            return
+        # A matching version string is not a content identity. Re-check the
+        # caller's archive immediately before every upload and always replace
+        # any preinstalled binary with that pinned artifact.
+        actual_sha256 = _sha256_file(self.codex_cli_tarball)
+        if actual_sha256 != self.codex_cli_sha256:
+            raise RuntimeError(
+                "codex_cli_tarball changed after initialization: "
+                f"expected {self.codex_cli_sha256}, got {actual_sha256}"
+            )
 
         await self.exec_as_root(
             environment,
@@ -79,6 +85,9 @@ class PortableCodex(Codex):
             environment,
             command=(
                 "set -eu; "
+                f"if ! printf '%s  %s\\n' {shlex.quote(self.codex_cli_sha256)} "
+                f"{remote_archive} | sha256sum -c -; then "
+                f"rm -f {remote_archive}; exit 1; fi; "
                 f"rm -rf {remote_root}; "
                 f"mkdir -p {remote_root} /usr/local/bin; "
                 f"tar -xzf {remote_archive} -C {remote_root} --strip-components=1; "
