@@ -507,6 +507,11 @@ describe("agent-kernel protocol behavior", () => {
     expect(isKernelState([])).toBe(false);
     expect(isKernelState({ ...state, deadlineRemainingMs: 1 })).toBe(true);
     expect(isKernelState({ ...state, deadlineRemainingMs: 0 })).toBe(false);
+    const unbounded = { ...state };
+    delete unbounded.deadlineAt;
+    expect(isKernelState(unbounded)).toBe(true);
+    expect(isKernelState({ ...unbounded, deadlineRemainingMs: 1 })).toBe(false);
+    expect(isKernelState({ ...state, deadlineAt: "not-a-date" })).toBe(false);
     expect(isKernelState({ ...state, lastModelFinishReason: "length" })).toBe(true);
     expect(isKernelState({ ...state, lastModelFinishReason: "unknown" })).toBe(false);
     expect(isKernelState({

@@ -19,7 +19,7 @@ import {
   getBuiltinModelDataGeneratedAt
 } from "@earendil-works/pi-ai/providers/all";
 import type { ModelCapabilities } from "agent-protocol";
-import { FileCredentialStore } from "./credential-store.js";
+import { defaultCredentialStore } from "./credential-bridge.js";
 import {
   hasKnownPricing,
   piModelPricing,
@@ -262,7 +262,7 @@ function capabilities(model: Model<Api>): ModelCapabilities {
 }
 
 export function createPiModels(
-  credentials: CredentialStore = new FileCredentialStore(),
+  credentials: CredentialStore = defaultCredentialStore(),
   modelsStore: ModelsStore = new FileModelsStore()
 ): MutableModels {
   const models = createModels({ credentials, modelsStore });
@@ -271,7 +271,7 @@ export function createPiModels(
 }
 
 export async function createHydratedPiModels(
-  credentials: CredentialStore = new FileCredentialStore(),
+  credentials: CredentialStore = defaultCredentialStore(),
   modelsStore: ModelsStore = new FileModelsStore()
 ): Promise<Models> {
   const models = createPiModels(credentials, modelsStore);
@@ -281,7 +281,7 @@ export async function createHydratedPiModels(
 
 export async function hydratePiModelCache(
   models: Models,
-  credentials: CredentialStore = new FileCredentialStore(),
+  credentials: CredentialStore = defaultCredentialStore(),
   modelsStore: ModelsStore = new FileModelsStore()
 ): Promise<void> {
   for (const provider of models.getProviders()) {
@@ -318,7 +318,7 @@ export async function refreshPiProviderModels(
   const provider = models.getProvider(providerId);
   if (!provider) throw new Error(`Unknown Pi provider '${providerId}'.`);
   if (!provider.refreshModels) return;
-  const credentials = options.credentials ?? new FileCredentialStore();
+  const credentials = options.credentials ?? defaultCredentialStore();
   const modelsStore = options.modelsStore ?? new FileModelsStore();
   let storedCredential: Credential | undefined;
   try {

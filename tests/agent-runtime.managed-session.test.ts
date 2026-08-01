@@ -30,6 +30,7 @@ class BindingAwareGateway implements ModelGateway {
     promptCache: false,
     tokenizer: "approximate"
   };
+  readonly releasedSessions: string[] = [];
 
   constructor(private readonly isBound: () => boolean) {}
 
@@ -49,6 +50,10 @@ class BindingAwareGateway implements ModelGateway {
 
   async countTokens(messages: ModelMessage[], tools: ModelToolDefinition[] = []): Promise<number> {
     return JSON.stringify({ messages, tools }).length / 4;
+  }
+
+  releaseSession(sessionId: string): void {
+    this.releasedSessions.push(sessionId);
   }
 }
 
@@ -95,8 +100,9 @@ describe("runtime managed session lifecycle", () => {
       bindManagedSession,
       releaseScratchLease
     };
+    const gateway = new BindingAwareGateway(() => bound);
     const runtime = createRuntime({
-      gateway: new BindingAwareGateway(() => bound),
+      gateway,
       store: new SegmentedJsonlStore({ rootDir: storeRootDir }),
       storeRootDir,
       tools: registerBuiltinTools(new EffectToolRegistry()),
@@ -114,5 +120,6 @@ describe("runtime managed session lifecycle", () => {
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "completed" });
     await runtime.releaseSession(session.sessionId);
     expect(releaseScratchLease).toHaveBeenCalledWith(session.sessionId, { timeoutMs: 5_000 });
+    expect(gateway.releasedSessions).toEqual([session.sessionId]);
   });
 });

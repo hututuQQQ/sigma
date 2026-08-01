@@ -27,7 +27,11 @@ function draft(overrides: Record<string, unknown> = {}) {
     formal_run_id: "generic-formal-run",
     source: { revision: sourceRevision, dirty: false, diff_sha256: null },
     archive_sha256: archiveSha256,
-    model: { provider: "provider-fixture", name: "model-fixture" },
+    model: {
+      provider: "provider-fixture",
+      name: "model-fixture",
+      reasoning_effort: "max"
+    },
     task_selection: {
       dataset: "generic-conformance",
       terminal_bench_revision: taskCommit,
@@ -159,7 +163,11 @@ describe("formal benchmark preregistration", () => {
     const value = manifest();
     expect(value).toMatchObject({
       kind: "SigmaFormalRunPreregistration",
-      model: { provider: "provider-fixture", name: "model-fixture" },
+      model: {
+        provider: "provider-fixture",
+        name: "model-fixture",
+        reasoning_effort: "max"
+      },
       solver_controls: { max_turns: 73, command_timeout_sec: 41, cleanup_grace_sec: 17 },
       execution: { concurrency: 2, attempts_per_task: 1, retries: 0 }
     });
@@ -225,7 +233,9 @@ describe("formal benchmark preregistration", () => {
       await writeFile(draftPath, `${JSON.stringify(draft(), null, 2)}\n`, "utf8");
       const written = await writeFormalPreregistration(draftPath, outputPath);
       expect(written.manifest.model).toEqual({
-        provider: "provider-fixture", name: "model-fixture"
+        provider: "provider-fixture",
+        name: "model-fixture",
+        reasoning_effort: "max"
       });
       expect(sha256(await readFile(outputPath))).toBe(written.sha256);
       await expect(writeFormalPreregistration(draftPath, outputPath))
@@ -243,6 +253,7 @@ describe("formal benchmark preregistration", () => {
       dataset: "generic-conformance",
       provider: "provider-fixture",
       model: "model-fixture",
+      reasoningEffort: "max",
       benchmarkClass: "standard",
       agentProfile: "standard",
       maxTurns: 73,
@@ -263,7 +274,13 @@ describe("formal benchmark preregistration", () => {
       taskProbe: { tasks: [{ network_mode: "public" }] },
       timeoutPlan: { agent_wall_time_sec: 900 },
       jobConfig: {
-        agents: [{ kwargs: { max_turns: 73, command_timeout_sec: 41 } }]
+        agents: [{
+          kwargs: {
+            max_turns: 73,
+            command_timeout_sec: 41,
+            reasoning_effort: "max"
+          }
+        }]
       },
       jobConfigSha256: "e".repeat(64)
     }));
@@ -288,7 +305,15 @@ describe("formal benchmark preregistration", () => {
       options,
       slots: [{
         ...slots[0],
-        jobConfig: { agents: [{ kwargs: { max_turns: 72, command_timeout_sec: 41 } }] }
+        jobConfig: {
+          agents: [{
+            kwargs: {
+              max_turns: 72,
+              command_timeout_sec: 41,
+              reasoning_effort: "max"
+            }
+          }]
+        }
       }, slots[1]]
     })).toThrow(/agent controls/u);
   });
@@ -387,6 +412,7 @@ describe("formal benchmark controller", () => {
         "--dataset", "generic-conformance",
         "--provider", "provider-fixture",
         "--model", "model-fixture",
+        "--reasoning-effort", "max",
         "--max-turns", "73",
         "--command-timeout-sec", "41",
         "--agent-timeout-grace-sec", "17",

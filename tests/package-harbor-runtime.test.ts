@@ -17,11 +17,15 @@ describe("package-harbor-runtime", () => {
     const result = await packageHarborRuntime({ artifactsDir, agentCliTarball });
 
     const runtimeSource = await readFile(path.join(result.harborRuntimeDir, "sigma_harbor_agent.py"), "utf8");
+    const codexRuntimeSource = await readFile(path.join(result.harborRuntimeDir, "codex_harbor_agent.py"), "utf8");
     const sandboxCompose = await readFile(result.sandboxComposePath, "utf8");
     const readme = await readFile(path.join(result.harborRuntimeDir, "README.md"), "utf8");
     const packagedFiles = await readdir(result.harborRuntimeDir);
 
     expect(runtimeSource).toContain("class SigmaCliHarborAgent(BaseAgent):");
+    expect(codexRuntimeSource).toContain("class PortableCodex(Codex):");
+    expect(codexRuntimeSource).not.toContain("npm install");
+    expect(codexRuntimeSource).not.toContain("nvm install");
     expect(runtimeSource).not.toContain(removedHarborPackageName);
     expect(runtimeSource).toContain(portableAgentImportPath.split(":")[1]);
     expect(sandboxCompose).toContain("SYS_ADMIN");

@@ -42,7 +42,7 @@ export class InProcessRuntimeClient implements RuntimeClient {
   private readonly sessions = new Map<string, RuntimeSession>();
   private readonly artifacts: ContentAddressedArtifactStore;
   private readonly effects: EffectRunner;
-  private readonly runDeadlineMs: number;
+  private readonly runDeadlineMs: number | undefined;
   private readonly commandBus: SessionCommandBus;
   private readonly control: RuntimeControlService;
   private readonly budgets: BudgetController;
@@ -66,7 +66,7 @@ export class InProcessRuntimeClient implements RuntimeClient {
       runtimeEnvironment: options.runtimeEnvironment,
       execution: options.execution
     });
-    this.runDeadlineMs = options.runDeadlineMs ?? 900_000;
+    this.runDeadlineMs = options.runDeadlineMs;
     this.events = new RuntimeEventLog(options.store);
     this.commandBus = new SessionCommandBus(options.storeRootDir, async (command) => await this.command(command));
     this.commands = new RuntimeCommandHandler({
@@ -228,9 +228,10 @@ export class InProcessRuntimeClient implements RuntimeClient {
       return;
     }
     if (session.recovery.openCheckpointRecovery) {
+      const checkpointId = session.recovery.openCheckpointRecovery.checkpointId;
       throw Object.assign(new Error(
-        `Checkpoint ${session.recovery.openCheckpointRecovery.checkpointId} requires an explicit user restore or keep decision.`
-      ), { code: "checkpoint_recovery_required" });
+        `Checkpoint ${checkpointId} requires an explicit user restore or keep decision.`
+      ), { code: "checkpoint_recovery_required", checkpointId });
     }
     if (command.type === "reviewer_waiver") return await this.commands.reviewerWaiver(session, command);
     if (command.type === "cancel") return await this.commands.cancel(session, command);
@@ -274,6 +275,12 @@ export class InProcessRuntimeClient implements RuntimeClient {
       async (idleSignal) => await this.effects.waitForQuiescence(sessionId, idleSignal),
       signal
     );
+  }
+  async pendingCheckpointRecovery(
+    sessionId: string
+  ): Promise<import("agent-protocol").PendingCheckpointRecovery | undefined> {
+    const recovery = this.required(sessionId).recovery.openCheckpointRecovery;
+    return recovery ? { checkpointId: recovery.checkpointId } : undefined;
   }
   async waitForQuiescence(sessionId: string, signal?: AbortSignal): Promise<void> { this.required(sessionId); await this.effects.waitForQuiescence(sessionId, signal); }
   async listSessions(limit = 20): Promise<SessionOverview[]> {

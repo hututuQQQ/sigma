@@ -77,7 +77,8 @@ export interface KernelState {
   revision: number;
   lastSeq: number;
   startedAt: string;
-  deadlineAt: string;
+  /** Present only when the caller explicitly configured a whole-run deadline. */
+  deadlineAt?: string;
   /** Active runtime milliseconds preserved while waiting for explicit user approval. */
   deadlineRemainingMs?: number;
   activeModelTurn?: ActiveModelTurn;
@@ -129,7 +130,7 @@ export interface CreateKernelStateOptions {
   runId: string;
   mode: RunMode;
   startedAt: string;
-  deadlineAt: string;
+  deadlineAt?: string;
   assurancePolicy?: AssuranceResourcePolicy;
 }
 
@@ -143,7 +144,7 @@ export function createKernelState(options: CreateKernelStateOptions): KernelStat
     revision: 0,
     lastSeq: 0,
     startedAt: options.startedAt,
-    deadlineAt: options.deadlineAt,
+    ...(options.deadlineAt ? { deadlineAt: options.deadlineAt } : {}),
     consecutiveLengthFinishes: 0,
     consecutiveLengthNoAction: 0,
     lastModelHadToolCalls: false,
@@ -177,7 +178,9 @@ function record(value: unknown): Record<string, unknown> | null {
 }
 
 function validDeadlineState(state: Record<string, unknown>): boolean {
-  return typeof state.deadlineAt === "string" && (state.deadlineRemainingMs === undefined
+  if (state.deadlineAt === undefined) return state.deadlineRemainingMs === undefined;
+  return typeof state.deadlineAt === "string" && Number.isFinite(Date.parse(state.deadlineAt))
+    && (state.deadlineRemainingMs === undefined
     || (Number.isSafeInteger(state.deadlineRemainingMs) && Number(state.deadlineRemainingMs) >= 1));
 }
 

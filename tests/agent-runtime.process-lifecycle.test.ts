@@ -253,7 +253,7 @@ describe("durable process lifecycle events", () => {
     expect(target.execution.processHandles.has("service")).toBe(true);
   });
 
-  it("terminates an unhanded deliverable before resource-boundary completion", async () => {
+  it("terminates an unhanded deliverable before resource-boundary failure", async () => {
     const target = runtimeSessionFixture({
       execution: {
         processHandles: new Map([[
@@ -307,8 +307,6 @@ describe("durable process lifecycle events", () => {
         decisionAuthority: "resource_boundary"
       },
       {
-        reviews: {} as never,
-        longHorizon: {} as never,
         emit: emit as never,
         finish,
         runtime: {
@@ -334,10 +332,10 @@ describe("durable process lifecycle events", () => {
     expect(finish).toHaveBeenCalledWith(
       target,
       expect.objectContaining({
-        kind: "completed",
+        kind: "recoverable_failure",
+        code: "budget_exhausted",
         decisionAuthority: "resource_boundary"
-      }),
-      target.durable.state.revision
+      })
     );
   });
 

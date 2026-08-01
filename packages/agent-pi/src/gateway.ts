@@ -1,9 +1,11 @@
-import type {
-  Api,
-  CredentialStore,
-  Model as PiModel,
-  Models,
-  ModelsStore
+import { randomUUID } from "node:crypto";
+import {
+  cleanupSessionResources,
+  type Api,
+  type CredentialStore,
+  type Model as PiModel,
+  type Models,
+  type ModelsStore
 } from "@earendil-works/pi-ai";
 import type {
   ModelCapabilities,
@@ -13,7 +15,8 @@ import type {
   ModelResponse,
   ModelStreamEvent
 } from "agent-protocol";
-import { FileCredentialStore } from "./credential-store.js";
+import { codexPayload } from "./codex-instructions.js";
+import { defaultCredentialStore } from "./credential-bridge.js";
 import { PiModelError, sanitizePiModelError } from "./errors.js";
 import {
   approximateTokens,
@@ -65,12 +68,13 @@ export class PiModelGateway implements ModelGateway {
   private readonly idleTimeoutMs: number;
   private readonly activeStreamTimeoutMs?: number;
   private readonly reasoningEffort?: PiReasoningEffort;
+  private readonly codexInstructionNonce = randomUUID();
 
   constructor(options: PiModelGatewayOptions) {
     this.provider = options.provider;
     this.model = options.model;
     this.models = options.models ?? createPiModels(
-      options.credentials ?? new FileCredentialStore(),
+      options.credentials ?? defaultCredentialStore(),
       options.modelsStore ?? new FileModelsStore()
     );
     const piModel = getPiModel(options.provider, options.model, this.models)
@@ -114,7 +118,7 @@ export class PiModelGateway implements ModelGateway {
     let responseStatus: number | undefined;
     try {
       const stream = monitoredPiStream((signal) => {
-        const context = piContext(request, this.piModel);
+        const context = piContext(request, this.piModel, this.codexInstructionNonce);
         const options = {
           signal,
           maxTokens: request.maxOutputTokens,
@@ -122,7 +126,7 @@ export class PiModelGateway implements ModelGateway {
           toolChoice: request.toolChoice,
           maxRetries: 0,
           ...(request.sessionId ? { sessionId: request.sessionId } : {}),
-          ...(this.provider === OPENAI_CODEX_PROVIDER_ID ? { transport: "sse" as const } : {}),
+          ...(this.provider === OPENAI_CODEX_PROVIDER_ID ? { transport: "auto" as const } : {}),
           ...piReasoningStreamOptions(
             this.piModel,
             this.reasoningEffort,
@@ -130,20 +134,24 @@ export class PiModelGateway implements ModelGateway {
             request.maxOutputTokens
           ),
           ...(this.requestTimeoutMs ? { timeoutMs: this.requestTimeoutMs } : {}),
-          ...(this.provider === "deepseek"
-            ? { onPayload: (payload: unknown) => deepSeekPayload(payload, request) }
-            : {}),
+          ...(this.provider === OPENAI_CODEX_PROVIDER_ID
+            ? {
+                onPayload: (payload: unknown) =>
+                  codexPayload(payload, this.codexInstructionNonce)
+              }
+            : this.provider === "deepseek"
+              ? { onPayload: (payload: unknown) => deepSeekPayload(payload, request) }
+              : {}),
           onResponse: (response: { status: number }) => {
             responseStatus = response.status;
           }
         };
-        return this.models.stream(
-          this.piModel,
-          context,
-          options as never
-        );
+        return this.models.stream(this.piModel, context, options as never);
       }, {
         signal: request.signal,
+        ...(this.requestTimeoutMs === undefined
+          ? {}
+          : { initialTimeoutMs: this.requestTimeoutMs }),
         idleTimeoutMs: this.idleTimeoutMs,
         ...(this.activeStreamTimeoutMs === undefined
           ? {}
@@ -181,5 +189,9 @@ export class PiModelGateway implements ModelGateway {
 
   async countTokens(messages: ModelMessage[], tools = []): Promise<number> {
     return approximateTokens({ messages, tools });
+  }
+
+  releaseSession(sessionId: string): void {
+    cleanupSessionResources(sessionId);
   }
 }

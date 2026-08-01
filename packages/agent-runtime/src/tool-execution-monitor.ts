@@ -18,7 +18,6 @@ import { turnPayload } from "./effect-runner-helpers.js";
 import type { RuntimeControlService } from "./runtime-control.js";
 import type { RuntimeOptions, RuntimeSession } from "./types.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
-import { ACTION_SETTLEMENT_GRACE_MS } from "./convergence-policy.js";
 import { toolRuntimeContext } from "./repository-recovery-context.js";
 
 export interface ToolExecutionMonitorOptions {
@@ -48,29 +47,6 @@ function processTimeout(message: string, code: "process_deadline" | "process_idl
   return Object.assign(new Error(message), { name: "TimeoutError", code });
 }
 
-function terminalOnlyDescriptor(descriptor: ToolDescriptor): boolean {
-  const effects = [
-    ...descriptor.possibleEffects,
-    ...(descriptor.maximumEffects ?? descriptor.possibleEffects)
-  ];
-  return effects.length > 0 && effects.every((effect) =>
-    effect === "outcome.propose"
-      || effect === "outcome.report_blocked"
-      || effect === "outcome.request_input");
-}
-
-function deadlineBoundedToolTimeoutMs(session: RuntimeSession, descriptor: ToolDescriptor): number {
-  const remainingMs = session.durable.state.deadlineRemainingMs
-    ?? Date.parse(session.durable.state.deadlineAt) - Date.now();
-  const settlementReserveMs = terminalOnlyDescriptor(descriptor)
-    ? 0
-    : ACTION_SETTLEMENT_GRACE_MS;
-  return Math.max(1, Math.min(
-    descriptor.timeoutMs,
-    Math.max(1, remainingMs - settlementReserveMs)
-  ));
-}
-
 function requiresToolSettlement(plan: ToolCallPlan): boolean {
   return plan.exactEffects.some((effect) => [
     "filesystem.write", "repository.write", "process.spawn", "process.spawn.readonly",
@@ -81,6 +57,14 @@ function requiresToolSettlement(plan: ToolCallPlan): boolean {
 function observesWorkspace(plan: ToolCallPlan): boolean {
   return plan.exactEffects.some((effect) =>
     ["filesystem.write", "destructive", "validation", "open_world"].includes(effect));
+}
+
+function requiresFallbackWorkspaceObservation(
+  descriptor: ToolDescriptor,
+  plan: ToolCallPlan
+): boolean {
+  return observesWorkspace(plan)
+    && descriptor.workspaceDeltaAuthority !== "structured_tool_receipt";
 }
 
 export class ToolExecutionMonitor {
@@ -114,9 +98,9 @@ export class ToolExecutionMonitor {
     const controller = new AbortController();
     const onAbort = (): void => controller.abort(signal.reason ?? new Error("Run cancelled."));
     if (signal.aborted) onAbort(); else signal.addEventListener("abort", onAbort, { once: true });
-    const timeoutMs = deadlineBoundedToolTimeoutMs(session, descriptor);
+    const timeoutMs = descriptor.timeoutMs;
     const timer = setTimeout(() => controller.abort(processTimeout(
-      `Tool '${call.name}' exceeded its ${timeoutMs}ms deadline-bounded timeout.`, "process_deadline"
+      `Tool '${call.name}' exceeded its ${timeoutMs}ms execution timeout.`, "process_deadline"
     )), timeoutMs);
     const idleTimeoutMs = resolveToolIdleWatchdogMs(this.options.runtime, descriptor);
     let idleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -131,7 +115,13 @@ export class ToolExecutionMonitor {
     heartbeat();
     try {
       const requiresSettlement = requiresToolSettlement(plan);
-      const before = observesWorkspace(plan) ? await this.gitState(session, controller.signal) : null;
+      const fallbackObservation = requiresFallbackWorkspaceObservation(descriptor, plan);
+      const before = fallbackObservation
+        ? await this.observeWorkspace(
+            session, call, modelTurn, controller.signal,
+            "Observing workspace state before execution."
+          )
+        : null;
       const execution = this.options.runtime.tools.execute({
         callId: call.id, name: call.name, arguments: call.arguments
       }, {
@@ -158,20 +148,9 @@ export class ToolExecutionMonitor {
         execution, requiresSettlement, controller, session.identity.sessionId, resourceKeys
       );
       if (!before) return receipt;
-      const after = await this.gitState(session, controller.signal);
-      if (!after) return receipt;
-      const observed = workspaceDelta(before, after);
-      const changed = observed.added.length + observed.modified.length + observed.deleted.length > 0;
-      const actualEffects = receipt.actualEffects ?? receipt.observedEffects;
-      const withWrite = changed && !actualEffects.includes("filesystem.write")
-        ? [...actualEffects, "filesystem.write" as const]
-        : actualEffects;
-      return {
-        ...receipt,
-        workspaceDelta: mergeDelta(receipt.workspaceDelta, observed),
-        observedEffects: withWrite,
-        actualEffects: withWrite
-      };
+      return await this.withFallbackWorkspaceDelta(
+        session, call, modelTurn, controller.signal, before, receipt
+      );
     } finally {
       clearTimeout(timer);
       if (idleTimer) clearTimeout(idleTimer);
@@ -215,6 +194,49 @@ export class ToolExecutionMonitor {
         if (this.unsettled.get(key) === combined) this.unsettled.delete(key);
       });
     }
+  }
+
+  private async observeWorkspace(
+    session: RuntimeSession,
+    call: ModelToolCall,
+    modelTurn: ActiveModelTurn,
+    signal: AbortSignal,
+    message: string
+  ): Promise<Map<string, string> | null> {
+    await this.options.emit(session, "tool.progress", "tool", {
+      callId: call.id,
+      name: call.name,
+      ...turnPayload(modelTurn),
+      message
+    });
+    return await this.gitState(session, signal);
+  }
+
+  private async withFallbackWorkspaceDelta(
+    session: RuntimeSession,
+    call: ModelToolCall,
+    modelTurn: ActiveModelTurn,
+    signal: AbortSignal,
+    before: Map<string, string>,
+    receipt: ToolReceipt
+  ): Promise<ToolReceipt> {
+    const after = await this.observeWorkspace(
+      session, call, modelTurn, signal,
+      "Observing workspace changes after execution."
+    );
+    if (!after) return receipt;
+    const observed = workspaceDelta(before, after);
+    const changed = observed.added.length + observed.modified.length + observed.deleted.length > 0;
+    const actualEffects = receipt.actualEffects ?? receipt.observedEffects;
+    const withWrite = changed && !actualEffects.includes("filesystem.write")
+      ? [...actualEffects, "filesystem.write" as const]
+      : actualEffects;
+    return {
+      ...receipt,
+      workspaceDelta: mergeDelta(receipt.workspaceDelta, observed),
+      observedEffects: withWrite,
+      actualEffects: withWrite
+    };
   }
 
   private async gitState(session: RuntimeSession, signal: AbortSignal): Promise<Map<string, string> | null> {

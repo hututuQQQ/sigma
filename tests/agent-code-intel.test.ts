@@ -252,6 +252,40 @@ describe("agent-code-intel", () => {
     await expect(client.close()).resolves.toBeUndefined();
   });
 
+  it("contains an idle language-server failure and reports it on the next request", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-lsp-idle-failure-"));
+    await writeFile(path.join(workspace, "fixture.ts"), "const answer = 42;", "utf8");
+    const decoder = new LspFrameDecoder();
+    let respondToInitialize!: (value: Uint8Array) => void;
+    let failTransport!: (error: unknown) => void;
+    const initializeResponse = new Promise<Uint8Array>((resolve) => { respondToInitialize = resolve; });
+    const transportFailure = new Promise<void>((_resolve, reject) => { failTransport = reject; });
+    const transport: LspTransport = {
+      async write(data) {
+        for (const body of decoder.push(data)) {
+          const message = JSON.parse(body) as { id?: number; method?: string };
+          if (message.method === "initialize") {
+            respondToInitialize(encodeLspMessage({ jsonrpc: "2.0", id: message.id, result: { capabilities: {} } }));
+          }
+        }
+      },
+      async *chunks() {
+        yield await initializeResponse;
+        await transportFailure;
+      },
+      async close() {}
+    };
+    const client = new LspClient({ rootPath: workspace, transport, requestTimeoutMs: 100 });
+    await client.start();
+
+    failTransport(Object.assign(new Error("fixture language server exited"), { code: "lsp_server_exited" }));
+    const pump = (client as unknown as { pump?: Promise<void> }).pump;
+    expect(pump).toBeDefined();
+    await expect(pump).resolves.toBeUndefined();
+    await expect(client.symbols("fixture.ts")).rejects.toThrow("fixture language server exited");
+    await expect(client.close()).resolves.toBeUndefined();
+  });
+
   it("rejects language-server input that resolves outside the workspace through a link", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-lsp-contained-"));
     const outside = await mkdtemp(path.join(os.tmpdir(), "sigma-lsp-outside-"));

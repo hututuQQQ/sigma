@@ -75,12 +75,13 @@ export function runtimeFailureOutcome(error: unknown, signal: AbortSignal): RunO
 export async function runRuntimeSession(options: RuntimeRunOptions, session: RuntimeSession): Promise<void> {
   const controller = new AbortController();
   session.execution.controller = controller;
-  const remainingMs = Date.parse(session.durable.state.deadlineAt) - Date.now();
-  if (remainingMs <= 0) {
+  const deadlineAt = session.durable.state.deadlineAt;
+  const remainingMs = deadlineAt ? Date.parse(deadlineAt) - Date.now() : undefined;
+  if (remainingMs !== undefined && remainingMs <= 0) {
     await finishOrThrow(options, session, {
       kind: "recoverable_failure",
       code: "budget_exhausted",
-      message: `Run deadline ${session.durable.state.deadlineAt} has already elapsed.`,
+      message: `Run deadline ${deadlineAt} has already elapsed.`,
       decisionAuthority: "resource_boundary"
     });
     session.execution.controller = null;
@@ -92,7 +93,7 @@ export async function runRuntimeSession(options: RuntimeRunOptions, session: Run
       sessionId: session.identity.sessionId,
       runId: session.durable.runId,
       mode: session.durable.mode,
-      deadlineAt: session.durable.state.deadlineAt
+      ...(deadlineAt ? { deadlineAt } : {})
     }, controller.signal);
     await options.effects.run(session, controller.signal);
     if (!hasRunOutcome(session) && session.durable.state.phase !== "needs_input") {

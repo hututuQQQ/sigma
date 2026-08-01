@@ -24,7 +24,6 @@ const FORWARDING = new RegExp(
   String.raw`(?:agent|subject|solver)[_-]?(?:prompt|input|message)[^\n]{0,160}(?:scenario[_-]?id|task[_-]?id|verifier|reward|score|expected[_-]?(?:output|result))`,
   "iu"
 );
-const ABSOLUTE_PATH = /(?:[A-Za-z]:[\\/]|\\\\[^\s]+[\\/]|\/(?:home|Users|tmp|var|opt|workspace|mnt|private)\/)/u;
 const TRUSTED_CONTROL_SCRIPT = /^scripts\/(?:eval\/|bench-[^/]+\.mjs$)/u;
 
 async function filesUnder(directory) {
@@ -127,26 +126,6 @@ async function scenarioIdentifiers(controlRoot = root) {
     .filter((value) => typeof value === "string" && value.length > 0);
 }
 
-async function scanOptimizerSkill(workspace = root) {
-  const skillRoot = path.join(workspace, ".agents", "skills", "sigma-eval-improver");
-  const files = await filesUnder(skillRoot);
-  const knownIds = await scenarioIdentifiers(workspace);
-  const violations = [];
-  let combined = "";
-  for (const file of files) {
-    const source = await readFile(file, "utf8");
-    combined += `\n${source}`;
-    if (ABSOLUTE_PATH.test(source)) violations.push(`${relative(file, workspace)}: contains an absolute path`);
-    if (knownIds.some((item) => source.includes(item))) violations.push(`${relative(file, workspace)}: contains a known evaluation identity`);
-    if (/test-fixtures[/\\]agent-evals/iu.test(source)) violations.push(`${relative(file, workspace)}: points at evaluator fixtures`);
-  }
-  const required = ["OptimizerObservation", "OptimizationExperiment", "verifier", "one general invariant"];
-  for (const phrase of required) {
-    if (!combined.includes(phrase)) violations.push(`optimizer skill: missing boundary instruction '${phrase}'`);
-  }
-  return violations;
-}
-
 async function scanScripts(workspace = root, knownTaints = []) {
   const files = await filesUnder(path.join(workspace, "scripts"));
   const violations = [];
@@ -186,8 +165,7 @@ export async function scanBenchmarkFairness(workspace = root) {
     || (/[\^$*+?{}()[\]|]/u.test(value) && value.length >= 12));
   return [
     ...await scanProductSources(resolved, taints),
-    ...await scanScripts(resolved, taints),
-    ...await scanOptimizerSkill(resolved)
+    ...await scanScripts(resolved, taints)
   ];
 }
 

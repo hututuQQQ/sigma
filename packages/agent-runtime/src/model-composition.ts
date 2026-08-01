@@ -14,8 +14,9 @@ import {
 import type { ModelExecutionRole, ModelGateway } from "agent-protocol";
 import type { RuntimeCustomization } from "./customization.js";
 
-const DEFAULT_MODEL_RETRIES = 5;
-const DEFAULT_MODEL_RETRY_BASE_DELAY_MS = 200;
+const DEFAULT_MODEL_RETRIES = 10;
+const DEFAULT_MODEL_RETRY_BASE_DELAY_MS = 500;
+const DEFAULT_MODEL_RETRY_MAX_DELAY_MS = 32_000;
 const DEFAULT_MODEL_RETRY_JITTER_RATIO = 0.1;
 
 export interface ModelCompositionConfig {
@@ -298,7 +299,7 @@ export function createRoleGateways(
     {
       maxRetriesPerCandidate: config.maxModelRetries ?? DEFAULT_MODEL_RETRIES,
       retryBaseDelayMs: DEFAULT_MODEL_RETRY_BASE_DELAY_MS,
-      retryMaxDelayMs: 60_000,
+      retryMaxDelayMs: DEFAULT_MODEL_RETRY_MAX_DELAY_MS,
       retryJitterRatio: DEFAULT_MODEL_RETRY_JITTER_RATIO
     }
   );

@@ -6,7 +6,10 @@ import type {
 import { availableAuxiliaryBudget } from "./assurance-budget.js";
 import type { BudgetController } from "./budget-controller.js";
 import { consumedBudget } from "./model-accounting.js";
-import { fitPreparedBudget } from "./model-budget-convergence.js";
+import {
+  affordableReviewerOutputLimit,
+  fitPreparedReviewerCall
+} from "./reviewer-budget.js";
 import {
   activeReservation,
   eligibleReviewAttempt,
@@ -247,33 +250,46 @@ export class ReviewCoordinator {
     input: ReviewerInput
   ): Promise<Awaited<ReturnType<AccountableReviewerPort["prepareReview"]>> | undefined> {
     const auxiliary = availableAuxiliaryBudget(session);
-    let prepared: Awaited<ReturnType<AccountableReviewerPort["prepareReview"]>>;
-    try {
-      prepared = await reviewer.prepareReview(input, auxiliary.costMicroUsd);
-    } catch (error) {
-      await this.emitUnavailableReview(
-        session,
-        input,
-        reviewerId,
-        `Independent reviewer could not be prepared within the assurance pool: ${error instanceof Error ? error.message : String(error)}`
+    const reviewerMaxTurns = session.durable.state.longHorizon.assurance.reviewerMaxTurns;
+    let outputLimit = affordableReviewerOutputLimit(auxiliary.outputTokens);
+    let passiveFallback: Awaited<ReturnType<AccountableReviewerPort["prepareReview"]>> | undefined;
+    let preparationFailure: unknown;
+    while (true) {
+      let prepared: Awaited<ReturnType<AccountableReviewerPort["prepareReview"]>>;
+      try {
+        prepared = await reviewer.prepareReview(
+          input,
+          auxiliary.costMicroUsd,
+          outputLimit
+        );
+      } catch (error) {
+        preparationFailure = error;
+        break;
+      }
+      const fitted = fitPreparedReviewerCall(
+        prepared,
+        auxiliary,
+        reviewerMaxTurns
       );
-      return undefined;
+      if (fitted) {
+        const inspectionCapable = (prepared.tools ?? []).some((tool) =>
+          tool.name !== "submit_verification" && tool.name !== "submit_review");
+        if (!inspectionCapable || (fitted.maxTurns ?? 1) >= 2) return fitted;
+        passiveFallback ??= fitted;
+      }
+      if (outputLimit <= 256) break;
+      outputLimit = Math.max(256, Math.floor(outputLimit / 2));
     }
-    const fitted = fitPreparedBudget(
-      prepared.budget,
-      auxiliary,
-      session.durable.state.longHorizon.assurance.reviewerMaxTurns
+    if (passiveFallback) return passiveFallback;
+    await this.emitUnavailableReview(
+      session,
+      input,
+      reviewerId,
+      preparationFailure
+        ? `Independent reviewer could not be prepared within the assurance pool: ${preparationFailure instanceof Error ? preparationFailure.message : String(preparationFailure)}`
+        : "The protected assurance pool cannot fund an independent completion review."
     );
-    if (!fitted) {
-      await this.emitUnavailableReview(
-        session,
-        input,
-        reviewerId,
-        "The protected assurance pool cannot fund an independent completion review."
-      );
-      return undefined;
-    }
-    return { ...prepared, budget: fitted };
+    return undefined;
   }
 
   private async emitUnavailableReview(

@@ -24,7 +24,7 @@ import {
   loadCliConfig, parseArgs, workspaceCustomizationTrustMessage, workspaceMcpTrustMessage
 } from "./config.js";
 import { createConfiguredRuntime, type RuntimeFactoryDeps } from "agent-runtime";
-import { configureOutboundProxy } from "agent-pi";
+import { configureCredentialBridgeFromEnvironment, configureOutboundProxy } from "agent-pi";
 
 export interface AgentCliMainOptions {
   tuiRunner?: (options: TuiAppOptions) => Promise<void>;
@@ -122,6 +122,7 @@ async function dispatchCommand(
 }
 
 export async function runAgentCommand(args = process.argv.slice(2), options: AgentCliMainOptions = {}): Promise<number> {
+  await configureCredentialBridgeFromEnvironment();
   const normalized = args[0] === "--" ? args.slice(1) : args;
   const [command, ...rest] = normalized;
   if (command === "--version" || command === "-v") return await runVersionCommand([]);

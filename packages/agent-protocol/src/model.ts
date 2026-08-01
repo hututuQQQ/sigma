@@ -106,4 +106,6 @@ export interface ModelGateway {
   complete(request: ModelRequest): Promise<ModelResponse>;
   stream(request: ModelRequest): AsyncIterable<ModelStreamEvent>;
   countTokens(messages: ModelMessage[], tools?: ModelToolDefinition[]): Promise<number>;
+  /** Release provider-side session affinity and transport resources. */
+  releaseSession?(sessionId: string): void | Promise<void>;
 }

@@ -27,11 +27,20 @@ export interface SessionOverview {
   lastMessage?: string;
 }
 
+export interface PendingCheckpointRecovery {
+  checkpointId: string;
+}
+
 export interface RuntimeClient {
   createSession(input: StartSession): Promise<SessionRef>;
   command(command: RunCommand): Promise<void>;
   subscribe(sessionId: string, signal?: AbortSignal): AsyncIterable<AgentEventEnvelope>;
   waitForOutcome(sessionId: string, signal?: AbortSignal): Promise<RunOutcome>;
+  /** Wait through queued follow-ups until the session is fully idle. */
+  waitForIdleOutcome?(sessionId: string, signal?: AbortSignal): Promise<RunOutcome>;
+  /** Read-only control-plane query used by interactive clients before they
+   * submit more input to a session interrupted during a workspace mutation. */
+  pendingCheckpointRecovery?(sessionId: string): Promise<PendingCheckpointRecovery | undefined>;
   listSessions(limit?: number): Promise<SessionOverview[]>;
   sessionEvents(sessionId: string, afterSeq?: number): AsyncIterable<AgentEventEnvelope>;
   releaseSession?(sessionId: string): Promise<void>;

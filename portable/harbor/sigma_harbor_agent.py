@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
+import datetime
 import hashlib
 import json
 import os
@@ -11,6 +13,7 @@ import pathlib
 import re
 import shlex
 import shutil
+import stat
 import tempfile
 import threading
 import time
@@ -34,6 +37,7 @@ ENV_KEYS = [
 ]
 
 CHECKPOINT_RECOVERY_POLICIES = {"restore", "keep", "ask"}
+REASONING_EFFORTS = {"auto", "none", "low", "medium", "high", "xhigh", "max"}
 MAX_EXTERNAL_RECOVERIES = 8
 RECOVERY_POLL_INTERVAL_SEC = 0.25
 MIN_CHECKPOINT_RECOVERY_TIMEOUT_SEC = 600
@@ -52,10 +56,18 @@ MAX_PARTIAL_ARTIFACT_CHARS = 1_048_576
 MAX_TRACE_ARTIFACT_BYTES = 4 * 1_048_576
 MAX_STREAM_LINE_CHARS = 65_536
 MAX_STREAM_RECORD_BYTES = 16 * 1_048_576
+MAX_CREDENTIAL_BRIDGE_BYTES = 1_048_576
 PROCESS_CLEANUP_TIMEOUT_SEC = 8
 PROCESS_TERM_GRACE_SEC = 1
 PRIVATE_ENV_DIR = "/tmp/agent/.credentials"
 ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+CREDENTIAL_BRIDGE_PROTOCOL = "stdio-v1"
+CREDENTIAL_UPDATE_PREFIX = "@@SIGMA_CREDENTIAL_UPDATE_V1@@"
+CREDENTIAL_LEASE_HEARTBEAT_SEC = 1.0
+CREDENTIAL_LEASE_MALFORMED_GRACE_SEC = 5.0
+CREDENTIAL_LEASE_RETRY_SEC = 0.025
+_HOST_CREDENTIAL_LOCKS: dict[str, threading.Lock] = {}
+_HOST_CREDENTIAL_LOCKS_GUARD = threading.Lock()
 
 
 def _failure_kind_for_code(code: Any, payload: dict[str, Any] | None = None) -> str | None:
@@ -146,6 +158,489 @@ def _stderr_text(result: Any) -> str:
         if isinstance(value, str):
             return value
     return ""
+
+
+class _ExecResultView:
+    """Preserve an environment result while replacing its captured streams."""
+
+    def __init__(self, original: Any, stdout: str, stderr: str) -> None:
+        self._original = original
+        self.stdout = stdout
+        self.stderr = stderr
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._original, name)
+
+
+def _result_with_streams(result: Any, stdout: str, stderr: str) -> Any:
+    if isinstance(result, dict):
+        return {**result, "stdout": stdout, "stderr": stderr}
+    return _ExecResultView(result, stdout, stderr)
+
+
+def _credential_lock(path: pathlib.Path) -> threading.Lock:
+    key = os.path.abspath(os.fspath(path))
+    with _HOST_CREDENTIAL_LOCKS_GUARD:
+        return _HOST_CREDENTIAL_LOCKS.setdefault(key, threading.Lock())
+
+
+def _linux_process_marker(pid: int) -> str | None:
+    if os.name == "nt" or not pathlib.Path("/proc").is_dir():
+        return None
+    try:
+        source = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        fields = source[source.rfind(")") + 1:].strip().split()
+        boot_id = pathlib.Path("/proc/sys/kernel/random/boot_id").read_text(
+            encoding="utf-8"
+        ).strip()
+        return f"linux:{boot_id}:{fields[19]}" if len(fields) > 19 else None
+    except (OSError, UnicodeError):
+        return None
+
+
+def _process_is_alive(pid: int) -> bool:
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        open_process.restype = wintypes.HANDLE
+        get_exit_code = kernel32.GetExitCodeProcess
+        get_exit_code.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        get_exit_code.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+        process_query_limited_information = 0x1000
+        error_invalid_parameter = 87
+        still_active = 259
+        handle = open_process(process_query_limited_information, False, pid)
+        if not handle:
+            # ERROR_INVALID_PARAMETER is returned for a PID that no longer
+            # exists. Access-denied and other inconclusive results fail closed.
+            return ctypes.get_last_error() != error_invalid_parameter
+        try:
+            exit_code = wintypes.DWORD()
+            return (
+                not get_exit_code(handle, ctypes.byref(exit_code))
+                or exit_code.value == still_active
+            )
+        finally:
+            close_handle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+
+
+def _credential_owner_record(instance_id: str) -> dict[str, Any]:
+    owner: dict[str, Any] = {
+        "pid": os.getpid(),
+        "instanceId": instance_id,
+        "startedAt": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+    }
+    marker = _linux_process_marker(os.getpid())
+    if marker is not None:
+        owner["processMarker"] = marker
+    return owner
+
+
+def _credential_owner_is_active(path: pathlib.Path) -> bool:
+    try:
+        info = path.stat()
+        owner = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        try:
+            return (
+                time.time() - path.stat().st_mtime
+                < CREDENTIAL_LEASE_MALFORMED_GRACE_SEC
+            )
+        except OSError:
+            return False
+    if not isinstance(owner, dict):
+        return time.time() - info.st_mtime < CREDENTIAL_LEASE_MALFORMED_GRACE_SEC
+    pid = owner.get("pid")
+    instance_id = owner.get("instanceId")
+    started_at = owner.get("startedAt")
+    if (
+        not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or pid <= 0
+        or not isinstance(instance_id, str)
+        or not instance_id
+        or not isinstance(started_at, str)
+        or not started_at
+    ):
+        return time.time() - info.st_mtime < CREDENTIAL_LEASE_MALFORMED_GRACE_SEC
+    try:
+        datetime.datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+    except ValueError:
+        return time.time() - info.st_mtime < CREDENTIAL_LEASE_MALFORMED_GRACE_SEC
+    if not _process_is_alive(pid):
+        return False
+    expected_marker = owner.get("processMarker")
+    if expected_marker is not None and (
+        not isinstance(expected_marker, str) or not expected_marker
+    ):
+        return time.time() - info.st_mtime < CREDENTIAL_LEASE_MALFORMED_GRACE_SEC
+    actual_marker = _linux_process_marker(pid)
+    if isinstance(expected_marker, str) and actual_marker is not None:
+        return expected_marker == actual_marker
+    return True
+
+
+def _publish_credential_owner(
+    path: pathlib.Path,
+    instance_id: str,
+) -> bool:
+    payload = (
+        json.dumps(_credential_owner_record(instance_id), separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    temporary = path.with_name(f".{path.name}.{instance_id}.tmp")
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            return False
+        return True
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+
+
+def _heartbeat_credential_owner(path: pathlib.Path, instance_id: str) -> None:
+    try:
+        owner = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(owner, dict) and owner.get("instanceId") == instance_id:
+            os.utime(path, None)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        pass
+
+
+class _CredentialOwnerHeartbeat:
+    def __init__(self, path: pathlib.Path, instance_id: str) -> None:
+        self.path = path
+        self.instance_id = instance_id
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self) -> None:
+        while not self.stop_event.wait(CREDENTIAL_LEASE_HEARTBEAT_SEC):
+            _heartbeat_credential_owner(self.path, self.instance_id)
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.thread.join()
+
+
+_CREDENTIAL_QUEUE_TICKET = re.compile(r"^(\d+)-([0-9a-f-]+)\.ticket$")
+
+
+def _credential_queue_tickets(
+    directory: pathlib.Path,
+) -> tuple[bool, list[tuple[int, str, pathlib.Path]]]:
+    blocked = False
+    tickets: list[tuple[int, str, pathlib.Path]] = []
+    try:
+        candidates = [path for path in directory.iterdir() if path.name.endswith(".ticket")]
+    except FileNotFoundError:
+        return blocked, tickets
+    for candidate in candidates:
+        if not _credential_owner_is_active(candidate):
+            with contextlib.suppress(OSError):
+                candidate.unlink()
+            continue
+        match = _CREDENTIAL_QUEUE_TICKET.fullmatch(candidate.name)
+        if match is None:
+            blocked = True
+            continue
+        tickets.append((int(match.group(1)), match.group(2), candidate))
+    tickets.sort(key=lambda item: (item[0], item[1]))
+    return blocked, tickets
+
+
+def _credential_queue_has_chooser(directory: pathlib.Path) -> bool:
+    try:
+        candidates = [path for path in directory.iterdir() if path.name.endswith(".choosing")]
+    except FileNotFoundError:
+        return False
+    active = False
+    for candidate in candidates:
+        if _credential_owner_is_active(candidate):
+            active = True
+        else:
+            with contextlib.suppress(OSError):
+                candidate.unlink()
+    return active
+
+
+class _CredentialReclaimTicket:
+    """Queue ticket matching agent-platform's stale-owner election protocol."""
+
+    def __init__(self, owner_path: pathlib.Path) -> None:
+        self.directory = pathlib.Path(f"{owner_path}.lease-queue")
+        self.token = uuid.uuid4().hex
+        self.ticket_path: pathlib.Path | None = None
+        self.ticket_heartbeat: _CredentialOwnerHeartbeat | None = None
+
+    def __enter__(self) -> "_CredentialReclaimTicket":
+        self.directory.mkdir(parents=True, exist_ok=True)
+        choosing_path = self.directory / f"{self.token}.choosing"
+        if not _publish_credential_owner(choosing_path, self.token):
+            raise RuntimeError("agent_credential_persistence_failed: lease queue token collision")
+        choosing_heartbeat = _CredentialOwnerHeartbeat(choosing_path, self.token)
+        try:
+            _blocked, existing = _credential_queue_tickets(self.directory)
+            number = (existing[-1][0] if existing else 0) + 1
+            self.ticket_path = self.directory / f"{number:020d}-{self.token}.ticket"
+            if not _publish_credential_owner(self.ticket_path, self.token):
+                raise RuntimeError(
+                    "agent_credential_persistence_failed: lease queue ticket collision"
+                )
+            self.ticket_heartbeat = _CredentialOwnerHeartbeat(
+                self.ticket_path,
+                self.token,
+            )
+        except BaseException:
+            if self.ticket_heartbeat is not None:
+                self.ticket_heartbeat.stop()
+                self.ticket_heartbeat = None
+            if self.ticket_path is not None:
+                self.ticket_path.unlink(missing_ok=True)
+                self.ticket_path = None
+            raise
+        finally:
+            choosing_heartbeat.stop()
+            choosing_path.unlink(missing_ok=True)
+        try:
+            while True:
+                blocked, tickets = _credential_queue_tickets(self.directory)
+                if (
+                    not _credential_queue_has_chooser(self.directory)
+                    and not blocked
+                    and tickets
+                    and tickets[0][2] == self.ticket_path
+                ):
+                    return self
+                time.sleep(CREDENTIAL_LEASE_RETRY_SEC)
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+
+    def __exit__(self, _type: Any, _value: Any, _traceback: Any) -> None:
+        if self.ticket_heartbeat is not None:
+            self.ticket_heartbeat.stop()
+            self.ticket_heartbeat = None
+        if self.ticket_path is not None:
+            self.ticket_path.unlink(missing_ok=True)
+            self.ticket_path = None
+        with contextlib.suppress(OSError):
+            self.directory.rmdir()
+
+
+class _CredentialFileLease:
+    """Cross-process lease compatible with FileCredentialStore's owner/queue."""
+
+    def __init__(self, credential_path: pathlib.Path) -> None:
+        self.path = pathlib.Path(f"{credential_path}.lock")
+        self.instance_id = uuid.uuid4().hex
+        self.thread_lock = _credential_lock(credential_path)
+        self.acquired = False
+        self.owner_heartbeat: _CredentialOwnerHeartbeat | None = None
+
+    def _finish_acquire(self) -> None:
+        self.acquired = True
+        self.owner_heartbeat = _CredentialOwnerHeartbeat(self.path, self.instance_id)
+
+    def heartbeat(self) -> None:
+        if self.acquired:
+            _heartbeat_credential_owner(self.path, self.instance_id)
+
+    def __enter__(self) -> "_CredentialFileLease":
+        self.thread_lock.acquire()
+        try:
+            while True:
+                if _publish_credential_owner(self.path, self.instance_id):
+                    self._finish_acquire()
+                    return self
+                if _credential_owner_is_active(self.path):
+                    time.sleep(CREDENTIAL_LEASE_RETRY_SEC)
+                    continue
+                with _CredentialReclaimTicket(self.path):
+                    if not _credential_owner_is_active(self.path):
+                        self.path.unlink(missing_ok=True)
+                    if _publish_credential_owner(self.path, self.instance_id):
+                        self._finish_acquire()
+                        return self
+        except BaseException:
+            self.thread_lock.release()
+            raise
+
+    def __exit__(self, _type: Any, _value: Any, _traceback: Any) -> None:
+        try:
+            if self.owner_heartbeat is not None:
+                self.owner_heartbeat.stop()
+                self.owner_heartbeat = None
+            if self.acquired:
+                try:
+                    owner = json.loads(self.path.read_text(encoding="utf-8"))
+                    if isinstance(owner, dict) and owner.get("instanceId") == self.instance_id:
+                        self.path.unlink(missing_ok=True)
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    pass
+        finally:
+            self.acquired = False
+            self.thread_lock.release()
+
+
+def _is_provider_credential(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if value.get("type") == "oauth":
+        return (
+            isinstance(value.get("access"), str)
+            and isinstance(value.get("refresh"), str)
+            and isinstance(value.get("expires"), (int, float))
+            and not isinstance(value.get("expires"), bool)
+        )
+    if value.get("type") != "api_key":
+        return False
+    return (
+        (value.get("key") is None or isinstance(value.get("key"), str))
+        and (value.get("env") is None or isinstance(value.get("env"), dict))
+    )
+
+
+class _CredentialBridge:
+    """Filter trusted credential updates out of CLI output and persist them."""
+
+    def __init__(self, agent: "SigmaCliHarborAgent", credential: dict[str, Any]) -> None:
+        self.agent = agent
+        self.nonce = uuid.uuid4().hex
+        self._pending_stdout = ""
+        self._seen_sequences: set[int] = set()
+        self.bootstrap = (
+            json.dumps({
+                "version": 1,
+                "nonce": self.nonce,
+                "provider": agent.provider,
+                "credential": credential,
+            }, ensure_ascii=False, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        if len(self.bootstrap) > MAX_CREDENTIAL_BRIDGE_BYTES:
+            raise RuntimeError(
+                "agent_credential_transport_failed: credential bootstrap exceeds "
+                "the size limit"
+            )
+
+    def _consume_marker(self, line: str) -> bool:
+        record = line.rstrip("\r\n")
+        expected = f"{CREDENTIAL_UPDATE_PREFIX}{self.nonce}:"
+        if not record.startswith(expected):
+            return False
+        encoded = record[len(expected):]
+        if not encoded or len(encoded) > MAX_CREDENTIAL_BRIDGE_BYTES * 2:
+            raise RuntimeError(
+                "agent_credential_persistence_failed: invalid bridge update size"
+            )
+        try:
+            normalized = encoded.replace("-", "+").replace("_", "/")
+            normalized += "=" * (-len(normalized) % 4)
+            decoded = base64.b64decode(normalized, validate=True)
+            if len(decoded) > MAX_CREDENTIAL_BRIDGE_BYTES:
+                raise ValueError("decoded bridge update exceeds the size limit")
+            payload = json.loads(decoded.decode("utf-8"))
+        except (ValueError, UnicodeError, json.JSONDecodeError) as error:
+            raise RuntimeError(
+                "agent_credential_persistence_failed: invalid bridge update"
+            ) from error
+        if not isinstance(payload, dict) or payload.get("version") != 1:
+            raise RuntimeError(
+                "agent_credential_persistence_failed: unsupported bridge update"
+            )
+        sequence = payload.get("sequence")
+        if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
+            raise RuntimeError(
+                "agent_credential_persistence_failed: invalid bridge sequence"
+            )
+        if sequence in self._seen_sequences:
+            return True
+        if sequence != len(self._seen_sequences) + 1:
+            raise RuntimeError(
+                "agent_credential_persistence_failed: out-of-order bridge update"
+            )
+        if payload.get("provider") != self.agent.provider:
+            raise RuntimeError(
+                "agent_credential_persistence_failed: bridge provider scope violation"
+            )
+        operation = payload.get("operation")
+        credential = payload.get("credential")
+        if operation == "replace":
+            if not _is_provider_credential(credential):
+                raise RuntimeError(
+                    "agent_credential_persistence_failed: invalid rotated credential"
+                )
+        elif operation == "delete":
+            credential = None
+        else:
+            raise RuntimeError(
+                "agent_credential_persistence_failed: invalid bridge operation"
+            )
+        self.agent._persist_provider_credential(credential)
+        self._seen_sequences.add(sequence)
+        return True
+
+    def filter_chunk(self, text: str, stream: str) -> str:
+        if stream != "stdout" or not text:
+            return text
+        lines = (self._pending_stdout + text).splitlines(keepends=True)
+        self._pending_stdout = ""
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            self._pending_stdout = lines.pop()
+            if len(self._pending_stdout) > MAX_CREDENTIAL_BRIDGE_BYTES * 2:
+                raise RuntimeError(
+                    "agent_credential_persistence_failed: unterminated bridge output"
+                )
+        return "".join(line for line in lines if not self._consume_marker(line))
+
+    def finish_stream(self) -> str:
+        pending = self._pending_stdout
+        self._pending_stdout = ""
+        return "" if pending and self._consume_marker(pending) else pending
+
+    def filter_complete(self, text: str) -> str:
+        return "".join(
+            line for line in text.splitlines(keepends=True)
+            if not self._consume_marker(line)
+        )
+
+    def sanitize_result(self, result: Any) -> Any:
+        stdout = _stdout_text(result)
+        filtered = self.filter_complete(stdout)
+        if filtered == stdout:
+            return result
+        return _result_with_streams(result, filtered, _stderr_text(result))
 
 
 def _is_timeout_error(error: BaseException) -> bool:
@@ -691,8 +1186,10 @@ class SigmaCliHarborAgent(BaseAgent):
         self,
         logs_dir: pathlib.Path | str | None = None,
         agent_cli_tarball: pathlib.Path | str | None = None,
+        credential_file: pathlib.Path | str | None = None,
         provider: str = "deepseek",
         model: str | None = None,
+        reasoning_effort: str = "auto",
         agent_profile: str = "standard",
         permission_mode: str = "auto",
         network_mode: str = "full",
@@ -725,8 +1222,23 @@ class SigmaCliHarborAgent(BaseAgent):
         resolved_model = model or harbor_model_name or _default_model(provider)
         super().__init__(logs_dir=resolved_logs_dir, model_name=resolved_model, **kwargs)
         self.agent_cli_tarball = pathlib.Path(agent_cli_tarball) if agent_cli_tarball is not None else None
+        configured_credential_file = (
+            credential_file or os.environ.get("SIGMA_HOST_CREDENTIAL_FILE")
+        )
+        if configured_credential_file is not None:
+            candidate_credential_file = pathlib.Path(configured_credential_file)
+            if not candidate_credential_file.is_absolute():
+                raise ValueError("credential_file must be an absolute path")
+            self.credential_file = candidate_credential_file
+        else:
+            self.credential_file = None
         self.provider = provider
         self.model = resolved_model
+        if reasoning_effort not in REASONING_EFFORTS:
+            raise ValueError(
+                "reasoning_effort must be one of: auto, none, low, medium, high, xhigh, max"
+            )
+        self.reasoning_effort = reasoning_effort
         if agent_profile not in {"standard", "strict"}:
             raise ValueError("agent_profile must be one of: standard, strict")
         self.agent_profile = agent_profile
@@ -1086,6 +1598,7 @@ class SigmaCliHarborAgent(BaseAgent):
         summary["harbor_topology"] = self.harbor_topology
         summary["permission_mode_effective"] = self._permission_mode()
         summary["agent_profile"] = self.agent_profile
+        summary["reasoning_effort"] = self.reasoning_effort
         summary["max_model_turns"] = self.max_turns
         summary["command_timeout_sec"] = self.command_timeout_sec
         summary["read_scope_effective"] = self.effective_read_scope
@@ -1147,6 +1660,8 @@ class SigmaCliHarborAgent(BaseAgent):
             self.provider,
             "--model",
             self.model,
+            "--reasoning-effort",
+            self.reasoning_effort,
             "--agent-profile",
             self.agent_profile,
             "--max-model-turns",
@@ -1599,6 +2114,8 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             self.provider,
             "--model",
             self.model,
+            "--reasoning-effort",
+            self.reasoning_effort,
             "--agent-profile",
             self.agent_profile,
             "--max-model-turns",
@@ -1793,6 +2310,7 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "managed_environment_mode": self.managed_environment_mode,
             "harbor_topology": self.harbor_topology,
             "agent_profile": self.agent_profile,
+            "reasoning_effort": self.reasoning_effort,
             "max_model_turns": self.max_turns,
             "command_timeout_sec": self.command_timeout_sec,
             "harbor_deadline_sec": self.outer_trial_deadline_sec,
@@ -1853,6 +2371,7 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "termination_source": "adapter_timeout",
             "harbor_deadline_sec": self.outer_trial_deadline_sec,
             "sigma_deadline_sec": self.max_wall_time_sec,
+            "reasoning_effort": self.reasoning_effort,
             "max_model_turns": self.max_turns,
             "command_timeout_sec": self.command_timeout_sec,
             "stdout": _text_artifact_summary(stdout),
@@ -1886,6 +2405,7 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "termination_source": state["termination_source"],
             "harbor_deadline_sec": state["harbor_deadline_sec"],
             "sigma_deadline_sec": state["sigma_deadline_sec"],
+            "reasoning_effort": state["reasoning_effort"],
             "max_model_turns": state["max_model_turns"],
             "command_timeout_sec": state["command_timeout_sec"],
             "process_cleanup": process_cleanup,
@@ -2102,6 +2622,8 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
                 shlex.quote(doctor_write_scope),
                 "--managed-environment-mode",
                 shlex.quote(self.managed_environment_mode),
+                "--reasoning-effort",
+                shlex.quote(self.reasoning_effort),
                 "--max-model-turns",
                 str(self.max_turns),
                 "--command-timeout-sec",
@@ -2255,6 +2777,7 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             "permission_mode_effective": self._permission_mode(),
             "managed_broker_bootstrap": self._managed_broker_bootstrap,
             "agent_profile": self.agent_profile,
+            "reasoning_effort": self.reasoning_effort,
             "max_model_turns": self.max_turns,
             "command_timeout_sec": self.command_timeout_sec,
             "available_network_modes": list(self.available_network_modes),
@@ -2342,16 +2865,222 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             )
         return remote_path
 
+    def _read_host_credential_document(self) -> dict[str, Any] | None:
+        if self.credential_file is None:
+            return None
+        try:
+            info = self.credential_file.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise RuntimeError(
+                "agent_credential_transport_failed: could not inspect the host "
+                "credential file"
+            ) from error
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise RuntimeError(
+                "agent_credential_transport_failed: the host credential path must "
+                "be a regular, non-symlink file"
+            )
+        try:
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(self.credential_file, flags)
+            try:
+                opened = os.fstat(descriptor)
+                if not stat.S_ISREG(opened.st_mode):
+                    raise OSError("credential path changed while opening")
+                with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+                    descriptor = -1
+                    content = handle.read(MAX_CREDENTIAL_BRIDGE_BYTES + 1)
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+            if len(content.encode("utf-8")) > MAX_CREDENTIAL_BRIDGE_BYTES:
+                raise ValueError("credential document exceeds the size limit")
+            document = json.loads(content)
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise RuntimeError(
+                "agent_credential_transport_failed: the host credential file is "
+                "not valid UTF-8 JSON"
+            ) from error
+        except ValueError as error:
+            raise RuntimeError(
+                "agent_credential_transport_failed: the host credential file exceeds "
+                "the size limit"
+            ) from error
+        if (
+            not isinstance(document, dict)
+            or document.get("version") != 1
+            or not isinstance(document.get("credentials"), dict)
+        ):
+            raise RuntimeError(
+                "agent_credential_transport_failed: the host credential file does "
+                "not match schema 1"
+            )
+        return document
+
+    def _provider_credential_document(self) -> dict[str, Any] | None:
+        document = self._read_host_credential_document()
+        if document is None:
+            return None
+        credential = document["credentials"].get(self.provider)
+        if credential is None:
+            return None
+        if not _is_provider_credential(credential):
+            raise RuntimeError(
+                "agent_credential_transport_failed: the selected provider credential "
+                "is invalid"
+            )
+        # Round-trip through JSON so later in-memory mutation cannot affect the
+        # trusted host document object.
+        return json.loads(json.dumps(credential, ensure_ascii=False))
+
+    def _persist_provider_credential(self, credential: dict[str, Any] | None) -> None:
+        if self.credential_file is None:
+            raise RuntimeError(
+                "agent_credential_persistence_failed: no host credential store is configured"
+            )
+        if credential is not None and not _is_provider_credential(credential):
+            raise RuntimeError(
+                "agent_credential_persistence_failed: rotated credential is invalid"
+            )
+        with _CredentialFileLease(self.credential_file) as lease:
+            lease.heartbeat()
+            document = self._read_host_credential_document()
+            if document is None:
+                raise RuntimeError(
+                    "agent_credential_persistence_failed: host credential store disappeared"
+                )
+            credentials = document.get("credentials")
+            if not isinstance(credentials, dict) or not all(
+                isinstance(provider, str) and provider and _is_provider_credential(value)
+                for provider, value in credentials.items()
+            ):
+                raise RuntimeError(
+                    "agent_credential_persistence_failed: host credential store is invalid"
+                )
+            if credential is None:
+                credentials.pop(self.provider, None)
+            else:
+                credentials[self.provider] = credential
+            content = (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+            if len(content) > MAX_CREDENTIAL_BRIDGE_BYTES:
+                raise RuntimeError(
+                    "agent_credential_persistence_failed: updated credential store exceeds "
+                    "the size limit"
+                )
+            temporary = self.credential_file.with_name(
+                f".{self.credential_file.name}.{uuid.uuid4().hex}.tmp"
+            )
+            descriptor = -1
+            published = False
+            try:
+                descriptor = os.open(
+                    temporary,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+                with os.fdopen(descriptor, "wb") as handle:
+                    descriptor = -1
+                    handle.write(content)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                lease.heartbeat()
+                try:
+                    os.chmod(temporary, 0o600)
+                except OSError:
+                    pass
+                os.replace(temporary, self.credential_file)
+                published = True
+                lease.heartbeat()
+                if os.name != "nt":
+                    directory = os.open(
+                        self.credential_file.parent,
+                        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                    )
+                    try:
+                        os.fsync(directory)
+                    finally:
+                        os.close(directory)
+            except OSError as error:
+                raise RuntimeError(
+                    "agent_credential_persistence_failed: could not atomically update "
+                    "the host credential store"
+                ) from error
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+                if not published:
+                    try:
+                        temporary.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
+    async def _upload_credential_bootstrap(
+        self,
+        environment: BaseEnvironment,
+        content: bytes,
+    ) -> str:
+        remote_path = f"{PRIVATE_ENV_DIR}/{uuid.uuid4().hex}.stdin"
+        prepared = await environment.exec(
+            f"umask 077; mkdir -p {shlex.quote(PRIVATE_ENV_DIR)}; "
+            f"chmod 700 {shlex.quote(PRIVATE_ENV_DIR)}",
+            timeout_sec=30,
+        )
+        if _return_code(prepared) != 0:
+            raise RuntimeError(
+                "agent_credential_transport_failed: could not prepare the private "
+                "credential directory"
+            )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            local_path = pathlib.Path(tmp_dir) / "auth.json"
+            local_path.write_bytes(content)
+            try:
+                os.chmod(local_path, 0o600)
+            except OSError:
+                pass
+            await environment.upload_file(local_path, remote_path)
+
+        protected = await environment.exec(
+            f"chmod 600 {shlex.quote(remote_path)}",
+            timeout_sec=30,
+        )
+        if _return_code(protected) != 0:
+            await self._remove_private_env(environment, remote_path)
+            raise RuntimeError(
+                "agent_credential_transport_failed: could not protect the uploaded "
+                "credential bootstrap"
+            )
+        return remote_path
+
     @staticmethod
-    def _command_with_private_env(command: str, remote_path: str) -> str:
+    def _command_with_private_env(
+        command: str,
+        remote_path: str,
+        credential_bootstrap_path: str | None = None,
+    ) -> str:
         quoted_path = shlex.quote(remote_path)
-        return (
+        prepared = (
             f"if . {quoted_path}; then "
             f"/bin/rm -f {quoted_path}; "
             "else sigma_private_env_status=$?; "
             f"/bin/rm -f {quoted_path}; "
             'exit "$sigma_private_env_status"; fi; '
-            f"{command}"
+        )
+        if credential_bootstrap_path is None:
+            return f"{prepared}{command}"
+        quoted_bootstrap = shlex.quote(credential_bootstrap_path)
+        quoted_command = shlex.quote(command)
+        # The outer shell opens stdin first. The child then unlinks the only
+        # pathname before starting Sigma; Sigma consumes and closes fd 0 before
+        # it creates any task tools.
+        return (
+            f"{prepared}"
+            f"if test -r {quoted_bootstrap}; then "
+            f"(/bin/rm -f {quoted_bootstrap} && exec /bin/sh -c {quoted_command}) "
+            f"< {quoted_bootstrap}; "
+            "else exit 126; fi"
         )
 
     async def _remove_private_env(
@@ -2382,21 +3111,53 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
         recorder: _OutputRecorder | None = None,
     ) -> Any:
         callback_scope = getattr(environment, "scoped_output_callback", None)
+        credential = self._provider_credential_document()
+        bridge = _CredentialBridge(self, credential) if credential is not None else None
 
         async def execute(command_text: str) -> Any:
             if recorder is not None and callable(callback_scope):
-                with callback_scope(recorder.callback):
-                    return await environment.exec(command_text, timeout_sec=timeout_sec)
-            return await environment.exec(command_text, timeout_sec=timeout_sec)
+                async def filtered_callback(text: str, stream: str) -> None:
+                    filtered = bridge.filter_chunk(text, stream) if bridge is not None else text
+                    if filtered:
+                        await recorder.callback(filtered, stream)
 
-        if not env_vars:
-            return await execute(command)
+                try:
+                    with callback_scope(filtered_callback):
+                        result = await environment.exec(command_text, timeout_sec=timeout_sec)
+                finally:
+                    if bridge is not None:
+                        pending = bridge.finish_stream()
+                        if pending:
+                            await recorder.callback(pending, "stdout")
+            else:
+                result = await environment.exec(command_text, timeout_sec=timeout_sec)
+            return bridge.sanitize_result(result) if bridge is not None else result
 
-        remote_path = await self._upload_private_env(environment, env_vars)
+        private_env = dict(env_vars)
+        remote_bootstrap_path: str | None = None
+        remote_env_path: str | None = None
         try:
-            return await execute(self._command_with_private_env(command, remote_path))
+            if bridge is not None:
+                remote_bootstrap_path = await self._upload_credential_bootstrap(
+                    environment,
+                    bridge.bootstrap,
+                )
+                private_env["SIGMA_CREDENTIAL_BRIDGE"] = CREDENTIAL_BRIDGE_PROTOCOL
+            if not private_env:
+                return await execute(command)
+            remote_env_path = await self._upload_private_env(environment, private_env)
+            return await execute(
+                self._command_with_private_env(
+                    command,
+                    remote_env_path,
+                    remote_bootstrap_path,
+                )
+            )
         finally:
-            await self._remove_private_env(environment, remote_path)
+            if remote_env_path is not None:
+                await self._remove_private_env(environment, remote_env_path)
+            if remote_bootstrap_path is not None:
+                await self._remove_private_env(environment, remote_bootstrap_path)
 
     def _agent_env(self) -> dict[str, str]:
         env_vars: dict[str, str] = {}
@@ -2530,6 +3291,7 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             ),
             "harbor_topology": summary.get("harbor_topology", self.harbor_topology),
             "agent_profile": summary.get("agent_profile", self.agent_profile),
+            "reasoning_effort": summary.get("reasoning_effort", self.reasoning_effort),
             "max_model_turns": summary.get("max_model_turns", self.max_turns),
             "command_timeout_sec": summary.get(
                 "command_timeout_sec", self.command_timeout_sec
@@ -2663,6 +3425,9 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             ),
             "harbor_topology": getattr(context, "harbor_topology", self.harbor_topology),
             "agent_profile": getattr(context, "agent_profile", self.agent_profile),
+            "reasoning_effort": getattr(
+                context, "reasoning_effort", self.reasoning_effort
+            ),
             "max_model_turns": getattr(context, "max_model_turns", self.max_turns),
             "command_timeout_sec": getattr(
                 context, "command_timeout_sec", self.command_timeout_sec

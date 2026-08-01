@@ -68,6 +68,7 @@ export const terminalBenchCliFlags = Object.freeze([
   "model",
   "network",
   "provider",
+  "reasoning-effort",
   "retries",
   "reuse-package",
   "run-label",
@@ -347,6 +348,14 @@ function benchmarkClass(value, fallback = "standard") {
   return classification;
 }
 
+function reasoningEffort(value, fallback = "auto") {
+  const effort = asString(value, fallback);
+  if (!["auto", "none", "low", "medium", "high", "xhigh", "max"].includes(effort)) {
+    throw new Error("reasoning effort must be auto, none, low, medium, high, xhigh, or max.");
+  }
+  return effort;
+}
+
 function normalizedSha256(value, name) {
   if (value === undefined || value === null || value === "") return null;
   const text = String(value).trim().toLowerCase();
@@ -421,6 +430,9 @@ export function resolveRunOptions(argv, env = process.env) {
     dataset: asString(flags.dataset ?? env.SIGMA_BENCH_DATASET, terminalBenchDataset),
     provider: asString(flags.provider, env.AGENT_PROVIDER ?? "deepseek"),
     model: asString(flags.model, env.AGENT_MODEL),
+    reasoningEffort: reasoningEffort(
+      flags["reasoning-effort"] ?? env.AGENT_REASONING_EFFORT
+    ),
     agentProfile: asString(flags["agent-profile"], env.SIGMA_AGENT_PROFILE ?? "standard"),
     networkMode: resolvedNetworkMode,
     executionMode: resolvedExecutionMode,
@@ -682,6 +694,7 @@ function benchmarkAgentKwargs(options, timeoutPlan = null) {
   const agentKwargs = {
     agent_cli_tarball: resolveAgentCliTarballPath(options, options.env ?? process.env),
     provider: options.provider,
+    reasoning_effort: options.reasoningEffort ?? "auto",
     agent_profile: options.agentProfile ?? "standard",
     network_mode: options.networkMode ?? "full",
     execution_mode: options.executionMode ?? "sandboxed",
@@ -922,6 +935,9 @@ export function buildHarborArgs(options) {
 
   args.push("--ak", formatAgentKwarg("agent_cli_tarball", "str", resolveAgentCliTarballPath(options, options.env ?? process.env), capabilities));
   args.push("--ak", formatAgentKwarg("provider", "str", options.provider, capabilities));
+  args.push("--ak", formatAgentKwarg(
+    "reasoning_effort", "str", options.reasoningEffort ?? "auto", capabilities
+  ));
   args.push("--ak", formatAgentKwarg("agent_profile", "str", options.agentProfile ?? "standard", capabilities));
   if (options.networkMode !== undefined) {
     args.push("--ak", formatAgentKwarg("network_mode", "str", options.networkMode, capabilities));
@@ -2489,6 +2505,14 @@ export function assertComparableBenchmarkReports(...reports) {
       `Benchmark reports use different evaluation lanes (${lanes.join(", ")}) and cannot be combined.`
     ), { code: "benchmark_lane_mismatch" });
   }
+  const reasoningEfforts = [...new Set(
+    reports.map((report) => report?.reasoning_effort ?? "auto")
+  )];
+  if (reasoningEfforts.length > 1) {
+    throw Object.assign(new Error(
+      `Benchmark reports use different reasoning efforts (${reasoningEfforts.join(", ")}) and cannot be combined.`
+    ), { code: "benchmark_reasoning_effort_mismatch" });
+  }
 }
 
 function taskHasSignal(task, pattern) {
@@ -2530,6 +2554,7 @@ export function formatMarkdownReport(report) {
     `- Infra status: ${report.infra_status ?? "unknown"}`,
     `- Provider: ${report.provider}`,
     `- Model: ${report.model ?? "default"}`,
+    `- Reasoning effort: ${report.reasoning_effort ?? "auto"}`,
     `- Dataset: ${report.dataset}`,
     `- Agent profile: ${report.agent_profile ?? "unknown"}`,
     `- Evaluation lane: ${report.evaluation_lane ?? "unknown"}`,
@@ -2847,6 +2872,7 @@ export async function generateBenchReport(runDir) {
     finished_at: config.finished_at ?? null,
     provider: config.provider ?? "unknown",
     model: config.model ?? null,
+    reasoning_effort: config.reasoning_effort ?? "auto",
     dataset: config.dataset ?? terminalBenchDataset,
     agent_profile: taskProfiles.length === 1 ? taskProfiles[0] : config.agent_profile ?? null,
     evaluation_lane: config.evaluation_lane
@@ -2936,6 +2962,17 @@ export function harborEnvForRun(runDir, env = process.env) {
   if (env.PYTHONPATH) {
     pythonPathEntries.push(env.PYTHONPATH);
   }
+  const configuredCredentialFile = (
+    env.SIGMA_HOST_CREDENTIAL_FILE || env.SIGMA_CREDENTIAL_FILE
+  )?.trim();
+  if (configuredCredentialFile && !path.isAbsolute(configuredCredentialFile)) {
+    throw new Error(
+      "credential_path_invalid: the Sigma host credential file must be an absolute path"
+    );
+  }
+  const hostCredentialFile = path.resolve(
+    configuredCredentialFile || path.join(os.homedir(), ".sigma", "auth.json")
+  );
 
   const next = {
     ...env,
@@ -2953,6 +2990,11 @@ export function harborEnvForRun(runDir, env = process.env) {
     RICH_NO_COLOR: env.RICH_NO_COLOR || "1",
     TERM: env.TERM || "dumb"
   };
+  if (existsSync(hostCredentialFile)) {
+    next.SIGMA_HOST_CREDENTIAL_FILE = hostCredentialFile;
+  } else {
+    delete next.SIGMA_HOST_CREDENTIAL_FILE;
+  }
   for (const key of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]) {
     const value = next[key];
     if (typeof value === "string" && /^htpp:\/\//i.test(value)) {

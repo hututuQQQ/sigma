@@ -71,6 +71,7 @@ Selection:
 Agent:
   --provider <id>                   Model provider (default: deepseek)
   --model <id>                      Provider model
+  --reasoning-effort <level>        auto, none, low, medium, high, xhigh, or max
   --agent-profile <standard|strict> Sigma profile (default: standard)
   --max-turns <count>               Hard model-turn limit
 
@@ -243,6 +244,7 @@ async function runTerminalBenchCliImpl(argv, deps, signal) {
     harbor_topology: options.harborTopology,
     provider: options.provider,
     model: options.model ?? null,
+    reasoning_effort: options.reasoningEffort,
     dataset: options.dataset ?? terminalBenchDataset,
     k: options.mode === "k" ? options.k : null,
     n_concurrent_trials: options.nConcurrentTrials,

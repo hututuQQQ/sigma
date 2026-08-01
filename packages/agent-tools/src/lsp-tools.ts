@@ -107,6 +107,7 @@ function descriptor(): ToolDescriptor {
     contextPathArguments: ["file"],
     approval: "prompt",
     idempotent: false,
+    workspaceDeltaAuthority: "structured_tool_receipt",
     timeoutMs: 120_000,
     prepare: (value, context) => callPlan(value, context.runMode)
   };

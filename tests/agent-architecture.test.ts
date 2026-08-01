@@ -798,7 +798,7 @@ describe("Sigma architecture", () => {
     expect(failedAt - started).toBeLessThan(1_500);
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "completed" });
     expect(gateway.requests[1].messages.some((message) => message.role === "tool"
-      && message.content.includes("exceeded its 25ms deadline-bounded timeout"))).toBe(true);
+      && message.content.includes("exceeded its 25ms execution timeout"))).toBe(true);
   });
 
   it("projects later streaming turns without historical messages clearing them", () => {

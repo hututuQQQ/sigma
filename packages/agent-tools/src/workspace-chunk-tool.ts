@@ -74,7 +74,7 @@ export function writeChunkTool(atomicPatchStateRootDir?: string): RegisteredEffe
       contextPathArguments: ["path"],
       writePathArguments: ["path"],
       approval: "prompt",
-      idempotent: true,
+      idempotent: true, workspaceDeltaAuthority: "structured_tool_receipt",
       timeoutMs: 30_000,
       async prepare(value, context) {
         const input = writeChunkArguments(args(value));

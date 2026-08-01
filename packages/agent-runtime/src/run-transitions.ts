@@ -2,12 +2,13 @@ import { randomUUID } from "node:crypto";
 import { createKernelState } from "agent-kernel";
 import type { AgentEventPayloadMap } from "agent-protocol";
 import { sessionAssurancePolicy } from "./assurance-policy.js";
+import { configuredRunDeadlineAt } from "./run-deadline.js";
 import type { RuntimeSession } from "./types.js";
 
 export function beginNextRun(
   session: RuntimeSession,
   mode: RuntimeSession["durable"]["mode"],
-  runDeadlineMs: number
+  runDeadlineMs?: number
 ): void {
   const now = new Date().toISOString();
   session.durable.runId = randomUUID();
@@ -18,7 +19,7 @@ export function beginNextRun(
     runId: session.durable.runId,
     mode,
     startedAt: now,
-    deadlineAt: new Date(Date.now() + runDeadlineMs).toISOString(),
+    deadlineAt: configuredRunDeadlineAt(runDeadlineMs),
     assurancePolicy: sessionAssurancePolicy(session)
   });
   session.durable.state = {

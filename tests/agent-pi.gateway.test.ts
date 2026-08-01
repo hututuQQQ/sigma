@@ -4,8 +4,9 @@ import { get as httpGet } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { zstdDecompressSync } from "node:zlib";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  defaultSigmaCredentialPath,
   FileCredentialStore,
   FileModelsStore,
   PiModelGateway,
@@ -31,6 +32,7 @@ import {
   type OAuthCredential,
   type Provider
 } from "../packages/agent-pi/src/index.js";
+import { monitoredPiStream } from "../packages/agent-pi/src/stream-timeout.js";
 import type { JsonValue, ModelMessage } from "../packages/agent-protocol/src/index.js";
 
 class MemoryCredentialStore implements CredentialStore {
@@ -181,6 +183,54 @@ function sse(events: readonly Record<string, unknown>[]): Response {
   });
 }
 
+describe("Pi stream timeout policy", () => {
+  it("uses the request deadline for the initial event and the idle deadline thereafter", async () => {
+    vi.useFakeTimers();
+    try {
+      let releaseInitialEvent: (() => void) | undefined;
+      const initialEventReady = new Promise<void>((resolve) => {
+        releaseInitialEvent = resolve;
+      });
+      const parent = new AbortController();
+      const stream = monitoredPiStream(async function* (signal) {
+        await initialEventReady;
+        yield "initial";
+        await new Promise<never>((_resolve, reject) => {
+          const rejectOnAbort = (): void => reject(signal.reason);
+          signal.addEventListener("abort", rejectOnAbort, { once: true });
+          if (signal.aborted) rejectOnAbort();
+        });
+      }, {
+        signal: parent.signal,
+        initialTimeoutMs: 100,
+        idleTimeoutMs: 10
+      });
+      const iterator = stream[Symbol.asyncIterator]();
+      let initialSettled = false;
+      const initial = iterator.next().finally(() => {
+        initialSettled = true;
+      });
+
+      await vi.advanceTimersByTimeAsync(20);
+      expect(initialSettled).toBe(false);
+      releaseInitialEvent?.();
+      await expect(initial).resolves.toEqual({ done: false, value: "initial" });
+
+      const idle = iterator.next().then(
+        (value) => ({ status: "fulfilled" as const, value }),
+        (error: unknown) => ({ status: "rejected" as const, error })
+      );
+      await vi.advanceTimersByTimeAsync(11);
+      await expect(idle).resolves.toMatchObject({
+        status: "rejected",
+        error: { code: "timeout", category: "timeout" }
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 function completedTextEvents(text: string, responseId = "resp_text"): Record<string, unknown>[] {
   const item = {
     type: "message",
@@ -324,6 +374,12 @@ function requestBody(init: RequestInit | undefined): Record<string, unknown> {
 }
 
 describe("OpenAI Codex subscription gateway", () => {
+  beforeEach(() => {
+    // These tests assert the HTTP fallback contract. WebSocket continuation is
+    // covered at the API-family boundary without opening a real connection.
+    vi.stubGlobal("WebSocket", undefined);
+  });
+
   it("pins the expected Pi catalog and defaults to Terra", () => {
     const models = listPiModels();
     const catalogSummary = models
@@ -592,8 +648,134 @@ describe("OpenAI Codex subscription gateway", () => {
       code: "rate_limited",
       category: "rate_limit"
     });
+    expect(sanitizePiModelError(Object.assign(new Error("opaque provider failure"), {
+      providerErrorCode: "invalid_prompt",
+      providerEventType: "response_failed"
+    }))).toMatchObject({ code: "protocol", category: "protocol" });
+    expect(sanitizePiModelError(Object.assign(new Error("opaque provider failure"), {
+      providerErrorCode: "unrecognized_transient",
+      providerEventType: "response_failed"
+    }))).toMatchObject({ code: "server", category: "server" });
+    expect(sanitizePiModelError(Object.assign(new Error("opaque provider failure"), {
+      providerErrorCode: "slow_down",
+      providerEventType: "response_failed"
+    }))).toMatchObject({ code: "server", category: "server" });
     expect(sanitizePiModelError(new Error("Provider is not configured: openai-codex")))
       .toMatchObject({ code: "auth_required", category: "auth" });
+  });
+
+  it("preserves and classifies Codex response.failed codes without exposing provider text", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => sse([
+      { type: "response.created", response: { id: "resp_failed", status: "in_progress" } },
+      {
+        type: "response.failed",
+        response: {
+          id: "resp_failed",
+          status: "failed",
+          error: { code: "server_error", message: "transient secret-token" }
+        }
+      }
+    ])));
+    const gateway = new PiModelGateway({
+      provider: OPENAI_CODEX_PROVIDER_ID,
+      model: OPENAI_CODEX_DEFAULT_MODEL,
+      credentials: new MemoryCredentialStore(oauth())
+    });
+
+    let failure: unknown;
+    try {
+      await gateway.complete({
+        messages: [{ role: "user", content: "wait" }],
+        signal: new AbortController().signal
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toMatchObject({
+      code: "server",
+      category: "server",
+      message: "The model provider returned a server error.",
+      providerErrorCode: "server_error",
+      providerEventType: "response_failed",
+      diagnostics: {
+        providerErrorCode: "server_error",
+        providerEventType: "response_failed"
+      }
+    });
+    expect(JSON.stringify(failure)).not.toContain("secret-token");
+  });
+
+  it("preserves Codex stream error codes through structured diagnostics", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => sse([{
+      type: "error",
+      code: "rate_limit_exceeded",
+      message: "rate-limit secret-token"
+    }])));
+    const gateway = new PiModelGateway({
+      provider: OPENAI_CODEX_PROVIDER_ID,
+      model: OPENAI_CODEX_DEFAULT_MODEL,
+      credentials: new MemoryCredentialStore(oauth())
+    });
+
+    let failure: unknown;
+    try {
+      await gateway.complete({
+        messages: [{ role: "user", content: "wait" }],
+        signal: new AbortController().signal
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toMatchObject({
+      code: "rate_limited",
+      category: "rate_limit",
+      providerErrorCode: "rate_limit_exceeded",
+      providerEventType: "error"
+    });
+    expect(JSON.stringify(failure)).not.toContain("secret-token");
+  });
+
+  it("uses the request deadline while waiting for Codex SSE headers", async () => {
+    vi.useFakeTimers();
+    try {
+      let releaseHeaders!: () => void;
+      const headersReady = new Promise<void>((resolve) => {
+        releaseHeaders = resolve;
+      });
+      vi.stubGlobal("fetch", vi.fn(async () => {
+        await headersReady;
+        return sse(completedTextEvents("ready", "resp_headers"));
+      }));
+      const gateway = new PiModelGateway({
+        provider: OPENAI_CODEX_PROVIDER_ID,
+        model: OPENAI_CODEX_DEFAULT_MODEL,
+        credentials: new MemoryCredentialStore(oauth()),
+        requestTimeoutMs: 100,
+        idleTimeoutMs: 10
+      });
+      let settled = false;
+      const completion = gateway.complete({
+        messages: [{ role: "user", content: "wait" }],
+        signal: new AbortController().signal
+      }).then(
+        (value) => ({ status: "fulfilled" as const, value }),
+        (error: unknown) => ({ status: "rejected" as const, error })
+      ).finally(() => {
+        settled = true;
+      });
+
+      await vi.advanceTimersByTimeAsync(20);
+      expect(settled).toBe(false);
+      releaseHeaders();
+      await expect(completion).resolves.toMatchObject({
+        status: "fulfilled",
+        value: { message: { content: "ready" } }
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("bounds an SSE stream that stops producing events", async () => {
@@ -1005,6 +1187,24 @@ describe("dynamic Pi model refresh", () => {
 });
 
 describe("OpenAI Codex credential persistence", () => {
+  it("supports an isolated absolute credential-file override", () => {
+    const credentialPath = path.join(os.tmpdir(), "sigma-remote-auth.json");
+
+    expect(defaultSigmaCredentialPath("unused-home", {
+      SIGMA_CREDENTIAL_FILE: credentialPath
+    })).toBe(path.resolve(credentialPath));
+    expect(new FileCredentialStore({
+      env: { SIGMA_CREDENTIAL_FILE: credentialPath }
+    }).filePath).toBe(path.resolve(credentialPath));
+    expect(() => defaultSigmaCredentialPath("unused-home", {
+      SIGMA_CREDENTIAL_FILE: "relative/auth.json"
+    })).toThrow("credential_path_invalid");
+    expect(new FileCredentialStore({
+      filePath: credentialPath,
+      env: { SIGMA_CREDENTIAL_FILE: "relative/auth.json" }
+    }).filePath).toBe(path.resolve(credentialPath));
+  });
+
   it("lists every provider's local auth state without network access", async () => {
     const fetchMock = vi.fn(async () => {
       throw new Error("offline status must not call fetch");

@@ -1,4 +1,4 @@
-import type { RunOutcome, ToolDescriptor } from "agent-protocol";
+import type { RunOutcome } from "agent-protocol";
 import { decide, mutationFrontierHasChanges, type KernelEffect } from "agent-kernel";
 import {
   attemptFromEffect,
@@ -49,18 +49,6 @@ export interface EffectRunnerOptions {
   hooks: RuntimeHookCoordinator;
 }
 
-function terminalOnlyDescriptor(descriptor: ToolDescriptor | undefined): boolean {
-  if (!descriptor) return false;
-  const effects = [
-    ...descriptor.possibleEffects,
-    ...(descriptor.maximumEffects ?? descriptor.possibleEffects)
-  ];
-  return effects.length > 0 && effects.every((effect) =>
-    effect === "outcome.propose"
-      || effect === "outcome.report_blocked"
-      || effect === "outcome.request_input");
-}
-
 export class EffectRunner {
   private readonly models: ModelEffectRunner;
   private readonly reviews: ReviewCoordinator;
@@ -102,8 +90,6 @@ export class EffectRunner {
     const failure = convergenceAdmissionFailure(session, { kind: "model" });
     if (failure) {
       return await finishSolvingBudgetBoundary(session, signal, failure, {
-        reviews: this.reviews,
-        longHorizon: this.longHorizon,
         emit: this.options.emit,
         finish: this.options.finish,
         runtime: this.options.runtime,
@@ -118,12 +104,8 @@ export class EffectRunner {
     signal: AbortSignal,
     effects: ExecuteToolEffect[]
   ): Promise<boolean> {
-    const descriptors = this.options.runtime.tools.descriptors();
-    const terminalOnly = effects.every((effect) => terminalOnlyDescriptor(
-      descriptors.find((item) => item.name === effect.request.name)
-    ));
     const failure = convergenceAdmissionFailure(session, {
-      kind: "tool", count: effects.length, terminalOnly
+      kind: "tool", count: effects.length
     });
     const deadline = deadlineForecast(session);
     // At a live deadline, cancellation remains an outer hard boundary. A
@@ -132,14 +114,6 @@ export class EffectRunner {
     // completion assurance can still run from a clean kernel phase.
     if (failure && deadline.stage === "stop") {
       return await this.options.finish(session, failure);
-    }
-    if (failure && deadline.stage === "converge") {
-      await this.toolBatches.rejectForResourceBoundary(
-        session,
-        effects.map(attemptFromEffect),
-        failure.message
-      );
-      return false;
     }
     await this.toolBatches.execute(session, effects.map(attemptFromEffect), signal);
     if (effects.some((effect) => effect.request.name === "request_review")) {

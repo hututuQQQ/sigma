@@ -18,7 +18,9 @@ import type {
   ModelStreamEvent,
   ModelToolCall
 } from "agent-protocol";
+import type { PiProviderEventType } from "./errors.js";
 import type { PiBillingMode } from "./models.js";
+import { codexInstructionSentinel } from "./codex-instructions.js";
 
 interface ReplayState {
   responseId?: string;
@@ -112,9 +114,14 @@ function instructionBlock(message: ModelMessage): string {
   return `<${message.role}>\n${message.content}\n</${message.role}>`;
 }
 
+function reminderContent(message: ModelMessage): string {
+  return `<latest_reminder>\n[authority: ${message.role}]\n${message.content}\n</latest_reminder>`;
+}
+
 function contextParts(
   messages: readonly ModelMessage[],
-  model: PiModel<Api>
+  model: PiModel<Api>,
+  codexInstructionNonce?: string
 ): { systemPrompt?: string; messages: Message[] } {
   const instructions: string[] = [];
   const result: Message[] = [];
@@ -122,10 +129,21 @@ function contextParts(
   let conversationStarted = false;
   for (const message of messages) {
     if (message.role === "system" || message.role === "developer") {
-      if (model.provider === "deepseek" && conversationStarted) {
+      if (conversationStarted && model.provider === "openai-codex"
+        && codexInstructionNonce) {
         result.push({
           role: "user",
-          content: `<latest_reminder>\n${message.content}\n</latest_reminder>`,
+          content: codexInstructionSentinel(
+            message.role,
+            codexInstructionNonce,
+            message.content
+          ),
+          timestamp: Date.now()
+        });
+      } else if (conversationStarted) {
+        result.push({
+          role: "user",
+          content: reminderContent(message),
           timestamp: Date.now()
         });
       } else {
@@ -160,8 +178,12 @@ function contextParts(
   };
 }
 
-export function piContext(request: ModelRequest, model: PiModel<Api>): Context {
-  const parts = contextParts(request.messages, model);
+export function piContext(
+  request: ModelRequest,
+  model: PiModel<Api>,
+  codexInstructionNonce?: string
+): Context {
+  const parts = contextParts(request.messages, model, codexInstructionNonce);
   return {
     ...parts,
     ...(request.tools?.length ? {
@@ -257,13 +279,34 @@ export function deepSeekPayload(payload: unknown, request: ModelRequest): unknow
   };
 }
 
+function codexProviderFailure(
+  event: Extract<AssistantMessageEvent, { type: "error" }>
+): { providerErrorCode?: string; providerEventType?: PiProviderEventType } {
+  for (const diagnostic of [...(event.error.diagnostics ?? [])].reverse()) {
+    if (diagnostic.type !== "codex_provider_failure") continue;
+    const providerErrorCode = diagnostic.details?.providerErrorCode;
+    const providerEventType = diagnostic.details?.providerEventType;
+    return {
+      ...(typeof providerErrorCode === "string" && /^[a-z0-9_.-]{1,128}$/iu.test(providerErrorCode)
+        ? { providerErrorCode }
+        : {}),
+      ...(providerEventType === "error" || providerEventType === "response_failed"
+        ? { providerEventType }
+        : {})
+    };
+  }
+  return {};
+}
+
 function providerEventError(
   event: Extract<AssistantMessageEvent, { type: "error" }>,
   responseStatus: number | undefined
 ): Error {
+  const message = event.error.errorMessage ?? event.reason;
   return Object.assign(
-    new Error(event.error.errorMessage ?? event.reason),
-    responseStatus === undefined ? {} : { status: responseStatus }
+    new Error(message),
+    responseStatus === undefined ? {} : { status: responseStatus },
+    codexProviderFailure(event)
   );
 }
 

@@ -315,6 +315,7 @@ schema_version = 1
 [model]
 provider = "deepseek"
 name = "auto"
+reasoning_effort = "auto"
 
 [permissions]
 mode = "workspace-auto"
@@ -330,7 +331,7 @@ mode = "auto"
 search_provider = "exa"
 
 [runtime]
-run_deadline_sec = 900
+run_deadline_sec = 0
 model_deadline_sec = 120
 stream_idle_sec = 45
 
@@ -346,6 +347,11 @@ output_format = "text"
 [tui]
 fps = 30
 ```
+
+`runtime.run_deadline_sec = 0` leaves an interactive run unbounded. Set a
+positive value only when the caller intentionally wants a whole-run wall-clock
+limit. Per-request and per-tool liveness timeouts remain independent so a hung
+provider or process can still be interrupted without imposing a task deadline.
 
 To opt into broader per-call capabilities, use:
 
@@ -374,6 +380,7 @@ subscription:
 [model]
 provider = "openai-codex"
 name = "gpt-5.6-terra"
+reasoning_effort = "max"
 ```
 
 This route uses ChatGPT OAuth and
@@ -385,6 +392,9 @@ API cost. Authentication, allowance, rate-limit, network, timeout, and server
 failures are returned directly. The built-in subscription route has one
 candidate and cannot silently fall back to DeepSeek, GLM, or
 `api.openai.com/v1`.
+
+`reasoning_effort` accepts `auto`, `none`, `low`, `medium`, `high`, `xhigh`,
+or `max`; the equivalent CLI flag is `--reasoning-effort`.
 
 The JSONL login interface is intended for trusted desktop clients:
 

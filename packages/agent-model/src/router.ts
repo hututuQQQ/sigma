@@ -109,6 +109,21 @@ function routedStreamEvent(
   return event;
 }
 
+function blocksStreamRetry(
+  lifecycle: RoutedStreamLifecycle,
+  current: ModelSpec,
+  next: ModelSpec | undefined
+): boolean {
+  if (!lifecycle.semanticDelta) return false;
+  // Reasoning deltas are observable but are not committed to conversation
+  // history and cannot execute tools. A transient retry is therefore safe only
+  // on the same provider/model before content, tool calls, or a terminal event.
+  return next?.id !== current.id
+    || lifecycle.hasContent
+    || lifecycle.hasToolCall
+    || lifecycle.completed;
+}
+
 export class ModelRoutingError extends Error {
   readonly code = "model_route_unavailable";
   constructor(readonly routeId: string, readonly rejected: readonly ModelRejection[]) {
@@ -142,6 +157,7 @@ export class ModelRouteExecutionError extends Error {
 export class ModelRouter {
   private readonly specs: ReadonlyMap<string, ModelSpec>;
   private readonly routes: ReadonlyMap<string, ModelRoute>;
+  private readonly sessionGateways = new Map<string, Set<ModelGateway>>();
   private readonly maxRetriesPerCandidate: number;
   private readonly retryBaseDelayMs: number;
   private readonly retryMaxDelayMs: number;
@@ -197,6 +213,29 @@ export class ModelRouter {
     );
   }
 
+  private gatewayFor(spec: ModelSpec, sessionId?: string): ModelGateway {
+    const gateway = this.gateways(spec);
+    if (!sessionId) return gateway;
+    const used = this.sessionGateways.get(sessionId) ?? new Set<ModelGateway>();
+    used.add(gateway);
+    this.sessionGateways.set(sessionId, used);
+    return gateway;
+  }
+
+  async releaseSession(sessionId: string): Promise<void> {
+    const gateways = this.sessionGateways.get(sessionId);
+    this.sessionGateways.delete(sessionId);
+    if (!gateways) return;
+    const settled = await Promise.allSettled(
+      [...gateways].map(async (gateway) => gateway.releaseSession?.(sessionId))
+    );
+    const failures = settled.flatMap((result) =>
+      result.status === "rejected" ? [result.reason] : []);
+    if (failures.length > 0) {
+      throw new AggregateError(failures, "Failed to release routed model session resources");
+    }
+  }
+
   async complete(
     role: ModelRole,
     routeId: string,
@@ -217,7 +256,7 @@ export class ModelRouter {
       const attempt = executed++;
       const startedAt = performance.now();
       try {
-        const response = await this.gateways(spec).complete(request);
+        const response = await this.gatewayFor(spec, request.sessionId).complete(request);
         return routedResponse(
           role,
           resolution.route.id,
@@ -280,7 +319,7 @@ export class ModelRouter {
       const startedAt = performance.now();
       const lifecycle: RoutedStreamLifecycle = newRoutedStreamLifecycle();
       try {
-        for await (const event of this.gateways(spec).stream(request)) {
+        for await (const event of this.gatewayFor(spec, request.sessionId).stream(request)) {
           observeRoutedStreamEvent(lifecycle, event);
           yield routedStreamEvent(event, role, routeId, spec, request, attempt, startedAt);
         }
@@ -294,7 +333,8 @@ export class ModelRouter {
         const category = classifyModelFailure(error);
         lifecycle.semanticDelta ||= errorSemanticDelta(error);
         const nextIndex = nextExecutionIndex(planned, index, category);
-        if (!canFallback(resolution.route, category, lifecycle.semanticDelta)
+        const next = nextIndex === undefined ? undefined : planned[nextIndex];
+        if (!canFallback(resolution.route, category, blocksStreamRetry(lifecycle, spec, next))
           || nextIndex === undefined) {
           throw new ModelRouteExecutionError(
             routeId,

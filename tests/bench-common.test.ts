@@ -208,11 +208,27 @@ describe("Terminal-Bench command construction", () => {
       { tasks: [{ agent_profile: "standard" }], evaluation_lane: "solving" },
       { agent_profile: "standard", evaluation_lane: "solving" }
     )).not.toThrow();
+    expect(() => assertComparableBenchmarkReports(
+      { agent_profile: "standard", evaluation_lane: "solving", reasoning_effort: "high" },
+      { agent_profile: "standard", evaluation_lane: "solving", reasoning_effort: "max" }
+    )).toThrow(/different reasoning efforts/iu);
+    expect(() => assertComparableBenchmarkReports(
+      { agent_profile: "standard", evaluation_lane: "solving" },
+      { agent_profile: "standard", evaluation_lane: "solving", reasoning_effort: "max" }
+    )).toThrow(/different reasoning efforts/iu);
+    expect(() => assertComparableBenchmarkReports(
+      { agent_profile: "standard", evaluation_lane: "solving" },
+      { agent_profile: "standard", evaluation_lane: "solving", reasoning_effort: "auto" }
+    )).not.toThrow();
   });
 
   it("propagates the run-level network mode into Harbor agent configuration", () => {
-    const options = resolveRunOptions(["--mode", "task", "--task-id", "generic-task", "--network", "full"]);
+    const options = resolveRunOptions([
+      "--mode", "task", "--task-id", "generic-task", "--network", "full",
+      "--reasoning-effort", "max"
+    ]);
     expect(options.networkMode).toBe("full");
+    expect(options.reasoningEffort).toBe("max");
     expect(buildHarborArgs({
       ...options,
       taskSelectionFlag: "--task-id",
@@ -221,14 +237,19 @@ describe("Terminal-Bench command construction", () => {
       "network_mode:str=full",
       "execution_mode:str=sandboxed",
       "write_scope:str=auto",
-      "agent_profile:str=standard"
+      "agent_profile:str=standard",
+      "reasoning_effort:str=max"
     ]));
     expect(buildHarborJobConfig(options, "jobs").agents[0].kwargs).toMatchObject({
       network_mode: "full",
       execution_mode: "sandboxed",
       write_scope: "auto",
-      agent_profile: "standard"
+      agent_profile: "standard",
+      reasoning_effort: "max"
     });
+    expect(() => resolveRunOptions([
+      "--mode", "task", "--task-id", "generic-task", "--reasoning-effort", "extreme"
+    ])).toThrow(/reasoning effort/iu);
   });
 
   it("freezes write-scope capability negotiation without assuming outer-container authority", () => {
@@ -407,6 +428,8 @@ describe("Terminal-Bench command construction", () => {
       "--ak",
       "provider:str=deepseek",
       "--ak",
+      "reasoning_effort:str=auto",
+      "--ak",
       "agent_profile:str=standard",
       "--ak",
       "model:str=deepseek-v4-pro",
@@ -453,6 +476,8 @@ describe("Terminal-Bench command construction", () => {
       `agent_cli_tarball=${defaultAgentCliTarballForEnv()}`,
       "--ak",
       "provider=glm",
+      "--ak",
+      "reasoning_effort=auto",
       "--ak",
       "agent_profile=standard",
       "--ak",
@@ -892,6 +917,24 @@ describe("Terminal-Bench command construction", () => {
     expect(existingEnv.PYTHONPATH.split(path.delimiter)).toEqual([harborRuntimeDir, "one", "two"]);
     expect(portableEnv.PYTHONDONTWRITEBYTECODE).toBe("1");
     expect(portableEnv.PYTHONPYCACHEPREFIX).toContain(path.join("runtime-scratch", "pycache"));
+  });
+
+  it("passes only an absolute host credential file path to the Harbor controller", async () => {
+    const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "sigma-harbor-credential-"));
+    try {
+      const credentialFile = path.join(temporaryDirectory, "auth.json");
+      await writeFile(credentialFile, '{"version":1,"credentials":{}}\n', "utf8");
+      const env = harborEnvForRun("run-dir", {
+        SIGMA_CREDENTIAL_FILE: credentialFile
+      });
+
+      expect(env.SIGMA_HOST_CREDENTIAL_FILE).toBe(credentialFile);
+      expect(() => harborEnvForRun("run-dir", {
+        SIGMA_CREDENTIAL_FILE: "relative/auth.json"
+      })).toThrow("credential_path_invalid");
+    } finally {
+      await rm(temporaryDirectory, { recursive: true, force: true });
+    }
   });
 
   it("rejects removed Harbor import paths before building run env", () => {

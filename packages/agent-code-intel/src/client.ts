@@ -55,6 +55,7 @@ export class LspClient {
   private nextId = 1;
   private pump?: Promise<void>;
   private starting?: Promise<void>;
+  private transportFailure?: { error: unknown };
   private initialized = false;
   private closed = false;
 
@@ -67,8 +68,8 @@ export class LspClient {
   }
 
   async start(signal?: AbortSignal): Promise<void> {
+    this.throwIfUnavailable();
     if (this.initialized) return;
-    if (this.closed) throw new Error("LSP client is closed.");
     let starting = this.starting;
     if (!starting) {
       starting = this.initialize(signal);
@@ -202,7 +203,7 @@ export class LspClient {
   }
 
   private async request(method: string, params: unknown, signal?: AbortSignal): Promise<unknown> {
-    if (this.closed) throw new Error("LSP client is closed.");
+    this.throwIfUnavailable();
     signal?.throwIfAborted();
     const id = this.nextId++;
     const response = new Promise<unknown>((resolve, reject) => {
@@ -241,6 +242,7 @@ export class LspClient {
   }
 
   private async send(message: unknown, signal?: AbortSignal): Promise<void> {
+    this.throwIfUnavailable();
     await this.transport.write(encodeLspMessage(message), signal);
   }
 
@@ -250,11 +252,23 @@ export class LspClient {
       for await (const chunk of this.transport.chunks(signal)) {
         for (const body of decoder.push(chunk)) this.receive(JSON.parse(body) as Record<string, unknown>);
       }
-      if (!this.closed) this.failPending(Object.assign(new Error("Language server exited."), { code: "lsp_server_exited" }));
+      if (!this.closed) {
+        this.failTransport(Object.assign(new Error("Language server exited."), { code: "lsp_server_exited" }));
+      }
     } catch (error) {
-      this.failPending(error);
-      if (!this.closed) throw error;
+      this.failTransport(error);
     }
+  }
+
+  private throwIfUnavailable(): void {
+    if (this.closed) throw new Error("LSP client is closed.");
+    if (this.transportFailure) throw this.transportFailure.error;
+  }
+
+  private failTransport(error: unknown): void {
+    if (this.closed) return;
+    this.transportFailure ??= { error };
+    this.failPending(this.transportFailure.error);
   }
 
   private receive(message: Record<string, unknown>): void {

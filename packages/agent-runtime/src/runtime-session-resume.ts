@@ -7,7 +7,7 @@ import type { RuntimeOptions, RuntimeSession } from "./types.js";
 export interface RuntimeSessionResumeOptions {
   runtime: RuntimeOptions;
   artifacts: ContentAddressedArtifactStore;
-  runDeadlineMs: number;
+  runDeadlineMs?: number;
   bind(session: RuntimeSession): Promise<void>;
   accept(session: RuntimeSession): void;
   recoverOpen(session: RuntimeSession): Promise<OpenCheckpointRecoveryResult>;

@@ -25,6 +25,7 @@ export interface CliConfig {
   workspace: string;
   provider: string;
   model: string;
+  reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
   agentProfile: string;
   permissionMode: "workspace-auto" | "ask" | "auto" | "deny";
   sandboxMode: "required";
@@ -207,6 +208,9 @@ function cliConfig(
     workspace: path.resolve(input.workspace, String(values.workspace)),
     provider: values.provider as CliConfig["provider"],
     model: String(values.model),
+    ...(values.reasoningEffort === "auto"
+      ? {}
+      : { reasoningEffort: values.reasoningEffort as CliConfig["reasoningEffort"] }),
     agentProfile: String(values.agentProfile),
     permissionMode: values.permissionMode as CliConfig["permissionMode"],
     sandboxMode: values.sandboxMode as CliConfig["sandboxMode"],

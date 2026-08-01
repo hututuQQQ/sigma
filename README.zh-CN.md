@@ -277,6 +277,7 @@ schema_version = 1
 [model]
 provider = "deepseek"
 name = "auto"
+reasoning_effort = "auto"
 
 [permissions]
 mode = "workspace-auto"

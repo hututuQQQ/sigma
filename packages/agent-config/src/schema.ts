@@ -138,9 +138,7 @@ function mcpServersValue(raw: unknown): McpServerConfigValue[] {
     };
   });
 }
-const booleanField = (key: string, flag: string, description: string, shortFlag?: string): ConfigField<boolean> => ({
-  key, flag, shortFlag, kind: "boolean", description, defaultValue: false, parse: (raw) => booleanValue(raw, key), hidden: true
-});
+const booleanField = (key: string, flag: string, description: string, shortFlag?: string): ConfigField<boolean> => ({ key, flag, shortFlag, kind: "boolean", description, defaultValue: false, parse: (raw) => booleanValue(raw, key), hidden: true });
 export const SIGMA_CONFIG_SCHEMA: readonly ConfigField[] = [
   { key: "configSchemaVersion", toml: "schema_version", description: "Configuration schema version", defaultValue: CONFIG_SCHEMA_VERSION, parse: (raw) => {
     const value = numberValue(raw, "configSchemaVersion");
@@ -151,6 +149,7 @@ export const SIGMA_CONFIG_SCHEMA: readonly ConfigField[] = [
   }, hidden: true },
   { key: "provider", flag: "provider", env: "SIGMA_PROVIDER", toml: "model.provider", description: "Model provider", defaultValue: "openai-codex", parse: (raw) => stringValue(raw, "provider") },
   { key: "model", flag: "model", env: "SIGMA_MODEL", toml: "model.name", description: "Model name (auto selects provider default)", defaultValue: "auto", parse: (raw) => stringValue(raw, "model") },
+  { key: "reasoningEffort", flag: "reasoning-effort", env: "SIGMA_REASONING_EFFORT", toml: "model.reasoning_effort", description: "Model reasoning effort (auto uses the provider/model default)", defaultValue: "auto", parse: (raw) => enumValue(raw, "reasoningEffort", ["auto", "none", "low", "medium", "high", "xhigh", "max"] as const) },
   {
     key: "modelSpecs", flag: "model-spec", kind: "repeatable", env: "SIGMA_MODEL_SPECS", toml: "model.specs",
     description: "Model catalog spec JSON (repeatable)", defaultValue: [], parse: modelSpecsValue, hidden: true
@@ -171,11 +170,11 @@ export const SIGMA_CONFIG_SCHEMA: readonly ConfigField[] = [
   { key: "webMode", flag: "web", env: "SIGMA_WEB_MODE", toml: "web.mode", description: "Read-only Web research mode", defaultValue: "auto", parse: (raw) => enumValue(raw, "webMode", ["auto", "disabled"] as const) },
   { key: "webSearchProvider", flag: "web-search-provider", env: "SIGMA_WEB_SEARCH_PROVIDER", toml: "web.search_provider", description: "Web search provider", defaultValue: "exa", parse: (raw) => enumValue(raw, "webSearchProvider", ["exa"] as const) },
   { key: "processHandoff", flag: "process-handoff", env: "SIGMA_PROCESS_HANDOFF", toml: "security.process_handoff", description: "Persistent process handoff policy", defaultValue: "allow", parse: (raw) => enumValue(raw, "processHandoff", ["allow", "deny"] as const) },
-  { key: "runDeadlineSec", flag: "run-deadline-sec", env: "SIGMA_RUN_DEADLINE_SEC", toml: "runtime.run_deadline_sec", description: "Whole-run hard deadline in seconds", defaultValue: 900, parse: (raw) => numberValue(raw, "runDeadlineSec", 1) },
+  { key: "runDeadlineSec", flag: "run-deadline-sec", env: "SIGMA_RUN_DEADLINE_SEC", toml: "runtime.run_deadline_sec", description: "Optional whole-run deadline in seconds (0 disables it)", defaultValue: 0, parse: (raw) => numberValue(raw, "runDeadlineSec", 0) },
   { key: "modelDeadlineSec", flag: "model-deadline-sec", env: "SIGMA_MODEL_DEADLINE_SEC", toml: "runtime.model_deadline_sec", description: "Model first-byte and non-stream request deadline in seconds", defaultValue: 120, parse: (raw) => numberValue(raw, "modelDeadlineSec", 1) },
   { key: "streamIdleSec", flag: "stream-idle-sec", env: "SIGMA_STREAM_IDLE_SEC", toml: "runtime.stream_idle_sec", description: "Model stream idle timeout in seconds", defaultValue: 45, parse: (raw) => numberValue(raw, "streamIdleSec", 1) },
-  { key: "streamActiveSec", flag: "stream-active-sec", env: "SIGMA_STREAM_ACTIVE_SEC", toml: "runtime.stream_active_sec", description: "Optional active model stream deadline in seconds (0 uses only the Agent/session deadline)", defaultValue: 0, parse: (raw) => numberValue(raw, "streamActiveSec", 0) },
-  { key: "maxModelRetries", flag: "max-model-retries", env: "SIGMA_MAX_MODEL_RETRIES", toml: "runtime.max_model_retries", description: "Maximum model request retries", defaultValue: 5, parse: (raw) => numberValue(raw, "maxModelRetries", 0, 10) },
+  { key: "streamActiveSec", flag: "stream-active-sec", env: "SIGMA_STREAM_ACTIVE_SEC", toml: "runtime.stream_active_sec", description: "Optional active model stream deadline in seconds (0 disables it)", defaultValue: 0, parse: (raw) => numberValue(raw, "streamActiveSec", 0) },
+  { key: "maxModelRetries", flag: "max-model-retries", env: "SIGMA_MAX_MODEL_RETRIES", toml: "runtime.max_model_retries", description: "Maximum model request retries", defaultValue: 10, parse: (raw) => numberValue(raw, "maxModelRetries", 0, 10) },
   { key: "maxParallelTools", flag: "max-parallel-tools", env: "SIGMA_MAX_PARALLEL_TOOLS", toml: "tools.max_parallel", description: "Maximum parallel tool calls", defaultValue: 4, parse: (raw) => numberValue(raw, "maxParallelTools", 1, 32) },
   { key: "commandTimeoutSec", flag: "command-timeout-sec", env: "SIGMA_COMMAND_TIMEOUT_SEC", toml: "tools.command_timeout_sec", description: "Default foreground command timeout in seconds", defaultValue: 600, parse: (raw) => numberValue(raw, "commandTimeoutSec", 1, 600) },
   { key: "maxParallelAgents", flag: "max-parallel-agents", env: "SIGMA_MAX_PARALLEL_AGENTS", toml: "agents.max_parallel", description: "Maximum parallel child agents", defaultValue: 4, parse: (raw) => numberValue(raw, "maxParallelAgents", 1, 32) },

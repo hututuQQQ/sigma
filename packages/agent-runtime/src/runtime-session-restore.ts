@@ -10,7 +10,7 @@ import { createRuntimeSessionAggregate } from "./runtime-session-state.js";
 export async function hydrateRuntimeSession(
   store: RunStore,
   sessionId: string,
-  runDeadlineMs: number,
+  runDeadlineMs: number | undefined,
   identity: {
     gateway: ModelGateway;
     profile?: FrozenAgentProfile;

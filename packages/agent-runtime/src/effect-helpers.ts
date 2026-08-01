@@ -41,6 +41,13 @@ export function modelTools(descriptors: readonly ToolDescriptor[]): ModelToolDef
     }));
 }
 
+const PROACTIVE_CONTEXT_WINDOW_PERCENT = 90;
+
+function contextOverflowError(error: unknown): boolean {
+  return Boolean(error && typeof error === "object"
+    && (error as { code?: unknown }).code === "context_overflow");
+}
+
 export async function providerSizedPlan(
   gateway: ModelGateway,
   input: Omit<PlanContextOptions, "contextWindowTokens" | "promptCache"> & { maxInputTokens?: number }
@@ -48,19 +55,44 @@ export async function providerSizedPlan(
   const providerLimit = gateway.capabilities.contextWindowTokens;
   const { maxInputTokens, ...contextInput } = input;
   const inputLimit = Math.min(providerLimit - input.outputReserveTokens, maxInputTokens ?? providerLimit);
-  // Begin with the provider window and use its tokenizer as the authority.
-  // Internal context estimates are intentionally conservative and must not
-  // reject a terminal turn that the provider tokenizer proves can fit.
-  let planningLimit = providerLimit;
+  // Keep replayable history below the provider's final context headroom so
+  // the existing archive path activates before a very large request reaches
+  // transport. Exact mandatory context still gets one full-window attempt.
+  const proactiveLimit = Math.floor(
+    providerLimit * PROACTIVE_CONTEXT_WINDOW_PERCENT / 100
+  );
+  let planningLimit = Math.min(
+    providerLimit,
+    Math.max(input.outputReserveTokens + 1, proactiveLimit)
+  );
+  let usedMandatoryFallback = planningLimit === providerLimit;
   while (planningLimit > input.outputReserveTokens) {
-    const plan = planContext({
-      ...contextInput,
-      contextWindowTokens: planningLimit,
-      promptCache: gateway.capabilities.promptCache
-    });
+    let plan: ContextPlan;
+    try {
+      plan = planContext({
+        ...contextInput,
+        contextWindowTokens: planningLimit,
+        promptCache: gateway.capabilities.promptCache
+      });
+    } catch (error) {
+      if (!usedMandatoryFallback && contextOverflowError(error)) {
+        planningLimit = providerLimit;
+        usedMandatoryFallback = true;
+        continue;
+      }
+      throw error;
+    }
     const tokens = await gateway.countTokens(plan.messages, input.tools);
-    if (tokens <= inputLimit && tokens + input.outputReserveTokens <= providerLimit) return plan;
-    const ratio = Math.min(inputLimit / Math.max(1, tokens), providerLimit / (tokens + input.outputReserveTokens));
+    const planningInputLimit = Math.min(
+      inputLimit,
+      planningLimit - input.outputReserveTokens
+    );
+    if (tokens <= planningInputLimit
+      && tokens + input.outputReserveTokens <= planningLimit) return plan;
+    const ratio = Math.min(
+      planningInputLimit / Math.max(1, tokens),
+      planningLimit / (tokens + input.outputReserveTokens)
+    );
     const next = Math.min(planningLimit - 1, Math.floor(planningLimit * ratio * 0.98));
     if (next <= input.outputReserveTokens) break;
     planningLimit = next;
