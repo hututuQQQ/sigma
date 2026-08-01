@@ -45,12 +45,27 @@ replace the unsigned assets of an existing immutable Release.
 2. Run `pnpm generate:manifest` and commit the generated facts.
 3. Run the normal product gates locally and review the exact staged diff.
 4. Merge through a pull request and require a green CI run on the release commit.
-5. In GitHub Actions, manually run **Release verification and publication** on `main`.
-   This is a dry run: it builds and verifies candidates but does not publish them.
+5. Update the four releasable package versions in `hututuQQQ/sigma-code` to the
+   same product SemVer, merge them through its green pull request, and keep both
+   repositories' `main` branches aligned.
+6. In GitHub Actions, manually run **Release verification and publication** on
+   Sigma `main`. This is a dry run: it verifies both Runtime archives and builds
+   the matching Sigma Code Windows installer from `sigma-code/main`, but does
+   not publish them.
 
 ## Publish
 
-Create and push an annotated tag only after the dry run succeeds:
+Create and push the matching annotated Sigma Code source tag only after the dry
+run succeeds. That repository tag is immutable build input and does not publish
+a separate Release:
+
+```powershell
+$Version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+git -C ..\sigma-code tag -a "v$Version" -m "Sigma Code UI v$Version"
+git -C ..\sigma-code push origin "v$Version"
+```
+
+Then create and push the Sigma product tag:
 
 ```powershell
 $Version = (Get-Content package.json -Raw | ConvertFrom-Json).version
@@ -59,11 +74,13 @@ git push origin "v$Version"
 ```
 
 The tag workflow verifies that the tag exactly equals the root package version.
-It then independently verifies the Linux x64 stable candidate and the Windows
-x64 unsigned preview. If both jobs pass, it creates one GitHub Release with
-both archives, checksums, SBOMs, signed provenance, and the public verification
-key. A version without a prerelease suffix is published as the latest formal
-release; a suffixed version is published as a prerelease.
+It independently verifies the Linux x64 stable candidate and Windows x64
+unsigned Runtime preview, checks out the exact same tag from `sigma-code`, and
+builds an unsigned Windows installer containing that verified Runtime. If every
+job passes, it creates one GitHub Release with the Runtime archives, checksums,
+SBOMs, signed provenance, public verification key, desktop installer, blockmap,
+and update manifest. A version without a prerelease suffix is published as the
+latest formal release; a suffixed version is published as a prerelease.
 
 Never replace assets on an existing release. If a published candidate is wrong,
 publish a new version so checksums and provenance remain immutable.
@@ -117,6 +134,9 @@ tag; a source-only GitHub prerelease remains the only fallback.
 - Confirm the Linux archive is labeled stable and passes
   `agent doctor` plus a packaged-product smoke run on a clean machine.
 - Confirm the Windows archive, package metadata, bundle README, and Release asset label all say unsigned preview, and confirm its executables have no Authenticode signer.
+- Install the published `Sigma-Code-<version>-x64.exe` on a clean Windows user,
+  confirm `resources/sigma-runtime` matches the release Runtime metadata, and
+  start one Sigma session without a separate Node.js or Agent CLI installation.
 - For an unsuffixed version, confirm the GitHub Release is not a prerelease and
   is marked latest. For a suffixed version, confirm the inverse.
 - Confirm both package metadata files report schema 1, the exact manifest

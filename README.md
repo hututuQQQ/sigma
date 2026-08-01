@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img alt="Status: 0.1.0 first stable release" src="https://img.shields.io/badge/status-0.1.0%20stable-2ea44f">
+  <img alt="Status: 0.1.4 stable release" src="https://img.shields.io/badge/status-0.1.4%20stable-2ea44f">
   <img alt="Release targets: Linux stable and Windows unsigned preview" src="https://img.shields.io/badge/release%20targets-Linux%20stable%20%2B%20Windows%20unsigned%20preview-0078d4">
   <img alt="Formal evaluation: preregistered" src="https://img.shields.io/badge/formal%20evaluation-preregistered-4cc9c0">
 </p>
@@ -25,7 +25,7 @@
 
 Sigma Code turns a coding task into a durable stream of typed decisions and evidence. It can explore a repository, make scoped changes, run sandboxed commands, validate the result, ask an independent reviewer, and recover the same session after interruption. The product uses one event-sourced kernel, one session format, and one terminal UI instead of separate execution paths that drift apart.
 
-`0.1.0` is the first formal release and the only supported product baseline.
+`0.1.4` is the current supported product baseline.
 Linux x64 is the stable release target. Windows x64 remains an explicitly
 unsigned preview until trusted Authenticode signing is available. See the [security
 policy](SECURITY.md) and [contribution guide](CONTRIBUTING.md) before reporting
@@ -34,7 +34,7 @@ or proposing changes.
 > [!IMPORTANT]
 > **Current product boundary**
 >
-> - **Sigma Code 0.1.0 is stable on Linux x64; Windows x64 is an unsigned preview.** Both candidates must pass native sandbox, packaged-product, checksum, SBOM, and signed-provenance gates. Windows executables do not yet have a trusted Authenticode signature and may trigger Windows security warnings.
+> - **Sigma Code 0.1.4 is stable on Linux x64; Windows x64 is an unsigned preview.** The Windows installer contains both the Sigma Code desktop UI and the verified Sigma Runtime, so users do not need a separate Node.js or agent CLI installation. Release candidates must pass native sandbox, packaged-product, checksum, SBOM, and signed-provenance gates. Windows executables do not yet have a trusted Authenticode signature and may trigger Windows security warnings.
 > - **Formal evaluation is preregistered, not provider-coded.** The SHA-bound run manifest freezes the provider, model, source, archive, task selection, network, timeouts, concurrency, attempts, and retries before execution.
 > - Provider comparisons are valid only when their SHA-bound run manifests freeze comparable controls; the harness does not infer comparability from a model name.
 
@@ -50,7 +50,7 @@ or proposing changes.
 
 ## Quick start on Linux
 
-Obtain the `0.1.0` Linux x64 stable archive from a verified project release or
+Obtain the `0.1.4` Linux x64 stable archive from a verified project release or
 build it from source, verify its SHA-256 sidecar and signed provenance, and
 extract it:
 
@@ -73,7 +73,15 @@ export DEEPSEEK_API_KEY="your-api-key"
 > Its executables do not have a trusted Authenticode signature, so Windows SmartScreen
 > or Smart App Control may warn or block execution.
 
-Download the Windows x64 preview archive from [GitHub Releases](https://github.com/hututuQQQ/sigma/releases) and extract it only if you accept the unsigned-preview risk. The bundle includes its pinned Node.js runtime, the native `sigma-exec` broker, the TUI runtime, TypeScript/Python language-server assets, and tokenizer data; a separate Node.js installation is not required.
+For the complete desktop product, download `Sigma-Code-0.1.4-x64.exe` from
+[GitHub Releases](https://github.com/hututuQQQ/sigma/releases), verify its
+SHA-256 sidecar, and run the installer. It installs the Sigma Code UI together
+with the verified Sigma Runtime; no separate Node.js or agent CLI installation
+is required.
+
+The `agent-cli-win32-x64.zip` asset remains available for terminal-only and
+portable use. It includes pinned Node.js, the native `sigma-exec` broker, the
+TUI runtime, TypeScript/Python language-server assets, and tokenizer data.
 
 ```powershell
 $Sigma = "C:\Tools\sigma-code"
@@ -94,7 +102,7 @@ The example sets the key only for the current PowerShell process. Keep secrets o
 
 Published archives include a SHA-256 checksum, CycloneDX SBOM, signed
 provenance, and the public provenance verification key. Linux x64 is stable at
-`0.1.0`; Windows x64 remains an unsigned preview. See
+`0.1.4`; Windows x64 remains an unsigned preview. See
 [SECURITY.md](SECURITY.md) for the trust boundary and
 [RELEASING.md](RELEASING.md) for the maintainer process.
 

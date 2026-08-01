@@ -3,6 +3,7 @@ import path from "node:path";
 import type { AgentEventEnvelope, RunStore, SessionOverview } from "agent-protocol";
 import { sessionDirectory } from "agent-store";
 import { storedSessionOverview } from "./session-overview.js";
+import { effectiveSessionEvents } from "./session-history.js";
 
 async function exists(target: string): Promise<boolean> {
   return await access(target).then(() => true, (error: unknown) => {
@@ -35,7 +36,7 @@ export async function* currentSessionEvents(
   afterSeq = 0
 ): AsyncIterable<AgentEventEnvelope> {
   await assertSessionStorageSupported(rootDir, sessionId);
-  for await (const event of store.events(sessionId, afterSeq)) yield event;
+  yield* effectiveSessionEvents(store.events(sessionId), afterSeq);
 }
 
 export async function listCurrentSessions(

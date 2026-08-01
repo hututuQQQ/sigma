@@ -39,6 +39,7 @@ export function mergeRequiredCapabilities(
   assignDefined(result, "reasoning", requiredBoolean(left.reasoning, right.reasoning));
   assignDefined(result, "structuredOutput", requiredBoolean(left.structuredOutput, right.structuredOutput));
   assignDefined(result, "promptCache", requiredBoolean(left.promptCache, right.promptCache));
+  assignDefined(result, "imageInput", requiredBoolean(left.imageInput, right.imageInput));
   assignDefined(result, "tokenizer", right.tokenizer ?? left.tokenizer);
   return result;
 }

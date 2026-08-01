@@ -1,6 +1,7 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import type * as acp from "@agentclientprotocol/sdk";
 import type { ModelReasoningEffort } from "agent-model";
 import type {
   PersistedAcpSession,
@@ -81,6 +82,7 @@ export class SigmaAcpSessionRegistry {
   private readonly sessionRoots = new Map<string, string>();
   private readonly attached = new Set<string>();
   private readonly attaching = new Map<string, Promise<void>>();
+  private readonly sessionMcpServers = new Map<string, readonly acp.McpServer[]>();
 
   constructor(private readonly options: SigmaAcpAgentOptions) {}
 
@@ -101,15 +103,31 @@ export class SigmaAcpSessionRegistry {
     this.attached.delete(this.attachmentKey(record));
   }
 
+  bindMcpServers(sessionId: string, servers: readonly acp.McpServer[]): void {
+    this.sessionMcpServers.set(sessionId, [...servers]);
+  }
+
+  forgetMcpServers(sessionId: string): void {
+    this.sessionMcpServers.delete(sessionId);
+  }
+
+  mcpServers(sessionId: string): readonly acp.McpServer[] {
+    return this.sessionMcpServers.get(sessionId) ?? [];
+  }
+
   handle(
     cwd: string,
     modelId: string,
-    reasoningEffort?: ModelReasoningEffort
+    reasoningEffort?: ModelReasoningEffort,
+    mcpServers: readonly acp.McpServer[] = []
   ): Promise<SigmaAcpRuntimeHandle> {
-    const key = `${path.resolve(cwd)}\0${modelId}\0${reasoningEffort ?? ""}`;
+    const mcpFingerprint = createHash("sha256")
+      .update(JSON.stringify(mcpServers))
+      .digest("hex");
+    const key = `${path.resolve(cwd)}\0${modelId}\0${reasoningEffort ?? ""}\0${mcpFingerprint}`;
     let handle = this.handles.get(key);
     if (!handle) {
-      handle = this.options.runtimeFactory(path.resolve(cwd), modelId, reasoningEffort);
+      handle = this.options.runtimeFactory(path.resolve(cwd), modelId, reasoningEffort, mcpServers);
       this.handles.set(key, handle);
       void handle.catch(() => this.handles.delete(key));
     }
@@ -171,28 +189,47 @@ export class SigmaAcpSessionRegistry {
     }
   }
 
-  async resolveSession(sessionId: string, cwdHint?: string): Promise<ResolvedSession> {
-    const knownRoot = cwdHint ? undefined : this.sessionRoots.get(sessionId);
-    if (knownRoot) {
-      const knownIndex = await this.index(knownRoot);
-      const knownRecord = knownIndex.sessions.find((candidate) => candidate.sessionId === sessionId);
-      if (knownRecord) {
-        const catalog = await this.options.modelCatalog(knownRecord.cwd);
-        const reasoningEffort = reasoningEffortForModel(
-          catalog,
-          knownRecord.modelId,
-          knownRecord.reasoningEffort
-        );
-        return {
-          record: knownRecord,
-          handle: await this.handle(knownRecord.cwd, knownRecord.modelId, reasoningEffort)
-        };
-      }
-    }
+  private async resolveKnownSession(
+    sessionId: string,
+    mcpServers: readonly acp.McpServer[]
+  ): Promise<ResolvedSession | undefined> {
+    const knownRoot = this.sessionRoots.get(sessionId);
+    if (!knownRoot) return undefined;
+    const knownIndex = await this.index(knownRoot);
+    const record = knownIndex.sessions.find((candidate) => candidate.sessionId === sessionId);
+    if (!record) return undefined;
+    const catalog = await this.options.modelCatalog(record.cwd);
+    const reasoningEffort = reasoningEffortForModel(
+      catalog,
+      record.modelId,
+      record.reasoningEffort
+    );
+    return {
+      record,
+      handle: await this.handle(record.cwd, record.modelId, reasoningEffort, mcpServers)
+    };
+  }
+
+  async resolveSession(
+    sessionId: string,
+    cwdHint?: string,
+    mcpServers?: readonly acp.McpServer[]
+  ): Promise<ResolvedSession> {
+    if (mcpServers) this.bindMcpServers(sessionId, mcpServers);
+    const effectiveMcpServers = mcpServers ?? this.sessionMcpServers.get(sessionId) ?? [];
+    const known = cwdHint
+      ? undefined
+      : await this.resolveKnownSession(sessionId, effectiveMcpServers);
+    if (known) return known;
     const cwd = path.resolve(cwdHint ?? process.cwd());
     const catalog = await this.options.modelCatalog(cwd);
     const defaultReasoningEffort = reasoningEffortForModel(catalog, catalog.currentModelId);
-    const defaultHandle = await this.handle(cwd, catalog.currentModelId, defaultReasoningEffort);
+    const defaultHandle = await this.handle(
+      cwd,
+      catalog.currentModelId,
+      defaultReasoningEffort,
+      effectiveMcpServers
+    );
     const index = await this.index(defaultHandle.storeRootDir);
     let record = index.sessions.find((candidate) => candidate.sessionId === sessionId);
     if (!record) {
@@ -226,7 +263,8 @@ export class SigmaAcpSessionRegistry {
         : await this.handle(
             record.cwd,
             record.modelId,
-            reasoningEffortForModel(catalog, record.modelId, record.reasoningEffort)
+            reasoningEffortForModel(catalog, record.modelId, record.reasoningEffort),
+            effectiveMcpServers
           )
     };
   }

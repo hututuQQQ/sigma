@@ -140,7 +140,15 @@ function inputRequestOutcome(
   args: Record<string, JsonValue>
 ): RunOutcome | null {
   if (!receipt.observedEffects.includes("outcome.request_input")) return null;
-  const message = typeof args.message === "string" ? args.message.trim() : "";
+  const firstQuestion = Array.isArray(args.questions)
+    && args.questions[0]
+    && typeof args.questions[0] === "object"
+    && !Array.isArray(args.questions[0])
+    ? args.questions[0] as Record<string, JsonValue>
+    : undefined;
+  const message = typeof args.message === "string"
+    ? args.message.trim()
+    : typeof firstQuestion?.question === "string" ? firstQuestion.question.trim() : "";
   return message
     ? { kind: "needs_input", requestId: pending.request.callId, message }
     : null;

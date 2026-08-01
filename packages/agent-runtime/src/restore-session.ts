@@ -8,6 +8,7 @@ import {
   type BudgetLimits,
   type ContextItem,
   type JsonValue,
+  type ModelImage,
   type ModelExecutionRole,
   type RunMode,
   type RunStore,
@@ -44,7 +45,7 @@ export interface RestoredSessionData {
   state: KernelState;
   modelTurn: number;
   lastSeq: number;
-  followUps: Array<{ id: string; text: string }>;
+  followUps: Array<{ id: string; text: string; images?: ModelImage[] }>;
   writeScope: string[];
   strictWriteScope: boolean;
   modelRole: ModelExecutionRole;
@@ -108,7 +109,7 @@ interface RestoreAccumulator {
   state: KernelState | undefined;
   modelTurn: number;
   lastSeq: number;
-  followUps: Map<string, string>;
+  followUps: Map<string, { text: string; images?: ModelImage[] }>;
   contextItems: Map<string, ContextItem>;
   pendingApprovals: Map<string, RecoveredApprovalMetadata>;
 }
@@ -193,7 +194,21 @@ function trackFollowUp(accumulator: RestoreAccumulator, event: AgentEventEnvelop
   if (event.type !== "user.follow_up" || !event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) return;
   const payload = event.payload as Record<string, JsonValue>;
   if (typeof payload.queueId !== "string" || typeof payload.text !== "string") return;
-  if (payload.status === "queued") accumulator.followUps.set(payload.queueId, payload.text);
+  const images = Array.isArray(payload.images)
+    ? payload.images.flatMap((raw): ModelImage[] => {
+        if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+        const image = raw as Record<string, JsonValue>;
+        return typeof image.data === "string" && typeof image.mimeType === "string"
+          ? [{ data: image.data, mimeType: image.mimeType }]
+          : [];
+      })
+    : [];
+  if (payload.status === "queued") {
+    accumulator.followUps.set(payload.queueId, {
+      text: payload.text,
+      ...(images.length > 0 ? { images } : {})
+    });
+  }
   if (payload.status === "delivered") accumulator.followUps.delete(payload.queueId);
 }
 
@@ -351,7 +366,7 @@ export async function restoreStoredSession(store: RunStore, sessionId: string, r
     state: accumulator.state,
     modelTurn: accumulator.modelTurn,
     lastSeq: accumulator.lastSeq,
-    followUps: [...accumulator.followUps].map(([id, text]) => ({ id, text })),
+    followUps: [...accumulator.followUps].map(([id, followUp]) => ({ id, ...followUp })),
     contextItems: [...accumulator.contextItems.values()],
     pendingApprovals
   };

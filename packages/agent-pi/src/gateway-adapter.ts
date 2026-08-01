@@ -3,6 +3,7 @@ import type {
   AssistantMessage,
   AssistantMessageEvent,
   Context,
+  ImageContent,
   Message,
   Model as PiModel,
   TextContent,
@@ -118,6 +119,36 @@ function reminderContent(message: ModelMessage): string {
   return `<latest_reminder>\n[authority: ${message.role}]\n${message.content}\n</latest_reminder>`;
 }
 
+function lateInstructionMessage(
+  role: "system" | "developer",
+  content: string,
+  model: PiModel<Api>,
+  codexInstructionNonce?: string
+): Message {
+  const mappedContent = model.provider === "openai-codex" && codexInstructionNonce
+    ? codexInstructionSentinel(role, codexInstructionNonce, content)
+    : reminderContent({ role, content });
+  return { role: "user", content: mappedContent, timestamp: Date.now() };
+}
+
+function piUserMessage(message: ModelMessage): Message {
+  const images: ImageContent[] = (message.images ?? []).map((image) => ({
+    type: "image",
+    data: image.data,
+    mimeType: image.mimeType
+  }));
+  return {
+    role: "user",
+    content: images.length === 0
+      ? message.content
+      : [
+          ...(message.content ? [{ type: "text" as const, text: message.content }] : []),
+          ...images
+        ],
+    timestamp: Date.now()
+  };
+}
+
 function contextParts(
   messages: readonly ModelMessage[],
   model: PiModel<Api>,
@@ -129,31 +160,19 @@ function contextParts(
   let conversationStarted = false;
   for (const message of messages) {
     if (message.role === "system" || message.role === "developer") {
-      if (conversationStarted && model.provider === "openai-codex"
-        && codexInstructionNonce) {
-        result.push({
-          role: "user",
-          content: codexInstructionSentinel(
-            message.role,
-            codexInstructionNonce,
-            message.content
-          ),
-          timestamp: Date.now()
-        });
-      } else if (conversationStarted) {
-        result.push({
-          role: "user",
-          content: reminderContent(message),
-          timestamp: Date.now()
-        });
-      } else {
-        instructions.push(instructionBlock(message));
-      }
+      if (conversationStarted) {
+        result.push(lateInstructionMessage(
+          message.role,
+          message.content,
+          model,
+          codexInstructionNonce
+        ));
+      } else instructions.push(instructionBlock(message));
       continue;
     }
     conversationStarted = true;
     if (message.role === "user") {
-      result.push({ role: "user", content: message.content, timestamp: Date.now() });
+      result.push(piUserMessage(message));
       continue;
     }
     if (message.role === "assistant") {

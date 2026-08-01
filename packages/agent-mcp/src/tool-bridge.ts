@@ -8,8 +8,14 @@ import type {
 } from "agent-protocol";
 import { assertMcpPersistentEffectsAllowed } from "agent-protocol";
 import { McpProtocolError } from "./errors.js";
-import { McpStdioClient } from "./stdio-client.js";
-import type { McpContentBlock, McpRequestOptions, McpToolBridgeOptions, McpToolDefinition, McpToolPolicy } from "./types.js";
+import type {
+  McpContentBlock,
+  McpRequestOptions,
+  McpToolBridgeOptions,
+  McpToolClient,
+  McpToolDefinition,
+  McpToolPolicy
+} from "./types.js";
 
 const DEFAULT_POLICY: McpToolPolicy = {
   possibleEffects: [],
@@ -71,7 +77,7 @@ export class McpToolBridge implements ToolExecutor {
   private readonly descriptorByName = new Map<string, ToolDescriptor>();
 
   private constructor(
-    private readonly client: McpStdioClient,
+    private readonly client: McpToolClient,
     tools: McpToolDefinition[],
     options: McpToolBridgeOptions
   ) {
@@ -104,7 +110,7 @@ export class McpToolBridge implements ToolExecutor {
   }
 
   static async create(
-    client: McpStdioClient,
+    client: McpToolClient,
     options: McpToolBridgeOptions,
     requestOptions: McpRequestOptions = {}
   ): Promise<McpToolBridge> {

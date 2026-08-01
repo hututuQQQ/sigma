@@ -22,7 +22,7 @@ export class McpTimeoutError extends Error {
   override name = "TimeoutError";
 
   constructor(
-    public readonly timeoutKind: "idle" | "deadline",
+    public readonly timeoutKind: "idle" | "deadline" | "shutdown",
     message: string
   ) {
     super(message);

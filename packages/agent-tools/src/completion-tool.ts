@@ -12,6 +12,19 @@ export interface BlockedReport {
   recoveryAttempted?: string;
 }
 
+export interface UserInputQuestionRequest {
+  id: string;
+  header: string;
+  question: string;
+  options: Array<{ label: string; description: string }>;
+  multiSelect: boolean;
+}
+
+export interface UserInputRequest {
+  message: string;
+  questions: UserInputQuestionRequest[];
+}
+
 export type TerminalProtocolAction = "report_blocked" | "request_input";
 
 /** Classify only explicit, pure terminal descriptors. Natural stop completes. */
@@ -27,6 +40,61 @@ export function terminalProtocolAction(
 
 function record(value: JsonValue): Record<string, JsonValue> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
+
+function nonempty(value: JsonValue | undefined): string | undefined {
+  const text = typeof value === "string" ? value.trim() : "";
+  return text || undefined;
+}
+
+function parseUserInputQuestion(
+  value: JsonValue,
+  index: number
+): UserInputQuestionRequest | null {
+  const input = record(value);
+  if (!input || Object.keys(input).some((key) =>
+    !["id", "header", "question", "options", "multiSelect"].includes(key))) return null;
+  const question = nonempty(input.question);
+  if (!question) return null;
+  const id = nonempty(input.id) ?? `question_${index + 1}`;
+  const header = nonempty(input.header) ?? "Question";
+  if (header.length > 12 || id.length > 128) return null;
+  if (input.multiSelect !== undefined && typeof input.multiSelect !== "boolean") return null;
+  if (input.options !== undefined && !Array.isArray(input.options)) return null;
+  const options = (input.options ?? []).map((value) => {
+    const option = record(value);
+    if (!option || Object.keys(option).some((key) => !["label", "description"].includes(key))) {
+      return null;
+    }
+    const label = nonempty(option.label);
+    const description = nonempty(option.description);
+    return label && description ? { label, description } : null;
+  });
+  if (options.some((option) => option === null) || options.length > 3) return null;
+  return {
+    id,
+    header,
+    question,
+    options: options as Array<{ label: string; description: string }>,
+    multiSelect: input.multiSelect === true
+  };
+}
+
+export function parseUserInputRequest(value: JsonValue): UserInputRequest | null {
+  const input = record(value);
+  if (!input || Object.keys(input).some((key) => key !== "message" && key !== "questions")) {
+    return null;
+  }
+  if (input.message !== undefined && typeof input.message !== "string") return null;
+  if (input.questions !== undefined && !Array.isArray(input.questions)) return null;
+  const parsedQuestions = (input.questions ?? []).map(parseUserInputQuestion);
+  if (
+    parsedQuestions.some((question) => question === null)
+    || parsedQuestions.length > 3
+  ) return null;
+  const questions = parsedQuestions as UserInputQuestionRequest[];
+  const message = nonempty(input.message) ?? questions[0]?.question;
+  return message ? { message, questions } : null;
 }
 
 export function parseBlockedReport(value: JsonValue): BlockedReport | null {
@@ -103,9 +171,42 @@ function requestUserInputTool(): RegisteredEffectTool {
     inputSchema: {
       type: "object",
       properties: {
-        message: { type: "string", description: "The concise question or information needed." }
+        message: {
+          type: "string",
+          description: "A concise fallback question for clients without structured input UI."
+        },
+        questions: {
+          type: "array",
+          minItems: 1,
+          maxItems: 3,
+          description: "One to three structured questions, following the Codex request_user_input shape.",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string", description: "Stable answer key." },
+              header: { type: "string", maxLength: 12, description: "Short UI label." },
+              question: { type: "string", description: "The question shown to the user." },
+              options: {
+                type: "array",
+                maxItems: 3,
+                items: {
+                  type: "object",
+                  properties: {
+                    label: { type: "string" },
+                    description: { type: "string" }
+                  },
+                  required: ["label", "description"],
+                  additionalProperties: false
+                }
+              },
+              multiSelect: { type: "boolean" }
+            },
+            required: ["id", "header", "question", "options"],
+            additionalProperties: false
+          }
+        }
       },
-      required: ["message"],
+      anyOf: [{ required: ["message"] }, { required: ["questions"] }],
       additionalProperties: false
     },
     possibleEffects: ["outcome.request_input"],
@@ -119,14 +220,13 @@ function requestUserInputTool(): RegisteredEffectTool {
     descriptor,
     async execute(request): Promise<ToolReceipt> {
       const startedAt = new Date().toISOString();
-      const input = record(request.arguments);
-      const message = typeof input?.message === "string" ? input.message.trim() : "";
-      const ok = message.length > 0;
-      const output = message
-        ? JSON.stringify({ message })
-        : "User-input request requires a non-empty message.";
-      const effects: ToolReceipt["observedEffects"] = message ? ["outcome.request_input"] : [];
-      const diagnostics = message ? [] : ["invalid_user_input_request"];
+      const input = parseUserInputRequest(request.arguments);
+      const ok = input !== null;
+      const output = input
+        ? JSON.stringify(input)
+        : "User-input request requires a non-empty message or one to three valid questions.";
+      const effects: ToolReceipt["observedEffects"] = input ? ["outcome.request_input"] : [];
+      const diagnostics = input ? [] : ["invalid_user_input_request"];
       return {
         callId: request.callId,
         ok,

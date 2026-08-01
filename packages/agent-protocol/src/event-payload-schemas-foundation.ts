@@ -30,9 +30,15 @@ export const modelToolCallSchema = z.object({
   arguments: jsonValueSchema
 }).strict();
 
+export const modelImageSchema = z.object({
+  data: nonEmptyStringSchema,
+  mimeType: nonEmptyStringSchema
+}).strict();
+
 export const modelMessageSchema = z.object({
   role: z.enum(["system", "developer", "user", "assistant", "tool"]),
   content: z.string(),
+  images: z.array(modelImageSchema).optional(),
   reasoningContent: z.string().optional(),
   toolCallId: z.string().optional(),
   toolCalls: z.array(modelToolCallSchema).optional(),

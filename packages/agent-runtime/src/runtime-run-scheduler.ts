@@ -43,7 +43,10 @@ export class RuntimeRunScheduler {
             : {})
         });
         await this.options.emit(session, "user.follow_up", "user", {
-          text: next.text, queueId: next.id, status: "delivered"
+          text: next.text,
+          ...(next.images?.length ? { images: next.images } : {}),
+          queueId: next.id,
+          status: "delivered"
         });
       } catch (error) {
         if (session.durable.state.phase === "terminal") {

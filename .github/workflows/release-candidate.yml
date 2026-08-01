@@ -267,10 +267,109 @@ jobs:
           include-hidden-files: true
           path: .artifacts/**
 
+  desktop:
+    name: Build Sigma Code Windows x64 installer
+    needs: [metadata, verify]
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - name: Checkout matching Sigma Code source
+        uses: actions/checkout@v4
+        with:
+          repository: hututuQQQ/sigma-code
+          ref: ${{ github.event_name == 'push' && github.ref_name || 'main' }}
+          path: sigma-code
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.10.0
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.13.1
+          cache: pnpm
+          cache-dependency-path: sigma-code/pnpm-lock.yaml
+      - name: Download verified Windows Runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: release-win32-x64-${{ github.run_id }}
+          path: runtime-assets
+      - name: Verify and extract matching Runtime
+        env:
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          $archive = Join-Path $env:GITHUB_WORKSPACE "runtime-assets/agent-cli-win32-x64.zip"
+          $sidecar = "$archive.sha256"
+          $expectedHash = ((Get-Content -LiteralPath $sidecar -Raw).Trim() -split '\s+')[0].ToLowerInvariant()
+          $actualHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) { throw "Sigma Runtime checksum mismatch." }
+          Expand-Archive -LiteralPath $archive -DestinationPath (Join-Path $env:GITHUB_WORKSPACE "runtime-assets")
+          $metadataPath = Join-Path $env:GITHUB_WORKSPACE "runtime-assets/agent-cli-win32-x64/package-metadata.json"
+          $metadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
+          if ($metadata.productVersion -ne $env:RELEASE_VERSION) {
+            throw "Runtime version $($metadata.productVersion) does not match $env:RELEASE_VERSION."
+          }
+      - name: Require matching Sigma Code version
+        working-directory: sigma-code
+        env:
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          foreach ($manifest in @(
+            "apps/server/package.json",
+            "apps/desktop/package.json",
+            "apps/web/package.json",
+            "packages/contracts/package.json"
+          )) {
+            $version = (Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json).version
+            if ($version -ne $env:RELEASE_VERSION) {
+              throw "$manifest version $version does not match $env:RELEASE_VERSION."
+            }
+          }
+      - name: Install Sigma Code workspace
+        working-directory: sigma-code
+        run: pnpm install --frozen-lockfile
+      - name: Build unsigned installer with bundled Runtime
+        working-directory: sigma-code
+        env:
+          SIGMACODE_DESKTOP_SIGMA_RUNTIME: ${{ github.workspace }}\runtime-assets\agent-cli-win32-x64
+          SIGMACODE_DESKTOP_OUTPUT_DIR: ${{ github.workspace }}\desktop-assets
+          SIGMACODE_DESKTOP_VERSION: ${{ needs.metadata.outputs.version }}
+          SIGMACODE_DESKTOP_UPDATE_REPOSITORY: hututuQQQ/sigma
+        run: pnpm run dist:desktop:win:x64
+      - name: Verify installer asset set
+        env:
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          $assetRoot = Join-Path $env:GITHUB_WORKSPACE "desktop-assets"
+          $installer = Join-Path $assetRoot "Sigma-Code-$env:RELEASE_VERSION-x64.exe"
+          $blockmap = "$installer.blockmap"
+          $updateManifest = Join-Path $assetRoot "latest.yml"
+          foreach ($asset in @($installer, $blockmap, $updateManifest)) {
+            if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) {
+              throw "Missing Sigma Code release asset: $asset"
+            }
+          }
+          $signature = Get-AuthenticodeSignature -LiteralPath $installer
+          if ($signature.Status -ne "NotSigned") {
+            throw "Expected an unsigned preview installer, got Authenticode status $($signature.Status)."
+          }
+          $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          $line = "$hash  $([IO.Path]::GetFileName($installer))`n"
+          [IO.File]::WriteAllText("$installer.sha256", $line, [Text.UTF8Encoding]::new($false))
+      - name: Upload verified desktop assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-desktop-win32-x64-${{ github.run_id }}
+          if-no-files-found: error
+          path: |
+            desktop-assets/Sigma-Code-${{ needs.metadata.outputs.version }}-x64.exe
+            desktop-assets/Sigma-Code-${{ needs.metadata.outputs.version }}-x64.exe.sha256
+            desktop-assets/Sigma-Code-${{ needs.metadata.outputs.version }}-x64.exe.blockmap
+            desktop-assets/latest.yml
+
   publish:
     name: Publish GitHub Release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    needs: [metadata, verify]
+    needs: [metadata, verify, desktop]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -285,6 +384,7 @@ jobs:
         shell: bash
         env:
           RELEASE_LIVE_EVAL_OVERRIDE: ${{ needs.metadata.outputs.live_eval_override }}
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           node --input-type=module <<'NODE'
           import { readdirSync } from "node:fs";
@@ -298,7 +398,11 @@ jobs:
             "agent-cli-win32-x64.zip.sha256",
             "agent-cli-win32-x64.sbom.cdx.json",
             "agent-cli-win32-x64.provenance.json",
-            "release-provenance-public.pem"
+            "release-provenance-public.pem",
+            `Sigma-Code-${process.env.RELEASE_VERSION}-x64.exe`,
+            `Sigma-Code-${process.env.RELEASE_VERSION}-x64.exe.sha256`,
+            `Sigma-Code-${process.env.RELEASE_VERSION}-x64.exe.blockmap`,
+            "latest.yml"
           ];
           if (process.env.RELEASE_LIVE_EVAL_OVERRIDE === "true") {
             expected.push("release-live-evaluation-override.json");
@@ -327,8 +431,9 @@ jobs:
 
           - **Linux x64:** stable release. The archive passed the complete release-readiness gate.
           - **Windows x64:** **unsigned preview**. The archive passed package, sandbox, live-product, checksum, SBOM, and signed-provenance verification, but its executables do not have a trusted Authenticode signature. Windows SmartScreen or Smart App Control may warn or block execution.
+          - **Sigma Code Windows x64 installer:** **unsigned preview** containing both the desktop UI and the verified Sigma Runtime from this release. Install it to use Sigma Code without separately installing Node.js or the agent CLI. The matching blockmap and update manifest enable Sigma-owned desktop updates.
 
-          Verify the matching SHA-256 sidecar and signed provenance before extracting either archive. The Windows preview is not an official trusted Windows binary release.
+          Verify the matching SHA-256 sidecar before running the installer. Verify the archive sidecars and signed provenance before extracting either Runtime archive. Windows assets are not trusted signed Windows binaries.
           EOF
           )"
           if [[ "${RELEASE_LIVE_EVAL_OVERRIDE}" == "true" ]]; then
@@ -345,11 +450,15 @@ jobs:
             "release-assets/agent-cli-linux-x64.tgz.sha256"
             "release-assets/agent-cli-linux-x64.sbom.cdx.json"
             "release-assets/agent-cli-linux-x64.provenance.json"
-            "release-assets/agent-cli-win32-x64.zip#Windows x64 — UNSIGNED PREVIEW"
+            "release-assets/agent-cli-win32-x64.zip#Windows x64 Runtime — UNSIGNED PREVIEW"
             "release-assets/agent-cli-win32-x64.zip.sha256"
             "release-assets/agent-cli-win32-x64.sbom.cdx.json"
             "release-assets/agent-cli-win32-x64.provenance.json"
             "release-assets/release-provenance-public.pem"
+            "release-assets/Sigma-Code-${RELEASE_VERSION}-x64.exe#Sigma Code Windows x64 installer — UI + Runtime (UNSIGNED PREVIEW)"
+            "release-assets/Sigma-Code-${RELEASE_VERSION}-x64.exe.sha256"
+            "release-assets/Sigma-Code-${RELEASE_VERSION}-x64.exe.blockmap"
+            "release-assets/latest.yml"
           )
           if [[ "${RELEASE_LIVE_EVAL_OVERRIDE}" == "true" ]]; then
             assets+=("release-assets/release-live-evaluation-override.json")

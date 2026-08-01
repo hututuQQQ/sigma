@@ -5,7 +5,7 @@ import { EffectRunner } from "./effect-runner.js";
 import { newRuntimeSession } from "./new-runtime-session.js";
 import { recoverInterruptedSession } from "./session-recovery.js";
 import { SessionCommandBus } from "./session-command-bus.js";
-import { assertSessionStorageSupported, currentSessionEvents, listCurrentSessions } from "./session-catalog.js";
+import { currentSessionEvents, listCurrentSessions } from "./session-catalog.js";
 import { streamSessionEvents } from "./runtime-stream.js";
 import { waitForSessionIdleOutcome, waitForSessionOutcome } from "./runtime-waiters.js";
 import type { RuntimeOptions, RuntimeSession } from "./types.js";
@@ -37,6 +37,8 @@ import { createRuntimeControlService } from "./create-runtime-control.js";
 import { releaseRepositoryRunBaselines } from "./runtime-restoration-control.js";
 import { runtimeReviewerFactory } from "./runtime-reviewer-factory.js";
 import { ModelReviewer } from "./reviewer.js";
+import { rollbackRuntimeTurns } from "./runtime-conversation-rollback.js";
+import { handleRuntimeResume } from "./runtime-resume-handler.js";
 
 export class InProcessRuntimeClient implements RuntimeClient {
   private readonly sessions = new Map<string, RuntimeSession>();
@@ -237,30 +239,17 @@ export class InProcessRuntimeClient implements RuntimeClient {
     if (command.type === "cancel") return await this.commands.cancel(session, command);
     if (command.type === "approve") return await this.commands.approval(session, command);
     if (command.type === "steer") return await this.commands.steer(session, command.text);
-    if (command.type === "follow_up") return await this.commands.followUp(session, command.text);
+    if (command.type === "follow_up") return await this.commands.followUp(session, command);
     await this.commands.submit(session, command);
   }
   private async handleResume(command: Extract<RunCommand, { type: "resume" }>): Promise<void> {
-    await assertSessionStorageSupported(this.options.storeRootDir, command.sessionId);
-    const existing = this.sessions.get(command.sessionId);
-    if (existing) {
-      // A checkpoint decision is intentionally two-phase. The runtime that
-      // owns the hydrated session may resume it after the durable decision
-      // without trying to reacquire its own command-bus lease.
-      if (existing.recovery.openCheckpointRecovery || existing.execution.running) return;
-      await this.recoverSession(existing);
-      return;
-    }
-    await this.commandBus.claim(command.sessionId);
-    try {
-      await this.resume(command.sessionId);
-      if (this.sessions.get(command.sessionId)?.durable.state.phase === "terminal") await this.commandBus.release(command.sessionId);
-    } catch (error) {
-      this.sessions.delete(command.sessionId);
-      await this.managedSessions.release(command.sessionId);
-      await this.commandBus.release(command.sessionId);
-      throw error;
-    }
+    await handleRuntimeResume(this.options.storeRootDir, command.sessionId, {
+      sessions: this.sessions,
+      commandBus: this.commandBus,
+      managedSessions: this.managedSessions,
+      recoverExisting: async (session) => await this.recoverSession(session),
+      resume: async (sessionId) => await this.resume(sessionId)
+    });
   }
   subscribe(sessionId: string, signal?: AbortSignal): AsyncIterable<AgentEventEnvelope> {
     return streamSessionEvents(this.options.store, this.sessions.get(sessionId), sessionId, signal);
@@ -276,18 +265,29 @@ export class InProcessRuntimeClient implements RuntimeClient {
       signal
     );
   }
-  async pendingCheckpointRecovery(
-    sessionId: string
-  ): Promise<import("agent-protocol").PendingCheckpointRecovery | undefined> {
-    const recovery = this.required(sessionId).recovery.openCheckpointRecovery;
-    return recovery ? { checkpointId: recovery.checkpointId } : undefined;
-  }
+  async pendingCheckpointRecovery(sessionId: string): Promise<import("agent-protocol").PendingCheckpointRecovery | undefined> { const recovery = this.required(sessionId).recovery.openCheckpointRecovery; return recovery ? { checkpointId: recovery.checkpointId } : undefined; }
   async waitForQuiescence(sessionId: string, signal?: AbortSignal): Promise<void> { this.required(sessionId); await this.effects.waitForQuiescence(sessionId, signal); }
   async listSessions(limit = 20): Promise<SessionOverview[]> {
     return await listCurrentSessions(this.options.store, this.options.storeRootDir, limit);
   }
   sessionEvents(sessionId: string, afterSeq = 0): AsyncIterable<AgentEventEnvelope> {
     return currentSessionEvents(this.options.store, this.options.storeRootDir, sessionId, afterSeq);
+  }
+  async rollbackTurns(
+    sessionId: string,
+    numTurns: number
+  ): Promise<import("agent-protocol").ThreadRollbackResult> {
+    const session = this.required(sessionId);
+    return await rollbackRuntimeTurns(session, numTurns, {
+      waitForQuiescence: async (signal) => await this.effects.waitForQuiescence(sessionId, signal),
+      emit: async (removedTurns) => await this.emit(
+        session,
+        "session.history_rolled_back",
+        "user",
+        { numTurns: removedTurns }
+      ),
+      writeSnapshot: async () => await this.events.writeSnapshot(session)
+    });
   }
   async releaseSession(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId);
@@ -301,12 +301,8 @@ export class InProcessRuntimeClient implements RuntimeClient {
     this.sessions.delete(sessionId);
     this.events.forget(sessionId);
   }
-  sessionBudget(sessionId: string): BudgetLedgerState {
-    return structuredClone(this.required(sessionId).durable.state.budget);
-  }
-  async undoLatestCheckpoint(sessionId: string): Promise<import("agent-protocol").CheckpointRef> {
-    return await this.checkpoints.undoLatest(this.required(sessionId));
-  }
+  sessionBudget(sessionId: string): BudgetLedgerState { return structuredClone(this.required(sessionId).durable.state.budget); }
+  async undoLatestCheckpoint(sessionId: string): Promise<import("agent-protocol").CheckpointRef> { return await this.checkpoints.undoLatest(this.required(sessionId)); }
   async recordChildEvent(
     parentSessionId: string,
     type: "child.spawned" | "child.message" | "child.completed",
@@ -327,12 +323,7 @@ export class InProcessRuntimeClient implements RuntimeClient {
         await this.emit(session, type, authority, value)
     );
   }
-  private async run(session: RuntimeSession): Promise<void> {
-    await runRuntimeSession({
-      hooks: this.hooks, effects: this.effects,
-      finish: async (target, outcome) => await this.finish(target, outcome)
-    }, session);
-  }
+  private async run(session: RuntimeSession): Promise<void> { await runRuntimeSession({ hooks: this.hooks, effects: this.effects, finish: async (target, outcome) => await this.finish(target, outcome) }, session); }
   private async finish(
     session: RuntimeSession,
     outcome: RunOutcome,
@@ -396,12 +387,6 @@ export class InProcessRuntimeClient implements RuntimeClient {
       start: () => this.startRun(session)
     });
   }
-  private required(sessionId: string): RuntimeSession {
-    const session = this.sessions.get(sessionId);
-    if (!session) throw new Error(`Unknown session '${sessionId}'.`);
-    return session;
-  }
-  private startRun(session: RuntimeSession): void {
-    this.runs.start(session);
-  }
+  private required(sessionId: string): RuntimeSession { const session = this.sessions.get(sessionId); if (!session) throw new Error(`Unknown session '${sessionId}'.`); return session; }
+  private startRun(session: RuntimeSession): void { this.runs.start(session); }
 }

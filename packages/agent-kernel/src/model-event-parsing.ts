@@ -1,5 +1,6 @@
 import type {
   JsonValue,
+  ModelImage,
   ModelMessage,
   ModelProviderState,
   ModelToolCall
@@ -32,6 +33,18 @@ function modelProviderState(value: JsonValue | undefined): ModelProviderState | 
     : undefined;
 }
 
+export function modelImages(value: JsonValue | undefined): ModelImage[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((raw): ModelImage[] => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+    const image = raw as Record<string, JsonValue>;
+    return typeof image.data === "string" && image.data.length > 0
+      && typeof image.mimeType === "string" && image.mimeType.length > 0
+      ? [{ data: image.data, mimeType: image.mimeType }]
+      : [];
+  });
+}
+
 export function modelMessage(value: JsonValue | undefined): ModelMessage | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const item = value as Record<string, JsonValue>;
@@ -39,9 +52,11 @@ export function modelMessage(value: JsonValue | undefined): ModelMessage | null 
   if (role !== "system" && role !== "developer" && role !== "user" && role !== "assistant" && role !== "tool") return null;
   const toolCalls = modelToolCalls(item.toolCalls);
   const providerState = modelProviderState(item.providerState);
+  const images = modelImages(item.images);
   return {
     role,
     content: text(item.content),
+    ...(images.length > 0 ? { images } : {}),
     ...(typeof item.reasoningContent === "string" ? { reasoningContent: item.reasoningContent } : {}),
     ...(typeof item.toolCallId === "string" ? { toolCallId: item.toolCallId } : {}),
     ...(toolCalls.length > 0 ? { toolCalls } : {}),

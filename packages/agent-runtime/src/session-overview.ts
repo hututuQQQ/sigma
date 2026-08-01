@@ -1,4 +1,5 @@
 import type { JsonValue, RunStore, SessionOverview } from "agent-protocol";
+import { effectiveSessionEvents } from "./session-history.js";
 
 export async function storedSessionOverview(
   store: RunStore,
@@ -8,7 +9,7 @@ export async function storedSessionOverview(
   let mode: SessionOverview["mode"] = "change";
   let status: SessionOverview["status"] = "idle";
   let lastMessage: string | undefined;
-  for await (const event of store.events(item.sessionId)) {
+  for await (const event of effectiveSessionEvents(store.events(item.sessionId))) {
     const data = event.payload && typeof event.payload === "object" && !Array.isArray(event.payload)
       ? event.payload as Record<string, JsonValue> : {};
     if (event.type === "session.created") {

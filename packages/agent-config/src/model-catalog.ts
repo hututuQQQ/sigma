@@ -38,7 +38,7 @@ const SPEC_KEYS = new Set([
 ]);
 const CAPABILITY_KEYS = new Set([
   "context_window_tokens", "max_output_tokens", "tools", "parallel_tools", "reasoning",
-  "structured_output", "prompt_cache", "tokenizer"
+  "structured_output", "prompt_cache", "image_input", "tokenizer"
 ]);
 const TOKENIZER_KEYS = new Set(["id", "accuracy", "asset_digest"]);
 const PRICING_KEYS = new Set([
@@ -109,7 +109,10 @@ function capabilitiesValue(value: Record<string, unknown>, label: string): Model
     reasoning: bool(value.reasoning, `${label}.reasoning`),
     structuredOutput: bool(value.structured_output, `${label}.structured_output`),
     promptCache: bool(value.prompt_cache, `${label}.prompt_cache`),
-    tokenizer: choice(value.tokenizer, ["provider", "approximate"], `${label}.tokenizer`)
+    tokenizer: choice(value.tokenizer, ["provider", "approximate"], `${label}.tokenizer`),
+    ...(value.image_input === undefined
+      ? {}
+      : { imageInput: bool(value.image_input, `${label}.image_input`) })
   };
 }
 
@@ -119,7 +122,8 @@ function partialCapabilities(value: Record<string, unknown>, label: string): Par
     ["context_window_tokens", "contextWindowTokens", "integer"], ["max_output_tokens", "maxOutputTokens", "integer"],
     ["tools", "tools", "boolean"], ["parallel_tools", "parallelTools", "boolean"],
     ["reasoning", "reasoning", "boolean"], ["structured_output", "structuredOutput", "boolean"],
-    ["prompt_cache", "promptCache", "boolean"], ["tokenizer", "tokenizer", "tokenizer"]
+    ["prompt_cache", "promptCache", "boolean"], ["image_input", "imageInput", "boolean"],
+    ["tokenizer", "tokenizer", "tokenizer"]
   ];
   for (const [source, target, kind] of entries) {
     if (value[source] === undefined) continue;

@@ -109,6 +109,7 @@ export interface CallApprovalGrant extends ToolCallApproval, ApprovalBinding {
 export interface QueuedFollowUp {
   id: string;
   text: string;
+  images?: import("agent-protocol").ModelImage[];
 }
 
 export interface OutcomeWaiter {

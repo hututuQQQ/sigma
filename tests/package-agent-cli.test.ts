@@ -25,7 +25,7 @@ async function writeBuiltPackage(
   rootDir: string,
   packageName: string,
   dependencies: Record<string, string> = {},
-  version = "0.1.0"
+  version = "0.1.4"
 ) {
   const packageDir = path.join(rootDir, "packages", packageName);
   await mkdir(path.join(packageDir, "dist"), { recursive: true });
@@ -101,7 +101,7 @@ async function writeFakeNodeRuntimeTarball(tmpDir: string, arch = "x64") {
   const nodePath = path.join(runtimeDir, "bin", "node");
   await writeFile(nodePath, `#!/usr/bin/env sh
 if [ "$1" = "--version" ]; then echo "${pinnedNodeVersion}"; exit 0; fi
-if [ "$2" = "version" ]; then echo '{"product":"Sigma Code","package":{"name":"agent-cli","version":"0.1.0"},"runtime":{"node":"${pinnedNodeVersion}"}}'; exit 0; fi
+if [ "$2" = "version" ]; then echo '{"product":"Sigma Code","package":{"name":"agent-cli","version":"0.1.4"},"runtime":{"node":"${pinnedNodeVersion}"}}'; exit 0; fi
 exec "${process.execPath}" "$@"
 `, "utf8");
   await chmod(nodePath, 0o755);
@@ -183,7 +183,7 @@ async function writePackageFixture() {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), "sigma-package-agent-cli-"));
   await writeFile(
     path.join(rootDir, "package.json"),
-    `${JSON.stringify({ name: "sigma", version: "0.1.0", private: true, license: "MIT" })}\n`,
+    `${JSON.stringify({ name: "sigma", version: "0.1.4", private: true, license: "MIT" })}\n`,
     "utf8"
   );
   await writeFile(path.join(rootDir, "LICENSE"), "MIT License\n", "utf8");
@@ -270,7 +270,7 @@ async function writePackagingWorkspace(
   brokerArch: "x64" | "arm64" = "x64"
 ) {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), "sigma-package-agent-cli-"));
-  const version = "0.1.0";
+  const version = "0.1.4";
   await writeFile(
     path.join(rootDir, "package.json"),
     `${JSON.stringify({ name: "sigma", version, private: true, license: "MIT" })}\n`,
@@ -616,7 +616,7 @@ describe("package-agent-cli", () => {
         product: "Sigma Code",
         package: {
           name: "agent-cli",
-          version: "0.1.0"
+          version: "0.1.4"
         }
       },
       metadata: {
@@ -1089,7 +1089,7 @@ describe("package-agent-cli", () => {
       if (command === "wsl" && args[0] === "-e" && args[3]?.includes("./bin/agent version --json")) {
         return {
           status: 0,
-          stdout: `${JSON.stringify({ product: "Sigma Code", package: { name: "agent-cli", version: "0.1.0" } })}\n`,
+          stdout: `${JSON.stringify({ product: "Sigma Code", package: { name: "agent-cli", version: "0.1.4" } })}\n`,
           stderr: ""
         };
       }
@@ -1112,7 +1112,7 @@ describe("package-agent-cli", () => {
         product: "Sigma Code",
         package: {
           name: "agent-cli",
-          version: "0.1.0"
+          version: "0.1.4"
         }
       }
     });
@@ -1129,7 +1129,7 @@ describe("package-agent-cli", () => {
       if (command === "docker" && args[0] === "run") {
         return {
           status: 0,
-          stdout: `${JSON.stringify({ product: "Sigma Code", package: { name: "agent-cli", version: "0.1.0" } })}\n`,
+          stdout: `${JSON.stringify({ product: "Sigma Code", package: { name: "agent-cli", version: "0.1.4" } })}\n`,
           stderr: ""
         };
       }
@@ -1146,7 +1146,7 @@ describe("package-agent-cli", () => {
       status: "passed",
       transport: "docker",
       dockerVersion: "29.5.3",
-      version: { product: "Sigma Code", package: { name: "agent-cli", version: "0.1.0" } }
+      version: { product: "Sigma Code", package: { name: "agent-cli", version: "0.1.4" } }
     });
     expect(calls.map((call) => call.command)).toEqual(["docker", "docker"]);
     expect(calls[1].args).toContain("linux/amd64");
@@ -1160,7 +1160,7 @@ describe("package-agent-cli", () => {
       if (command === "powershell.exe" && args.join(" ").includes("agent.cmd") && args.join(" ").includes("version --json")) {
         return {
           status: 0,
-          stdout: `${JSON.stringify({ product: "Sigma Code", package: { name: "agent-cli", version: "0.1.0" } })}\n`,
+          stdout: `${JSON.stringify({ product: "Sigma Code", package: { name: "agent-cli", version: "0.1.4" } })}\n`,
           stderr: ""
         };
       }
@@ -1181,7 +1181,7 @@ describe("package-agent-cli", () => {
         product: "Sigma Code",
         package: {
           name: "agent-cli",
-          version: "0.1.0"
+          version: "0.1.4"
         }
       }
     });

@@ -3,6 +3,7 @@ import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
 import { SIGMA_PROJECT_FACTS } from "agent-config";
+import { defaultSkillRoots, discoverSkills } from "agent-extensions";
 import {
   BUILTIN_MODEL_SPECS,
   defaultModel,
@@ -13,6 +14,7 @@ import {
 import type { RuntimeClient } from "agent-protocol";
 import {
   createConfiguredRuntime,
+  type RuntimeMcpHttpServerConfig,
   type RuntimeFactoryDeps
 } from "agent-runtime";
 import {
@@ -38,6 +40,38 @@ export interface AcpCommandDeps {
 interface SelectedModel {
   provider: string;
   model: string;
+}
+
+function clientMcpServers(servers: readonly acp.McpServer[]): RuntimeMcpHttpServerConfig[] {
+  return servers.map((server): RuntimeMcpHttpServerConfig => {
+    if (!("type" in server) || server.type !== "http") {
+      const transport = "type" in server && typeof server.type === "string" ? server.type : "stdio";
+      throw new Error(`Sigma ACP does not support client MCP transport '${transport}'.`);
+    }
+    const headers: Record<string, string> = {};
+    const names = new Set<string>();
+    for (const header of server.headers) {
+      const normalized = header.name.trim().toLowerCase();
+      if (!normalized || names.has(normalized)) {
+        throw new Error(`Sigma ACP MCP server '${server.name}' has an invalid or duplicate HTTP header.`);
+      }
+      names.add(normalized);
+      headers[header.name] = header.value;
+    }
+    return {
+      type: "http",
+      name: server.name,
+      url: server.url,
+      headers,
+      possibleEffects: ["network"],
+      approval: "auto",
+      executionMode: "sequential",
+      idempotent: false,
+      timeoutMs: 120_000,
+      idleTimeoutMs: 30_000,
+      hardDeadlineMs: 120_000
+    };
+  });
 }
 
 function modelId(provider: string, model: string): string {
@@ -88,12 +122,14 @@ function catalogFor(
         : {}),
       ...(spec.defaultReasoningEffort
         ? { defaultReasoningEffort: spec.defaultReasoningEffort }
-        : {})
+        : {}),
+      ...(spec.capabilities.imageInput ? { imageInput: true } : {})
     })),
     ...config.modelSpecs.map((spec) => ({
       id: modelId(spec.providerId, spec.upstreamModel),
       name: spec.upstreamModel,
-      description: `${spec.providerId} · custom model`
+      description: `${spec.providerId} · custom model`,
+      ...(spec.capabilities.imageInput ? { imageInput: true } : {})
     }))
   ];
   return {
@@ -105,6 +141,16 @@ function catalogFor(
 function trustFailure(flags: Record<string, unknown>, cwd: string): string | undefined {
   const config = loadCliConfig({ ...flags, workspace: cwd });
   return workspaceMcpTrustMessage(config) ?? workspaceCustomizationTrustMessage(config);
+}
+
+async function acpSkillCatalog(cwd: string) {
+  return (await discoverSkills(defaultSkillRoots(os.homedir(), cwd))).descriptors.map((skill) => ({
+    name: skill.name,
+    qualifiedName: skill.qualifiedName,
+    description: skill.description,
+    source: skill.source,
+    path: skill.skillFilePath
+  }));
 }
 
 export async function runAcpCommand(
@@ -130,7 +176,8 @@ export async function runAcpCommand(
   const runtimeFactory = async (
     cwd: string,
     selectedId: string,
-    reasoningEffort?: ModelReasoningEffort
+    reasoningEffort?: ModelReasoningEffort,
+    mcpServers: readonly acp.McpServer[] = []
   ): Promise<SigmaAcpRuntimeHandle> => {
     const trustMessage = trustFailure(baseFlags, cwd);
     if (trustMessage) throw new Error(trustMessage);
@@ -155,13 +202,15 @@ export async function runAcpCommand(
       ...(reasoningEffort ? { reasoningEffort } : {})
     }, deps.runtimeFactoryDeps, {
       surface: "acp",
-      interactiveApprovals: true
+      interactiveApprovals: true,
+      additionalMcpServers: clientMcpServers(mcpServers)
     });
   };
   const sigma = new SigmaAcpAgent({
     agentVersion: SIGMA_PROJECT_FACTS.productVersion,
     runtimeFactory,
     modelCatalog: async (cwd) => catalogFor(baseFlags, cwd, catalogSpecs),
+    skillCatalog: acpSkillCatalog,
     stderr: deps.stderr
   });
   const input = deps.stdin ?? process.stdin;
