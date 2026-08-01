@@ -20,6 +20,7 @@ import type {
 } from "agent-protocol";
 import type { PiProviderEventType } from "./errors.js";
 import type { PiBillingMode } from "./models.js";
+import { codexInstructionSentinel } from "./codex-instructions.js";
 
 interface ReplayState {
   responseId?: string;
@@ -113,9 +114,14 @@ function instructionBlock(message: ModelMessage): string {
   return `<${message.role}>\n${message.content}\n</${message.role}>`;
 }
 
+function reminderContent(message: ModelMessage): string {
+  return `<latest_reminder>\n[authority: ${message.role}]\n${message.content}\n</latest_reminder>`;
+}
+
 function contextParts(
   messages: readonly ModelMessage[],
-  model: PiModel<Api>
+  model: PiModel<Api>,
+  codexInstructionNonce?: string
 ): { systemPrompt?: string; messages: Message[] } {
   const instructions: string[] = [];
   const result: Message[] = [];
@@ -123,10 +129,21 @@ function contextParts(
   let conversationStarted = false;
   for (const message of messages) {
     if (message.role === "system" || message.role === "developer") {
-      if (model.provider === "deepseek" && conversationStarted) {
+      if (conversationStarted && model.provider === "openai-codex"
+        && codexInstructionNonce) {
         result.push({
           role: "user",
-          content: `<latest_reminder>\n${message.content}\n</latest_reminder>`,
+          content: codexInstructionSentinel(
+            message.role,
+            codexInstructionNonce,
+            message.content
+          ),
+          timestamp: Date.now()
+        });
+      } else if (conversationStarted) {
+        result.push({
+          role: "user",
+          content: reminderContent(message),
           timestamp: Date.now()
         });
       } else {
@@ -161,8 +178,12 @@ function contextParts(
   };
 }
 
-export function piContext(request: ModelRequest, model: PiModel<Api>): Context {
-  const parts = contextParts(request.messages, model);
+export function piContext(
+  request: ModelRequest,
+  model: PiModel<Api>,
+  codexInstructionNonce?: string
+): Context {
+  const parts = contextParts(request.messages, model, codexInstructionNonce);
   return {
     ...parts,
     ...(request.tools?.length ? {

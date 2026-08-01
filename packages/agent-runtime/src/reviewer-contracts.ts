@@ -104,6 +104,11 @@ export interface PreparedReviewerCall {
   tools?: ModelToolDefinition[];
   toolChoice?: ModelRequest["toolChoice"];
   maxOutputTokens: number;
+  /** Maximum logical reviewer turns funded by the aggregate reservation. */
+  maxTurns?: number;
+  /** Per-model-call routing and retry budget retained across logical turns. */
+  turnBudget?: PreparedModelBudget;
+  /** Aggregate reservation for the complete bounded review. */
   budget: PreparedModelBudget;
 }
 

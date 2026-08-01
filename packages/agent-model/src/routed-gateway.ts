@@ -150,4 +150,8 @@ export class RoutedModelGateway implements ModelGateway {
   async countTokens(messages: ModelMessage[], tools?: ModelToolDefinition[]): Promise<number> {
     return await this.representative.countTokens(messages, tools);
   }
+
+  async releaseSession(sessionId: string): Promise<void> {
+    await this.router.releaseSession(sessionId);
+  }
 }

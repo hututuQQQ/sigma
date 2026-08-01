@@ -307,6 +307,7 @@ class InspectOnceThenSubmitGateway implements ModelGateway {
     strictToolChoiceDisablesReasoning: true
   };
   readonly requests: ModelRequest[] = [];
+  readonly releasedSessions: string[] = [];
 
   async complete(request: ModelRequest): Promise<ModelResponse> {
     this.requests.push(request);
@@ -362,6 +363,10 @@ class InspectOnceThenSubmitGateway implements ModelGateway {
 
   async countTokens(): Promise<number> {
     return 100;
+  }
+
+  releaseSession(sessionId: string): void {
+    this.releasedSessions.push(sessionId);
   }
 }
 
@@ -948,6 +953,46 @@ describe("independent reviewer budget accounting", () => {
       role: "reviewer", providerId: "deepseek", modelId: "deepseek-v4-pro"
     });
     expect(target.durable.state.evidence.find((item) => item.kind === "review")).toMatchObject({ status: "passed" });
+  });
+
+  it("fits an active review to the logical turns the assurance pool can fund", async () => {
+    const target = runtimeSession(limits({
+      inputTokens: 2_500,
+      outputTokens: 40_000,
+      costMicroUsd: 10_000,
+      modelTurns: 10
+    }));
+    const gateway = new InspectOnceThenSubmitGateway();
+    const { budgets, emit } = harness(target);
+    const reviewer = new ModelReviewer(
+      gateway,
+      "fitted-active-reviewer",
+      inspectionEnvironment(),
+      { maxTurns: 4, maxToolCalls: 12 }
+    );
+
+    await new ReviewCoordinator(reviewer, emit, budgets)
+      .maybeReview(target, new AbortController().signal, true, "completion");
+
+    expect(gateway.requests).toHaveLength(2);
+    expect(new Set(gateway.requests.map((request) => request.sessionId)).size).toBe(1);
+    expect(gateway.requests[0]!.sessionId).not.toBe(target.identity.sessionId);
+    expect(gateway.releasedSessions).toEqual([gateway.requests[0]!.sessionId]);
+    expect(gateway.requests[0]!.tools.map((tool) => tool.name)).toEqual(["read"]);
+    expect(gateway.requests[1]!.tools.map((tool) => tool.name)).toEqual([
+      "submit_verification"
+    ]);
+    expect(target.durable.state.usage).toEqual([
+      expect.objectContaining({ role: "reviewer", attempt: 2 })
+    ]);
+    const review = target.durable.state.evidence.find((item) => item.kind === "review");
+    expect(review?.data.failureCode).not.toBe("review_unavailable");
+    expect(review?.data.actualChecks).toEqual([
+      expect.objectContaining({
+        toolName: "read",
+        evidenceIds: ["review-check:inspect-current-frontier"]
+      })
+    ]);
   });
 
   it("lets the independent reviewer judge an unvalidated text mutation", async () => {

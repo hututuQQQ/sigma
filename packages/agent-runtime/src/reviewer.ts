@@ -42,6 +42,7 @@ import {
   settleReviewerTurn,
   type ReviewerTurnLoopResult
 } from "./reviewer-loop-support.js";
+import { aggregateReviewerBudget } from "./reviewer-budget.js";
 
 export {
   isAccountableReviewer,
@@ -55,6 +56,10 @@ export {
 export {
   isActionableErrorFinding
 } from "./reviewer-result.js";
+
+function reviewerModelSessionId(input: ReviewerInput, requestId: string): string {
+  return `review:${input.sessionId}:${requestId}`;
+}
 
 export class ModelReviewer implements ReviewerPort {
   constructor(
@@ -98,27 +103,15 @@ export class ModelReviewer implements ReviewerPort {
       remainingBudgetMicroUsd
     );
     const turnCapacity = this.toolEnvironment ? this.limits.maxTurns : 1;
-    const budget = turnCapacity === 1
-      ? singleTurnBudget
-      : {
-          ...singleTurnBudget,
-          estimatedInputTokens:
-            singleTurnBudget.estimatedInputTokens * turnCapacity * 2,
-          reserved: {
-            inputTokens:
-              (singleTurnBudget.reserved.inputTokens ?? 0) * turnCapacity * 2,
-            outputTokens:
-              (singleTurnBudget.reserved.outputTokens ?? 0) * turnCapacity,
-            costMicroUsd:
-              (singleTurnBudget.reserved.costMicroUsd ?? 0) * turnCapacity * 2,
-            modelTurns:
-              (singleTurnBudget.reserved.modelTurns ?? 1) * turnCapacity
-          },
-          reservedAttempts:
-            singleTurnBudget.reservedAttempts * turnCapacity,
-          attemptReservations: undefined
-        };
-    return { messages, tools, ...(toolChoice ? { toolChoice } : {}), maxOutputTokens, budget };
+    return {
+      messages,
+      tools,
+      ...(toolChoice ? { toolChoice } : {}),
+      maxOutputTokens,
+      maxTurns: turnCapacity,
+      turnBudget: singleTurnBudget,
+      budget: aggregateReviewerBudget(singleTurnBudget, turnCapacity)
+    };
   }
 
   async reviewPrepared(
@@ -147,6 +140,11 @@ export class ModelReviewer implements ReviewerPort {
         await toolSession?.close();
       } catch (error) {
         closeFailure = error;
+      }
+      try {
+        await this.gateway.releaseSession?.(reviewerModelSessionId(input, requestId));
+      } catch {
+        // Provider transport cleanup must not replace the independent verdict.
       }
     }
     if (closeFailure) throw closeFailure;
@@ -194,7 +192,7 @@ export class ModelReviewer implements ReviewerPort {
         ]
       : messages;
     const request: ModelRequest = {
-      sessionId: input.sessionId,
+      sessionId: reviewerModelSessionId(input, requestId),
       signal,
       tools,
       ...(toolChoice ? { toolChoice } : {}),
@@ -208,11 +206,12 @@ export class ModelReviewer implements ReviewerPort {
         constraints: ModelRouteConstraints
       ): Promise<ModelResponse>;
     };
-    const response = prepared.budget.routeConstraints
+    const turnBudget = prepared.turnBudget ?? prepared.budget;
+    const response = turnBudget.routeConstraints
       && constrained.completeWithConstraints
       ? await constrained.completeWithConstraints(
           request,
-          prepared.budget.routeConstraints
+          turnBudget.routeConstraints
         )
       : await this.gateway.complete(request);
     return {
@@ -223,7 +222,7 @@ export class ModelReviewer implements ReviewerPort {
         `${requestId}:turn:${turn}`,
         { messages: requestMessages, tools },
         response,
-        prepared.budget,
+        turnBudget,
         performance.now() - startedAt,
         "reviewer"
       )
@@ -242,7 +241,9 @@ export class ModelReviewer implements ReviewerPort {
     const usages: UsageRecord[] = [];
     let toolCalls = 0;
     let verdictOnly = false;
-    const maximumTurns = toolSession ? this.limits.maxTurns : 1;
+    const maximumTurns = toolSession
+      ? Math.max(1, Math.min(this.limits.maxTurns, prepared.maxTurns ?? this.limits.maxTurns))
+      : 1;
     const inspectionRequired = activeInspectionRequired(
       prepared, toolSession, maximumTurns
     );

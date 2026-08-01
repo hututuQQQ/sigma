@@ -354,7 +354,7 @@ describe.each(apiFamilies)("Pi %s API family contract", (api) => {
     expect(call.options.signal).toBeInstanceOf(AbortSignal);
     expect(call.options.toolChoice).toBe("auto");
     expect(call.options.transport).toBe(
-      api === "openai-codex-responses" ? "sse" : undefined
+      api === "openai-codex-responses" ? "auto" : undefined
     );
     const expectedReasoningOptions: Record<
       (typeof apiFamilies)[number],
@@ -375,6 +375,49 @@ describe.each(apiFamilies)("Pi %s API family contract", (api) => {
       "pi-messages": { reasoning: "high" }
     };
     expect(call.options).toMatchObject(expectedReasoningOptions[api]);
+  });
+});
+
+describe("Pi Codex cache-preserving instruction projection", () => {
+  it("keeps dynamic developer context at the input suffix and restores its wire role", async () => {
+    const model = contractModel("openai-codex-responses");
+    const captured: CapturedCall[] = [];
+    const gateway = new PiModelGateway({
+      provider: model.provider,
+      model: model.id,
+      models: contractModels(model, captured)
+    });
+    const modelRequest = request(model);
+    modelRequest.messages.push({
+      role: "developer",
+      content: "Use the latest durable runtime state."
+    });
+
+    await gateway.complete(modelRequest);
+
+    const call = captured[0]!;
+    expect(call.context.systemPrompt).not.toContain("latest durable runtime state");
+    const suffix = call.context.messages.at(-1);
+    expect(suffix).toMatchObject({ role: "user" });
+    const onPayload = call.options.onPayload as (
+      payload: unknown,
+      model: PiModel<Api>
+    ) => unknown;
+    const transformed = onPayload({
+      input: [{
+        role: "user",
+        content: [{ type: "input_text", text: (suffix as { content: string }).content }]
+      }]
+    }, model) as {
+      input: Array<{ role: string; content: Array<{ text: string }> }>;
+    };
+    expect(transformed.input).toEqual([{
+      role: "developer",
+      content: [{
+        type: "input_text",
+        text: "Use the latest durable runtime state."
+      }]
+    }]);
   });
 });
 

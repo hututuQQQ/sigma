@@ -991,7 +991,7 @@ describe("EvaluationVault", () => {
 });
 
 describe("benchmark fairness scanner", () => {
-  it("scans product, native, scripts, configuration, and the Codex skill", async () => {
+  it("scans product, native, scripts, and configuration", async () => {
     await expect(scanBenchmarkFairness()).resolves.toEqual([]);
   });
 

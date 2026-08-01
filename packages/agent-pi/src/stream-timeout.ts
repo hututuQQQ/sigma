@@ -2,6 +2,7 @@ import { PiModelError } from "./errors.js";
 
 interface StreamTimeoutOptions {
   signal: AbortSignal;
+  initialTimeoutMs?: number;
   idleTimeoutMs: number;
   activeTimeoutMs?: number;
 }
@@ -49,9 +50,17 @@ export async function* monitoredPiStream<T>(
     ? undefined
     : setTimeout(() => controller.abort(timeoutError()), options.activeTimeoutMs);
   const iterator = create(controller.signal)[Symbol.asyncIterator]();
+  let awaitingInitialEvent = true;
   try {
     while (true) {
-      const item = await nextWithDeadline(iterator, controller, options.idleTimeoutMs);
+      const item = await nextWithDeadline(
+        iterator,
+        controller,
+        awaitingInitialEvent
+          ? options.initialTimeoutMs ?? options.idleTimeoutMs
+          : options.idleTimeoutMs
+      );
+      awaitingInitialEvent = false;
       if (item.done) return;
       yield item.value;
     }

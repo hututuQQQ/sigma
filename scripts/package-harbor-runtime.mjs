@@ -64,7 +64,13 @@ pnpm bench:tb:formal -- \\
   --batch <batch-id>
 \`\`\`
 
-The Python adapter only depends on the Python standard library and Harbor. It uploads the packaged Sigma CLI, installs it as \`/usr/local/bin/agent\` in the task container, invokes \`agent run\`, and records its structured result after the run. Evaluation output is never passed back into the solving session.
+The Python adapters only depend on the Python standard library and Harbor. The
+Sigma adapter uploads the packaged Sigma CLI, installs it as
+\`/usr/local/bin/agent\`, invokes \`agent run\`, and records its structured
+result after the run. The optional \`codex_harbor_agent:PortableCodex\` adapter
+inherits Harbor's stock Codex behavior while installing a caller-provided,
+SHA-256-bound native Codex archive without live runtime downloads. Evaluation
+output is never passed back into either solving session.
 `;
 }
 
@@ -82,6 +88,9 @@ export async function packageHarborRuntime(options = {}) {
   const sourcePath = options.sourcePath
     ? path.resolve(options.sourcePath)
     : path.join(rootDir, "portable", "harbor", "sigma_harbor_agent.py");
+  const codexSourcePath = options.codexSourcePath
+    ? path.resolve(options.codexSourcePath)
+    : path.join(rootDir, "portable", "harbor", "codex_harbor_agent.py");
   const sandboxComposeSourcePath = options.sandboxComposeSourcePath
     ? path.resolve(options.sandboxComposeSourcePath)
     : path.join(rootDir, "portable", "harbor", "docker-compose-sigma-sandbox.yaml");
@@ -93,6 +102,9 @@ export async function packageHarborRuntime(options = {}) {
   if (!existsSync(sourcePath)) {
     throw new Error(`Portable Harbor runtime source is missing: ${sourcePath}`);
   }
+  if (!existsSync(codexSourcePath)) {
+    throw new Error(`Portable Codex Harbor runtime source is missing: ${codexSourcePath}`);
+  }
   if (!existsSync(sandboxComposeSourcePath)) {
     throw new Error(`Portable Harbor sandbox Compose overlay is missing: ${sandboxComposeSourcePath}`);
   }
@@ -101,14 +113,18 @@ export async function packageHarborRuntime(options = {}) {
   }
 
   const sourceText = await readFile(sourcePath, "utf8");
+  const codexSourceText = await readFile(codexSourcePath, "utf8");
   const sandboxComposeText = await readFile(sandboxComposeSourcePath, "utf8");
   assertNoRemovedHarborAdapter(sourceText, "Portable Harbor runtime source");
+  assertNoRemovedHarborAdapter(codexSourceText, "Portable Codex Harbor runtime source");
 
   await rm(harborRuntimeDir, { recursive: true, force: true });
   await mkdir(harborRuntimeDir, { recursive: true });
 
   const runtimePath = path.join(harborRuntimeDir, "sigma_harbor_agent.py");
+  const codexRuntimePath = path.join(harborRuntimeDir, "codex_harbor_agent.py");
   await writeFile(runtimePath, sourceText, "utf8");
+  await writeFile(codexRuntimePath, codexSourceText, "utf8");
   await writeFile(sandboxComposePath, sandboxComposeText, "utf8");
 
   const readmeText = runtimeReadme(agentCliTarball);
@@ -121,6 +137,7 @@ export async function packageHarborRuntime(options = {}) {
     artifactsDir,
     harborRuntimeDir,
     runtimePath,
+    codexRuntimePath,
     sandboxComposePath,
     agentCliTarball
   };

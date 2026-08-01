@@ -449,9 +449,63 @@ describe("capability-aware model routing", () => {
         await vi.runAllTimersAsync();
         await failed;
         expect(new Set(calls)).toEqual(new Set(["openai-codex"]));
-        expect(calls).toHaveLength(category === "auth" || category === "capacity" ? 1 : 6);
+        expect(calls).toHaveLength(category === "auth" || category === "capacity" ? 1 : 11);
       }
     } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("uses the bounded production retry schedule by default", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    try {
+      const profile = freezeAgentProfile({
+        id: "retry-schedule",
+        roleRoutes: {},
+        toolAllow: null,
+        toolDeny: [],
+        skills: [],
+        hooks: [],
+        permissionMode: "deny",
+        budget: { ...DEFAULT_PROFILE_BUDGET },
+        mutationPolicy: {
+          requirePlanBeforeMutation: true,
+          checkpointBeforeMutation: true,
+          reviewMode: "advisory"
+        },
+        allowedChildProfiles: []
+      });
+      let calls = 0;
+      const gateways = createRoleGateways({
+        provider: "openai-codex",
+        model: "gpt-5.6-terra",
+        modelDeadlineSec: 10,
+        streamIdleSec: 5
+      }, {
+        gatewayFactory: ({ provider, model }) => gateway(`${provider}/${model}`, async () => {
+          calls += 1;
+          throw Object.assign(new Error("temporary server failure"), { category: "server" });
+        })
+      }, {
+        profile,
+        profileSource: "builtin",
+        availableProfiles: [{ profile, source: "builtin" }]
+      } as unknown as RuntimeCustomization, {});
+
+      const failed = expect(gateways.orchestrator.complete(request())).rejects.toThrow("server");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(calls).toBe(1);
+      const delays = [500, 1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 32_000, 32_000, 32_000];
+      for (const [index, delay] of delays.entries()) {
+        await vi.advanceTimersByTimeAsync(delay - 1);
+        expect(calls).toBe(index + 1);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(calls).toBe(index + 2);
+      }
+      await failed;
+    } finally {
+      vi.restoreAllMocks();
       vi.useRealTimers();
     }
   });
@@ -656,6 +710,46 @@ describe("capability-aware model routing", () => {
       retryAttempt: 1,
       costMicroUsd: expect.any(Number)
     });
+  });
+
+  it("releases every gateway actually touched by a routed session", async () => {
+    const releases: string[] = [];
+    const routedGateways = new Map<string, ModelGateway>();
+    const router = new ModelRouter(
+      [spec("deepseek/a"), spec("glm/b")],
+      [route()],
+      (item) => {
+        const existing = routedGateways.get(item.id);
+        if (existing) return existing;
+        const created: ModelGateway = {
+          ...gateway(item.id, async () => {
+            if (item.id === "deepseek/a") {
+              throw Object.assign(new Error("busy"), { category: "rate_limit" });
+            }
+            return response("recovered");
+          }),
+          releaseSession(sessionId) {
+            releases.push(`${item.id}:${sessionId}`);
+          }
+        };
+        routedGateways.set(item.id, created);
+        return created;
+      }
+    );
+    const routed = new RoutedModelGateway({
+      router,
+      role: "orchestrator",
+      routeId: "main",
+      representative: gateway("representative", async () => response("unused"))
+    });
+
+    await routed.complete({ ...request(), sessionId: "routed-session" });
+    await routed.releaseSession("routed-session");
+
+    expect(releases.sort()).toEqual([
+      "deepseek/a:routed-session",
+      "glm/b:routed-session"
+    ]);
   });
 
   it("keeps transport retries in the Sigma policy layer and reserves them", async () => {

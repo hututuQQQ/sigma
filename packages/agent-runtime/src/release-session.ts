@@ -9,6 +9,11 @@ export async function releaseRuntimeSession(
   await running?.catch(() => undefined);
   await waitForQuiescence().catch(() => undefined);
   if (session.execution.running && session.execution.running !== running) return false;
+  try {
+    await session.services.gateway.releaseSession?.(session.identity.sessionId);
+  } catch {
+    // Session release must still settle durable ownership when provider cleanup fails.
+  }
   for (const subscriber of session.interaction.subscribers) subscriber.close();
   await releaseOwner();
   return true;
