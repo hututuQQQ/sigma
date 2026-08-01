@@ -21,7 +21,6 @@ function realSandboxValidationTurn() {
   return fakeToolTurn([fakeToolCall("validate-package-smoke", "shell", {
     executable: "node",
     args: ["--check", "hello.js"],
-    access: "readonly",
     validation: true
   })]);
 }
