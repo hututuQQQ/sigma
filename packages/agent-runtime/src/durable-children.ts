@@ -13,6 +13,7 @@ import type { ChildJoinSummary, RuntimeSession } from "./types.js";
 
 export interface DurableChild {
   childId: string;
+  runId: string;
   detached: boolean;
   metadata: Record<string, JsonValue>;
   childSessionId?: string;
@@ -50,6 +51,7 @@ export async function readDurableChildren(store: RunStore, parentSessionId: stri
     if (event.type === "child.spawned") {
       children.set(parsed.childId, {
         childId: parsed.childId,
+        runId: event.runId,
         detached: parsed.detail.detached === true,
         metadata: record(parsed.detail.metadata ?? null),
         integrated: false,
@@ -89,10 +91,13 @@ function failure(child: DurableChild): string | null {
 export async function auditDurableChildren(
   store: RunStore,
   parentSessionId: string,
+  parentRunId: string,
   excludeIds: ReadonlySet<string> = new Set()
 ): Promise<ChildJoinSummary> {
   const children = await readDurableChildren(store, parentSessionId);
-  const joined = [...children.values()].filter((child) => !child.detached && !excludeIds.has(child.childId));
+  const joined = [...children.values()].filter((child) =>
+    child.runId === parentRunId && !child.detached && !excludeIds.has(child.childId)
+  );
   return {
     evidence: joined.map((child) => ({
       childId: child.childId,

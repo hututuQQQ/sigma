@@ -51,9 +51,10 @@ async function joinChildren(
   supervisor: AgentSupervisor,
   store: RunStore,
   parentId: string,
+  parentRunId: string,
   signal: AbortSignal
 ): Promise<ChildJoinSummary> {
-  const jobs = await supervisor.joinParent(parentId, signal);
+  const jobs = await supervisor.joinParent(parentId, parentRunId, signal);
   const evidence: JsonValue[] = jobs.map((job) => JSON.parse(JSON.stringify({
     childId: job.id,
     status: job.status,
@@ -72,6 +73,7 @@ async function joinChildren(
   const durable = await auditDurableChildren(
     store,
     parentId,
+    parentRunId,
     new Set(jobs.map((job) => job.id))
   );
   return {
@@ -137,10 +139,10 @@ export function createComposedRuntime(input: {
     hookArtifacts: customization.hookArtifacts,
     hookRunner,
     agentProfileHookRunner,
-    joinChildren: async (parentId, signal) =>
-      await joinChildren(supervisor, store, parentId, signal),
-    cancelChildren: async (parentId, reason) =>
-      await supervisor.cancelParent(parentId, reason),
+    joinChildren: async (parentId, parentRunId, signal) =>
+      await joinChildren(supervisor, store, parentId, parentRunId, signal),
+    cancelChildren: async (parentId, parentRunId, reason) =>
+      await supervisor.cancelParent(parentId, parentRunId, reason),
     hasActiveChildren: (parentId) => supervisor.list(parentId)
       .some((child) => child.status === "queued" || child.status === "running")
   });

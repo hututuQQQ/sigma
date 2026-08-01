@@ -14,6 +14,7 @@ export interface ChildMessage {
 export interface ChildAgentContext {
   childId: string;
   parentId: string;
+  runId: string;
   instruction: string;
   intent: ChildRunIntent;
   workspacePath: string;
@@ -31,6 +32,7 @@ export interface ChildAgentContext {
 export interface SpawnChildInput {
   childId?: string;
   parentId: string;
+  runId: string;
   instruction: string;
   workspacePath: string;
   intent?: ChildRunIntent;
@@ -51,6 +53,7 @@ export type ChildAgentFactory = (context: ChildAgentContext) => Promise<ChildAge
 export interface ChildSupervisorEvent {
   type: "child.spawned" | "child.message" | "child.completed";
   parentId: string;
+  runId: string;
   childId: string;
   payload: JsonValue;
 }
@@ -60,6 +63,7 @@ export type ChildEventSink = (event: ChildSupervisorEvent) => Promise<void>;
 export interface ChildJob {
   id: string;
   parentId: string;
+  runId: string;
   status: "queued" | "running" | "completed" | "failed" | "cancelled";
   detached: boolean;
   writeScope: string[];
@@ -145,6 +149,7 @@ export class AgentSupervisor implements SupervisorPort {
     const job: ChildJob = {
       id,
       parentId: input.parentId,
+      runId: input.runId,
       status: "queued",
       detached: input.detached === true,
       writeScope: [...(input.writeScope ?? [])]
@@ -209,9 +214,9 @@ export class AgentSupervisor implements SupervisorPort {
     finally { job.controller.abort(new Error(reason)); }
   }
 
-  async cancelParent(parentId: string, reason = "parent cancelled children"): Promise<void> {
+  async cancelParent(parentId: string, runId: string, reason = "parent cancelled children"): Promise<void> {
     const children = [...this.jobs.values()].filter((job) =>
-      job.public.parentId === parentId && !job.public.detached
+      job.public.parentId === parentId && job.public.runId === runId && !job.public.detached
     );
     for (const job of children) this.cancel(job.public.id, reason);
     await Promise.all(children.map(async (job) => await job.completion));
@@ -221,8 +226,10 @@ export class AgentSupervisor implements SupervisorPort {
     return await this.required(childId).completion;
   }
 
-  async joinParent(parentId: string, signal?: AbortSignal): Promise<ChildJob[]> {
-    const jobs = [...this.jobs.values()].filter((job) => job.public.parentId === parentId && !job.public.detached);
+  async joinParent(parentId: string, runId: string, signal?: AbortSignal): Promise<ChildJob[]> {
+    const jobs = [...this.jobs.values()].filter((job) =>
+      job.public.parentId === parentId && job.public.runId === runId && !job.public.detached
+    );
     if (!signal) return await Promise.all(jobs.map((job) => job.completion));
     return await new Promise<ChildJob[]>((resolve, reject) => {
       let settled = false;
@@ -319,6 +326,7 @@ export class AgentSupervisor implements SupervisorPort {
     void this.factory({
       childId: job.public.id,
       parentId: job.input.parentId,
+      runId: job.input.runId,
       instruction: job.input.instruction,
       intent: job.intent,
       workspacePath: allocation.workspacePath,
@@ -394,6 +402,12 @@ export class AgentSupervisor implements SupervisorPort {
 
   private async publish(job: InternalJob, type: ChildSupervisorEvent["type"], payload: JsonValue): Promise<void> {
     if (!this.eventSink) return;
-    await this.eventSink({ type, parentId: job.public.parentId, childId: job.public.id, payload });
+    await this.eventSink({
+      type,
+      parentId: job.public.parentId,
+      runId: job.public.runId,
+      childId: job.public.id,
+      payload
+    });
   }
 }

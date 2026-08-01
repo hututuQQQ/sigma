@@ -229,6 +229,7 @@ describe("child cancellation cleanup ordering", () => {
     }, 2, new WorkspaceIsolationManager(path.join(root, "isolation"), { execution }));
     const first = supervisor.spawn({
       parentId: firstParent.sessionId,
+      runId: firstParent.runId,
       instruction: "run the slow writer",
       workspacePath: workspace,
       intent: "write",
@@ -238,6 +239,7 @@ describe("child cancellation cleanup ordering", () => {
     await within(slowStarted.promise);
     const second = supervisor.spawn({
       parentId: secondParent.sessionId,
+      runId: secondParent.runId,
       instruction: "observe the workspace",
       workspacePath: workspace,
       intent: "write",
@@ -246,7 +248,11 @@ describe("child cancellation cleanup ordering", () => {
     });
 
     let parentCancellationSettled = false;
-    const parentCancellation = supervisor.cancelParent(firstParent.sessionId, "cancel the first writer").then(() => {
+    const parentCancellation = supervisor.cancelParent(
+      firstParent.sessionId,
+      firstParent.runId,
+      "cancel the first writer"
+    ).then(() => {
       parentCancellationSettled = true;
     });
     await new Promise((resolve) => setTimeout(resolve, 100));

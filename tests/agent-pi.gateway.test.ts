@@ -688,6 +688,18 @@ describe("OpenAI Codex subscription gateway", () => {
     }))).toMatchObject({ code: "server", category: "server" });
     expect(sanitizePiModelError(new Error("Provider is not configured: openai-codex")))
       .toMatchObject({ code: "auth_required", category: "auth" });
+    for (const message of [
+      "WebSocket stream closed before response.completed",
+      "stream closed before response.completed",
+      "unexpected EOF while reading response body",
+      "socket hang up"
+    ]) {
+      expect(sanitizePiModelError(new Error(message))).toMatchObject({
+        code: "network",
+        category: "network",
+        message: "Could not reach the model provider."
+      });
+    }
   });
 
   it("preserves and classifies Codex response.failed codes without exposing provider text", async () => {

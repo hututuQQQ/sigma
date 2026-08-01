@@ -15,7 +15,7 @@ export interface RuntimeSessionFinishOptions {
   hooks: RuntimeHookCoordinator;
   events: RuntimeEventLog;
   commandBus: SessionCommandBus;
-  cancelChildren?(parentSessionId: string, reason: string): Promise<void> | void;
+  cancelChildren?(parentSessionId: string, parentRunId: string, reason: string): Promise<void> | void;
   beforeOutcome?(session: RuntimeSession, outcome: RunOutcome): Promise<number>;
 }
 
@@ -120,7 +120,11 @@ async function cancelChildrenAfterFailure(
   outcome: RunOutcome
 ): Promise<void> {
   if (outcome.kind === "completed") return;
-  await options.cancelChildren?.(session.identity.sessionId, `Parent run ended as ${outcome.kind}.`);
+  await options.cancelChildren?.(
+    session.identity.sessionId,
+    session.durable.runId,
+    `Parent run ended as ${outcome.kind}.`
+  );
 }
 
 async function settleBeforeTerminalEvent(

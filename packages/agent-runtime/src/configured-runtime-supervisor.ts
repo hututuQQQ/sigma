@@ -16,7 +16,7 @@ export function createConfiguredSupervisor(
     async (event) => {
       const runtime = runtimeReference.current;
       if (!runtime) throw new Error("Runtime is not ready to record child events.");
-      await runtime.recordChildEvent(event.parentId, event.type, {
+      await runtime.recordChildEvent(event.parentId, event.runId, event.type, {
         childId: event.childId,
         payload: event.payload
       });

@@ -677,6 +677,7 @@ describe("sensitive per-call approvals", () => {
     const supervisor = new AgentSupervisor(createChildAgentFactory(() => runtime), 1);
     const child = supervisor.spawn({
       parentId: parent.sessionId,
+      runId: parent.runId,
       instruction: "Run one network check.",
       workspacePath: root,
       intent: "analyze",

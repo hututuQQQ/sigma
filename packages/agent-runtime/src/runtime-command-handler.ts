@@ -142,7 +142,11 @@ export class RuntimeCommandHandler {
     session.interaction.approvals.clear();
     session.interaction.callApprovals.clear();
     const children = Promise.resolve().then(async () =>
-      await this.options.cancelChildren?.(session.identity.sessionId, reason));
+      await this.options.cancelChildren?.(
+        session.identity.sessionId,
+        session.durable.runId,
+        reason
+      ));
     // A cancellation acknowledgement is a quiescence boundary: mutation
     // tools and broker processes must settle before the caller can observe it.
     await waitForCancelledRunSettlement(session, running);

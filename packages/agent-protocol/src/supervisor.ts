@@ -4,6 +4,7 @@ import type { ToolEffect } from "./tools.js";
 export interface SupervisorSpawnInput {
   childId?: string;
   parentId: string;
+  runId: string;
   instruction: string;
   workspacePath: string;
   intent: "analyze" | "write";
