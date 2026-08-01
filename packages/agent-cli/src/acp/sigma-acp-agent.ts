@@ -43,6 +43,24 @@ interface SigmaSessionConfigSelection {
   nextReasoningEffort?: ModelReasoningEffort;
 }
 
+interface ActivePrompt {
+  readonly controller: AbortController;
+  readonly settled: Promise<void>;
+  readonly settle: () => void;
+}
+
+function createActivePrompt(): ActivePrompt {
+  const controller = new AbortController();
+  let settlePrompt!: () => void;
+  return {
+    controller,
+    settled: new Promise<void>((resolve) => {
+      settlePrompt = resolve;
+    }),
+    settle: () => settlePrompt()
+  };
+}
+
 class CheckpointRecoveryCancelled extends Error {}
 
 function checkpointRecoveryDecision(
@@ -98,7 +116,7 @@ function resolveSessionConfigSelection(
 export class SigmaAcpAgent {
   private readonly sessions: SigmaAcpSessionRegistry;
   private readonly events = new SigmaAcpEventForwarder();
-  private readonly activePrompts = new Map<string, AbortController>();
+  private readonly activePrompts = new Map<string, ActivePrompt>();
   private readonly activeRuntimeSessions = new Map<string, ResolvedSession>();
 
   constructor(private readonly options: SigmaAcpAgentOptions) {
@@ -130,7 +148,7 @@ export class SigmaAcpAgent {
   }
 
   async close(): Promise<void> {
-    for (const controller of this.activePrompts.values()) {
+    for (const { controller } of this.activePrompts.values()) {
       controller.abort(new Error("ACP connection closed."));
     }
     const cancellations = await Promise.allSettled(
@@ -292,8 +310,8 @@ export class SigmaAcpAgent {
   private async closeSession(params: acp.CloseSessionRequest): Promise<void> {
     const resolved = this.activeRuntimeSessions.get(params.sessionId)
       ?? await this.sessions.resolveSession(params.sessionId);
-    const controller = this.activePrompts.get(params.sessionId);
-    controller?.abort(new Error("ACP session closed."));
+    const activePrompt = this.activePrompts.get(params.sessionId);
+    activePrompt?.controller.abort(new Error("ACP session closed."));
     await this.sessions.ensureAttached(resolved);
     await cancelResolvedSession(resolved, "ACP session closed.");
     await resolved.handle.runtime.releaseSession?.(resolved.record.runtimeSessionId);
@@ -496,17 +514,33 @@ export class SigmaAcpAgent {
     return { stopReason: "end_turn", _meta: { "sigma.command": "steer" } };
   }
 
+  private async waitForPromptSlot(
+    sessionId: string,
+    text: string,
+    signal: AbortSignal
+  ): Promise<acp.PromptResponse | undefined> {
+    while (true) {
+      const activePrompt = this.activePrompts.get(sessionId);
+      if (!activePrompt) return undefined;
+      if (!activePrompt.controller.signal.aborted) {
+        return await this.steerActivePrompt(sessionId, text);
+      }
+      await activePrompt.settled;
+      signal.throwIfAborted();
+    }
+  }
+
   private async prompt(
     params: acp.PromptRequest,
     client: acp.AgentContext,
     signal: AbortSignal
   ): Promise<acp.PromptResponse> {
     const text = promptText(params.prompt);
-    if (this.activePrompts.has(params.sessionId)) {
-      return await this.steerActivePrompt(params.sessionId, text);
-    }
-    const controller = new AbortController();
-    this.activePrompts.set(params.sessionId, controller);
+    const activeResponse = await this.waitForPromptSlot(params.sessionId, text, signal);
+    if (activeResponse) return activeResponse;
+    const activePrompt = createActivePrompt();
+    const { controller } = activePrompt;
+    this.activePrompts.set(params.sessionId, activePrompt);
     let resolved: ResolvedSession | undefined;
     let forwarding: Promise<void> | undefined;
     const onRequestAbort = (): void => {
@@ -564,7 +598,7 @@ export class SigmaAcpAgent {
       throw error;
     } finally {
       signal.removeEventListener("abort", onRequestAbort);
-      if (this.activePrompts.get(params.sessionId) === controller) {
+      if (this.activePrompts.get(params.sessionId) === activePrompt) {
         this.activePrompts.delete(params.sessionId);
         this.activeRuntimeSessions.delete(params.sessionId);
       }
@@ -574,11 +608,14 @@ export class SigmaAcpAgent {
           if (!expectedAbort(error, controller.signal)) this.log(error);
         });
       }
+      activePrompt.settle();
     }
   }
 
   private async cancel(params: acp.CancelNotification): Promise<void> {
-    this.activePrompts.get(params.sessionId)?.abort(new Error("Cancelled by ACP client."));
+    this.activePrompts.get(params.sessionId)?.controller.abort(
+      new Error("Cancelled by ACP client.")
+    );
     const resolved = this.activeRuntimeSessions.get(params.sessionId)
       ?? await this.sessions.resolveSession(params.sessionId);
     await this.sessions.ensureAttached(resolved);

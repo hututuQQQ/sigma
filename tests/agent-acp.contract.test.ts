@@ -746,9 +746,26 @@ describe("Sigma ACP v1 contract", () => {
       void pendingPrompt.then(() => { promptSettled = true; });
       await new Promise<void>((resolve) => setTimeout(resolve, 10));
       expect(promptSettled).toBe(false);
+      const promptAfterCancel = clientConnection.agent.request(
+        acp.methods.agent.session.prompt,
+        {
+          sessionId: cancellable.sessionId,
+          prompt: [{ type: "text", text: "continue after cancellation" }]
+        }
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      expect(runtime.commands).not.toContainEqual(expect.objectContaining({
+        type: "steer",
+        text: "continue after cancellation"
+      }));
       releaseCancel();
       await notification;
       expect((await pendingPrompt).stopReason).toBe("cancelled");
+      expect((await promptAfterCancel).stopReason).toBe("end_turn");
+      expect(runtime.commands).toContainEqual(expect.objectContaining({
+        type: "follow_up",
+        text: "continue after cancellation"
+      }));
       delete runtime.cancelSettlement;
 
       const failing = await clientConnection.agent.request(acp.methods.agent.session.new, {
