@@ -98,7 +98,8 @@ export class PiModelGateway implements ModelGateway {
       structuredOutput: piModel.api === "openai-responses"
         || piModel.api === "openai-codex-responses",
       promptCache: true,
-      tokenizer: "approximate"
+      tokenizer: "approximate",
+      imageInput: piModel.input.includes("image")
     };
   }
 

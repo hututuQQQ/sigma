@@ -47,6 +47,7 @@ function envelope(
 class FakeRuntime implements RuntimeClient {
   readonly commands: RunCommand[] = [];
   readonly releasedSessions: string[] = [];
+  readonly rollbacks: Array<{ sessionId: string; numTurns: number }> = [];
   cancelSettlement?: { started(): void; wait: Promise<void> };
   resumeSettlement?: { started(): void; wait: Promise<void> };
   private readonly attached = new Set<string>();
@@ -96,6 +97,18 @@ class FakeRuntime implements RuntimeClient {
       if (command.type === "submit") overview.mode = command.mode ?? overview.mode;
       overview.updatedAt = new Date().toISOString();
       this.outcomes.delete(command.sessionId);
+      this.emit(
+        command.sessionId,
+        command.type === "submit" ? "user.message" : "user.follow_up",
+        command.type === "submit"
+          ? { text: command.text, ...(command.images ? { images: command.images } : {}) }
+          : {
+              text: command.text,
+              ...(command.images ? { images: command.images } : {}),
+              queueId: `queue-${this.events.length + 1}`,
+              status: "delivered"
+            }
+      );
       if (command.text === "wait for cancellation") {
         this.emit(command.sessionId, "model.reasoning_delta", { turnId: 2, delta: "Waiting." });
         return;
@@ -106,6 +119,10 @@ class FakeRuntime implements RuntimeClient {
           code: "server",
           message: "The model provider is temporarily unavailable."
         });
+        return;
+      }
+      if (command.text === "ask structured input") {
+        this.requestStructuredInput(command.sessionId);
         return;
       }
       void this.completeTurn(command.sessionId);
@@ -185,6 +202,17 @@ class FakeRuntime implements RuntimeClient {
     for (const event of this.events) {
       if (event.sessionId === sessionId && event.seq > afterSeq) yield event;
     }
+  }
+
+  async rollbackTurns(
+    sessionId: string,
+    numTurns: number
+  ): Promise<{ removedTurns: number; lastSeq: number }> {
+    const overview = this.required(sessionId);
+    this.rollbacks.push({ sessionId, numTurns });
+    overview.lastSeq += 1;
+    overview.updatedAt = new Date().toISOString();
+    return { removedTurns: numTurns, lastSeq: overview.lastSeq };
   }
 
   async releaseSession(sessionId: string): Promise<void> {
@@ -310,12 +338,13 @@ class FakeRuntime implements RuntimeClient {
         reasoningContent: "Inspecting the workspace. "
       },
       toolCalls: [],
+      contextWindowTokens: 200_000,
       usage: {
         usageId: "usage-1",
         requestId: "request-1",
         sessionId,
         runId,
-        role: "root",
+        role: "orchestrator",
         routeId: "default",
         providerId: "fake",
         modelId: "fake-model",
@@ -334,6 +363,51 @@ class FakeRuntime implements RuntimeClient {
       }
     }, runId);
     this.finish(sessionId, { kind: "completed", message: "Done.", evidence: [] });
+  }
+
+  private requestStructuredInput(sessionId: string): void {
+    const runId = `input-${sessionId}`;
+    const now = new Date().toISOString();
+    const arguments_ = {
+      questions: [{
+        id: "language",
+        header: "Language",
+        question: "Which language should I use?",
+        options: [
+          { label: "TypeScript", description: "Use TypeScript." },
+          { label: "Rust", description: "Use Rust." }
+        ],
+        multiSelect: false
+      }]
+    };
+    this.emit(sessionId, "tool.requested", {
+      callId: "ask-1",
+      name: "request_user_input",
+      arguments: arguments_,
+      turnId: 1,
+      effectRevision: 0
+    }, runId);
+    this.emit(sessionId, "tool.completed", {
+      callId: "ask-1",
+      name: "request_user_input",
+      ok: true,
+      output: JSON.stringify(arguments_),
+      outcome: { status: "succeeded", output: JSON.stringify(arguments_), diagnosticCodes: [] },
+      observedEffects: ["outcome.request_input"],
+      actualEffects: ["outcome.request_input"],
+      artifacts: [],
+      diagnostics: [],
+      evidence: [],
+      startedAt: now,
+      completedAt: now,
+      turnId: 1,
+      effectRevision: 0
+    }, runId);
+    this.finish(sessionId, {
+      kind: "needs_input",
+      requestId: "ask-1",
+      message: "Which language should I use?"
+    });
   }
 
   private emit(sessionId: string, type: AgentEventEnvelope["type"], payload: unknown, runId?: string): void {
@@ -463,6 +537,13 @@ describe("Sigma ACP v1 contract", () => {
   it("speaks NDJSON JSON-RPC and maps streaming, plans, tools, approvals, cancellation, load and resume", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-acp-contract-"));
     temporaryDirectories.push(root);
+    const skillRoot = path.join(root, ".agent", "skills", "review");
+    await mkdir(skillRoot, { recursive: true });
+    await writeFile(
+      path.join(skillRoot, "SKILL.md"),
+      "---\nname: review\ndescription: Review the current change.\n---\nReview carefully.\n",
+      "utf8"
+    );
     const runtime = new FakeRuntime();
     const nativeSession = await runtime.createSession({ workspacePath: root, mode: "change" });
     runtime.seedHistory(nativeSession.sessionId, "Existing native Sigma session");
@@ -470,6 +551,7 @@ describe("Sigma ACP v1 contract", () => {
     runtime.requireResumeBeforeCancel(coldSession.sessionId);
     const updates: acp.SessionNotification[] = [];
     const permissionRequests: acp.RequestPermissionRequest[] = [];
+    const userInputRequests: Array<Record<string, unknown>> = [];
     let permissionOptionId = "allow";
     const clientToAgent = new PassThrough();
     const agentToClient = new PassThrough();
@@ -499,7 +581,18 @@ describe("Sigma ACP v1 contract", () => {
           ? "keep"
           : permissionOptionId;
         return { outcome: { outcome: "selected", optionId } };
-      });
+      })
+      .onRequest<Record<string, unknown>, object>(
+        "_x.ai/ask_user_question",
+        (value) => value as Record<string, unknown>,
+        ({ params }) => {
+          userInputRequests.push(params);
+          return {
+            outcome: "accepted",
+            answers: { "Which language should I use?": ["TypeScript"] }
+          };
+        }
+      );
     const clientConnection = client.connect(acp.ndJsonStream(
       Writable.toWeb(clientToAgent),
       Readable.toWeb(agentToClient)
@@ -512,6 +605,8 @@ describe("Sigma ACP v1 contract", () => {
       });
       expect(initialized.protocolVersion).toBe(1);
       expect(initialized.agentCapabilities?.loadSession).toBe(true);
+      expect(initialized.agentCapabilities?.mcpCapabilities).toEqual({ http: true, sse: false });
+      expect(initialized.agentCapabilities?.promptCapabilities?.image).toBe(true);
       expect(initialized.agentCapabilities?.sessionCapabilities?.resume).toEqual({});
       expect(Object.hasOwn(initialized as object, "authMethods")).toBe(false);
       const health = await clientConnection.agent.request<SigmaHealthForTest, Record<string, never>>(
@@ -519,6 +614,20 @@ describe("Sigma ACP v1 contract", () => {
         {}
       );
       expect(health).toMatchObject({ ok: true, name: "Sigma", protocolVersion: 1 });
+      const capabilities = await clientConnection.agent.request<
+        SigmaCapabilitiesForTest,
+        { cwd: string }
+      >("_sigma/capabilities", { cwd: root });
+      expect(capabilities).toMatchObject({
+        skills: expect.arrayContaining([expect.objectContaining({
+          name: "review",
+          qualifiedName: "workspace:review",
+          description: "Review the current change.",
+          source: "workspace",
+          path: path.join(skillRoot, "SKILL.md")
+        })]),
+        slashCommands: []
+      });
       const nativeList = await clientConnection.agent.request(acp.methods.agent.session.list, {
         cwd: root
       });
@@ -630,7 +739,10 @@ describe("Sigma ACP v1 contract", () => {
 
       const prompt = await clientConnection.agent.request(acp.methods.agent.session.prompt, {
         sessionId: created.sessionId,
-        prompt: [{ type: "text", text: "Update README" }]
+        prompt: [
+          { type: "text", text: "Update README" },
+          { type: "image", mimeType: "image/png", data: "AQ==" }
+        ]
       });
       expect(prompt.stopReason).toBe("end_turn");
       expect(permissionRequests).toHaveLength(2);
@@ -654,7 +766,11 @@ describe("Sigma ACP v1 contract", () => {
           checkpointId: "checkpoint-1",
           decision: "keep"
         }),
-        expect.objectContaining({ type: "submit", text: "Update README" }),
+        expect.objectContaining({
+          type: "submit",
+          text: "Update README",
+          images: [{ mimeType: "image/png", data: "AQ==" }]
+        }),
         expect.objectContaining({ type: "approve", decision: "allow" })
       ]));
       const updateKinds = updates.map((notification) => notification.update.sessionUpdate);
@@ -663,8 +779,22 @@ describe("Sigma ACP v1 contract", () => {
         "agent_thought_chunk",
         "plan",
         "tool_call",
-        "tool_call_update"
+        "tool_call_update",
+        "usage_update"
       ]));
+      expect(updates.find((notification) =>
+        notification.update.sessionUpdate === "usage_update"
+      )?.update).toMatchObject({
+        sessionUpdate: "usage_update",
+        size: 200_000,
+        used: 2,
+        _meta: {
+          "sigma.inputTokens": 1,
+          "sigma.outputTokens": 1,
+          "sigma.reasoningOutputTokens": 1,
+          "sigma.compactsAutomatically": true
+        }
+      });
       expect(updates.some((notification) =>
         notification.update.sessionUpdate === "tool_call_update"
         && notification.update.status === "completed"
@@ -690,6 +820,46 @@ describe("Sigma ACP v1 contract", () => {
         type: "follow_up",
         text: "Check the result"
       }));
+      const authoritativeThread = await clientConnection.agent.request<
+        { turns: Array<{ id: string; items: unknown[] }> },
+        { sessionId: string }
+      >("_sigma/thread/read", { sessionId: created.sessionId });
+      expect(authoritativeThread.turns).toHaveLength(2);
+      expect(authoritativeThread.turns[0]?.items).toEqual(expect.arrayContaining([
+        expect.objectContaining({ role: "user", text: "Update README" }),
+        expect.objectContaining({ role: "assistant", text: "I will update the file. Done." })
+      ]));
+      const structured = await clientConnection.agent.request(acp.methods.agent.session.new, {
+        cwd: root,
+        mcpServers: []
+      });
+      const structuredPrompt = await clientConnection.agent.request(
+        acp.methods.agent.session.prompt,
+        {
+          sessionId: structured.sessionId,
+          prompt: [{ type: "text", text: "ask structured input" }]
+        }
+      );
+      expect(structuredPrompt.stopReason).toBe("end_turn");
+      expect(userInputRequests).toEqual([expect.objectContaining({
+        sessionId: structured.sessionId,
+        toolCallId: "ask-1",
+        questions: [expect.objectContaining({
+          id: "language",
+          header: "Language",
+          question: "Which language should I use?"
+        })]
+      })]);
+      expect(runtime.commands).toContainEqual(expect.objectContaining({
+        type: "follow_up",
+        text: "TypeScript"
+      }));
+      const rollback = await clientConnection.agent.request<
+        { removedTurns: number },
+        SigmaRollbackCommandForTest
+      >("_sigma/rollback", { sessionId: created.sessionId, numTurns: 1 });
+      expect(rollback).toEqual({ removedTurns: 1 });
+      expect(runtime.rollbacks).toContainEqual(expect.objectContaining({ numTurns: 1 }));
       await clientConnection.agent.request<object, SigmaTextCommandForTest>(
         "_sigma/steer",
         { sessionId: created.sessionId, text: "Focus on the final diff" }
@@ -819,9 +989,25 @@ interface SigmaTextCommandForTest {
   text: string;
 }
 
+interface SigmaRollbackCommandForTest {
+  sessionId: string;
+  numTurns: number;
+}
+
 interface SigmaHealthForTest {
   ok: boolean;
   name: string;
   protocolVersion: number;
   version: string;
+}
+
+interface SigmaCapabilitiesForTest {
+  skills: Array<{
+    name: string;
+    qualifiedName: string;
+    description: string;
+    source: "home" | "workspace";
+    path: string;
+  }>;
+  slashCommands: unknown[];
 }

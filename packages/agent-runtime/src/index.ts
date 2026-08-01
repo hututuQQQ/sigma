@@ -4,6 +4,7 @@ export {
   type RuntimeFactoryDeps,
   type RuntimeFactoryOptions
 } from "./configured-runtime.js";
+export type { RuntimeMcpHttpServerConfig } from "./composition-mcp.js";
 export { configuredExecutionBroker } from "./container-runtime-execution.js";
 export {
   SUBJECT_ATTESTATION_SOURCE,

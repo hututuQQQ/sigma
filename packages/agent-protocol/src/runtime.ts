@@ -31,6 +31,11 @@ export interface PendingCheckpointRecovery {
   checkpointId: string;
 }
 
+export interface ThreadRollbackResult {
+  removedTurns: number;
+  lastSeq: number;
+}
+
 export interface RuntimeClient {
   createSession(input: StartSession): Promise<SessionRef>;
   command(command: RunCommand): Promise<void>;
@@ -44,6 +49,8 @@ export interface RuntimeClient {
   listSessions(limit?: number): Promise<SessionOverview[]>;
   sessionEvents(sessionId: string, afterSeq?: number): AsyncIterable<AgentEventEnvelope>;
   releaseSession?(sessionId: string): Promise<void>;
+  /** Drop the newest user turns from model-visible history without changing files. */
+  rollbackTurns?(sessionId: string, numTurns: number): Promise<ThreadRollbackResult>;
   /** User control-plane operation; never exposed as a model tool. */
   undoLatestCheckpoint?(sessionId: string): Promise<CheckpointRef>;
 }

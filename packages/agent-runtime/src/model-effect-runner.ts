@@ -319,6 +319,7 @@ export class ModelEffectRunner {
       finishReason: response.finishReason,
       message: response.message,
       toolCalls: response.message.toolCalls ?? [],
+      contextWindowTokens: session.services.gateway.capabilities.contextWindowTokens,
       usage
     });
     await this.options.hooks.dispatch(session, "post_model", {

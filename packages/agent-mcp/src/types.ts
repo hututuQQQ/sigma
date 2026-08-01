@@ -34,6 +34,16 @@ export interface McpStdioServerConfig {
   maxStderrBytes?: number;
 }
 
+export interface McpHttpServerConfig {
+  name: string;
+  url: string;
+  headers?: Record<string, string>;
+  clientInfo?: McpImplementation;
+  supportedProtocolVersions?: string[];
+  timeouts?: Partial<McpTimeoutConfig>;
+  maxMessageBytes?: number;
+}
+
 export interface McpProcessExecution {
   broker: ExecutionBroker;
   policy: ExecutionPolicy;
@@ -82,6 +92,15 @@ export interface McpRequestOptions {
   idleTimeoutMs?: number;
   hardDeadlineMs?: number;
   onProgress?: (progress: McpProgress) => void | Promise<void>;
+}
+
+export interface McpToolClient {
+  listTools(options?: McpRequestOptions): Promise<McpToolDefinition[]>;
+  callTool(
+    name: string,
+    argumentsValue: { [key: string]: JsonValue },
+    options?: McpRequestOptions
+  ): Promise<McpCallToolResult>;
 }
 
 export interface McpProgress {

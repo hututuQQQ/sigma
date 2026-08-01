@@ -20,6 +20,7 @@ import { SegmentedJsonlStore } from "agent-store";
 import { AgentSupervisor, WorkspaceIsolationManager } from "agent-supervisor";
 import { ensurePrivateStateDirectory, isInside } from "agent-platform";
 import { closeMcpClients, connectMcpServers } from "./composition-mcp.js";
+import type { RuntimeMcpHttpServerConfig } from "./composition-mcp.js";
 import { createChildAgentFactory } from "./composition-supervision.js";
 import type { InProcessRuntimeClient } from "./runtime-client.js";
 import { verifyWorkspaceMcpTrust } from "./workspace-mcp-trust.js";
@@ -108,6 +109,7 @@ export interface RuntimeFactoryOptions {
   connectMcp?: boolean;
   surface?: "cli" | "tui" | "acp";
   interactiveApprovals?: boolean;
+  additionalMcpServers?: readonly RuntimeMcpHttpServerConfig[];
 }
 
 interface PreparedComposition extends RuntimeAssemblyPrepared {
@@ -167,7 +169,8 @@ export async function createConfiguredRuntime(
       config.mcpServers,
       workspace,
       tools,
-      execution
+      execution,
+      options.additionalMcpServers
     );
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
     const runtime = createComposedRuntime({

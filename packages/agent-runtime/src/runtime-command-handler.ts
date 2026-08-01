@@ -225,13 +225,24 @@ export class RuntimeCommandHandler {
     }
   }
 
-  async followUp(session: RuntimeSession, text: string): Promise<void> {
+  async followUp(
+    session: RuntimeSession,
+    command: Extract<RunCommand, { type: "follow_up" }>
+  ): Promise<void> {
+    const { text, images } = command;
     if (session.interaction.followUps.length >= 256) throw new Error("Follow-up queue is full (256 messages).");
     await waitForTerminalRunSettlement(session);
     if (session.execution.running) {
-      const followUp = { id: randomUUID(), text };
+      const followUp = {
+        id: randomUUID(),
+        text,
+        ...(images?.length ? { images } : {})
+      };
       await this.options.emit(session, "user.follow_up", "user", {
-        text, queueId: followUp.id, status: "queued"
+        text,
+        ...(images?.length ? { images } : {}),
+        queueId: followUp.id,
+        status: "queued"
       });
       session.interaction.followUps.push(followUp);
       return;
@@ -250,7 +261,10 @@ export class RuntimeCommandHandler {
         : {})
     });
     await this.options.emit(session, "user.follow_up", "user", {
-      text, queueId: randomUUID(), status: "delivered"
+      text,
+      ...(images?.length ? { images } : {}),
+      queueId: randomUUID(),
+      status: "delivered"
     });
     this.options.start(session);
   }
@@ -258,6 +272,9 @@ export class RuntimeCommandHandler {
   async submit(session: RuntimeSession, command: Extract<RunCommand, { type: "submit" }>): Promise<void> {
     await waitForTerminalRunSettlement(session);
     if (session.execution.running) {
+      if (command.images?.length) {
+        throw new Error("Image input cannot be used to steer an active Sigma turn.");
+      }
       await this.steer(session, command.text);
       return;
     }
@@ -274,7 +291,10 @@ export class RuntimeCommandHandler {
         ? { deadlineAt: session.durable.state.deadlineAt }
         : {})
     });
-    await this.options.emit(session, "user.message", "user", { text: command.text });
+    await this.options.emit(session, "user.message", "user", {
+      text: command.text,
+      ...(command.images?.length ? { images: command.images } : {})
+    });
     this.options.start(session);
   }
 }

@@ -2,14 +2,17 @@ import type {
   AgentEventEnvelope,
   AgentEventType,
   JsonValue,
+  ModelMessage,
   RunOutcome
 } from "agent-protocol";
+import { createEmptyPlan } from "agent-protocol";
 import { durableReducers, type KernelEventReducer } from "./durable-reducers.js";
 import {
   lengthContinuationMessage,
   modelReducers,
   resetModelCompletion
 } from "./model-reducers.js";
+import { modelImages } from "./model-event-parsing.js";
 import { acceptMutationFrontier } from "./mutation-frontier.js";
 import { receiptContent, toolReceipt } from "./receipt-parsing.js";
 import {
@@ -28,6 +31,15 @@ import {
 import type { KernelState } from "./state.js";
 
 type EventReducer = KernelEventReducer;
+
+function userMessage(payload: Record<string, JsonValue>): ModelMessage {
+  const images = modelImages(payload.images);
+  return {
+    role: "user",
+    content: text(payload.text),
+    ...(images.length > 0 ? { images } : {})
+  };
+}
 
 const runStarted: EventReducer = (state, _event, payload) => ({
   ...state,
@@ -48,7 +60,7 @@ const userInput: EventReducer = (state, _event, payload) => ({
   activeModelTurn: undefined,
   activeModelSemanticDelta: undefined,
   ...resetModelCompletion,
-  messages: [...state.messages, { role: "user", content: text(payload.text) }],
+  messages: [...state.messages, userMessage(payload)],
   outcome: undefined,
   proposedOutcome: undefined
 });
@@ -77,10 +89,31 @@ const followUpInput: EventReducer = (state, _event, payload) => payload.status =
       activeModelTurn: undefined,
       activeModelSemanticDelta: undefined,
       ...resetModelCompletion,
-      messages: [...state.messages, { role: "user", content: text(payload.text) }],
+      messages: [...state.messages, userMessage(payload)],
       outcome: undefined,
       proposedOutcome: undefined
     };
+
+const historyRolledBack: EventReducer = (state, _event, payload) => {
+  if (state.phase !== "terminal") return state;
+  const userPositions = state.messages.flatMap((message, index) =>
+    message.role === "user" ? [index] : []);
+  const requested = Number(payload.numTurns);
+  if (!Number.isInteger(requested) || requested < 1 || userPositions.length === 0) return state;
+  const firstRemovedPosition = userPositions[Math.max(0, userPositions.length - requested)];
+  return {
+    ...state,
+    messages: firstRemovedPosition === undefined
+      ? state.messages
+      : state.messages.slice(0, firstRemovedPosition),
+    plan: createEmptyPlan(),
+    activeModelTurn: undefined,
+    activeModelSemanticDelta: undefined,
+    pendingTools: [],
+    proposedOutcome: undefined,
+    ...resetModelCompletion
+  };
+};
 
 const toolRequested: EventReducer = (state) => state;
 
@@ -283,6 +316,7 @@ const reducers: Partial<Record<AgentEventType, EventReducer>> = {
   "user.message": userInput,
   "user.steer": steeringInput,
   "user.follow_up": followUpInput,
+  "session.history_rolled_back": historyRolledBack,
   ...modelReducers,
   "tool.requested": toolRequested,
   "tool.approval_requested": approvalRequested,
@@ -306,7 +340,9 @@ export function evolve(previous: KernelState, event: AgentEventEnvelope): Kernel
   if (event.seq <= previous.lastSeq) {
     throw new Error(`Kernel event sequence must increase: ${event.seq} <= ${previous.lastSeq}`);
   }
-  if (previous.phase === "terminal" && event.type !== "review.waived") return previous;
+  if (previous.phase === "terminal"
+    && event.type !== "review.waived"
+    && event.type !== "session.history_rolled_back") return previous;
   const state: KernelState = {
     ...previous,
     revision: previous.revision + 1,

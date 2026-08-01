@@ -257,6 +257,7 @@ function capabilities(model: Model<Api>): ModelCapabilities {
       || model.api === "openai-codex-responses",
     promptCache: true,
     tokenizer: "approximate",
+    imageInput: model.input.includes("image"),
     ...(strictToolChoice ? { strictToolChoice: true } : {})
   };
 }

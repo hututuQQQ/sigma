@@ -118,6 +118,13 @@ function accountingScopeIssue(event: AgentEventEnvelope): ProtocolValidationIssu
   if (event.type === "budget.limit_increased" && event.authority !== "user") {
     return { path: ["authority"], code: "invalid_authority", message: "Budget increases require user authority" };
   }
+  if (event.type === "session.history_rolled_back" && event.authority !== "user") {
+    return {
+      path: ["authority"],
+      code: "invalid_authority",
+      message: "Conversation rollback requires user authority"
+    };
+  }
   if (["budget.reserved", "budget.reservation_bound", "budget.committed", "budget.released"].includes(event.type)
     && event.authority !== "runtime") {
     return { path: ["authority"], code: "invalid_authority", message: "Budget accounting requires runtime authority" };

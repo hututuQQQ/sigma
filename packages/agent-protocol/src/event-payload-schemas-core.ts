@@ -5,6 +5,7 @@ import {
   contextItemSchema,
   runtimePromptStateSchema,
   durableToolReceiptShape,
+  modelImageSchema,
   modelMessageSchema,
   modelToolCallSchema,
   runModeSchema,
@@ -292,10 +293,19 @@ export const coreEventPayloadSchemas = {
     decisionAuthority: decisionAuthoritySchema.optional(),
     outcomeRevision: z.number().int().nonnegative().optional()
   }).strict(),
-  "user.message": z.object({ text: z.string() }).strict(),
+  "user.message": z.object({
+    text: z.string(),
+    images: z.array(modelImageSchema).optional()
+  }).strict(),
   "user.steer": z.object({ text: z.string() }).strict(),
   "user.follow_up": z.object({
-    text: z.string(), queueId: nonEmptyStringSchema, status: z.enum(["queued", "delivered"])
+    text: z.string(),
+    images: z.array(modelImageSchema).optional(),
+    queueId: nonEmptyStringSchema,
+    status: z.enum(["queued", "delivered"])
+  }).strict(),
+  "session.history_rolled_back": z.object({
+    numTurns: z.number().int().positive()
   }).strict(),
   "model.started": z.object({
     provider: nonEmptyStringSchema, model: nonEmptyStringSchema, ...turnSchema
@@ -321,6 +331,7 @@ export const coreEventPayloadSchemas = {
     finishReason: z.enum(["stop", "length", "tool_calls", "content_filter", "protocol_error"]),
     message: modelMessageSchema,
     toolCalls: z.array(modelToolCallSchema),
+    contextWindowTokens: z.number().int().positive().optional(),
     usage: sharedSchemas.usageRecordSchema
   }).strict().superRefine((value, context) => {
     if (value.message.content !== value.text) {

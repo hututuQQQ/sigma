@@ -14,9 +14,16 @@ export interface ModelProviderState {
   data: JsonValue;
 }
 
+/** Provider-neutral image input retained in durable conversation history. */
+export interface ModelImage {
+  data: string;
+  mimeType: string;
+}
+
 export interface ModelMessage {
   role: ModelRole;
   content: string;
+  images?: ModelImage[];
   reasoningContent?: string;
   toolCallId?: string;
   toolCalls?: ModelToolCall[];
@@ -38,6 +45,8 @@ export interface ModelCapabilities {
   structuredOutput: boolean;
   promptCache: boolean;
   tokenizer: "provider" | "approximate";
+  /** The selected model accepts image blocks in user messages. */
+  imageInput?: boolean;
   /**
    * The active provider/wire profile can honor toolChoice="required".
    * Optional so third-party gateways remain source compatible.

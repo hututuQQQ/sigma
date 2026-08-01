@@ -33,6 +33,7 @@ import {
   type Provider
 } from "../packages/agent-pi/src/index.js";
 import { monitoredPiStream } from "../packages/agent-pi/src/stream-timeout.js";
+import { piContext } from "../packages/agent-pi/src/gateway-adapter.js";
 import type { JsonValue, ModelMessage } from "../packages/agent-protocol/src/index.js";
 
 class MemoryCredentialStore implements CredentialStore {
@@ -228,6 +229,31 @@ describe("Pi stream timeout policy", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("Pi image context mapping", () => {
+  it("maps durable user images to Pi image content blocks", () => {
+    const model = getPiModel(OPENAI_CODEX_PROVIDER_ID, OPENAI_CODEX_DEFAULT_MODEL);
+    expect(model).toBeDefined();
+    const context = piContext({
+      messages: [{
+        role: "user",
+        content: "Inspect this screenshot",
+        images: [{ mimeType: "image/png", data: "AQ==" }]
+      }],
+      signal: new AbortController().signal
+    }, model!);
+
+    expect(context.messages).toEqual([
+      expect.objectContaining({
+        role: "user",
+        content: [
+          { type: "text", text: "Inspect this screenshot" },
+          { type: "image", mimeType: "image/png", data: "AQ==" }
+        ]
+      })
+    ]);
   });
 });
 

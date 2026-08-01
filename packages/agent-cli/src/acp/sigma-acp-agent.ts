@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import * as acp from "@agentclientprotocol/sdk";
 import type { ModelReasoningEffort } from "agent-model";
+import { isAgentEventOf } from "agent-protocol";
 import { SigmaAcpEventForwarder } from "./sigma-acp-events.js";
 import { SigmaAcpSessionRegistry } from "./sigma-acp-session-registry.js";
 import {
@@ -16,9 +17,12 @@ import {
   listOffset,
   modelConfig,
   parseHealthRequest,
+  parseSigmaCapabilitiesRequest,
+  parseSigmaRollbackCommand,
+  parseSigmaSessionRequest,
   parseSigmaTextCommand,
+  promptContent,
   promptResponseForOutcome,
-  promptText,
   reasoningEffortForModel,
   sessionModes,
   titleFromPrompt,
@@ -27,6 +31,8 @@ import {
   type ResolvedSession,
   type SigmaAcpAgentOptions,
   type SigmaAcpModelCatalog,
+  type SigmaPromptContent,
+  type SigmaRollbackCommand,
   type SigmaTextCommand
 } from "./sigma-acp-shared.js";
 
@@ -126,12 +132,15 @@ export class SigmaAcpAgent {
   app(): acp.AgentApp {
     return acp.agent({ name: "sigma" })
       .onRequest(acp.methods.agent.initialize, () => this.initialize())
-      .onRequest(acp.methods.agent.session.new, (context) => this.newSession(context.params))
+      .onRequest(acp.methods.agent.session.new, (context) =>
+        this.newSession(context.params, context.client))
       .onRequest(acp.methods.agent.session.load, (context) =>
         this.loadSession(context.params, context.client))
       .onRequest(acp.methods.agent.session.list, (context) => this.listSessions(context.params))
-      .onRequest(acp.methods.agent.session.resume, (context) => this.resumeSession(context.params))
-      .onRequest(acp.methods.agent.session.close, (context) => this.closeSession(context.params))
+      .onRequest(acp.methods.agent.session.resume, (context) =>
+        this.resumeSession(context.params, context.client))
+      .onRequest(acp.methods.agent.session.close, (context) =>
+        this.closeSession(context.params, context.client))
       .onRequest(acp.methods.agent.session.setMode, (context) => this.setMode(context.params))
       .onRequest(acp.methods.agent.session.setConfigOption, (context) =>
         this.setConfigOption(context.params))
@@ -139,6 +148,18 @@ export class SigmaAcpAgent {
         this.prompt(context.params, context.client, context.signal))
       .onNotification(acp.methods.agent.session.cancel, (context) => this.cancel(context.params))
       .onRequest("_sigma/steer", parseSigmaTextCommand, (context) => this.steer(context.params))
+      .onRequest("_sigma/rollback", parseSigmaRollbackCommand, (context) =>
+        this.rollback(context.params))
+      .onRequest("_sigma/capabilities", parseSigmaCapabilitiesRequest, async (context) => ({
+        skills: this.options.skillCatalog
+          ? await this.options.skillCatalog(context.params.cwd)
+          : [],
+        // T3 owns /model, /plan, and /default. Do not advertise provider
+        // commands until Sigma ACP can execute them authoritatively.
+        slashCommands: []
+      }))
+      .onRequest("_sigma/thread/read", parseSigmaSessionRequest, (context) =>
+        this.readThread(context.params.sessionId))
       .onRequest("_sigma/health", parseHealthRequest, () => ({
         ok: true,
         name: "Sigma",
@@ -168,7 +189,8 @@ export class SigmaAcpAgent {
       protocolVersion: acp.PROTOCOL_VERSION,
       agentCapabilities: {
         loadSession: true,
-        promptCapabilities: { image: false, audio: false, embeddedContext: false },
+        mcpCapabilities: { http: true, sse: false },
+        promptCapabilities: { image: true, audio: false, embeddedContext: false },
         sessionCapabilities: { list: {}, resume: {}, close: {} }
       },
       agentInfo: {
@@ -179,11 +201,19 @@ export class SigmaAcpAgent {
     };
   }
 
-  private async newSession(params: acp.NewSessionRequest): Promise<acp.NewSessionResponse> {
+  private async newSession(
+    params: acp.NewSessionRequest,
+    client: acp.AgentContext
+  ): Promise<acp.NewSessionResponse> {
     const cwd = path.resolve(params.cwd);
     const catalog = await this.options.modelCatalog(cwd);
     const reasoningEffort = reasoningEffortForModel(catalog, catalog.currentModelId);
-    const handle = await this.sessions.handle(cwd, catalog.currentModelId, reasoningEffort);
+    const handle = await this.sessions.handle(
+      cwd,
+      catalog.currentModelId,
+      reasoningEffort,
+      params.mcpServers
+    );
     const created = await handle.runtime.createSession({
       workspacePath: handle.workspace,
       mode: "change"
@@ -201,8 +231,12 @@ export class SigmaAcpAgent {
       started: false,
       lastSeq: 0
     };
+    this.sessions.bindMcpServers(record.sessionId, params.mcpServers);
     this.sessions.markAttached(record);
     await this.sessions.upsert(handle.storeRootDir, record);
+    for (const server of params.mcpServers) {
+      await this.events.forwardMcpStatus(record.sessionId, server, client, "connected");
+    }
     return {
       sessionId: record.sessionId,
       modes: sessionModes(record.mode),
@@ -214,7 +248,11 @@ export class SigmaAcpAgent {
     params: acp.LoadSessionRequest,
     client: acp.AgentContext
   ): Promise<acp.LoadSessionResponse> {
-    const resolved = await this.sessions.resolveSession(params.sessionId, params.cwd);
+    const resolved = await this.sessions.resolveSession(
+      params.sessionId,
+      params.cwd,
+      params.mcpServers
+    );
     await this.sessions.ensureAttached(resolved);
     const state: ForwardState = { modelText: new Map(), reasoningText: new Map() };
     for await (const event of resolved.handle.runtime.sessionEvents(resolved.record.runtimeSessionId)) {
@@ -231,9 +269,19 @@ export class SigmaAcpAgent {
     };
   }
 
-  private async resumeSession(params: acp.ResumeSessionRequest): Promise<acp.ResumeSessionResponse> {
-    const resolved = await this.sessions.resolveSession(params.sessionId, params.cwd);
+  private async resumeSession(
+    params: acp.ResumeSessionRequest,
+    client: acp.AgentContext
+  ): Promise<acp.ResumeSessionResponse> {
+    const resolved = await this.sessions.resolveSession(
+      params.sessionId,
+      params.cwd,
+      params.mcpServers
+    );
     await this.sessions.ensureAttached(resolved);
+    for (const server of params.mcpServers ?? []) {
+      await this.events.forwardMcpStatus(params.sessionId, server, client, "connected");
+    }
     const catalog = await this.options.modelCatalog(resolved.record.cwd);
     return {
       modes: sessionModes(resolved.record.mode),
@@ -307,7 +355,10 @@ export class SigmaAcpAgent {
     };
   }
 
-  private async closeSession(params: acp.CloseSessionRequest): Promise<void> {
+  private async closeSession(
+    params: acp.CloseSessionRequest,
+    client: acp.AgentContext
+  ): Promise<void> {
     const resolved = this.activeRuntimeSessions.get(params.sessionId)
       ?? await this.sessions.resolveSession(params.sessionId);
     const activePrompt = this.activePrompts.get(params.sessionId);
@@ -315,7 +366,11 @@ export class SigmaAcpAgent {
     await this.sessions.ensureAttached(resolved);
     await cancelResolvedSession(resolved, "ACP session closed.");
     await resolved.handle.runtime.releaseSession?.(resolved.record.runtimeSessionId);
+    for (const server of this.sessions.mcpServers(params.sessionId)) {
+      await this.events.forwardMcpStatus(params.sessionId, server, client, "disconnected");
+    }
     this.sessions.detach(resolved.record);
+    this.sessions.forgetMcpServers(params.sessionId);
   }
 
   private async setMode(params: acp.SetSessionModeRequest): Promise<void> {
@@ -345,7 +400,8 @@ export class SigmaAcpAgent {
     const replacement = await this.sessions.handle(
       resolved.record.cwd,
       nextModelId,
-      nextReasoningEffort
+      nextReasoningEffort,
+      this.sessions.mcpServers(sessionId)
     );
     const created = resolved.record.started
       ? undefined
@@ -414,12 +470,12 @@ export class SigmaAcpAgent {
 
   private async dispatchPrompt(
     resolved: ResolvedSession,
-    text: string,
+    content: SigmaPromptContent,
     signal: AbortSignal
   ): Promise<void> {
     const firstPrompt = !resolved.record.started;
     resolved.record.started = true;
-    resolved.record.title ??= titleFromPrompt(text);
+    resolved.record.title ??= titleFromPrompt(content.text || "Image prompt");
     resolved.record.updatedAt = new Date().toISOString();
     await this.sessions.upsert(resolved.handle.storeRootDir, resolved.record);
     signal.throwIfAborted();
@@ -427,13 +483,15 @@ export class SigmaAcpAgent {
       ? {
           type: "submit",
           sessionId: resolved.record.runtimeSessionId,
-          text,
+          text: content.text,
+          ...(content.images.length > 0 ? { images: content.images } : {}),
           mode: resolved.record.mode
         }
       : {
           type: "follow_up",
           sessionId: resolved.record.runtimeSessionId,
-          text
+          text: content.text,
+          ...(content.images.length > 0 ? { images: content.images } : {})
         });
   }
 
@@ -489,6 +547,8 @@ export class SigmaAcpAgent {
   private async waitForPromptOutcome(
     resolved: ResolvedSession,
     client: acp.AgentContext,
+    state: ForwardState,
+    forwarding: Promise<void>,
     signal: AbortSignal
   ): Promise<import("agent-protocol").RunOutcome> {
     while (true) {
@@ -496,7 +556,41 @@ export class SigmaAcpAgent {
       const outcome = runtime.waitForIdleOutcome
         ? await runtime.waitForIdleOutcome(resolved.record.runtimeSessionId, signal)
         : await runtime.waitForOutcome(resolved.record.runtimeSessionId, signal);
-      if (!await this.resolveCheckpointRecovery(resolved, client, signal)) return outcome;
+      if (await this.resolveCheckpointRecovery(resolved, client, signal)) continue;
+      if (outcome.kind !== "needs_input") return outcome;
+      await this.waitForForwardedOutcome(resolved, forwarding, signal);
+      const continuation = state.userInputContinuation;
+      if (!continuation) return outcome;
+      const continued = await continuation;
+      if (state.userInputContinuation === continuation) {
+        delete state.userInputContinuation;
+      }
+      if (!continued) return outcome;
+    }
+  }
+
+  private async waitForForwardedOutcome(
+    resolved: ResolvedSession,
+    forwarding: Promise<void>,
+    signal: AbortSignal
+  ): Promise<void> {
+    const overview = (await resolved.handle.runtime.listSessions(Number.MAX_SAFE_INTEGER))
+      .find((candidate) => candidate.sessionId === resolved.record.runtimeSessionId);
+    const targetSeq = overview?.lastSeq ?? resolved.record.lastSeq;
+    const deadline = performance.now() + 5_000;
+    while (resolved.record.lastSeq < targetSeq) {
+      signal.throwIfAborted();
+      if (performance.now() >= deadline) {
+        throw new Error(
+          `Sigma Runtime event forwarding stopped at ${resolved.record.lastSeq}; expected ${targetSeq}.`
+        );
+      }
+      await Promise.race([
+        forwarding.then(() => {
+          throw new Error("Sigma Runtime event stream ended before the terminal event was forwarded.");
+        }),
+        new Promise<void>((resolve) => setTimeout(resolve, 1))
+      ]);
     }
   }
 
@@ -516,18 +610,57 @@ export class SigmaAcpAgent {
 
   private async waitForPromptSlot(
     sessionId: string,
-    text: string,
+    content: SigmaPromptContent,
     signal: AbortSignal
   ): Promise<acp.PromptResponse | undefined> {
     while (true) {
       const activePrompt = this.activePrompts.get(sessionId);
       if (!activePrompt) return undefined;
       if (!activePrompt.controller.signal.aborted) {
-        return await this.steerActivePrompt(sessionId, text);
+        if (content.images.length > 0) {
+          throw new Error("Sigma cannot add images while steering an active prompt.");
+        }
+        return await this.steerActivePrompt(sessionId, content.text);
       }
       await activePrompt.settled;
       signal.throwIfAborted();
     }
+  }
+
+  private async ensureImageInputSupported(
+    resolved: ResolvedSession,
+    content: SigmaPromptContent
+  ): Promise<void> {
+    if (content.images.length === 0) return;
+    const catalog = await this.options.modelCatalog(resolved.record.cwd);
+    const selected = catalog.options.find((option) => option.id === resolved.record.modelId);
+    if (selected?.imageInput !== true) {
+      throw new Error(`Sigma model '${resolved.record.modelId}' does not support image input.`);
+    }
+  }
+
+  private async promptFailureResponse(
+    error: unknown,
+    resolved: ResolvedSession | undefined,
+    controller: AbortController
+  ): Promise<acp.PromptResponse> {
+    if (error instanceof acp.RequestError && error.code === SIGMA_RUNTIME_REQUEST_ERROR) throw error;
+    if (error instanceof CheckpointRecoveryCancelled) {
+      controller.abort(error);
+      return { stopReason: "cancelled" };
+    }
+    if (!expectedAbort(error, controller.signal)) throw error;
+    // Do not expose the cancelled prompt response until the runtime has
+    // settled any in-flight mutation. The ACP cancel notification and the
+    // prompt waiter run concurrently, so relying on the notification handler
+    // alone leaves an acknowledgement/write race.
+    if (resolved) {
+      await cancelResolvedSession(
+        resolved,
+        cancellationReason(controller.signal, "ACP prompt request cancelled.")
+      );
+    }
+    return { stopReason: "cancelled" };
   }
 
   private async prompt(
@@ -535,8 +668,8 @@ export class SigmaAcpAgent {
     client: acp.AgentContext,
     signal: AbortSignal
   ): Promise<acp.PromptResponse> {
-    const text = promptText(params.prompt);
-    const activeResponse = await this.waitForPromptSlot(params.sessionId, text, signal);
+    const content = promptContent(params.prompt);
+    const activeResponse = await this.waitForPromptSlot(params.sessionId, content, signal);
     if (activeResponse) return activeResponse;
     const activePrompt = createActivePrompt();
     const { controller } = activePrompt;
@@ -553,22 +686,31 @@ export class SigmaAcpAgent {
     if (signal.aborted) onRequestAbort();
     else signal.addEventListener("abort", onRequestAbort, { once: true });
     try {
-      resolved = await this.sessions.resolveSession(params.sessionId);
-      this.activeRuntimeSessions.set(params.sessionId, resolved);
-      await this.sessions.ensureAttached(resolved);
+      const promptSession = await this.sessions.resolveSession(params.sessionId);
+      resolved = promptSession;
+      await this.ensureImageInputSupported(promptSession, content);
+      this.activeRuntimeSessions.set(params.sessionId, promptSession);
+      await this.sessions.ensureAttached(promptSession);
       controller.signal.throwIfAborted();
       const state: ForwardState = { modelText: new Map(), reasoningText: new Map() };
-      forwarding = this.events.forwardLive(resolved, client, state, controller.signal);
+      forwarding = this.events.forwardLive(promptSession, client, state, controller.signal);
       // Observe stream rejection while recovery permission is still open.
       void forwarding.catch(() => undefined);
-      await this.resolveCheckpointRecovery(resolved, client, controller.signal);
-      await this.dispatchPrompt(resolved, text, controller.signal);
+      await this.resolveCheckpointRecovery(promptSession, client, controller.signal);
+      await this.dispatchPrompt(promptSession, content, controller.signal);
       const outcome = await Promise.race([
-        this.waitForPromptOutcome(resolved, client, controller.signal),
+        this.waitForPromptOutcome(
+          promptSession,
+          client,
+          state,
+          forwarding,
+          controller.signal
+        ),
         forwarding.then(() => {
           throw new Error("Sigma Runtime event stream ended before the run outcome.");
         })
       ]);
+      await this.waitForForwardedOutcome(promptSession, forwarding, controller.signal);
       controller.abort(new Error("Sigma Runtime turn completed."));
       await forwarding.catch((error: unknown) => {
         if (!expectedAbort(error, controller.signal)) throw error;
@@ -577,25 +719,7 @@ export class SigmaAcpAgent {
       await this.sessions.upsert(resolved.handle.storeRootDir, resolved.record);
       return promptResponseForOutcome(outcome);
     } catch (error) {
-      if (error instanceof acp.RequestError && error.code === SIGMA_RUNTIME_REQUEST_ERROR) throw error;
-      if (error instanceof CheckpointRecoveryCancelled) {
-        controller.abort(error);
-        return { stopReason: "cancelled" };
-      }
-      if (expectedAbort(error, controller.signal)) {
-        // Do not expose the cancelled prompt response until the runtime has
-        // settled any in-flight mutation. The ACP cancel notification and the
-        // prompt waiter run concurrently, so relying on the notification
-        // handler alone leaves an acknowledgement/write race.
-        if (resolved) {
-          await cancelResolvedSession(
-            resolved,
-            cancellationReason(controller.signal, "ACP prompt request cancelled.")
-          );
-        }
-        return { stopReason: "cancelled" };
-      }
-      throw error;
+      return await this.promptFailureResponse(error, resolved, controller);
     } finally {
       signal.removeEventListener("abort", onRequestAbort);
       if (this.activePrompts.get(params.sessionId) === activePrompt) {
@@ -631,6 +755,73 @@ export class SigmaAcpAgent {
       text: params.text
     });
     return {};
+  }
+
+  private async rollback(params: SigmaRollbackCommand): Promise<object> {
+    if (this.activePrompts.has(params.sessionId)) {
+      throw new Error("Cannot rollback a Sigma session while a prompt is active.");
+    }
+    const resolved = await this.sessions.resolveSession(params.sessionId);
+    await this.sessions.ensureAttached(resolved);
+    if (!resolved.handle.runtime.rollbackTurns) {
+      throw new Error("This Sigma runtime does not support conversation rollback.");
+    }
+    const result = await resolved.handle.runtime.rollbackTurns(
+      resolved.record.runtimeSessionId,
+      params.numTurns
+    );
+    resolved.record.lastSeq = Math.max(resolved.record.lastSeq, result.lastSeq);
+    resolved.record.updatedAt = new Date().toISOString();
+    await this.sessions.upsert(resolved.handle.storeRootDir, resolved.record);
+    return { removedTurns: result.removedTurns };
+  }
+
+  private async readThread(sessionId: string): Promise<object> {
+    const resolved = await this.sessions.resolveSession(sessionId);
+    const turns: Array<{ id: string; items: unknown[] }> = [];
+    let current: { id: string; items: unknown[] } | undefined;
+    for await (const event of resolved.handle.runtime.sessionEvents(
+      resolved.record.runtimeSessionId
+    )) {
+      if (
+        isAgentEventOf(event, "user.message")
+        || isAgentEventOf(event, "user.steer")
+        || (isAgentEventOf(event, "user.follow_up") && event.payload.status === "delivered")
+      ) {
+        current = { id: `sigma-turn:${event.seq}`, items: [] };
+        turns.push(current);
+        current.items.push({
+          role: "user",
+          text: event.payload.text,
+          ...(isAgentEventOf(event, "user.message") || isAgentEventOf(event, "user.follow_up")
+            ? { images: event.payload.images ?? [] }
+            : {})
+        });
+        continue;
+      }
+      if (!current) continue;
+      if (isAgentEventOf(event, "model.completed")) {
+        current.items.push({
+          role: "assistant",
+          text: event.payload.text,
+          ...(event.payload.message.reasoningContent
+            ? { reasoningContent: event.payload.message.reasoningContent }
+            : {}),
+          usage: event.payload.usage
+        });
+        continue;
+      }
+      if (isAgentEventOf(event, "tool.completed") || isAgentEventOf(event, "tool.failed")) {
+        current.items.push({
+          type: "tool",
+          name: event.payload.name,
+          callId: event.payload.callId,
+          ok: event.payload.ok,
+          output: event.payload.output
+        });
+      }
+    }
+    return { turns };
   }
 
   private log(error: unknown): void {

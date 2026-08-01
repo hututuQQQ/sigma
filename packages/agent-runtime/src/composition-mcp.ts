@@ -1,10 +1,40 @@
 import path from "node:path";
 import { realpath } from "node:fs/promises";
 import type { McpServerConfigValue } from "agent-config";
-import { McpStdioClient, McpToolBridge } from "agent-mcp";
+import {
+  McpHttpClient,
+  McpStdioClient,
+  McpToolBridge,
+  type McpToolClient
+} from "agent-mcp";
 import type { ExecutionBroker } from "agent-execution";
 import { assertMcpPersistentEffectsAllowed, type ToolEffect } from "agent-protocol";
 import { registerToolExecutor, type EffectToolRegistry } from "agent-tools";
+
+export interface RuntimeMcpHttpServerConfig {
+  type: "http";
+  name: string;
+  url: string;
+  headers: Record<string, string>;
+  possibleEffects: ToolEffect[];
+  approval: "auto" | "prompt" | "deny";
+  executionMode: "parallel" | "sequential" | "exclusive";
+  idempotent: boolean;
+  timeoutMs: number;
+  idleTimeoutMs: number;
+  hardDeadlineMs: number;
+}
+
+interface McpRegistrationPolicy {
+  name: string;
+  possibleEffects: ToolEffect[];
+  approval: "auto" | "prompt" | "deny";
+  executionMode: "parallel" | "sequential" | "exclusive";
+  idempotent: boolean;
+  timeoutMs: number;
+}
+
+type ManagedMcpClient = (McpToolClient & { close(): Promise<void> });
 
 function createClient(
   server: McpServerConfigValue,
@@ -50,13 +80,17 @@ export async function resolveMcpWorkingDirectory(workspace: string, configuredCw
   return canonicalCwd;
 }
 
-async function registerClient(client: McpStdioClient, server: McpServerConfigValue, tools: EffectToolRegistry): Promise<void> {
-  assertMcpPersistentEffectsAllowed(server.name, server.possibleEffects as ToolEffect[]);
+async function registerClient(
+  client: ManagedMcpClient & { connect(): Promise<unknown> },
+  server: McpRegistrationPolicy,
+  tools: EffectToolRegistry
+): Promise<void> {
+  assertMcpPersistentEffectsAllowed(server.name, server.possibleEffects);
   await client.connect();
   const bridge = await McpToolBridge.create(client, {
     namespace: `mcp_${server.name}`,
     policy: {
-      possibleEffects: server.possibleEffects as ToolEffect[],
+      possibleEffects: server.possibleEffects,
       approval: server.approval,
       executionMode: server.executionMode,
       idempotent: server.idempotent,
@@ -66,7 +100,7 @@ async function registerClient(client: McpStdioClient, server: McpServerConfigVal
   registerToolExecutor(tools, bridge);
 }
 
-export async function closeMcpClients(clients: readonly McpStdioClient[]): Promise<void> {
+export async function closeMcpClients(clients: readonly ManagedMcpClient[]): Promise<void> {
   await Promise.allSettled(clients.map(async (client) => await client.close()));
 }
 
@@ -74,12 +108,16 @@ export async function connectMcpServers(
   servers: readonly McpServerConfigValue[],
   workspace: string,
   tools: EffectToolRegistry,
-  execution: ExecutionBroker
-): Promise<McpStdioClient[]> {
-  const clients: McpStdioClient[] = [];
+  execution: ExecutionBroker,
+  httpServers: readonly RuntimeMcpHttpServerConfig[] = []
+): Promise<ManagedMcpClient[]> {
+  const clients: ManagedMcpClient[] = [];
   try {
     for (const server of servers) {
       assertMcpPersistentEffectsAllowed(server.name, server.possibleEffects as ToolEffect[]);
+    }
+    for (const server of httpServers) {
+      assertMcpPersistentEffectsAllowed(server.name, server.possibleEffects);
     }
     const resolved = await Promise.all(servers.map(async (server) => ({
       server,
@@ -87,6 +125,22 @@ export async function connectMcpServers(
     })));
     for (const { server, cwd } of resolved) {
       const client = createClient(server, cwd, workspace, execution);
+      clients.push(client);
+      await registerClient(client, {
+        ...server,
+        possibleEffects: server.possibleEffects as ToolEffect[]
+      }, tools);
+    }
+    for (const server of httpServers) {
+      const client = new McpHttpClient({
+        name: server.name,
+        url: server.url,
+        headers: server.headers,
+        timeouts: {
+          idleTimeoutMs: server.idleTimeoutMs,
+          hardDeadlineMs: server.hardDeadlineMs
+        }
+      });
       clients.push(client);
       await registerClient(client, server, tools);
     }

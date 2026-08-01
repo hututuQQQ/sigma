@@ -1,6 +1,7 @@
+import path from "node:path";
 import * as acp from "@agentclientprotocol/sdk";
 import type { ModelReasoningEffort } from "agent-model";
-import type { RunMode, RunOutcome, RuntimeClient } from "agent-protocol";
+import type { ModelImage, RunMode, RunOutcome, RuntimeClient } from "agent-protocol";
 
 export const MODEL_CONFIG_ID = "sigma.model";
 export const REASONING_EFFORT_CONFIG_ID = "sigma.reasoning_effort";
@@ -19,6 +20,7 @@ export interface SigmaAcpModelOption {
   description?: string;
   supportedReasoningEfforts?: readonly ModelReasoningEffort[];
   defaultReasoningEffort?: ModelReasoningEffort;
+  imageInput?: boolean;
 }
 
 export interface SigmaAcpModelCatalog {
@@ -26,14 +28,24 @@ export interface SigmaAcpModelCatalog {
   options: SigmaAcpModelOption[];
 }
 
+export interface SigmaAcpSkill {
+  name: string;
+  qualifiedName: string;
+  description: string;
+  source: "home" | "workspace";
+  path: string;
+}
+
 export interface SigmaAcpAgentOptions {
   agentVersion: string;
   runtimeFactory(
     cwd: string,
     modelId: string,
-    reasoningEffort?: ModelReasoningEffort
+    reasoningEffort?: ModelReasoningEffort,
+    mcpServers?: readonly acp.McpServer[]
   ): Promise<SigmaAcpRuntimeHandle>;
   modelCatalog(cwd: string): Promise<SigmaAcpModelCatalog>;
+  skillCatalog?(cwd: string): Promise<readonly SigmaAcpSkill[]>;
   stderr?: NodeJS.WritableStream;
 }
 
@@ -59,12 +71,35 @@ export interface ResolvedSession {
 export interface ForwardState {
   modelText: Map<number, string>;
   reasoningText: Map<number, string>;
+  userInputContinuation?: Promise<boolean>;
 }
 
 export interface SigmaTextCommand {
   sessionId: string;
   text: string;
 }
+
+export interface SigmaRollbackCommand {
+  sessionId: string;
+  numTurns: number;
+}
+
+export interface SigmaCapabilitiesRequest {
+  cwd: string;
+}
+
+export interface SigmaSessionRequest {
+  sessionId: string;
+}
+
+export interface SigmaPromptContent {
+  text: string;
+  images: ModelImage[];
+}
+
+const MAX_PROMPT_IMAGES = 8;
+const MAX_IMAGE_BYTES = 10 * 1_024 * 1_024;
+const MAX_TOTAL_IMAGE_BYTES = MAX_PROMPT_IMAGES * MAX_IMAGE_BYTES;
 
 export function parseSigmaTextCommand(value: unknown): SigmaTextCommand {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -78,6 +113,42 @@ export function parseSigmaTextCommand(value: unknown): SigmaTextCommand {
     throw new Error("Sigma ACP command requires text.");
   }
   return { sessionId: params.sessionId, text: params.text };
+}
+
+export function parseSigmaRollbackCommand(value: unknown): SigmaRollbackCommand {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Sigma ACP rollback params must be an object.");
+  }
+  const params = value as Record<string, unknown>;
+  if (typeof params.sessionId !== "string" || !params.sessionId) {
+    throw new Error("Sigma ACP rollback requires sessionId.");
+  }
+  if (!Number.isInteger(params.numTurns) || Number(params.numTurns) < 1) {
+    throw new Error("Sigma ACP rollback requires numTurns to be an integer >= 1.");
+  }
+  return { sessionId: params.sessionId, numTurns: Number(params.numTurns) };
+}
+
+export function parseSigmaCapabilitiesRequest(value: unknown): SigmaCapabilitiesRequest {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Sigma ACP capabilities params must be an object.");
+  }
+  const params = value as Record<string, unknown>;
+  if (typeof params.cwd !== "string" || !params.cwd.trim()) {
+    throw new Error("Sigma ACP capabilities requires cwd.");
+  }
+  return { cwd: path.resolve(params.cwd) };
+}
+
+export function parseSigmaSessionRequest(value: unknown): SigmaSessionRequest {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Sigma ACP session request params must be an object.");
+  }
+  const params = value as Record<string, unknown>;
+  if (typeof params.sessionId !== "string" || !params.sessionId) {
+    throw new Error("Sigma ACP session request requires sessionId.");
+  }
+  return { sessionId: params.sessionId };
 }
 
 export function parseHealthRequest(value: unknown): Record<string, never> {
@@ -163,14 +234,37 @@ export function reasoningEffortForModel(
   return supported[0];
 }
 
-export function promptText(prompt: acp.ContentBlock[]): string {
-  const unsupported = prompt.find((block) => block.type !== "text");
+export function promptContent(prompt: acp.ContentBlock[]): SigmaPromptContent {
+  const unsupported = prompt.find((block) => block.type !== "text" && block.type !== "image");
   if (unsupported) {
-    throw new Error(`Sigma ACP currently accepts text prompts; received '${unsupported.type}'.`);
+    throw new Error(`Sigma ACP accepts text and image prompts; received '${unsupported.type}'.`);
   }
   const text = prompt.map((block) => block.type === "text" ? block.text : "").join("");
-  if (!text) throw new Error("Sigma ACP prompt text must not be empty.");
-  return text;
+  const imageBlocks = prompt.filter((block): block is acp.ImageContent & { type: "image" } =>
+    block.type === "image");
+  if (imageBlocks.length > MAX_PROMPT_IMAGES) {
+    throw new Error(`Sigma ACP accepts at most ${MAX_PROMPT_IMAGES} images per prompt.`);
+  }
+  let totalBytes = 0;
+  const images = imageBlocks.map((block, index): ModelImage => {
+    if (!/^image\/[a-z0-9.+-]+$/iu.test(block.mimeType)) {
+      throw new Error(`Sigma ACP image ${index + 1} has an invalid MIME type.`);
+    }
+    if (!/^[a-z0-9+/]*={0,2}$/iu.test(block.data) || block.data.length % 4 === 1) {
+      throw new Error(`Sigma ACP image ${index + 1} is not valid base64 data.`);
+    }
+    const sizeBytes = Buffer.from(block.data, "base64").byteLength;
+    if (sizeBytes === 0 || sizeBytes > MAX_IMAGE_BYTES) {
+      throw new Error(`Sigma ACP image ${index + 1} must be between 1 byte and ${MAX_IMAGE_BYTES} bytes.`);
+    }
+    totalBytes += sizeBytes;
+    return { data: block.data, mimeType: block.mimeType };
+  });
+  if (totalBytes > MAX_TOTAL_IMAGE_BYTES) {
+    throw new Error(`Sigma ACP prompt images exceed the ${MAX_TOTAL_IMAGE_BYTES} byte total limit.`);
+  }
+  if (!text && images.length === 0) throw new Error("Sigma ACP prompt must not be empty.");
+  return { text, images };
 }
 
 export function titleFromPrompt(text: string): string {

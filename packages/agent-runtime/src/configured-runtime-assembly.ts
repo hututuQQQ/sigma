@@ -5,6 +5,7 @@ import type { JsonValue, RunStore } from "agent-protocol";
 import type { SegmentedJsonlStore } from "agent-store";
 import type { AgentSupervisor } from "agent-supervisor";
 import { connectMcpServers } from "./composition-mcp.js";
+import type { RuntimeMcpHttpServerConfig } from "./composition-mcp.js";
 import { createRuntime } from "./create-runtime.js";
 import { auditDurableChildren } from "./durable-children.js";
 import { brokerRuntimeEnvironment } from "./execution-capabilities.js";
@@ -39,10 +40,11 @@ export async function configuredMcpClients(
   servers: McpServerConfigValue[],
   workspace: string,
   tools: ReturnType<typeof createConfiguredTools>,
-  execution: ExecutionBroker
+  execution: ExecutionBroker,
+  httpServers: readonly RuntimeMcpHttpServerConfig[] = []
 ) {
   if (!connect) return [];
-  return await connectMcpServers(servers, workspace, tools, execution);
+  return await connectMcpServers(servers, workspace, tools, execution, httpServers);
 }
 
 async function joinChildren(

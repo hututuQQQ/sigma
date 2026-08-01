@@ -57,7 +57,7 @@ export function addFrozenSkillMetadata(
   customization: FrozenSessionCustomization
 ): void {
   for (const skill of customization.skills) {
-    const content = `Available skill ${skill.qualifiedName}: ${skill.description} (digest ${skill.digest}). Call load_skill to load its instructions.`;
+    const content = `Available skill ${skill.qualifiedName}: ${skill.description} (digest ${skill.digest}). A user reference such as $${skill.name} invokes this skill; call load_skill with '${skill.qualifiedName}' before following its instructions.`;
     const id = `skill:${skill.qualifiedName}:${skill.digest}`;
     if (session.interaction.loadedContextIds.has(id)) continue;
     session.interaction.contextItems.push({

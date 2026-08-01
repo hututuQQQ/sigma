@@ -116,6 +116,7 @@ export const agentEventPayloadFixtures = {
   "user.message": { text: "hello" },
   "user.steer": { text: "adjust" },
   "user.follow_up": { text: "continue", queueId: "queue", status: "queued" },
+  "session.history_rolled_back": { numTurns: 1 },
   "model.started": { provider: "provider", model: "model", ...turn },
   "model.prompt_materialized": {
     ...turn,
@@ -277,7 +278,12 @@ export const agentEventPayloadFixtures = {
 } as const satisfies AgentEventPayloadMap;
 
 export function authorityForEvent(type: AgentEventType): "runtime" | "user" {
-  return ["review.waived", "checkpoint.recovery_resolved", "budget.limit_increased"].includes(type)
+  return [
+    "review.waived",
+    "checkpoint.recovery_resolved",
+    "budget.limit_increased",
+    "session.history_rolled_back"
+  ].includes(type)
     ? "user" : "runtime";
 }
 

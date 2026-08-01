@@ -237,7 +237,7 @@ export class InProcessRuntimeClient implements RuntimeClient {
     if (command.type === "cancel") return await this.commands.cancel(session, command);
     if (command.type === "approve") return await this.commands.approval(session, command);
     if (command.type === "steer") return await this.commands.steer(session, command.text);
-    if (command.type === "follow_up") return await this.commands.followUp(session, command.text);
+    if (command.type === "follow_up") return await this.commands.followUp(session, command);
     await this.commands.submit(session, command);
   }
   private async handleResume(command: Extract<RunCommand, { type: "resume" }>): Promise<void> {
@@ -288,6 +288,48 @@ export class InProcessRuntimeClient implements RuntimeClient {
   }
   sessionEvents(sessionId: string, afterSeq = 0): AsyncIterable<AgentEventEnvelope> {
     return currentSessionEvents(this.options.store, this.options.storeRootDir, sessionId, afterSeq);
+  }
+  async rollbackTurns(
+    sessionId: string,
+    numTurns: number
+  ): Promise<import("agent-protocol").ThreadRollbackResult> {
+    if (!Number.isInteger(numTurns) || numTurns < 1) {
+      throw Object.assign(new Error("numTurns must be an integer >= 1."), {
+        code: "conversation_rollback_invalid"
+      });
+    }
+    const session = this.required(sessionId);
+    if (session.durable.state.phase !== "terminal") {
+      throw Object.assign(new Error("Cannot rollback conversation history while a turn is active."), {
+        code: "conversation_rollback_busy"
+      });
+    }
+    await waitForSessionIdleOutcome(
+      session,
+      async (signal) => await this.effects.waitForQuiescence(sessionId, signal)
+    );
+    if (session.execution.running || session.interaction.followUps.length > 0
+      || session.durable.state.phase !== "terminal") {
+      throw Object.assign(new Error("Cannot rollback conversation history while a turn is active."), {
+        code: "conversation_rollback_busy"
+      });
+    }
+    const availableTurns = session.durable.state.messages.filter((message) =>
+      message.role === "user").length;
+    if (availableTurns === 0) {
+      throw Object.assign(new Error("Conversation history has no user turns to rollback."), {
+        code: "conversation_rollback_empty"
+      });
+    }
+    const removedTurns = Math.min(numTurns, availableTurns);
+    const event = await this.emit(session, "session.history_rolled_back", "user", {
+      numTurns: removedTurns
+    });
+    await Promise.resolve(
+      session.services.gateway.releaseSession?.(session.identity.sessionId)
+    ).catch(() => undefined);
+    await this.events.writeSnapshot(session);
+    return { removedTurns, lastSeq: event.seq };
   }
   async releaseSession(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId);

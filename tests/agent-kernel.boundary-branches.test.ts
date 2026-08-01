@@ -377,6 +377,24 @@ describe("agent-kernel boundary contracts", () => {
     expect(terminalOutcome(input, receipt("input", ["outcome.request_input"]), [{
       id: "input", name: "request_user_input", arguments: {}
     }])).toEqual({ kind: "needs_input", requestId: "input", message: "Choose." });
+    const structuredInput = pending("structured-input", "request_user_input", {
+      questions: [{
+        id: "target",
+        header: "Target",
+        question: "Which target?",
+        options: [],
+        multiSelect: false
+      }]
+    });
+    expect(terminalOutcome(
+      structuredInput,
+      receipt("structured-input", ["outcome.request_input"]),
+      [{ id: "structured-input", name: "request_user_input", arguments: {} }]
+    )).toEqual({
+      kind: "needs_input",
+      requestId: "structured-input",
+      message: "Which target?"
+    });
     const blocked = pending("blocked", "report_blocked", {
       code: "missing",
       summary: "Cannot continue.",

@@ -1,4 +1,5 @@
 import type { EvidenceRecord } from "./domain.js";
+import type { ModelImage } from "./model.js";
 
 export type RunMode = "analyze" | "change";
 
@@ -46,9 +47,9 @@ export type RunOutcome =
   };
 
 export type RunCommand =
-  | { type: "submit"; sessionId: string; text: string; mode?: RunMode }
+  | { type: "submit"; sessionId: string; text: string; images?: ModelImage[]; mode?: RunMode }
   | { type: "steer"; sessionId: string; text: string }
-  | { type: "follow_up"; sessionId: string; text: string }
+  | { type: "follow_up"; sessionId: string; text: string; images?: ModelImage[] }
   | { type: "approve"; sessionId: string; requestId: string; decision: "allow" | "deny" | "always_allow" }
   /** User-only control-plane decision for an interrupted open checkpoint. */
   | {
