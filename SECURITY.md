@@ -33,8 +33,14 @@ open a minimal issue asking the maintainer to enable a private contact path.
 Portable product archives are official release artifacts only when created by
 the repository's GitHub Actions release workflow. Each archive is accompanied
 by a SHA-256 checksum, CycloneDX SBOM, signed provenance statement, and the
-public provenance verification key. For `0.1.0`, Linux x64 is stable and
+public provenance verification key. For `0.1.4`, Linux x64 is stable and
 Windows x64 is an unsigned preview.
+
+The Sigma Code Windows installer published by that workflow is also an official
+release artifact. It bundles the verified Windows Runtime from the same release
+and includes a SHA-256 sidecar, blockmap, and Sigma-owned update manifest. The
+installer remains an unsigned preview and does not have a trusted Authenticode
+signature.
 
 Windows x64 is an explicitly labeled unsigned preview until trusted
 Authenticode signing is available. Its package, sandbox, wrapper, live-provider,

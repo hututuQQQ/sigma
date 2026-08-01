@@ -17,11 +17,10 @@ import type {
 } from "agent-execution";
 import type { HookDefinition, HookRunnerPort } from "agent-extensions";
 import { SegmentedJsonlStore } from "agent-store";
-import { AgentSupervisor, WorkspaceIsolationManager } from "agent-supervisor";
 import { ensurePrivateStateDirectory, isInside } from "agent-platform";
 import { closeMcpClients, connectMcpServers } from "./composition-mcp.js";
 import type { RuntimeMcpHttpServerConfig } from "./composition-mcp.js";
-import { createChildAgentFactory } from "./composition-supervision.js";
+import { createConfiguredSupervisor } from "./configured-runtime-supervisor.js";
 import type { InProcessRuntimeClient } from "./runtime-client.js";
 import { verifyWorkspaceMcpTrust } from "./workspace-mcp-trust.js";
 import { runtimeStateRoot } from "./runtime-state.js";
@@ -162,7 +161,7 @@ export async function createConfiguredRuntime(
       executionReport
     );
     const runtimeReference: { current?: InProcessRuntimeClient } = {};
-    const supervisor = createSupervisor(config, execution, runtimeReference);
+    const supervisor = createConfiguredSupervisor(config, execution, runtimeReference);
     const tools = createConfiguredTools(config, execution, supervisor, executionReport, storeRootDir);
     mcpClients = await configuredMcpClients(
       options.connectMcp !== false,
@@ -383,22 +382,5 @@ function createHookRunner(
       verifyCustomization(config, workspace, customization);
     },
     frozenHookExecutionRoot(storeRootDir)
-  );
-}
-
-function createSupervisor(
-  config: RuntimeCompositionConfig,
-  execution: ExecutionBroker,
-  runtimeReference: { current?: InProcessRuntimeClient }
-): AgentSupervisor {
-  return new AgentSupervisor(
-    createChildAgentFactory(() => runtimeReference.current as InProcessRuntimeClient),
-    config.maxParallelAgents,
-    new WorkspaceIsolationManager(undefined, { execution }),
-    async (event) => {
-      const runtime = runtimeReference.current;
-      if (!runtime) throw new Error("Runtime is not ready to record child events.");
-      await runtime.recordChildEvent(event.parentId, event.type, { childId: event.childId, payload: event.payload });
-    }
   );
 }

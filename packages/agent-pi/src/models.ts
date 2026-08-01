@@ -2,7 +2,6 @@ import {
   createModels,
   createProvider,
   envApiKeyAuth,
-  getSupportedThinkingLevels,
   type Api,
   type AuthType,
   type Credential,
@@ -20,15 +19,29 @@ import {
 } from "@earendil-works/pi-ai/providers/all";
 import type { ModelCapabilities } from "agent-protocol";
 import { defaultCredentialStore } from "./credential-bridge.js";
+import { piModelPricing, type PiModelPricing } from "./model-pricing.js";
 import {
-  hasKnownPricing,
-  piModelPricing,
-  type PiModelPricing
-} from "./model-pricing.js";
+  DEFAULT_PI_REASONING_EFFORT,
+  piBillingMode,
+  providerAuthMethods,
+  supportedReasoningEfforts,
+  type PiModelDescriptor,
+  type PiProviderDescriptor
+} from "./model-descriptors.js";
 import { sanitizePiModelError } from "./errors.js";
 import { FileModelsStore } from "./models-store.js";
 
 export type { PiModelPricing, PiModelPricingTier } from "./model-pricing.js";
+export {
+  DEFAULT_PI_REASONING_EFFORT,
+  PI_REASONING_EFFORTS,
+  piBillingMode,
+  type PiAuthMethodDescriptor,
+  type PiBillingMode,
+  type PiModelDescriptor,
+  type PiProviderDescriptor,
+  type PiReasoningEffort
+} from "./model-descriptors.js";
 
 export const OPENAI_CODEX_PROVIDER_ID = "openai-codex" as const;
 export const OPENAI_CODEX_DEFAULT_MODEL = "gpt-5.6-terra" as const;
@@ -37,72 +50,10 @@ export const GLM_PROVIDER_ID = "glm" as const;
 export const GLM_DEFAULT_MODEL = "glm-5.2" as const;
 export const PI_AI_VERSION = "0.82.1" as const;
 
-export type PiBillingMode = "metered" | "subscription" | "unpriced";
-export const PI_REASONING_EFFORTS = [
-  "none",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max"
-] as const;
-export type PiReasoningEffort = (typeof PI_REASONING_EFFORTS)[number];
-export const DEFAULT_PI_REASONING_EFFORT: PiReasoningEffort = "medium";
-
-export interface PiAuthMethodDescriptor {
-  id: string;
-  label: string;
-  kind: AuthType;
-  billingMode: PiBillingMode;
-}
-
-export interface PiProviderDescriptor {
-  id: string;
-  name: string;
-  dynamic: boolean;
-  authMethods: readonly PiAuthMethodDescriptor[];
-}
-
-export interface PiModelDescriptor {
-  id: string;
-  name: string;
-  providerId: string;
-  providerName: string;
-  api: string;
-  contextWindowTokens: number;
-  maxOutputTokens: number;
-  reasoning: boolean;
-  imageInput: boolean;
-  capabilities: ModelCapabilities;
-  billingModes: readonly PiBillingMode[];
-  pricing?: PiModelPricing;
-  recommended: boolean;
-  supportedReasoningEfforts: readonly PiReasoningEffort[];
-  defaultReasoningEffort?: PiReasoningEffort;
-}
-
 const generatedAt = getBuiltinModelDataGeneratedAt();
 const catalogEffectiveAt = generatedAt === undefined
   ? "2026-07-30"
   : new Date(generatedAt).toISOString().slice(0, 10);
-
-const subscriptionAuth = new Set<string>([
-  "openai-codex/oauth",
-  "anthropic/oauth",
-  "github-copilot/api_key",
-  "github-copilot/oauth",
-  "kimi-coding/api_key",
-  "kimi-coding/oauth",
-  "xai/oauth",
-  "qwen-token-plan/api_key",
-  "qwen-token-plan-cn/api_key",
-  "xiaomi-token-plan-ams/api_key",
-  "xiaomi-token-plan-cn/api_key",
-  "xiaomi-token-plan-sgp/api_key",
-  "zai/api_key",
-  "zai-coding-cn/api_key"
-]);
 
 const recommendedModels = new Set<string>([
   "openai-codex/gpt-5.6-terra",
@@ -157,89 +108,6 @@ function freshProviders(): Provider[] {
 
 function pricing(model: Model<Api>): PiModelPricing | undefined {
   return piModelPricing(model, catalogEffectiveAt);
-}
-
-function supportedReasoningEfforts(model: Model<Api>): readonly PiReasoningEffort[] {
-  if (!model.reasoning) return [];
-  const supportedLevels = new Set(getSupportedThinkingLevels(model));
-  const candidates = PI_REASONING_EFFORTS.flatMap((effort) => {
-    const level = effort === "none" ? "off" : effort;
-    if (!supportedLevels.has(level)) return [];
-    const mapped = model.thinkingLevelMap?.[level];
-    return [{
-      effort,
-      effective: typeof mapped === "string" ? mapped.toLowerCase() : level
-    }];
-  });
-  const effectiveLevels = new Map<string, PiReasoningEffort[]>();
-  for (const candidate of candidates) {
-    const efforts = effectiveLevels.get(candidate.effective) ?? [];
-    efforts.push(candidate.effort);
-    effectiveLevels.set(candidate.effective, efforts);
-  }
-  const supported = new Set<PiReasoningEffort>();
-  for (const [effective, efforts] of effectiveLevels) {
-    const matchingEffort = efforts.find((effort) => effort === effective);
-    supported.add(matchingEffort ?? efforts[0]!);
-  }
-  const result = PI_REASONING_EFFORTS.filter((effort) => supported.has(effort));
-  return result.length > 1 ? result : [];
-}
-
-export function piBillingMode(
-  providerId: string,
-  authType: AuthType,
-  model?: Model<Api>
-): PiBillingMode {
-  if (subscriptionAuth.has(`${providerId}/${authType}`)) return "subscription";
-  if (providerId === "radius") return "unpriced";
-  return model && hasKnownPricing(model) ? "metered" : "unpriced";
-}
-
-function providerAuthMethods(provider: Provider): PiAuthMethodDescriptor[] {
-  const providerModels = provider.getModels();
-  const mode = (authType: AuthType): PiBillingMode => {
-    if (subscriptionAuth.has(`${provider.id}/${authType}`)) return "subscription";
-    if (provider.id === "radius") return "unpriced";
-    return providerModels.length > 0 && providerModels.every(hasKnownPricing)
-      ? "metered"
-      : "unpriced";
-  };
-  const result: PiAuthMethodDescriptor[] = [];
-  if (provider.auth.apiKey?.login) {
-    result.push({
-      id: "api-key",
-      label: provider.auth.apiKey.name,
-      kind: "api_key",
-      billingMode: mode("api_key")
-    });
-  }
-  if (provider.auth.oauth) {
-    if (provider.id === OPENAI_CODEX_PROVIDER_ID) {
-      result.push(
-        {
-          id: "browser",
-          label: "Login with ChatGPT",
-          kind: "oauth",
-          billingMode: "subscription"
-        },
-        {
-          id: "device-code",
-          label: "Use device code",
-          kind: "oauth",
-          billingMode: "subscription"
-        }
-      );
-    } else {
-      result.push({
-        id: "oauth",
-        label: provider.auth.oauth.loginLabel ?? provider.auth.oauth.name,
-        kind: "oauth",
-        billingMode: mode("oauth")
-      });
-    }
-  }
-  return result;
 }
 
 function capabilities(model: Model<Api>): ModelCapabilities {

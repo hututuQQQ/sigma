@@ -1328,7 +1328,7 @@ class SigmaCliHarborAgent(BaseAgent):
         return "sigma-agent-cli"
 
     def version(self) -> str | None:
-        return "0.1.0"
+        return "0.1.4"
 
     async def setup(self, environment: BaseEnvironment) -> None:
         self._managed_environment_verified = False

@@ -41,6 +41,7 @@ import { toolRuntimeContext } from "./repository-recovery-context.js";
 import { normalizeToolTransactionReceipt } from "./tool-receipt-normalization.js";
 import { materializeLargeToolArtifacts } from "./large-tool-artifacts.js";
 import { repeatedExactCallFailure } from "./repeated-tool-call-guard.js";
+import { settleCheckpointAfterToolFailure } from "./tool-checkpoint-recovery.js";
 import {
   availableOrchestratorBudget,
   reviewRepairActive
@@ -351,56 +352,10 @@ export class ToolTransactionRunner {
         code: executionFailureCode(error),
         message: error instanceof Error ? error.message : String(error)
       });
-      if (checkpoint) await this.settleCheckpointAfterFailure(session, checkpoint, error);
+      if (checkpoint) {
+        await settleCheckpointAfterToolFailure(this.options.control, session, checkpoint, error);
+      }
       throw error;
     }
   }
-
-  private async settleCheckpointAfterFailure(
-    session: RuntimeSession,
-    checkpoint: CheckpointRef,
-    executionError: unknown
-  ): Promise<void> {
-    try {
-      const recovery = await this.options.control.recoverOpen(session);
-      if (recovery.kind !== "needs_input") return;
-      session.recovery.openCheckpointRecovery = {
-        checkpointId: recovery.checkpointId,
-        currentManifestDigest: recovery.currentManifestDigest
-      };
-      if (executionFailureCode(executionError) === "effect_plan_violation"
-        && recovery.checkpointId === checkpoint.checkpointId) {
-        await this.options.control.restorePolicyViolation(
-          session,
-          recovery.checkpointId,
-          recovery.currentManifestDigest
-        );
-        session.recovery.openCheckpointRecovery = undefined;
-      }
-    } catch (recoveryError) {
-      const durableHead = session.durable.state.checkpointHead;
-      if (durableHead?.checkpointId === checkpoint.checkpointId
-        && durableHead.status === "sealed") {
-        session.recovery.openCheckpointRecovery = undefined;
-        throw Object.assign(new AggregateError(
-          [executionError],
-          "The mutation checkpoint is sealed, but its evidence could not be reconciled.",
-          { cause: recoveryError }
-        ), { code: "checkpoint_evidence_failed" });
-      }
-      session.recovery.openCheckpointRecovery ??= {
-        checkpointId: checkpoint.checkpointId,
-        // A preimage digest cannot authorize keeping/restoring a changed
-        // postimage; it only provides a fail-closed placeholder until a later
-        // inspection refreshes the recovery state.
-        currentManifestDigest: checkpoint.preManifestDigest
-      };
-      throw Object.assign(new AggregateError(
-        [executionError],
-        "Failed to settle the mutation checkpoint after tool failure.",
-        { cause: recoveryError }
-      ), { code: "checkpoint_recovery_failed" });
-    }
-  }
-
 }

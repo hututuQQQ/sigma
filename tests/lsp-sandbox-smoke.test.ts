@@ -115,7 +115,7 @@ describe("bundled LSP sandbox smoke", () => {
     const digest = "a".repeat(64);
     const metadata = {
       schemaVersion: 1,
-      productVersion: "0.1.0",
+      productVersion: "0.1.4",
       targetPlatform: "win32",
       targetArch: "x64",
       sigmaExec: { path: "bin/sigma-exec.exe", sha256: digest }
@@ -126,7 +126,7 @@ describe("bundled LSP sandbox smoke", () => {
     )).toThrow("unsupported_schema_version");
     expect(() => assertMetadata(
       { ...metadata, productVersion: "0.1.1" }, "win32", broker, digest, layout
-    )).toThrow("must match sigma-manifest.json productVersion '0.1.0'");
+    )).toThrow("must match sigma-manifest.json productVersion '0.1.4'");
   });
 
   it("rejects unknown package metadata without rewriting the artifact", async () => {
@@ -134,7 +134,7 @@ describe("bundled LSP sandbox smoke", () => {
     const metadataPath = path.join(root, "package-metadata.json");
     const metadata = {
       schemaVersion: 999,
-      productVersion: "0.1.0",
+      productVersion: "0.1.4",
       targetPlatform: "win32",
       targetArch: "x64",
       sigmaExec: { path: "bin/sigma-exec.exe", sha256: "a".repeat(64) }
