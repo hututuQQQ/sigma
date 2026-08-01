@@ -1,15 +1,17 @@
 import asyncio
+import base64
 import contextlib
 import importlib
 import json
 import os
 import sys
+import threading
 import types
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 
 PORTABLE_AGENT_ENV_KEYS = (
@@ -185,7 +187,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "NUL"):
             module.SigmaCliHarborAgent._private_env_script({"SAFE_NAME": "bad\0value"})
 
-    async def test_provider_credential_is_filtered_uploaded_privately_and_removed(self):
+    async def test_provider_credential_is_bootstrapped_on_stdin_and_unlinked_before_start(self):
         module = import_portable_agent_module()
 
         class RecordingEnvironment:
@@ -240,35 +242,284 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result.return_code, 0)
-        json_upload = next(item for item in env.uploads if item["target"].endswith(".json"))
+        bootstrap_upload = next(item for item in env.uploads if item["target"].endswith(".stdin"))
         env_upload = next(item for item in env.uploads if item["target"].endswith(".sh"))
-        uploaded_document = json.loads(json_upload["content"])
+        uploaded_document = json.loads(bootstrap_upload["content"])
+        self.assertEqual(uploaded_document["provider"], "openai-codex")
         self.assertEqual(
-            list(uploaded_document["credentials"]),
-            ["openai-codex"],
-        )
-        self.assertEqual(
-            uploaded_document["credentials"]["openai-codex"]["access"],
+            uploaded_document["credential"]["access"],
             selected_access,
         )
         self.assertNotIn(
             unrelated_secret,
             "\n".join(item["content"] for item in env.uploads),
         )
-        self.assertIn("SIGMA_CREDENTIAL_FILE", env_upload["content"])
-        self.assertIn(json_upload["target"], env_upload["content"])
-        self.assertFalse(json_upload["source"].exists())
+        self.assertIn("SIGMA_CREDENTIAL_BRIDGE", env_upload["content"])
+        self.assertNotIn("SIGMA_CREDENTIAL_FILE", env_upload["content"])
+        self.assertNotIn(bootstrap_upload["target"], env_upload["content"])
+        self.assertFalse(bootstrap_upload["source"].exists())
         self.assertFalse(env_upload["source"].exists())
 
         serialized_calls = json.dumps(env.exec_calls)
         self.assertNotIn(selected_access, serialized_calls)
         self.assertNotIn(selected_refresh, serialized_calls)
-        removal_commands = [
+        launch_command = next(
             command for command, _ in env.exec_calls
-            if command.startswith("rm -f ")
-        ]
-        self.assertTrue(any(json_upload["target"] in command for command in removal_commands))
-        self.assertTrue(any(env_upload["target"] in command for command in removal_commands))
+            if bootstrap_upload["target"] in command and "exec /bin/sh -c" in command
+        )
+        self.assertIn(f"< {bootstrap_upload['target']}", launch_command)
+        self.assertLess(
+            launch_command.index(f"rm -f {bootstrap_upload['target']}"),
+            launch_command.index("exec /bin/sh -c"),
+        )
+
+    async def test_rotated_oauth_credential_is_persisted_on_the_host(self):
+        module = import_portable_agent_module()
+
+        class RotatingEnvironment:
+            def __init__(self):
+                self.bootstrap = None
+
+            async def upload_file(self, source, target):
+                if target.endswith(".stdin"):
+                    self.bootstrap = json.loads(Path(source).read_text(encoding="utf-8"))
+
+            async def exec(self, command, **_kwargs):
+                if "exec /bin/sh -c" not in command:
+                    return SimpleNamespace(return_code=0, stdout="", stderr="")
+                rotated = {
+                    "type": "oauth",
+                    "access": "rotated-access",
+                    "refresh": "rotated-refresh",
+                    "expires": 10_000_000_000_000,
+                }
+                update = {
+                    "version": 1,
+                    "sequence": 1,
+                    "operation": "replace",
+                    "provider": "openai-codex",
+                    "credential": rotated,
+                }
+                encoded = base64.urlsafe_b64encode(
+                    json.dumps(update, separators=(",", ":")).encode("utf-8")
+                ).decode("ascii").rstrip("=")
+                marker = (
+                    f"{module.CREDENTIAL_UPDATE_PREFIX}{self.bootstrap['nonce']}:"
+                    f"{encoded}\n"
+                )
+                return SimpleNamespace(
+                    return_code=0,
+                    stdout=f'{{"kind":"result","result":{{"status":"completed"}}}}\n{marker}',
+                    stderr="",
+                )
+
+        with TemporaryDirectory() as tmp:
+            credential_path = Path(tmp) / "auth.json"
+            credential_path.write_text(json.dumps({
+                "version": 1,
+                "credentials": {
+                    "openai-codex": {
+                        "type": "oauth",
+                        "access": "old-access",
+                        "refresh": "old-refresh",
+                        "expires": 1,
+                    },
+                    "deepseek": {"type": "api_key", "key": "unrelated"},
+                },
+            }), encoding="utf-8")
+            environment = RotatingEnvironment()
+            agent = module.SigmaCliHarborAgent(
+                provider="openai-codex",
+                credential_file=credential_path,
+                extra_env={},
+            )
+
+            result = await agent._exec_with_private_env(
+                environment,
+                "agent run",
+                {},
+                timeout_sec=30,
+            )
+            persisted = json.loads(credential_path.read_text(encoding="utf-8"))
+
+        self.assertNotIn(module.CREDENTIAL_UPDATE_PREFIX, result.stdout)
+        self.assertNotIn("rotated-refresh", result.stdout)
+        self.assertEqual(
+            persisted["credentials"]["openai-codex"]["refresh"],
+            "rotated-refresh",
+        )
+        self.assertEqual(persisted["credentials"]["deepseek"]["key"], "unrelated")
+
+    async def test_host_credential_updates_are_serialized_across_process_local_locks(self):
+        module = import_portable_agent_module()
+
+        with TemporaryDirectory() as tmp:
+            credential_path = Path(tmp) / "auth.json"
+            credential_path.write_text(json.dumps({
+                "version": 1,
+                "credentials": {
+                    "openai-codex": {
+                        "type": "oauth",
+                        "access": "old-access",
+                        "refresh": "old-refresh",
+                        "expires": 1,
+                    },
+                    "deepseek": {"type": "api_key", "key": "old-key"},
+                },
+            }), encoding="utf-8")
+            oauth_agent = module.SigmaCliHarborAgent(
+                provider="openai-codex",
+                credential_file=credential_path,
+                extra_env={},
+            )
+            api_key_agent = module.SigmaCliHarborAgent(
+                provider="deepseek",
+                credential_file=credential_path,
+                extra_env={},
+            )
+            first_read = threading.Event()
+            second_started = threading.Event()
+            original_read = oauth_agent._read_host_credential_document
+
+            def delayed_first_read():
+                document = original_read()
+                first_read.set()
+                if not second_started.wait(2):
+                    raise AssertionError("second credential update did not start")
+                return document
+
+            oauth_agent._read_host_credential_document = delayed_first_read
+
+            async def write_oauth():
+                await asyncio.to_thread(
+                    oauth_agent._persist_provider_credential,
+                    {
+                        "type": "oauth",
+                        "access": "new-access",
+                        "refresh": "new-refresh",
+                        "expires": 2,
+                    },
+                )
+
+            async def write_api_key():
+                if not await asyncio.to_thread(first_read.wait, 2):
+                    raise AssertionError("first credential update did not reach its read")
+                second_started.set()
+                await asyncio.to_thread(
+                    api_key_agent._persist_provider_credential,
+                    {"type": "api_key", "key": "new-key"},
+                )
+
+            # Distinct process-local locks model two Harbor launcher processes;
+            # the shared atomic owner file must prevent a lost update.
+            with patch.object(module, "_credential_lock", side_effect=lambda _path: threading.Lock()):
+                await asyncio.wait_for(
+                    asyncio.gather(write_oauth(), write_api_key()),
+                    timeout=5,
+                )
+            persisted = json.loads(credential_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            persisted["credentials"]["openai-codex"]["refresh"],
+            "new-refresh",
+        )
+        self.assertEqual(persisted["credentials"]["deepseek"]["key"], "new-key")
+        self.assertFalse(Path(f"{credential_path}.lock").exists())
+
+    async def test_host_credential_lease_reclaims_a_dead_owner(self):
+        module = import_portable_agent_module()
+
+        with TemporaryDirectory() as tmp:
+            credential_path = Path(tmp) / "auth.json"
+            credential_path.write_text(
+                json.dumps({"version": 1, "credentials": {}}),
+                encoding="utf-8",
+            )
+            lock_path = Path(f"{credential_path}.lock")
+            dead_pid = 1_073_741_823
+            self.assertFalse(module._process_is_alive(dead_pid))
+            lock_path.write_text(json.dumps({
+                "pid": dead_pid,
+                "instanceId": "dead-owner",
+                "startedAt": "2026-01-01T00:00:00.000Z",
+            }), encoding="utf-8")
+
+            with module._CredentialFileLease(credential_path) as lease:
+                owner = json.loads(lock_path.read_text(encoding="utf-8"))
+                self.assertEqual(owner["instanceId"], lease.instance_id)
+
+            self.assertFalse(lock_path.exists())
+            self.assertFalse(Path(f"{lock_path}.lease-queue").exists())
+
+    async def test_host_credential_bridge_rejects_invalid_order_and_retries_persistence(self):
+        module = import_portable_agent_module()
+
+        with TemporaryDirectory() as tmp:
+            credential_path = Path(tmp) / "auth.json"
+            original = {
+                "type": "oauth",
+                "access": "old-access",
+                "refresh": "old-refresh",
+                "expires": 1,
+            }
+            credential_path.write_text(json.dumps({
+                "version": 1,
+                "credentials": {"openai-codex": original},
+            }), encoding="utf-8")
+            agent = module.SigmaCliHarborAgent(
+                provider="openai-codex",
+                credential_file=credential_path,
+                extra_env={},
+            )
+            bridge = module._CredentialBridge(agent, original)
+
+            def marker(payload):
+                encoded = base64.urlsafe_b64encode(
+                    json.dumps(payload, separators=(",", ":")).encode("utf-8")
+                ).decode("ascii").rstrip("=")
+                return f"{module.CREDENTIAL_UPDATE_PREFIX}{bridge.nonce}:{encoded}"
+
+            rotated = {
+                "type": "oauth",
+                "access": "new-access",
+                "refresh": "new-refresh",
+                "expires": 2,
+            }
+            update = {
+                "version": 1,
+                "sequence": 1,
+                "operation": "replace",
+                "provider": "openai-codex",
+                "credential": rotated,
+            }
+            with self.assertRaisesRegex(RuntimeError, "out-of-order"):
+                bridge._consume_marker(marker({**update, "sequence": 2}))
+            with self.assertRaisesRegex(RuntimeError, "invalid bridge update"):
+                bridge._consume_marker(
+                    f"{module.CREDENTIAL_UPDATE_PREFIX}{bridge.nonce}:not-base64!"
+                )
+            oversized = base64.urlsafe_b64encode(
+                b"x" * (module.MAX_CREDENTIAL_BRIDGE_BYTES + 1)
+            ).decode("ascii").rstrip("=")
+            with self.assertRaisesRegex(RuntimeError, "invalid bridge update"):
+                bridge._consume_marker(
+                    f"{module.CREDENTIAL_UPDATE_PREFIX}{bridge.nonce}:{oversized}"
+                )
+            with patch.object(
+                agent,
+                "_persist_provider_credential",
+                side_effect=RuntimeError("fixture persistence failure"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "fixture persistence failure"):
+                    bridge._consume_marker(marker(update))
+
+            self.assertTrue(bridge._consume_marker(marker(update)))
+            persisted = json.loads(credential_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            persisted["credentials"]["openai-codex"]["refresh"],
+            "new-refresh",
+        )
 
     async def test_model_name_is_used_unless_model_is_explicit(self):
         module = import_portable_agent_module()

@@ -8,6 +8,7 @@ import type {
   CredentialStore,
   OAuthCredential
 } from "@earendil-works/pi-ai";
+import { defaultCredentialStore } from "./credential-bridge.js";
 import { FileCredentialStore } from "./credential-store.js";
 import {
   createPiModels,
@@ -89,7 +90,7 @@ function storedStatus(providerId: string, credential: Credential): PiAuthStatus 
 
 export async function piAuthStatus(
   providerId: string,
-  credentials: CredentialStore = new FileCredentialStore()
+  credentials: CredentialStore = defaultCredentialStore()
 ): Promise<PiAuthStatus> {
   if (!getPiProvider(providerId)) {
     throw new Error(`Unknown Pi provider '${providerId}'.`);
@@ -108,7 +109,7 @@ export async function piAuthStatus(
 }
 
 export async function listPiAuthStatuses(
-  credentials: CredentialStore = new FileCredentialStore()
+  credentials: CredentialStore = defaultCredentialStore()
 ): Promise<readonly PiAuthStatus[]> {
   return await Promise.all(listPiProviders().map((provider) =>
     piAuthStatus(provider.id, credentials)));
@@ -155,7 +156,7 @@ export async function loginPiProvider(
   providerId: string,
   methodId: string,
   interaction: PiLoginInteraction,
-  credentials: CredentialStore = new FileCredentialStore()
+  credentials: CredentialStore = defaultCredentialStore()
 ): Promise<PiAuthStatus> {
   const method = loginMethod(providerId, methodId);
   const lease = credentials instanceof FileCredentialStore
@@ -194,7 +195,7 @@ export async function loginPiProvider(
 
 export async function logoutPiProvider(
   providerId: string,
-  credentials: CredentialStore = new FileCredentialStore()
+  credentials: CredentialStore = defaultCredentialStore()
 ): Promise<PiAuthStatus> {
   if (!getPiProvider(providerId)) {
     throw new Error(`Unknown Pi provider '${providerId}'.`);
@@ -217,7 +218,7 @@ export type OpenAICodexAuthStatus = PiAuthStatus & {
 export type OpenAICodexLoginInteraction = PiLoginInteraction;
 
 export async function openAICodexAuthStatus(
-  credentials: CredentialStore = new FileCredentialStore()
+  credentials: CredentialStore = defaultCredentialStore()
 ): Promise<OpenAICodexAuthStatus> {
   return await piAuthStatus(
     OPENAI_CODEX_PROVIDER_ID,
@@ -228,7 +229,7 @@ export async function openAICodexAuthStatus(
 export async function loginOpenAICodex(
   method: OpenAICodexLoginMethod,
   interaction: OpenAICodexLoginInteraction,
-  credentials: CredentialStore = new FileCredentialStore()
+  credentials: CredentialStore = defaultCredentialStore()
 ): Promise<OpenAICodexAuthStatus> {
   return await loginPiProvider(
     OPENAI_CODEX_PROVIDER_ID,
@@ -239,7 +240,7 @@ export async function loginOpenAICodex(
 }
 
 export async function logoutOpenAICodex(
-  credentials: CredentialStore = new FileCredentialStore()
+  credentials: CredentialStore = defaultCredentialStore()
 ): Promise<void> {
   await logoutPiProvider(OPENAI_CODEX_PROVIDER_ID, credentials);
 }

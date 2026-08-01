@@ -16,7 +16,7 @@ import type {
   ModelStreamEvent
 } from "agent-protocol";
 import { codexPayload } from "./codex-instructions.js";
-import { FileCredentialStore } from "./credential-store.js";
+import { defaultCredentialStore } from "./credential-bridge.js";
 import { PiModelError, sanitizePiModelError } from "./errors.js";
 import {
   approximateTokens,
@@ -74,7 +74,7 @@ export class PiModelGateway implements ModelGateway {
     this.provider = options.provider;
     this.model = options.model;
     this.models = options.models ?? createPiModels(
-      options.credentials ?? new FileCredentialStore(),
+      options.credentials ?? defaultCredentialStore(),
       options.modelsStore ?? new FileModelsStore()
     );
     const piModel = getPiModel(options.provider, options.model, this.models)

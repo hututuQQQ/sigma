@@ -1,4 +1,5 @@
 export * from "./auth.js";
+export * from "./credential-bridge.js";
 export * from "./credential-store.js";
 export * from "./errors.js";
 export * from "./gateway.js";

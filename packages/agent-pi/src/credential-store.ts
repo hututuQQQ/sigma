@@ -69,7 +69,7 @@ function invalidPersistedState(filePath: string): Error {
   });
 }
 
-function isCredential(value: unknown): value is Credential {
+export function isCredential(value: unknown): value is Credential {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const candidate = value as Record<string, unknown>;
   if (candidate.type === "api_key") {
