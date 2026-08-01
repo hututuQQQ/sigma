@@ -25,6 +25,7 @@ describe("agent-config single-source schema", () => {
   });
 
   it("applies source precedence and rejects unknown TOML keys", () => {
+    expect(resolveConfig({}).runDeadlineSec).toBe(0);
     expect(resolveConfig({}).maxModelRetries).toBe(10);
     expect(resolveConfig({ env: { SIGMA_MAX_MODEL_RETRIES: "3" } }).maxModelRetries).toBe(3);
     const values = resolveConfig({

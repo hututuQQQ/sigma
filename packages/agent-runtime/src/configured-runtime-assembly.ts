@@ -108,7 +108,9 @@ export function createComposedRuntime(input: {
     tools,
     permissionMode: customization.permissionMode,
     interactiveApprovals,
-    runDeadlineMs: config.runDeadlineSec * 1_000,
+    ...(config.runDeadlineSec > 0
+      ? { runDeadlineMs: config.runDeadlineSec * 1_000 }
+      : {}),
     maxParallelTools: config.maxParallelTools,
     budgetLimits: customization.budgetLimits,
     checkpointMaxFiles: config.checkpoint?.maxFiles,

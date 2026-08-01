@@ -33,7 +33,7 @@ const runStarted: EventReducer = (state, _event, payload) => ({
   ...state,
   mode: payload.mode === "analyze" || payload.mode === "change" ? payload.mode : state.mode,
   phase: state.messages.length > 0 ? "ready_model" : "idle",
-  deadlineAt: typeof payload.deadlineAt === "string" ? payload.deadlineAt : state.deadlineAt,
+  deadlineAt: typeof payload.deadlineAt === "string" ? payload.deadlineAt : undefined,
   deadlineRemainingMs: undefined,
   activeModelTurn: undefined,
   activeModelSemanticDelta: undefined,

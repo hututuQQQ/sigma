@@ -6,12 +6,13 @@ import type { RuntimeEnvironment } from "agent-platform";
 import { createBudgetLedger, type BudgetLimits, type StartSession } from "agent-protocol";
 import { normalizedAssurancePolicy } from "./assurance-policy.js";
 import { baseContext } from "./runtime-context.js";
+import { configuredRunDeadlineAt } from "./run-deadline.js";
 import type { RuntimeSession, RuntimeSessionServices } from "./types.js";
 import { createRuntimeSessionAggregate } from "./runtime-session-state.js";
 
 export async function newRuntimeSession(
   input: StartSession,
-  runDeadlineMs: number,
+  runDeadlineMs: number | undefined,
   budgetLimits: BudgetLimits | undefined,
   identity: RuntimeSessionServices & {
     parentSessionId?: string;
@@ -27,7 +28,7 @@ export async function newRuntimeSession(
     runId,
     mode: input.mode,
     startedAt: now,
-    deadlineAt: new Date(Date.now() + runDeadlineMs).toISOString(),
+    deadlineAt: configuredRunDeadlineAt(runDeadlineMs),
     assurancePolicy: normalizedAssurancePolicy(
       identity.profile?.profile.assurancePolicy
     )

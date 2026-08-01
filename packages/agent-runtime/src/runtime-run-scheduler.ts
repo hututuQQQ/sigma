@@ -6,7 +6,7 @@ import type { RuntimeSession } from "./types.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 
 export interface RuntimeRunSchedulerOptions {
-  runDeadlineMs: number;
+  runDeadlineMs?: number;
   commandBus: SessionCommandBus;
   run(session: RuntimeSession): Promise<void>;
   emit: RuntimeEventEmitter;
@@ -37,7 +37,10 @@ export class RuntimeRunScheduler {
         await this.options.commandBus.claim(session.identity.sessionId);
         beginNextRun(session, session.durable.mode, this.options.runDeadlineMs);
         await this.options.emit(session, "run.started", "runtime", {
-          mode: session.durable.mode, deadlineAt: session.durable.state.deadlineAt
+          mode: session.durable.mode,
+          ...(session.durable.state.deadlineAt
+            ? { deadlineAt: session.durable.state.deadlineAt }
+            : {})
         });
         await this.options.emit(session, "user.follow_up", "user", {
           text: next.text, queueId: next.id, status: "delivered"

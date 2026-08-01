@@ -331,7 +331,7 @@ mode = "auto"
 search_provider = "exa"
 
 [runtime]
-run_deadline_sec = 900
+run_deadline_sec = 0
 model_deadline_sec = 120
 stream_idle_sec = 45
 
@@ -347,6 +347,11 @@ output_format = "text"
 [tui]
 fps = 30
 ```
+
+`runtime.run_deadline_sec = 0` leaves an interactive run unbounded. Set a
+positive value only when the caller intentionally wants a whole-run wall-clock
+limit. Per-request and per-tool liveness timeouts remain independent so a hung
+provider or process can still be interrupted without imposing a task deadline.
 
 To opt into broader per-call capabilities, use:
 

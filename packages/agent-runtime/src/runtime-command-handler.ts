@@ -11,7 +11,7 @@ import { recordReviewerWaiver } from "./review-waiver-command.js";
 import { armRunDeadline, resumedDeadlineAt } from "./run-deadline.js";
 
 export interface RuntimeCommandHandlerOptions {
-  runDeadlineMs: number;
+  runDeadlineMs?: number;
   commandBus: SessionCommandBus;
   cancelChildren: RuntimeOptions["cancelChildren"];
   emit: RuntimeEventEmitter;
@@ -244,7 +244,10 @@ export class RuntimeCommandHandler {
       session.recovery.lastOutcome = undefined;
     }
     await this.options.emit(session, "run.started", "runtime", {
-      mode: session.durable.mode, deadlineAt: session.durable.state.deadlineAt
+      mode: session.durable.mode,
+      ...(session.durable.state.deadlineAt
+        ? { deadlineAt: session.durable.state.deadlineAt }
+        : {})
     });
     await this.options.emit(session, "user.follow_up", "user", {
       text, queueId: randomUUID(), status: "delivered"
@@ -266,7 +269,10 @@ export class RuntimeCommandHandler {
       session.recovery.lastOutcome = undefined;
     }
     await this.options.emit(session, "run.started", "runtime", {
-      mode: session.durable.mode, deadlineAt: session.durable.state.deadlineAt
+      mode: session.durable.mode,
+      ...(session.durable.state.deadlineAt
+        ? { deadlineAt: session.durable.state.deadlineAt }
+        : {})
     });
     await this.options.emit(session, "user.message", "user", { text: command.text });
     this.options.start(session);

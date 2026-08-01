@@ -42,7 +42,7 @@ export class InProcessRuntimeClient implements RuntimeClient {
   private readonly sessions = new Map<string, RuntimeSession>();
   private readonly artifacts: ContentAddressedArtifactStore;
   private readonly effects: EffectRunner;
-  private readonly runDeadlineMs: number;
+  private readonly runDeadlineMs: number | undefined;
   private readonly commandBus: SessionCommandBus;
   private readonly control: RuntimeControlService;
   private readonly budgets: BudgetController;
@@ -66,7 +66,7 @@ export class InProcessRuntimeClient implements RuntimeClient {
       runtimeEnvironment: options.runtimeEnvironment,
       execution: options.execution
     });
-    this.runDeadlineMs = options.runDeadlineMs ?? 900_000;
+    this.runDeadlineMs = options.runDeadlineMs;
     this.events = new RuntimeEventLog(options.store);
     this.commandBus = new SessionCommandBus(options.storeRootDir, async (command) => await this.command(command));
     this.commands = new RuntimeCommandHandler({

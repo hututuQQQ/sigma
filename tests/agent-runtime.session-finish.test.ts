@@ -102,4 +102,31 @@ describe("runtime terminal commit", () => {
       code: "child_settlement_failed"
     }));
   });
+
+  it("rejects a resource-boundary completion as typed budget exhaustion", async () => {
+    const fixture = finishFixture();
+
+    await expect(finishRuntimeSession(fixture.finishOptions, fixture.session, {
+      kind: "completed",
+      message: "Partial work was preserved.",
+      evidence: [],
+      decisionAuthority: "resource_boundary"
+    })).resolves.toBe(true);
+
+    expect(fixture.emitted).toEqual([{
+      type: "run.failed",
+      payload: {
+        kind: "recoverable_failure",
+        code: "budget_exhausted",
+        message: "Partial work was preserved.",
+        decisionAuthority: "resource_boundary"
+      }
+    }]);
+    expect(fixture.finishOptions.hooks.dispatch).not.toHaveBeenCalledWith(
+      fixture.session,
+      "pre_complete",
+      expect.anything(),
+      expect.anything()
+    );
+  });
 });

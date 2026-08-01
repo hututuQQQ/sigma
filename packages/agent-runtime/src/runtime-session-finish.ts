@@ -19,6 +19,18 @@ export interface RuntimeSessionFinishOptions {
   beforeOutcome?(session: RuntimeSession, outcome: RunOutcome): Promise<number>;
 }
 
+function failClosedResourceBoundaryCompletion(outcome: RunOutcome): RunOutcome {
+  if (outcome.kind !== "completed" || outcome.decisionAuthority !== "resource_boundary") {
+    return outcome;
+  }
+  return {
+    kind: "recoverable_failure",
+    code: "budget_exhausted",
+    message: outcome.message,
+    decisionAuthority: "resource_boundary"
+  };
+}
+
 function isCurrentOutcomeRevision(session: RuntimeSession, outcomeRevision?: number): boolean {
   return outcomeRevision === undefined
     || (session.durable.state.phase === "outcome_pending" && session.durable.state.revision === outcomeRevision);
@@ -186,8 +198,8 @@ export async function finishRuntimeSession(
   suspensionContext?: RunSuspensionContext
 ): Promise<boolean> {
   if (!isCurrentOutcomeRevision(session, outcomeRevision)) return false;
-  let coordinatedOutcome = outcome;
-  if (outcome.kind === "completed") {
+  let coordinatedOutcome = failClosedResourceBoundaryCompletion(outcome);
+  if (coordinatedOutcome.kind === "completed") {
     const decision = completionGateDecision(session);
     if (decision.action === "continue") {
       await options.events.emit(session, "diagnostic", "runtime", {
@@ -204,10 +216,10 @@ export async function finishRuntimeSession(
           decisionAuthority: decision.authority
         }
       : {
-          ...outcome,
-          decisionAuthority: outcome.decisionAuthority ?? decision.authority,
+          ...coordinatedOutcome,
+          decisionAuthority: coordinatedOutcome.decisionAuthority ?? decision.authority,
           ...(decision.statusNote
-            ? { message: `${outcome.message}\n\n${decision.statusNote}` }
+            ? { message: `${coordinatedOutcome.message}\n\n${decision.statusNote}` }
             : {})
         };
   }

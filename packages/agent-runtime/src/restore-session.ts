@@ -35,6 +35,7 @@ import {
   type RecoveredApprovalMetadata
 } from "./approval-binding.js";
 import { assurancePolicyFromState } from "./assurance-policy.js";
+import { configuredRunDeadlineAt } from "./run-deadline.js";
 
 export interface RestoredSessionData {
   workspacePath: string;
@@ -55,7 +56,7 @@ function freshState(
   sessionId: string,
   event: AgentEventEnvelope,
   mode: RunMode,
-  runDeadlineMs: number,
+  runDeadlineMs: number | undefined,
   budgetLimits?: BudgetLimits,
   assurancePolicy?: AssuranceResourcePolicy
 ): KernelState {
@@ -64,7 +65,7 @@ function freshState(
     runId: event.runId || randomUUID(),
     mode,
     startedAt: event.occurredAt,
-    deadlineAt: new Date(Date.now() + runDeadlineMs).toISOString(),
+    deadlineAt: configuredRunDeadlineAt(runDeadlineMs),
     ...(assurancePolicy ? { assurancePolicy } : {})
   });
   if (budgetLimits) state.budget = createBudgetLedger(budgetLimits);
@@ -77,7 +78,7 @@ function eventRunMode(event: AgentEventEnvelope, fallback: RunMode): RunMode {
   return mode === "analyze" || mode === "change" ? mode : fallback;
 }
 
-function nextRun(state: KernelState, event: AgentEventEnvelope, runDeadlineMs: number): KernelState {
+function nextRun(state: KernelState, event: AgentEventEnvelope, runDeadlineMs: number | undefined): KernelState {
   if (event.runId === state.runId || event.type !== "run.started") return state;
   return {
     ...freshState(
@@ -239,7 +240,7 @@ function initializeFromCreated(
   accumulator: RestoreAccumulator,
   event: AgentEventEnvelope,
   sessionId: string,
-  runDeadlineMs: number
+  runDeadlineMs: number | undefined
 ): void {
   if (accumulator.metadata || event.type !== "session.created") return;
   accumulator.metadata = createdSessionMetadata(event);
@@ -263,7 +264,7 @@ function replayEvent(
   accumulator: RestoreAccumulator,
   event: AgentEventEnvelope,
   snapshotSeq: number,
-  runDeadlineMs: number
+  runDeadlineMs: number | undefined
 ): void {
   accumulator.lastSeq = event.seq;
   trackFollowUp(accumulator, event);
@@ -302,7 +303,7 @@ export interface SnapshotRebuildInput {
 /** Replays the durable event log through the kernel to rebuild a current snapshot. */
 export async function rebuildSnapshotFromEvents(
   input: SnapshotRebuildInput,
-  runDeadlineMs = 30 * 60 * 1_000
+  runDeadlineMs?: number
 ): Promise<SnapshotEnvelope> {
   const accumulator = emptyAccumulator();
   for await (const event of input.events()) replayEvent(accumulator, event, 0, runDeadlineMs);
@@ -319,7 +320,7 @@ export async function rebuildSnapshotFromEvents(
   };
 }
 
-export async function restoreStoredSession(store: RunStore, sessionId: string, runDeadlineMs: number): Promise<RestoredSessionData> {
+export async function restoreStoredSession(store: RunStore, sessionId: string, runDeadlineMs?: number): Promise<RestoredSessionData> {
   const snapshot = await store.latestSnapshot(sessionId);
   const restoredSnapshot = snapshotState(snapshot, sessionId);
   const accumulator = emptyAccumulator(restoredSnapshot);

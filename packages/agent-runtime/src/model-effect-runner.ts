@@ -27,7 +27,6 @@ import {
 import {
   convergenceAdmissionFailure,
   deadlineForecast,
-  openConvergenceActionScope,
   type DeadlineForecast
 } from "./convergence-policy.js";
 import {
@@ -123,8 +122,6 @@ export class ModelEffectRunner {
   ): Promise<boolean> {
     if (!this.reviews) return await this.options.finish(session, outcome);
     return await finishSolvingBudgetBoundary(session, signal, outcome, {
-      reviews: this.reviews,
-      longHorizon: this.longHorizon,
       emit: this.options.emit,
       finish: this.options.finish,
       runtime: this.options.runtime,
@@ -239,7 +236,7 @@ export class ModelEffectRunner {
     await this.options.emit(session, "diagnostic", "runtime", {
       kind: "deadline.stage",
       stage: forecast.stage,
-      remainingMs: forecast.remainingMs,
+      ...(forecast.remainingMs === undefined ? {} : { remainingMs: forecast.remainingMs }),
       outputReserveTokens: turn.outputReserveTokens
     });
     await this.emitContextComposition(session, plan, forecast);
@@ -265,15 +262,14 @@ export class ModelEffectRunner {
   ): Promise<void> {
     const startedAt = performance.now();
     const state: ModelReservationState = { settled: false };
-    const boundary = openConvergenceActionScope(session, signal, { kind: "model" });
     try {
       const response = await streamModelResponse(
-        this.options, session, turnId, turn.messages, turn.tools, turn.toolChoice, boundary.signal,
+        this.options, session, turnId, turn.messages, turn.tools, turn.toolChoice, signal,
         turn.budget.routeConstraints, turn.outputReserveTokens
       );
       state.response = response;
       await this.completeReservation(
-        session, turnId, effectRevision, boundary.signal, turn, requestId, reservationId, response, startedAt, state
+        session, turnId, effectRevision, signal, turn, requestId, reservationId, response, startedAt, state
       );
     } catch (error) {
       if (!state.settled && state.response) {
@@ -285,8 +281,6 @@ export class ModelEffectRunner {
         await this.commitFailure(session, turn, requestId, reservationId, startedAt, error);
       }
       throw error;
-    } finally {
-      boundary.close();
     }
   }
 

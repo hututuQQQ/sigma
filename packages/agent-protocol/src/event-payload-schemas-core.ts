@@ -211,9 +211,9 @@ const diagnosticSchema = z.discriminatedUnion("kind", [
   }).strict(),
   z.object({
     kind: z.literal("deadline.stage"),
-    stage: z.enum(["normal", "converge", "stop"]),
+    stage: z.enum(["unbounded", "normal", "converge", "stop"]),
     budgetStage: z.enum(["normal", "converge", "terminal"]).optional(),
-    remainingMs: z.number(),
+    remainingMs: z.number().optional(),
     outputReserveTokens: z.number().int().positive()
   }).strict(),
   z.object({
@@ -231,7 +231,7 @@ const diagnosticSchema = z.discriminatedUnion("kind", [
     dynamicSuffixTokens: z.number().int().nonnegative(),
     modelVisibleOutputTruncatedBytes: z.number().int().nonnegative(),
     reviewCount: z.number().int().nonnegative(),
-    deadlineStage: z.enum(["normal", "converge", "stop"]),
+    deadlineStage: z.enum(["unbounded", "normal", "converge", "stop"]),
     executionMode: z.enum(["sandboxed", "container"])
   }).strict(),
   z.object({
@@ -261,7 +261,7 @@ export const coreEventPayloadSchemas = {
     assurancePolicy: assuranceResourcePolicySchema.optional(),
     parentSessionId: nonEmptyStringSchema.optional()
   }).strict(),
-  "run.started": z.object({ mode: runModeSchema, deadlineAt: dateTimeSchema }).strict(),
+  "run.started": z.object({ mode: runModeSchema, deadlineAt: dateTimeSchema.optional() }).strict(),
   "run.suspended": suspensionSchema,
   "run.completed": z.object({
     kind: z.literal("completed"),

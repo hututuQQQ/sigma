@@ -296,7 +296,9 @@ export class ToolApprovalCoordinator {
       const message = `Tool '${descriptor.name}' requires human approval, but this runtime surface is non-interactive.`;
       const committed = await this.options.finish(session, {
         kind: "needs_input", requestId: request.id, message
-      }, undefined, { remainingDeadlineMs });
+      }, undefined, remainingDeadlineMs === undefined
+        ? undefined
+        : { remainingDeadlineMs });
       if (!committed) {
         throw Object.assign(new Error("Runtime could not commit a non-interactive approval suspension."), {
           code: "approval_suspension_failed"
