@@ -313,6 +313,12 @@ export class ToolTransactionRunner {
       assertToolReceiptIdentity(rawReceipt, call.id);
       let receipt = rawReceipt;
       if (checkpoint) {
+        await this.options.emit(session, "tool.progress", "tool", {
+          callId: call.id,
+          name: call.name,
+          ...turnPayload(prepared.modelTurn),
+          message: "Verifying workspace changes."
+        });
         const inspection = await this.options.control.inspectOpenCheckpoint(session, checkpoint.checkpointId);
         receipt = {
           ...rawReceipt,

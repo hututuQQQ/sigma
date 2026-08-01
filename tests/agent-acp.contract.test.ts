@@ -57,6 +57,7 @@ class FakeRuntime implements RuntimeClient {
   private readonly outcomeWaiters = new Map<string, Set<(outcome: RunOutcome) => void>>();
   private readonly sessions = new Map<string, SessionOverview>();
   private readonly approvals = new Map<string, (decision: string) => void>();
+  private readonly checkpointRecoveries = new Map<string, string>();
   private nextSession = 0;
 
   async createSession(input: StartSession): Promise<SessionRef> {
@@ -79,6 +80,14 @@ class FakeRuntime implements RuntimeClient {
       this.resumeSettlement?.started();
       await this.resumeSettlement?.wait;
       this.attached.add(command.sessionId);
+      return;
+    }
+    if (command.type === "checkpoint_recovery") {
+      const checkpointId = this.checkpointRecoveries.get(command.sessionId);
+      if (checkpointId !== command.checkpointId) {
+        throw new Error(`Unknown fake checkpoint '${command.checkpointId}'.`);
+      }
+      this.checkpointRecoveries.delete(command.sessionId);
       return;
     }
     if (command.type === "submit" || command.type === "follow_up") {
@@ -161,6 +170,13 @@ class FakeRuntime implements RuntimeClient {
     });
   }
 
+  async pendingCheckpointRecovery(
+    sessionId: string
+  ): Promise<{ checkpointId: string } | undefined> {
+    const checkpointId = this.checkpointRecoveries.get(sessionId);
+    return checkpointId ? { checkpointId } : undefined;
+  }
+
   async listSessions(): Promise<SessionOverview[]> {
     return [...this.sessions.values()];
   }
@@ -182,6 +198,14 @@ class FakeRuntime implements RuntimeClient {
     overview.status = "completed";
     overview.lastMessage = text;
     this.outcomes.set(sessionId, { kind: "completed", message: "Stored response.", evidence: [] });
+  }
+
+  seedCheckpointRecovery(sessionId: string, checkpointId: string): void {
+    this.checkpointRecoveries.set(sessionId, checkpointId);
+  }
+
+  latestSessionId(): string {
+    return `runtime-${this.nextSession}`;
   }
 
   requireResumeBeforeCancel(sessionId: string): void {
@@ -471,7 +495,10 @@ describe("Sigma ACP v1 contract", () => {
       })
       .onRequest(acp.methods.client.session.requestPermission, ({ params }) => {
         permissionRequests.push(params);
-        return { outcome: { outcome: "selected", optionId: permissionOptionId } };
+        const optionId = params._meta?.["sigma.permission.requiresExplicitDecision"] === true
+          ? "keep"
+          : permissionOptionId;
+        return { outcome: { outcome: "selected", optionId } };
       });
     const clientConnection = client.connect(acp.ndJsonStream(
       Writable.toWeb(clientToAgent),
@@ -574,6 +601,7 @@ describe("Sigma ACP v1 contract", () => {
         }
       );
       expect(changedReasoning.configOptions[1]).toMatchObject({ currentValue: "high" });
+      runtime.seedCheckpointRecovery(runtime.latestSessionId(), "checkpoint-1");
       const modelSwitchSession = await clientConnection.agent.request(
         acp.methods.agent.session.new,
         { cwd: root, mcpServers: [] }
@@ -605,8 +633,27 @@ describe("Sigma ACP v1 contract", () => {
         prompt: [{ type: "text", text: "Update README" }]
       });
       expect(prompt.stopReason).toBe("end_turn");
-      expect(permissionRequests).toHaveLength(1);
+      expect(permissionRequests).toHaveLength(2);
+      expect(permissionRequests[0]).toMatchObject({
+        options: [
+          { optionId: "keep", name: "Keep current changes", kind: "allow_once" },
+          {
+            optionId: "restore",
+            name: "Restore pre-interruption state",
+            kind: "reject_once"
+          }
+        ],
+        _meta: {
+          "sigma.permission.requiresExplicitDecision": true,
+          "sigma.checkpoint.id": "checkpoint-1"
+        }
+      });
       expect(runtime.commands).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          type: "checkpoint_recovery",
+          checkpointId: "checkpoint-1",
+          decision: "keep"
+        }),
         expect.objectContaining({ type: "submit", text: "Update README" }),
         expect.objectContaining({ type: "approve", decision: "allow" })
       ]));

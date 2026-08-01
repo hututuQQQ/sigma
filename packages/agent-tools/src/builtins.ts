@@ -40,6 +40,7 @@ function deleteFileTool(): RegisteredEffectTool {
       writePathArguments: ["path"],
       approval: "prompt",
       idempotent: false,
+      workspaceDeltaAuthority: "structured_tool_receipt",
       timeoutMs: 30_000
     }),
     async execute(request, context) {
@@ -76,6 +77,7 @@ function applyPatchTool(atomicPatchStateRootDir?: string): RegisteredEffectTool 
       resourceKeys: ["workspace:write"],
       approval: "prompt",
       idempotent: false,
+      workspaceDeltaAuthority: "structured_tool_receipt",
       timeoutMs: 120_000,
       prepare(argumentsValue) {
         const input = args(argumentsValue);

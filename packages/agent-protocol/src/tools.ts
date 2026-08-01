@@ -53,6 +53,11 @@ export interface ToolDescriptor {
   idleTimeoutMs?: number;
   /** Trusted built-in declaration permitting broker-owned mutation journals. */
   brokerMutationAuthority?: "repository_transaction" | "disposable_enclosing_container";
+  /** Trusted runtime-owned structured writer whose receipt reports its exact
+   * workspace delta. The runtime still verifies the declared checkpoint scope
+   * before sealing; this only suppresses the generic whole-worktree observer
+   * used for open-world executors. */
+  workspaceDeltaAuthority?: "structured_tool_receipt";
   prepare?(argumentsValue: JsonValue, context: ToolPreparationContext): Promise<ToolCallPlan> | ToolCallPlan;
 }
 

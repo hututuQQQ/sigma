@@ -59,6 +59,14 @@ function observesWorkspace(plan: ToolCallPlan): boolean {
     ["filesystem.write", "destructive", "validation", "open_world"].includes(effect));
 }
 
+function requiresFallbackWorkspaceObservation(
+  descriptor: ToolDescriptor,
+  plan: ToolCallPlan
+): boolean {
+  return observesWorkspace(plan)
+    && descriptor.workspaceDeltaAuthority !== "structured_tool_receipt";
+}
+
 export class ToolExecutionMonitor {
   private readonly unsettled = new Map<string, Promise<void>>();
   private readonly sessionUnsettled = new Map<string, Set<Promise<void>>>();
@@ -107,7 +115,13 @@ export class ToolExecutionMonitor {
     heartbeat();
     try {
       const requiresSettlement = requiresToolSettlement(plan);
-      const before = observesWorkspace(plan) ? await this.gitState(session, controller.signal) : null;
+      const fallbackObservation = requiresFallbackWorkspaceObservation(descriptor, plan);
+      const before = fallbackObservation
+        ? await this.observeWorkspace(
+            session, call, modelTurn, controller.signal,
+            "Observing workspace state before execution."
+          )
+        : null;
       const execution = this.options.runtime.tools.execute({
         callId: call.id, name: call.name, arguments: call.arguments
       }, {
@@ -134,20 +148,9 @@ export class ToolExecutionMonitor {
         execution, requiresSettlement, controller, session.identity.sessionId, resourceKeys
       );
       if (!before) return receipt;
-      const after = await this.gitState(session, controller.signal);
-      if (!after) return receipt;
-      const observed = workspaceDelta(before, after);
-      const changed = observed.added.length + observed.modified.length + observed.deleted.length > 0;
-      const actualEffects = receipt.actualEffects ?? receipt.observedEffects;
-      const withWrite = changed && !actualEffects.includes("filesystem.write")
-        ? [...actualEffects, "filesystem.write" as const]
-        : actualEffects;
-      return {
-        ...receipt,
-        workspaceDelta: mergeDelta(receipt.workspaceDelta, observed),
-        observedEffects: withWrite,
-        actualEffects: withWrite
-      };
+      return await this.withFallbackWorkspaceDelta(
+        session, call, modelTurn, controller.signal, before, receipt
+      );
     } finally {
       clearTimeout(timer);
       if (idleTimer) clearTimeout(idleTimer);
@@ -191,6 +194,49 @@ export class ToolExecutionMonitor {
         if (this.unsettled.get(key) === combined) this.unsettled.delete(key);
       });
     }
+  }
+
+  private async observeWorkspace(
+    session: RuntimeSession,
+    call: ModelToolCall,
+    modelTurn: ActiveModelTurn,
+    signal: AbortSignal,
+    message: string
+  ): Promise<Map<string, string> | null> {
+    await this.options.emit(session, "tool.progress", "tool", {
+      callId: call.id,
+      name: call.name,
+      ...turnPayload(modelTurn),
+      message
+    });
+    return await this.gitState(session, signal);
+  }
+
+  private async withFallbackWorkspaceDelta(
+    session: RuntimeSession,
+    call: ModelToolCall,
+    modelTurn: ActiveModelTurn,
+    signal: AbortSignal,
+    before: Map<string, string>,
+    receipt: ToolReceipt
+  ): Promise<ToolReceipt> {
+    const after = await this.observeWorkspace(
+      session, call, modelTurn, signal,
+      "Observing workspace changes after execution."
+    );
+    if (!after) return receipt;
+    const observed = workspaceDelta(before, after);
+    const changed = observed.added.length + observed.modified.length + observed.deleted.length > 0;
+    const actualEffects = receipt.actualEffects ?? receipt.observedEffects;
+    const withWrite = changed && !actualEffects.includes("filesystem.write")
+      ? [...actualEffects, "filesystem.write" as const]
+      : actualEffects;
+    return {
+      ...receipt,
+      workspaceDelta: mergeDelta(receipt.workspaceDelta, observed),
+      observedEffects: withWrite,
+      actualEffects: withWrite
+    };
   }
 
   private async gitState(session: RuntimeSession, signal: AbortSignal): Promise<Map<string, string> | null> {

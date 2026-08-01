@@ -36,6 +36,7 @@ function writeTool(atomicPatchStateRootDir?: string): RegisteredEffectTool {
       writePathArguments: ["path"],
       approval: "prompt",
       idempotent: true,
+      workspaceDeltaAuthority: "structured_tool_receipt",
       timeoutMs: 30_000,
       async prepare(value, context) {
         const input = args(value);
@@ -109,6 +110,7 @@ function editTool(atomicPatchStateRootDir?: string): RegisteredEffectTool {
       writePathArguments: ["path"],
       approval: "prompt",
       idempotent: false,
+      workspaceDeltaAuthority: "structured_tool_receipt",
       timeoutMs: 30_000
     }),
     async probeNoChange(request, context) {

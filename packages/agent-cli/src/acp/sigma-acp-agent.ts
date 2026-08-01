@@ -43,6 +43,18 @@ interface SigmaSessionConfigSelection {
   nextReasoningEffort?: ModelReasoningEffort;
 }
 
+class CheckpointRecoveryCancelled extends Error {}
+
+function checkpointRecoveryDecision(
+  response: acp.RequestPermissionResponse
+): "keep" | "restore" | undefined {
+  if (response.outcome.outcome !== "selected") return undefined;
+  if (response.outcome.optionId === "keep" || response.outcome.optionId === "restore") {
+    return response.outcome.optionId;
+  }
+  throw new Error(`Unknown checkpoint recovery option '${response.outcome.optionId}'.`);
+}
+
 function resolveSessionConfigSelection(
   configId: string,
   value: string,
@@ -407,6 +419,83 @@ export class SigmaAcpAgent {
         });
   }
 
+  private async pendingCheckpointRecovery(
+    resolved: ResolvedSession
+  ): Promise<{ checkpointId: string } | undefined> {
+    return await resolved.handle.runtime.pendingCheckpointRecovery?.(
+      resolved.record.runtimeSessionId
+    );
+  }
+
+  private async resolveCheckpointRecovery(
+    resolved: ResolvedSession,
+    client: acp.AgentContext,
+    signal: AbortSignal
+  ): Promise<boolean> {
+    const recovery = await this.pendingCheckpointRecovery(resolved);
+    if (!recovery) return false;
+    const response = await client.request(acp.methods.client.session.requestPermission, {
+      sessionId: resolved.record.sessionId,
+      toolCall: {
+        toolCallId: `checkpoint:${recovery.checkpointId}`,
+        title: "Recover interrupted workspace changes",
+        name: "checkpoint_recovery",
+        kind: "edit",
+        status: "pending",
+        rawInput: { checkpointId: recovery.checkpointId }
+      },
+      options: [
+        { optionId: "keep", name: "Keep current changes", kind: "allow_once" },
+        { optionId: "restore", name: "Restore pre-interruption state", kind: "reject_once" }
+      ],
+      _meta: {
+        "sigma.permission.requiresExplicitDecision": true,
+        "sigma.checkpoint.id": recovery.checkpointId
+      }
+    }, { cancellationSignal: signal });
+    const decision = checkpointRecoveryDecision(response);
+    if (!decision) throw new CheckpointRecoveryCancelled("Checkpoint recovery was cancelled.");
+    await resolved.handle.runtime.command({
+      type: "checkpoint_recovery",
+      sessionId: resolved.record.runtimeSessionId,
+      checkpointId: recovery.checkpointId,
+      decision
+    });
+    await resolved.handle.runtime.command({
+      type: "resume",
+      sessionId: resolved.record.runtimeSessionId
+    });
+    return true;
+  }
+
+  private async waitForPromptOutcome(
+    resolved: ResolvedSession,
+    client: acp.AgentContext,
+    signal: AbortSignal
+  ): Promise<import("agent-protocol").RunOutcome> {
+    while (true) {
+      const runtime = resolved.handle.runtime;
+      const outcome = runtime.waitForIdleOutcome
+        ? await runtime.waitForIdleOutcome(resolved.record.runtimeSessionId, signal)
+        : await runtime.waitForOutcome(resolved.record.runtimeSessionId, signal);
+      if (!await this.resolveCheckpointRecovery(resolved, client, signal)) return outcome;
+    }
+  }
+
+  private async steerActivePrompt(
+    sessionId: string,
+    text: string
+  ): Promise<acp.PromptResponse> {
+    const resolved = await this.sessions.resolveSession(sessionId);
+    await this.sessions.ensureAttached(resolved);
+    await resolved.handle.runtime.command({
+      type: "steer",
+      sessionId: resolved.record.runtimeSessionId,
+      text
+    });
+    return { stopReason: "end_turn", _meta: { "sigma.command": "steer" } };
+  }
+
   private async prompt(
     params: acp.PromptRequest,
     client: acp.AgentContext,
@@ -414,14 +503,7 @@ export class SigmaAcpAgent {
   ): Promise<acp.PromptResponse> {
     const text = promptText(params.prompt);
     if (this.activePrompts.has(params.sessionId)) {
-      const resolved = await this.sessions.resolveSession(params.sessionId);
-      await this.sessions.ensureAttached(resolved);
-      await resolved.handle.runtime.command({
-        type: "steer",
-        sessionId: resolved.record.runtimeSessionId,
-        text
-      });
-      return { stopReason: "end_turn", _meta: { "sigma.command": "steer" } };
+      return await this.steerActivePrompt(params.sessionId, text);
     }
     const controller = new AbortController();
     this.activePrompts.set(params.sessionId, controller);
@@ -442,10 +524,13 @@ export class SigmaAcpAgent {
       await this.sessions.ensureAttached(resolved);
       controller.signal.throwIfAborted();
       const state: ForwardState = { modelText: new Map(), reasoningText: new Map() };
-      await this.dispatchPrompt(resolved, text, controller.signal);
       forwarding = this.events.forwardLive(resolved, client, state, controller.signal);
+      // Observe stream rejection while recovery permission is still open.
+      void forwarding.catch(() => undefined);
+      await this.resolveCheckpointRecovery(resolved, client, controller.signal);
+      await this.dispatchPrompt(resolved, text, controller.signal);
       const outcome = await Promise.race([
-        resolved.handle.runtime.waitForOutcome(resolved.record.runtimeSessionId, controller.signal),
+        this.waitForPromptOutcome(resolved, client, controller.signal),
         forwarding.then(() => {
           throw new Error("Sigma Runtime event stream ended before the run outcome.");
         })
@@ -459,6 +544,10 @@ export class SigmaAcpAgent {
       return promptResponseForOutcome(outcome);
     } catch (error) {
       if (error instanceof acp.RequestError && error.code === SIGMA_RUNTIME_REQUEST_ERROR) throw error;
+      if (error instanceof CheckpointRecoveryCancelled) {
+        controller.abort(error);
+        return { stopReason: "cancelled" };
+      }
       if (expectedAbort(error, controller.signal)) {
         // Do not expose the cancelled prompt response until the runtime has
         // settled any in-flight mutation. The ACP cancel notification and the

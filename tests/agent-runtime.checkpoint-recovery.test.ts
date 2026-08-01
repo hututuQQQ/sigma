@@ -248,6 +248,9 @@ describe("runtime checkpoint recovery control plane", () => {
       kind: "needs_input",
       requestId: `checkpoint:${fixture.checkpoint.checkpointId}`
     });
+    await expect(fixture.runtime.pendingCheckpointRecovery(
+      fixture.checkpoint.sessionId
+    )).resolves.toEqual({ checkpointId: fixture.checkpoint.checkpointId });
     await expect(fixture.runtime.command({
       type: "submit",
       sessionId: fixture.checkpoint.sessionId,
@@ -261,6 +264,9 @@ describe("runtime checkpoint recovery control plane", () => {
       checkpointId: fixture.checkpoint.checkpointId,
       decision: "restore"
     })).rejects.toMatchObject({ code: "checkpoint_conflict" });
+    await expect(fixture.runtime.pendingCheckpointRecovery(
+      fixture.checkpoint.sessionId
+    )).resolves.toEqual({ checkpointId: fixture.checkpoint.checkpointId });
     await expect(readFile(path.join(fixture.workspace, "target.txt"), "utf8")).resolves.toBe("edit after prompt");
 
     await fixture.runtime.command({
@@ -270,6 +276,9 @@ describe("runtime checkpoint recovery control plane", () => {
       decision: "restore"
     });
     await expect(readFile(path.join(fixture.workspace, "target.txt"), "utf8")).resolves.toBe("before");
+    await expect(fixture.runtime.pendingCheckpointRecovery(
+      fixture.checkpoint.sessionId
+    )).resolves.toBeUndefined();
     const events = await storedEvents(fixture.store, fixture.checkpoint.sessionId);
     expect(events).toContainEqual(expect.objectContaining({
       type: "checkpoint.restored",
