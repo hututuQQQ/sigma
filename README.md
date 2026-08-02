@@ -5,8 +5,8 @@
 <h1 align="center">Sigma Code</h1>
 
 <p align="center">
-  A durable, evidence-driven coding agent with a unified Pi model gateway.<br>
-  Plan, inspect, edit, execute, validate, review, and resume from the terminal or the Sigma Code desktop app.
+  The open-source coding agent that survives interruptions and proves its changes.<br>
+  Run long coding tasks in a native sandbox, resume anytime, and finish with evidence.
 </p>
 
 <p align="center">
@@ -36,7 +36,7 @@
   </sub>
 </p>
 
-Sigma Code turns a coding task into a durable stream of typed decisions and evidence. It can explore a repository, make scoped changes, run sandboxed commands, validate the result, ask an independent reviewer, and recover the same session after interruption. This repository owns Sigma Runtime, the CLI, and the TUI; the desktop, Web, and mobile client lives in [hututuQQQ/sigma-code](https://github.com/hututuQQQ/sigma-code). The terminal surfaces use the in-process `RuntimeClient`, while the client's first-party Sigma provider launches the same event-sourced kernel, session store, tools, recovery logic, and outcome protocol through stable ACP v1.
+Sigma Code is built for coding tasks that must not lose their state or declare victory too early. It runs commands inside a required native sandbox, persists the full working session so it can resume after interruption, and completes only after current changes are validated and any required review is satisfied. This repository owns Sigma Runtime, the CLI, and the TUI; the desktop, Web, and mobile client lives in [hututuQQQ/sigma-code](https://github.com/hututuQQQ/sigma-code). Every surface uses the same event-sourced kernel, session store, tools, recovery logic, and outcome protocol, either in process through `RuntimeClient` or over stable ACP v1.
 
 `0.1.4` is the current supported product baseline.
 Linux x64 is the stable release target. Windows x64 remains an explicitly
@@ -56,13 +56,11 @@ or proposing changes.
 
 ## Why Sigma Code
 
-| Principle | What it means in practice |
+| Core capability | What it means for you |
 | --- | --- |
-| Durable by default | Commands, model turns, tool receipts, approvals, plans, evidence, and outcomes are stored as checksummed events and can be replayed. |
-| Effects before execution | Every tool declares its possible effects; each call is narrowed to an exact plan before policy, approval, locking, checkpointing, and execution. |
-| Current-state validation before “done” | The runtime completes only when semantic validation covers every net change on the current mutation frontier. |
-| Fail-closed containment | Process execution stays in the required native sandbox even when host reads or networking are authorized. If the sandbox is unhealthy, Sigma refuses to execute. |
-| One runtime, multiple surfaces | CLI automation and the TUI use the same `RuntimeClient`; `sigma acp` exposes that runtime over stable ACP v1 to the Sigma Code desktop client without creating a second Agent path. |
+| Native sandbox execution | Commands stay inside required OS-level isolation. If the sandbox is unhealthy, Sigma refuses to execute. |
+| Sessions that survive interruption | Commands, model turns, tool receipts, plans, and outcomes are persisted as checksummed events, so the same task can be resumed and replayed. |
+| Evidence before completion | Model prose alone cannot mark changed work as done. Sigma requires current-state validation and any required review evidence. |
 
 ## Sigma Code desktop and T3 integration
 
