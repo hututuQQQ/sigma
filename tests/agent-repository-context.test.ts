@@ -648,6 +648,34 @@ describe("host repository context", () => {
     expect(changedIndex.id).toBe(firstIndex.id);
   });
 
+  it("reuses versioned repository context until the runtime workspace version advances", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-versioned-context-"));
+    try {
+      await writeFile(path.join(workspace, "first.ts"), "export const first = true;\n", "utf8");
+      const provider = new RepositoryContextProvider();
+      const signal = new AbortController().signal;
+      const first = await provider.collect(workspace, "first", signal, {
+        workspaceStateVersion: "frontier-1"
+      });
+
+      await writeFile(path.join(workspace, "second.ts"), "export const second = true;\n", "utf8");
+      const unchanged = await provider.collect(workspace, "first", signal, {
+        workspaceStateVersion: "frontier-1"
+      });
+      const advanced = await provider.collect(workspace, "first", signal, {
+        workspaceStateVersion: "frontier-2"
+      });
+
+      const content = (items: typeof first) => items.find((item) =>
+        item.provenance === "incremental repository index")!.content;
+      expect(content(first)).toContain('"first.ts"');
+      expect(content(unchanged)).not.toContain('"second.ts"');
+      expect(content(advanced)).toContain('"second.ts"');
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
   it("applies root and nested gitignore rules without exposing gitignore files", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-host-context-ignore-"));
     await Promise.all([

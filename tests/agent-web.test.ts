@@ -148,6 +148,15 @@ async function executeTool(
 }
 
 describe("agent-web", () => {
+  it("describes local-first code research boundaries", () => {
+    const description = webRunTool({
+      broker: broker(async () => webResponse({ body: new Uint8Array() }))
+    }).descriptor.description;
+
+    expect(description).toContain("inspect project instructions, source, history, and tests first");
+    expect(description).toContain("do not search exact task wording");
+  });
+
   it("parses Exa JSON and SSE responses and sends advanced filters", async () => {
     const requests: WebRequest[] = [];
     let count = 0;

@@ -860,7 +860,7 @@ describe("capability-aware model routing", () => {
       async *stream() {
         contentAttempts += 1;
         yield { type: "content", delta: "partial" } as const;
-        throw Object.assign(new Error("transient stream failure"), { category: "server" });
+        throw Object.assign(new Error("transient stream failure"), { category: "network" });
       }
     };
     const blocked = new ModelRouter(
@@ -874,6 +874,37 @@ describe("capability-aware model routing", () => {
     };
     await expect(consume()).rejects.toMatchObject({ semanticDelta: true, attempts: 1 });
     expect(contentAttempts).toBe(1);
+  });
+
+  it("retries an interrupted stream only before durable output", async () => {
+    const only = spec("deepseek/a");
+    let attempts = 0;
+    const interrupted: ModelGateway = {
+      ...gateway(only.id, async () => response("unused")),
+      async *stream() {
+        attempts += 1;
+        if (attempts === 1) {
+          throw Object.assign(new Error("transport ended"), { category: "network" });
+        }
+        yield { type: "done", response: response("recovered") } as const;
+      }
+    };
+    const router = new ModelRouter(
+      [only],
+      [route({ candidates: [only.id], maxAttempts: 1 })],
+      () => interrupted,
+      { maxRetriesPerCandidate: 1 }
+    );
+
+    const events = [];
+    for await (const event of router.stream("orchestrator", "main", request())) events.push(event);
+
+    expect(attempts).toBe(2);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "done",
+      response: { message: { content: "recovered" }, attempt: 1 }
+    });
   });
 
   it("uses abortable exponential backoff only between same-provider retries", async () => {
@@ -1135,6 +1166,67 @@ describe("normalized model usage", () => {
       role: "reviewer",
       tokenizerAssetDigest: "c".repeat(64)
     });
+  });
+
+  it("charges failed usage only for retry attempts that actually ran", async () => {
+    const only = spec("deepseek/a");
+    const representative = gateway(only.id, async () => response("unused"));
+    const router = new ModelRouter(
+      [only],
+      [route({ candidates: [only.id], maxAttempts: 1 })],
+      () => representative,
+      { maxRetriesPerCandidate: 2 }
+    );
+    const routed = new RoutedModelGateway({
+      router,
+      role: "orchestrator",
+      routeId: "main",
+      representative
+    });
+    const prepared = await prepareModelBudget(
+      routed,
+      request().messages,
+      [],
+      100,
+      10_000
+    );
+    const reservations = prepared.attemptReservations!;
+    const reservedInput = reservations.reduce((total, item) => total + item.inputTokens, 0);
+    const firstFailure = failedModelUsage(
+      { sessionId: "session", runId: "run" },
+      routed,
+      "failed-once",
+      prepared,
+      5,
+      "orchestrator",
+      1
+    );
+    const secondFailure = failedModelUsage(
+      { sessionId: "session", runId: "run" },
+      routed,
+      "failed-twice",
+      prepared,
+      5,
+      "orchestrator",
+      2
+    );
+
+    expect(reservations).toHaveLength(3);
+    expect(prepared.estimatedInputTokens).toBe(reservations[0]!.inputTokens);
+    expect(prepared.reserved.inputTokens).toBe(reservedInput);
+    expect(firstFailure).toMatchObject({
+      inputTokens: reservations[0]!.inputTokens,
+      costMicroUsd: reservations[0]!.costMicroUsd,
+      attempt: 1
+    });
+    expect(secondFailure).toMatchObject({
+      inputTokens: reservations[0]!.inputTokens + reservations[1]!.inputTokens,
+      costMicroUsd: (reservations[0]!.costMicroUsd ?? 0)
+        + (reservations[1]!.costMicroUsd ?? 0),
+      attempt: 2
+    });
+    expect(consumedBudget(firstFailure, prepared).modelTurns).toBe(1);
+    expect(consumedBudget(secondFailure, prepared).modelTurns).toBe(2);
   });
 
   it("persists subscription usage as null cost while charging zero to the budget ledger", async () => {

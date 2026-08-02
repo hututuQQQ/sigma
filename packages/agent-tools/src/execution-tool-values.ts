@@ -78,7 +78,11 @@ export function availableRuntimeCommands(options: ExecutionToolOptions): string[
 export function executableCapabilityDescription(options: ExecutionToolOptions): string {
   if (options.managedEnvironment === true
     || options.directExecutableResolution === true) {
-    return "Bare executable aliases and explicit paths are resolved, pinned, and authorized by the connected sandbox. A missing or unauthorized executable returns a structured dependency observation; do not infer availability from stderr.";
+    const enclosingShellGuidance = options.writeScope === "enclosing-container"
+      && (options.shells?.length ?? 0) > 0
+      ? " For ordinary repository commands, prefer the verified shell command form. Image-provided toolchains outside primary execution roots can be invoked by that shell inside the same attested disposable container."
+      : "";
+    return `Bare executable aliases and explicit paths are resolved, pinned, and authorized by the connected sandbox. A missing or unauthorized executable returns a structured dependency observation; do not infer availability from stderr.${enclosingShellGuidance}`;
   }
   const commands = availableRuntimeCommands(options);
   const aliasDescription = commands.length > 0

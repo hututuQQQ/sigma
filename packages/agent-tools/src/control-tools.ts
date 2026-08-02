@@ -103,7 +103,7 @@ function updatePlanTool(): RegisteredEffectTool {
   return {
     descriptor: descriptor(
       "update_plan",
-      "Update the durable work checklist. For non-trivial work keep 3-7 meaningful steps; update it when evidence changes the active hypothesis, a step finishes, or the approach changes instead of batching status changes at the end. The runtime owns revisions, active-step normalization, dependencies, ownership, and evidence.",
+      "Update the durable work checklist only for work with several distinct milestones, multiple components, or substantial uncertainty; a focused inspect-edit-test fix does not require one. Keep 3-7 meaningful steps and update only at meaningful milestones or when evidence changes the approach, not after every small action. The runtime owns revisions, active-step normalization, dependencies, ownership, and evidence.",
       UPDATE_PLAN_PROPERTIES,
       ["plan"]
     ),
@@ -194,7 +194,7 @@ function requestReviewTool(): RegisteredEffectTool {
   return {
     descriptor: descriptor(
       "request_review",
-      "Request an independent review of the current mutation frontier as a standalone tool call. Supply no evidence IDs: the runtime binds the current frontier and objective receipts. The first substantive rejection opens one repair opportunity. In Standard mode unresolved findings remain advisory and must be reported honestly; in Strict mode an unchanged repeat or non-approved final review round ends with a typed verification failure.",
+      "Request an independent review of the current mutation frontier only when the user asks, the change is high-risk or cross-cutting, or material uncertainty remains after validation; do not use it as a routine completion step for a focused change with direct evidence. Call it as a standalone tool. Supply no evidence IDs: the runtime binds the current frontier and objective receipts. The first substantive rejection opens one repair opportunity. In Standard mode unresolved findings remain advisory and must be reported honestly; in Strict mode an unchanged repeat or non-approved final review round ends with a typed verification failure.",
       {}
     ),
     async execute(request, context) {

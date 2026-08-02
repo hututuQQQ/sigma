@@ -265,6 +265,7 @@ describe("execution tool capability closure", () => {
       networkModes: ["none"],
       runtimeCommands: ["runtime"],
       shells: ["bash"],
+      directExecutableResolution: true,
       protectedPaths: [path.join(root, ".runtime")]
     });
     expect(tools.descriptor("environment_process_spawn")).toBeUndefined();
@@ -283,6 +284,8 @@ describe("execution tool capability closure", () => {
     )).toContain("only to later calls that also use target=environment");
     expect(shell?.description
     ).toContain("workspace-target calls use a separate sandbox view");
+    expect(JSON.stringify(shell?.inputSchema)).toContain("prefer the verified shell command form");
+    expect(JSON.stringify(shell?.inputSchema)).toContain("outside primary execution roots");
     expect(shell).toMatchObject({
       brokerMutationAuthority: "disposable_enclosing_container"
     });
