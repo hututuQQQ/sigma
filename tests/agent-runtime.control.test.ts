@@ -66,8 +66,18 @@ function receipt(artifactId: string): ToolReceipt {
 
 describe("runtime control tools", () => {
   it("projects a low-friction plan schema and normalizes runtime-owned details", async () => {
-    const updateDescriptor = registerBuiltinTools(new EffectToolRegistry()).modelDescriptors()
+    const descriptors = registerBuiltinTools(new EffectToolRegistry()).modelDescriptors();
+    const updateDescriptor = descriptors
       .find((descriptor) => descriptor.name === "update_plan")!;
+    const reviewDescriptor = descriptors
+      .find((descriptor) => descriptor.name === "request_review")!;
+    expect(updateDescriptor.description).toContain(
+      "a focused inspect-edit-test fix does not require one"
+    );
+    expect(updateDescriptor.description).toContain("not after every small action");
+    expect(reviewDescriptor.description).toContain(
+      "do not use it as a routine completion step"
+    );
     const properties = updateDescriptor.inputSchema.properties as Record<string, unknown>;
     expect(Object.keys(properties)).toEqual([
       "explanation", "goal", "acceptanceCriteria", "plan"

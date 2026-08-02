@@ -21,7 +21,15 @@ export type PiProviderEventType = "error" | "response_failed";
 export interface PiModelErrorDiagnostics {
   provider?: string;
   model?: string;
+  category?: PiModelFailureCategory;
   httpStatus?: number;
+  totalDurationMs?: number;
+  doneReceived?: boolean;
+  transportEnded?: boolean;
+  lastEventType?: string;
+  hasContent?: boolean;
+  hasReasoning?: boolean;
+  hasToolCall?: boolean;
   providerErrorCode?: string;
   providerEventType?: PiProviderEventType;
 }
@@ -188,7 +196,9 @@ function isNetworkFailure(error: unknown, text: string): boolean {
       "premature close",
       "websocket stream closed",
       "stream closed before response.completed",
-      "connection closed before response.completed"
+      "connection closed before response.completed",
+      "stream ended before a terminal response event",
+      "stream ended without a stop reason"
     ]);
 }
 
@@ -208,7 +218,28 @@ function fallbackFailure(
   return ["protocol", "protocol"];
 }
 
-export function sanitizePiModelError(error: unknown): PiModelError {
+export function sanitizePiModelError(
+  error: unknown,
+  additionalDiagnostics?: PiModelErrorDiagnostics
+): PiModelError {
+  const sanitized = sanitizePiModelErrorBase(error);
+  if (!additionalDiagnostics) return sanitized;
+  return new PiModelError(sanitized.code, sanitized.category, sanitized.status, {
+    ...(sanitized.providerErrorCode
+      ? { providerErrorCode: sanitized.providerErrorCode }
+      : {}),
+    ...(sanitized.providerEventType
+      ? { providerEventType: sanitized.providerEventType }
+      : {}),
+    diagnostics: {
+      ...sanitized.diagnostics,
+      ...additionalDiagnostics,
+      category: sanitized.category
+    }
+  });
+}
+
+function sanitizePiModelErrorBase(error: unknown): PiModelError {
   if (error instanceof PiModelError) return error;
   const text = errorText(error);
   const status = errorStatus(error);

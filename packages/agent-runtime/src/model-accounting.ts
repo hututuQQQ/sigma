@@ -88,8 +88,13 @@ export async function prepareModelBudget(
   const outputTokens = Math.min(outputReserveTokens, gateway.capabilities.maxOutputTokens);
   if (budgetAware(gateway) && remainingBudgetMicroUsd !== undefined) {
     const plan = await gateway.budgetPlan(messages, tools, outputTokens, remainingBudgetMicroUsd);
+    const firstAttemptInputTokens = plan.attemptReservations[0]?.inputTokens
+      ?? plan.estimatedInputTokens;
     return {
-      estimatedInputTokens: Math.max(1, plan.reservedInputTokens),
+      // This is a per-request estimate. The aggregate retry reservation stays
+      // in `reserved`; conflating the two over-reports a one-attempt failure as
+      // though every reserved retry had already reached the provider.
+      estimatedInputTokens: Math.max(1, firstAttemptInputTokens),
       reserved: {
         inputTokens: Math.max(1, plan.reservedInputTokens),
         outputTokens: plan.reservedOutputTokens,
@@ -271,6 +276,24 @@ export function successfulModelUsage(
   };
 }
 
+function failedUsageCost(
+  prepared: PreparedModelBudget,
+  inputTokens: number,
+  attemptedReservations: readonly ModelReservationEstimate[]
+): number | null {
+  if (prepared.spec?.billingMode === "subscription"
+    || prepared.spec?.billingMode === "unpriced") return null;
+  if (attemptedReservations.length > 0) {
+    return attemptedReservations.reduce(
+      (total, item) => total + (item.costMicroUsd ?? 0),
+      0
+    );
+  }
+  return prepared.spec
+    ? maximumCost(prepared.spec, inputTokens, 0)
+    : prepared.reserved.costMicroUsd ?? 0;
+}
+
 export function failedModelUsage(
   session: ModelUsageSession,
   gateway: ModelGateway,
@@ -280,33 +303,23 @@ export function failedModelUsage(
   role: ModelExecutionRole = "orchestrator",
   attempt = 1
 ): UsageRecord {
-  const inputTokens = prepared.estimatedInputTokens;
-  const usage = record(session, gateway, requestId, prepared, {
+  const attemptedReservations = prepared.attemptReservations
+    ?.slice(0, Math.max(1, Math.trunc(attempt))) ?? [];
+  const inputTokens = attemptedReservations.length > 0
+    ? attemptedReservations.reduce((total, item) => total + item.inputTokens, 0)
+    : prepared.estimatedInputTokens;
+  return record(session, gateway, requestId, prepared, {
     inputTokens,
     outputTokens: 0,
     reasoningTokens: 0,
     cacheReadTokens: 0,
     cacheWriteTokens: 0,
     providerReported: false,
-    costMicroUsd: prepared.spec?.billingMode === "subscription"
-      || prepared.spec?.billingMode === "unpriced"
-      ? null
-      : prepared.spec
-        ? maximumCost(prepared.spec, inputTokens, 0)
-        : prepared.reserved.costMicroUsd ?? 0,
+    costMicroUsd: failedUsageCost(prepared, inputTokens, attemptedReservations),
     ...(prepared.spec ? { billingMode: prepared.spec.billingMode } : {}),
     latencyMs: Math.max(0, Math.round(latencyMs)),
     retryAttempt: Math.max(0, attempt - 1)
   }, undefined, role);
-  return prepared.attemptReservations
-    ? {
-        ...usage,
-        costMicroUsd: prepared.spec?.billingMode === "subscription"
-          || prepared.spec?.billingMode === "unpriced"
-          ? null
-          : prepared.attemptReservations.reduce((total, item) => total + (item.costMicroUsd ?? 0), 0)
-      }
-    : usage;
 }
 
 export function consumedBudget(

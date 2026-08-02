@@ -86,6 +86,11 @@ interface ModelStreamState extends ModelStreamLifecycle {
   lastFlush: number;
 }
 
+// Stream deltas are durable recovery/UI projections, not animation frames.
+// Persisting them at display-refresh cadence makes filesystem durability
+// backpressure the provider stream without adding semantic information.
+const MODEL_STREAM_DELTA_FLUSH_MS = 200;
+
 function newModelStreamState(): ModelStreamState {
   return {
     doneReceived: false,
@@ -179,7 +184,7 @@ async function consumeModelStream(
     for await (const event of stream) {
       if (signal.aborted) throw signal.reason;
       observeModelStreamEvent(state, event, session.services.gateway.provider, session.services.gateway.model);
-      if (Date.now() - state.lastFlush >= 33) {
+      if (Date.now() - state.lastFlush >= MODEL_STREAM_DELTA_FLUSH_MS) {
         await flushModelStreamDeltas(options, session, turnId, state);
       }
     }

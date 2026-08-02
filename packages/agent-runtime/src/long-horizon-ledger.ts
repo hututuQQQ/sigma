@@ -16,7 +16,6 @@ export function longHorizonLedger(session: RuntimeSession): ContextItem {
   const strategyCurrent = strategy?.basisDigest
     === longHorizonProgressBasisDigest(session);
   const stateDigest = digest({
-    settledBatchCount: state.settledBatchCount,
     duplicateStreak: state.duplicateStreak,
     strategyRequested: state.strategyRequested,
     resourceBandTriggered: state.resourceBandTriggered,
@@ -26,7 +25,6 @@ export function longHorizonLedger(session: RuntimeSession): ContextItem {
   });
   const lines = [
     "Durable long-horizon state (objective action/resource signals; never wall-clock based):",
-    `- settled tool batches: ${state.settledBatchCount}`,
     `- exact same call-and-result streak: ${state.duplicateStreak}/${state.assurance.duplicateThreshold}`,
     `- main model requested strategy help: ${state.strategyRequested ? "yes" : "no"}`,
     `- configured resource band crossed: ${state.resourceBandTriggered ? "yes" : "no"}`,

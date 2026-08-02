@@ -75,7 +75,63 @@ class DiagnosticFailureGateway extends IncompleteStreamGateway {
   }
 }
 
+class CoalescedStreamGateway extends IncompleteStreamGateway {
+  override async *stream(_request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    const reasoning = ["one ", "two ", "three ", "four ", "five ", "six"];
+    for (const delta of reasoning) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      yield { type: "reasoning", delta };
+    }
+    yield { type: "content", delta: "Done." };
+    yield {
+      type: "done",
+      response: {
+        message: {
+          role: "assistant",
+          content: "Done.",
+          reasoningContent: reasoning.join("")
+        },
+        finishReason: "stop"
+      }
+    };
+  }
+}
+
 describe("runtime model stream lifecycle", () => {
+  it("coalesces durable stream projections without losing their content", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-coalesced-model-stream-"));
+    const storeRootDir = path.join(workspace, ".agent");
+    const runtime = createRuntime({
+      gateway: new CoalescedStreamGateway(),
+      store: new SegmentedJsonlStore({ rootDir: storeRootDir }),
+      storeRootDir,
+      tools: new EffectToolRegistry(),
+      permissionMode: "auto",
+      runDeadlineMs: 60_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+
+    await runtime.command({
+      type: "submit",
+      sessionId: session.sessionId,
+      text: "exercise generic stream projection coalescing",
+      mode: "analyze"
+    });
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "completed",
+      message: "Done."
+    });
+
+    const events: AgentEventEnvelope[] = [];
+    for await (const event of runtime.sessionEvents(session.sessionId)) events.push(event);
+    const reasoning = events.filter((event) => event.type === "model.reasoning_delta");
+    expect(reasoning).toHaveLength(2);
+    expect(reasoning.map((event) => (event.payload as { delta: string }).delta).join(""))
+      .toBe("one two three four five six");
+    expect(events.filter((event) => event.type === "model.delta"))
+      .toHaveLength(1);
+  });
+
   it("emits model and run failure terminals when a model stream has no final response", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-incomplete-model-stream-"));
     const storeRootDir = path.join(workspace, ".agent");

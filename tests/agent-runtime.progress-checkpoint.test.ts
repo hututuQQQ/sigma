@@ -246,6 +246,20 @@ function coordinatorHarness(
 }
 
 describe("objective long-horizon triggers", () => {
+  it("keeps pure settled-batch telemetry out of the model-visible prompt identity", () => {
+    const session = runtimeSessionFixture();
+    const before = longHorizonLedger(session);
+    session.durable.state.longHorizon = {
+      ...session.durable.state.longHorizon,
+      settledBatchCount: session.durable.state.longHorizon.settledBatchCount + 1
+    };
+    const after = longHorizonLedger(session);
+
+    expect(after.cacheKey).toBe(before.cacheKey);
+    expect(after.content).toBe(before.content);
+    expect(after.content).not.toContain("settled tool batches");
+  });
+
   it("does not turn a finite diverse sequence below the attention boundary into a semantic checkpoint", () => {
     const session = runtimeSessionFixture();
     session.durable.state.messages.push({ role: "user", content: "Investigate." });

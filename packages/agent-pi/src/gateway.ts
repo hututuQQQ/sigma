@@ -17,7 +17,11 @@ import type {
 } from "agent-protocol";
 import { codexPayload } from "./codex-instructions.js";
 import { defaultCredentialStore } from "./credential-bridge.js";
-import { PiModelError, sanitizePiModelError } from "./errors.js";
+import {
+  PiModelError,
+  sanitizePiModelError,
+  type PiModelErrorDiagnostics
+} from "./errors.js";
 import {
   approximateTokens,
   deepSeekPayload,
@@ -56,6 +60,83 @@ function fallbackModel(providerId: string, modelId: string): PiModel<Api> | unde
   return template
     ? { ...template, id: modelId, name: modelId }
     : undefined;
+}
+
+interface PiStreamLifecycle {
+  doneReceived: boolean;
+  transportEnded: boolean;
+  lastEventType: string;
+  hasContent: boolean;
+  hasReasoning: boolean;
+  hasToolCall: boolean;
+}
+
+function newPiStreamLifecycle(): PiStreamLifecycle {
+  return {
+    doneReceived: false,
+    transportEnded: false,
+    lastEventType: "none",
+    hasContent: false,
+    hasReasoning: false,
+    hasToolCall: false
+  };
+}
+
+function observePiStreamEvent(
+  lifecycle: PiStreamLifecycle,
+  event: ModelStreamEvent
+): void {
+  lifecycle.lastEventType = event.type;
+  if (event.type === "content") lifecycle.hasContent = true;
+  if (event.type === "reasoning") lifecycle.hasReasoning = true;
+  if (event.type === "tool_call") lifecycle.hasToolCall = true;
+  if (event.type === "done") lifecycle.doneReceived = true;
+}
+
+function streamFailureDiagnostics(
+  provider: string,
+  model: string,
+  lifecycle: PiStreamLifecycle,
+  startedAt: number,
+  responseStatus: number | undefined
+): PiModelErrorDiagnostics {
+  return {
+    provider,
+    model,
+    ...(responseStatus !== undefined && responseStatus >= 400
+      ? { httpStatus: responseStatus }
+      : {}),
+    totalDurationMs: Math.max(0, Math.round(performance.now() - startedAt)),
+    doneReceived: lifecycle.doneReceived,
+    ...(lifecycle.transportEnded ? { transportEnded: true } : {}),
+    lastEventType: lifecycle.lastEventType,
+    hasContent: lifecycle.hasContent,
+    hasReasoning: lifecycle.hasReasoning,
+    hasToolCall: lifecycle.hasToolCall
+  };
+}
+
+function sanitizedStreamFailure(
+  error: unknown,
+  signal: ModelRequest["signal"],
+  provider: string,
+  model: string,
+  lifecycle: PiStreamLifecycle,
+  startedAt: number,
+  responseStatus: number | undefined
+): PiModelError {
+  signal.throwIfAborted();
+  const statusAwareError = responseStatus === undefined
+    || (error && typeof error === "object" && "status" in error)
+    ? error
+    : Object.assign(
+        error instanceof Error ? error : new Error("Provider request failed."),
+        { status: responseStatus }
+      );
+  return sanitizePiModelError(
+    statusAwareError,
+    streamFailureDiagnostics(provider, model, lifecycle, startedAt, responseStatus)
+  );
 }
 
 export class PiModelGateway implements ModelGateway {
@@ -117,6 +198,7 @@ export class PiModelGateway implements ModelGateway {
     const billingMode = piBillingMode(this.provider, auth.type, this.piModel);
     let toolIndex = 0;
     let responseStatus: number | undefined;
+    const lifecycle = newPiStreamLifecycle();
     try {
       const stream = monitoredPiStream((signal) => {
         const context = piContext(request, this.piModel, this.codexInstructionNonce);
@@ -159,31 +241,30 @@ export class PiModelGateway implements ModelGateway {
           : { activeTimeoutMs: this.activeStreamTimeoutMs })
       });
       for await (const event of stream) {
-        const mapped = mapPiStreamEvent(
-          event,
-          toolIndex,
-          startedAt,
-          billingMode,
-          responseStatus
-        );
+        const mapped = mapPiStreamEvent(event, toolIndex, startedAt, billingMode, responseStatus);
         toolIndex = mapped.nextToolIndex;
         if (mapped.error) {
+          lifecycle.lastEventType = "error";
           request.signal.throwIfAborted();
           throw mapped.error;
         }
-        for (const output of mapped.events) yield output;
+        for (const output of mapped.events) {
+          observePiStreamEvent(lifecycle, output);
+          yield output;
+        }
         if (mapped.done) return;
       }
-      throw new PiModelError("protocol", "protocol");
+      lifecycle.transportEnded = true;
+      throw new PiModelError("network", "network");
     } catch (error) {
-      request.signal.throwIfAborted();
-      throw sanitizePiModelError(
-        responseStatus === undefined || (error && typeof error === "object" && "status" in error)
-          ? error
-          : Object.assign(
-              error instanceof Error ? error : new Error("Provider request failed."),
-              { status: responseStatus }
-            )
+      throw sanitizedStreamFailure(
+        error,
+        request.signal,
+        this.provider,
+        this.model,
+        lifecycle,
+        startedAt,
+        responseStatus
       );
     }
   }

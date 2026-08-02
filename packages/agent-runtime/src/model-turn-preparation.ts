@@ -164,7 +164,13 @@ export async function prepareModelAttempt(
   const query = [...session.durable.state.messages].reverse()
     .find((message) => message.role === "user")?.content ?? "";
   const dynamic = await repositoryContext.collect(
-    session.identity.workspacePath, query, signal
+    session.identity.workspacePath,
+    query,
+    signal,
+    {
+      workspaceStateVersion:
+        session.durable.state.mutationFrontier.currentStateDigest
+    }
   );
   let available = availableOrchestratorBudget(session);
   if (!session.durable.frozenCustomization) {

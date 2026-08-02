@@ -1,8 +1,48 @@
 diff --git a/dist/api/openai-codex-responses.js b/dist/api/openai-codex-responses.js
-index 844d116..2d09765 100644
+index 705d9aa..d87e48f 100644
 --- a/dist/api/openai-codex-responses.js
 +++ b/dist/api/openai-codex-responses.js
-@@ -339,6 +339,16 @@ export const stream = (model, context, options) => {
+@@ -135,6 +135,14 @@ function compressRequestBodyZstd(bodyJson) {
+         return null;
+     }
+ }
++function assertSuccessfulOutput(output) {
++    if (output.stopReason === "pending") {
++        throw new Error("Codex stream ended without a stop reason");
++    }
++    if (output.stopReason === "error" || output.stopReason === "aborted") {
++        throw new Error(output.errorMessage || "An unknown error occurred");
++    }
++}
+ // ============================================================================
+ // Main Stream Function
+ // ============================================================================
+@@ -155,7 +163,7 @@ export const stream = (model, context, options) => {
+                 totalTokens: 0,
+                 cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+             },
+-            stopReason: "stop",
++            stopReason: "pending",
+             timestamp: Date.now(),
+         };
+         try {
+@@ -201,6 +209,7 @@ export const stream = (model, context, options) => {
+                         if (options?.signal?.aborted) {
+                             throw new Error("Request was aborted");
+                         }
++                        assertSuccessfulOutput(output);
+                         stream.push({
+                             type: "done",
+                             reason: output.stopReason,
+@@ -329,6 +338,7 @@ export const stream = (model, context, options) => {
+             if (options?.signal?.aborted) {
+                 throw new Error("Request was aborted");
+             }
++            assertSuccessfulOutput(output);
+             stream.push({ type: "done", reason: output.stopReason, message: output });
+             stream.end();
+         }
+@@ -339,6 +349,16 @@ export const stream = (model, context, options) => {
                  delete block.customInput;
              }
              output.stopReason = options?.signal?.aborted ? "aborted" : "error";
@@ -19,7 +59,7 @@ index 844d116..2d09765 100644
              output.errorMessage = formatProviderError(normalizeProviderError(error));
              stream.push({ type: "error", reason: output.stopReason, error: output });
              stream.end();
-@@ -471,11 +481,13 @@ async function processStream(response, output, stream, model, grammarToolInputPr
+@@ -471,11 +491,13 @@ async function processStream(response, output, stream, model, grammarToolInputPr
  class CodexApiError extends Error {
      code;
      payload;
@@ -33,7 +73,7 @@ index 844d116..2d09765 100644
          this.cause = options?.cause;
      }
  }
-@@ -515,16 +527,17 @@ async function* mapCodexEvents(events) {
+@@ -515,16 +537,17 @@ async function* mapCodexEvents(events) {
              continue;
          if (type === "error") {
              const { code, message } = extractCodexEventError(event);
@@ -53,3 +93,16 @@ index 844d116..2d09765 100644
          }
          if (type === "response.done" || type === "response.completed" || type === "response.incomplete") {
              const response = event.response;
+diff --git a/dist/types.d.ts b/dist/types.d.ts
+index 0a1b769..df576ff 100644
+--- a/dist/types.d.ts
++++ b/dist/types.d.ts
+@@ -270,7 +270,7 @@ export interface Usage {
+         total: number;
+     };
+ }
+-export type StopReason = "stop" | "length" | "toolUse" | "error" | "aborted";
++export type StopReason = "pending" | "stop" | "length" | "toolUse" | "error" | "aborted";
+ export interface UserMessage {
+     role: "user";
+     content: string | (TextContent | ImageContent)[];

@@ -691,6 +691,8 @@ describe("OpenAI Codex subscription gateway", () => {
     for (const message of [
       "WebSocket stream closed before response.completed",
       "stream closed before response.completed",
+      "OpenAI Responses stream ended before a terminal response event",
+      "Codex stream ended without a stop reason",
       "unexpected EOF while reading response body",
       "socket hang up"
     ]) {
@@ -700,6 +702,45 @@ describe("OpenAI Codex subscription gateway", () => {
         message: "Could not reach the model provider."
       });
     }
+  });
+
+  it("classifies a Codex stream ending before completion as a transient transport failure", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => sse([{
+      type: "response.created",
+      response: { id: "resp_incomplete", status: "in_progress" }
+    }])));
+    const gateway = new PiModelGateway({
+      provider: OPENAI_CODEX_PROVIDER_ID,
+      model: OPENAI_CODEX_DEFAULT_MODEL,
+      credentials: new MemoryCredentialStore(oauth())
+    });
+
+    let failure: unknown;
+    try {
+      await gateway.complete({
+        messages: [{ role: "user", content: "wait" }],
+        signal: new AbortController().signal
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toMatchObject({
+      code: "network",
+      category: "network",
+      message: "Could not reach the model provider.",
+      diagnostics: {
+        provider: OPENAI_CODEX_PROVIDER_ID,
+        model: OPENAI_CODEX_DEFAULT_MODEL,
+        category: "network",
+        doneReceived: false,
+        lastEventType: "error",
+        hasContent: false,
+        hasReasoning: false,
+        hasToolCall: false,
+        totalDurationMs: expect.any(Number)
+      }
+    });
   });
 
   it("preserves and classifies Codex response.failed codes without exposing provider text", async () => {
