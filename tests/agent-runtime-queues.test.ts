@@ -1309,18 +1309,60 @@ describe("runtime queues and non-blocking instruction steering", () => {
       seq += 1;
     };
     await append("child.spawned", { detached: false });
-    await expect(auditDurableChildren(store, parentSessionId)).resolves.toMatchObject({
+    await expect(auditDurableChildren(store, parentSessionId, "parent-run")).resolves.toMatchObject({
       failures: [expect.stringContaining("interrupted")]
     });
     await append("child.completed", {
       status: "completed",
       isolation: { kind: "git_worktree", cleanup: "retained", worktreePath: "worktree" }
     });
-    await expect(auditDurableChildren(store, parentSessionId)).resolves.toMatchObject({
+    await expect(auditDurableChildren(store, parentSessionId, "parent-run")).resolves.toMatchObject({
       failures: [expect.stringContaining("unintegrated")]
     });
     await append("child.message", { kind: "integrated" });
-    await expect(auditDurableChildren(store, parentSessionId)).resolves.toMatchObject({ failures: [] });
+    await expect(auditDurableChildren(store, parentSessionId, "parent-run")).resolves.toMatchObject({ failures: [] });
+  });
+
+  it("does not carry a cancelled child from an earlier run into the current run gate", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-durable-child-runs-"));
+    const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
+    const parentSessionId = "parent-session";
+    let seq = 0;
+    const append = async (
+      runId: string,
+      childId: string,
+      type: "child.spawned" | "child.completed",
+      detail: Record<string, unknown>
+    ): Promise<void> => {
+      const event = {
+        schemaVersion: EVENT_SCHEMA_VERSION,
+        seq: seq + 1,
+        eventId: `child-run-event-${seq + 1}`,
+        sessionId: parentSessionId,
+        runId,
+        occurredAt: new Date(Date.now() + seq).toISOString(),
+        type,
+        authority: "runtime" as const,
+        payload: { childId, payload: detail }
+      };
+      await store.append(event, seq);
+      seq += 1;
+    };
+    await append("old-run", "old-child", "child.spawned", { detached: false });
+    await append("old-run", "old-child", "child.completed", { status: "cancelled" });
+    await append("current-run", "current-child", "child.spawned", { detached: false });
+    await append("current-run", "current-child", "child.completed", {
+      status: "completed",
+      isolation: { kind: "shared_workspace", cleanup: "clean" }
+    });
+
+    await expect(auditDurableChildren(store, parentSessionId, "old-run")).resolves.toMatchObject({
+      failures: [expect.stringContaining("cancelled")]
+    });
+    await expect(auditDurableChildren(store, parentSessionId, "current-run")).resolves.toMatchObject({
+      evidence: [expect.objectContaining({ childId: "current-child", status: "completed" })],
+      failures: []
+    });
   });
 
   it("preserves 100 steering messages and rejects the superseded model turn", async () => {
@@ -1849,6 +1891,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     );
     const child = supervisor.spawn({
       parentId: parent.sessionId,
+      runId: parent.runId,
       instruction: "write child.txt",
       workspacePath: workspace,
       intent: "write",

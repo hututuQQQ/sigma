@@ -305,11 +305,17 @@ export class InProcessRuntimeClient implements RuntimeClient {
   async undoLatestCheckpoint(sessionId: string): Promise<import("agent-protocol").CheckpointRef> { return await this.checkpoints.undoLatest(this.required(sessionId)); }
   async recordChildEvent(
     parentSessionId: string,
+    parentRunId: string,
     type: "child.spawned" | "child.message" | "child.completed",
     payload: JsonValue
   ): Promise<void> {
+    const session = this.required(parentSessionId);
+    // Detached children may finish after the parent has advanced to a new
+    // run. Never apply their historical completion to the new run's budget,
+    // plan, or event stream.
+    if (session.durable.runId !== parentRunId) return;
     await handleChildEvent(
-      this.required(parentSessionId), type, payload, this.control,
+      session, type, payload, this.control,
       async (target, eventType, authority, value) => await this.emit(target, eventType, authority, value)
     );
   }

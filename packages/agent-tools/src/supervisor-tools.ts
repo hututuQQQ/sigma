@@ -185,6 +185,7 @@ async function executeSpawn(
     const child = await supervisor.spawnDurable({
       childId,
       parentId: context.sessionId,
+      runId: context.runId,
       instruction: requiredText(value, "instruction"),
       workspacePath: context.workspacePath,
       intent: mode === "change" ? "write" : "analyze",
@@ -218,7 +219,19 @@ function spawnTool(supervisor: SupervisorPort): RegisteredEffectTool {
     profileId: { type: "string" },
     network: { type: "string", enum: ["none", "loopback", "full"] },
     allowDestructive: { type: "boolean" },
-    budget: { type: "object", additionalProperties: { type: "integer", minimum: 0 } },
+    budget: {
+      type: "object",
+      properties: {
+        inputTokens: { type: "integer", minimum: 0 },
+        outputTokens: { type: "integer", minimum: 0 },
+        costMicroUsd: { type: "integer", minimum: 0 },
+        modelTurns: { type: "integer", minimum: 0 },
+        toolCalls: { type: "integer", minimum: 0 },
+        children: { type: "integer", minimum: 0 },
+        maxDepth: { type: "integer", minimum: 0 }
+      },
+      additionalProperties: false
+    },
     detached: { type: "boolean" }
   }, ["instruction", "planNodeIds"], {
     effects: DELEGATED_CHILD_EFFECTS,

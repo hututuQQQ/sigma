@@ -178,7 +178,18 @@ function isServerFailure(status: number | undefined, text: string): boolean {
 
 function isNetworkFailure(error: unknown, text: string): boolean {
   return error instanceof TypeError
-    || containsAny(text, ["fetch failed", "network", "econn", "enotfound"]);
+    || containsAny(text, [
+      "fetch failed",
+      "network",
+      "econn",
+      "enotfound",
+      "socket hang up",
+      "unexpected eof",
+      "premature close",
+      "websocket stream closed",
+      "stream closed before response.completed",
+      "connection closed before response.completed"
+    ]);
 }
 
 function fallbackFailure(

@@ -137,14 +137,14 @@ async function interruptedExclusiveWriter(root: string, store: SegmentedJsonlSto
     strictWriteScope: true
   }, undefined, undefined, true);
   const childId = "77777777-7777-4777-8777-777777777777";
-  await runtime.recordChildEvent(parent.sessionId, "child.spawned", {
+  await runtime.recordChildEvent(parent.sessionId, parent.runId, "child.spawned", {
     childId,
     payload: {
       detached: false,
       metadata: { mode: "change", planNodeIds: ["delegated"] }
     }
   });
-  await runtime.recordChildEvent(parent.sessionId, "child.message", {
+  await runtime.recordChildEvent(parent.sessionId, parent.runId, "child.message", {
     childId,
     payload: { kind: "started", sessionId: child.sessionId }
   });
@@ -271,6 +271,7 @@ describe("durable child identity and crash recovery", () => {
     const child = await supervisor.spawnDurable({
       childId: "22222222-2222-4222-8222-222222222222",
       parentId: "parent",
+      runId: "run",
       instruction: "inspect",
       workspacePath: process.cwd(),
       metadata: { planNodeIds: ["delegated"], budget: { inputTokens: 10 } }

@@ -819,7 +819,7 @@ describe("Sigma architecture", () => {
       }
       throw new Error("mailbox closed");
     }, 1);
-    const child = supervisor.spawn({ parentId: "parent", instruction: "inspect", workspacePath: "." });
+    const child = supervisor.spawn({ parentId: "parent", runId: "run", instruction: "inspect", workspacePath: "." });
     const deadline = Date.now() + 1_000;
     while (supervisor.list("parent")[0]?.status !== "running" && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 10));

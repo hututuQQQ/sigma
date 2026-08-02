@@ -70,6 +70,26 @@ function harness(reserve: RuntimeControlPort["reserveChildBudget"], spawn: Super
 }
 
 describe("spawn_agent budget and Plan transaction", () => {
+  it("advertises only the budget dimensions accepted by the runtime", () => {
+    const test = harness(
+      async () => allocation(),
+      async ({ childId }) => ({ id: childId! })
+    );
+    const schema = test.tools.descriptor("spawn_agent")?.inputSchema as {
+      properties?: { budget?: { properties?: Record<string, unknown>; additionalProperties?: unknown } };
+    };
+    expect(Object.keys(schema.properties?.budget?.properties ?? {})).toEqual([
+      "inputTokens",
+      "outputTokens",
+      "costMicroUsd",
+      "modelTurns",
+      "toolCalls",
+      "children",
+      "maxDepth"
+    ]);
+    expect(schema.properties?.budget?.additionalProperties).toBe(false);
+  });
+
   it("returns budget_exhausted before changing Plan or spawning", async () => {
     const spawn = vi.fn<SupervisorPort["spawnDurable"]>();
     const reserve = vi.fn<RuntimeControlPort["reserveChildBudget"]>(async () => {
@@ -116,6 +136,25 @@ describe("spawn_agent budget and Plan transaction", () => {
     expect(test.current().nodes[0]!.owner).toEqual(owner);
     expect(spawn).toHaveBeenCalledOnce();
     expect(reserve).toHaveBeenCalledOnce();
+  });
+
+  it("passes the originating run and an accepted budget allocation to the supervisor", async () => {
+    const reserve = vi.fn<RuntimeControlPort["reserveChildBudget"]>(async () => allocation());
+    const spawn = vi.fn<SupervisorPort["spawnDurable"]>(async ({ childId }) => ({ id: childId! }));
+    const test = harness(reserve, spawn);
+    await expect(test.tools.execute({
+      callId: "spawn", name: "spawn_agent",
+      arguments: {
+        instruction: "inspect",
+        planNodeIds: ["root"],
+        budget: { inputTokens: 20, modelTurns: 2 }
+      }
+    }, test.context)).resolves.toMatchObject({ ok: true });
+    expect(reserve).toHaveBeenCalledWith(expect.any(String), { inputTokens: 20, modelTurns: 2 });
+    expect(spawn).toHaveBeenCalledWith(expect.objectContaining({
+      parentId: "parent",
+      runId: "run"
+    }));
   });
 });
 

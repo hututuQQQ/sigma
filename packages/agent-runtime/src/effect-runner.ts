@@ -177,7 +177,11 @@ export class EffectRunner {
       return false;
     }
     if (outcome.kind === "completed" && this.options.runtime.joinChildren) {
-      const children = await this.options.runtime.joinChildren(session.identity.sessionId, signal);
+      const children = await this.options.runtime.joinChildren(
+        session.identity.sessionId,
+        session.durable.runId,
+        signal
+      );
       if (children.failures.length > 0) {
         await this.options.emit(session, "diagnostic", "runtime", {
           kind: "child.join_failed",

@@ -70,8 +70,8 @@ export interface RuntimeOptions {
   /** Runtime-authority provenance supplied by a trusted launcher. Never derive
    * this from the workspace being operated on. */
   subjectAttestation?: SubjectAttestationContext;
-  joinChildren?(parentSessionId: string, signal: AbortSignal): Promise<ChildJoinSummary>;
-  cancelChildren?(parentSessionId: string, reason: string): Promise<void> | void;
+  joinChildren?(parentSessionId: string, parentRunId: string, signal: AbortSignal): Promise<ChildJoinSummary>;
+  cancelChildren?(parentSessionId: string, parentRunId: string, reason: string): Promise<void> | void;
   hasActiveChildren?(parentSessionId: string): Promise<boolean> | boolean;
 }
 

@@ -102,8 +102,8 @@ describe("AgentSupervisor writer isolation", () => {
       return result(context);
     }, 4, isolationManager(path.join(root, "worktrees")));
 
-    const first = supervisor.spawn({ parentId: "parent", instruction: "first", workspacePath: repository, intent: "write" });
-    const second = supervisor.spawn({ parentId: "parent", instruction: "second", workspacePath: repository, intent: "write" });
+    const first = supervisor.spawn({ parentId: "parent", runId: "run", instruction: "first", workspacePath: repository, intent: "write" });
+    const second = supervisor.spawn({ parentId: "parent", runId: "run", instruction: "second", workspacePath: repository, intent: "write" });
     await until(() => contexts.length === 2);
 
     expect(contexts[0].isolation.kind).toBe("git_worktree");
@@ -132,8 +132,8 @@ describe("AgentSupervisor writer isolation", () => {
       return result(context);
     }, 2, isolationManager(path.join(root, "worktrees")));
 
-    const uncommitted = supervisor.spawn({ parentId: "parent", instruction: "uncommitted", workspacePath: repository, intent: "write" });
-    const committed = supervisor.spawn({ parentId: "parent", instruction: "committed", workspacePath: repository, intent: "write" });
+    const uncommitted = supervisor.spawn({ parentId: "parent", runId: "run", instruction: "uncommitted", workspacePath: repository, intent: "write" });
+    const committed = supervisor.spawn({ parentId: "parent", runId: "run", instruction: "committed", workspacePath: repository, intent: "write" });
     const jobs = await Promise.all([supervisor.join(uncommitted.id), supervisor.join(committed.id)]);
 
     expect(jobs.map((job) => job.isolation?.cleanup)).toEqual(["retained", "retained"]);
@@ -173,11 +173,11 @@ describe("AgentSupervisor writer isolation", () => {
       return result(context);
     }, 4, isolationManager(path.join(root, "worktrees")));
 
-    const first = supervisor.spawn({ parentId: "parent", instruction: "writer one", workspacePath: workspace, intent: "write" });
+    const first = supervisor.spawn({ parentId: "parent", runId: "run", instruction: "writer one", workspacePath: workspace, intent: "write" });
     await until(() => writerContexts.length === 1);
-    const second = supervisor.spawn({ parentId: "parent", instruction: "writer two", workspacePath: workspace, metadata: { mode: "change" } });
-    const analyzeOne = supervisor.spawn({ parentId: "parent", instruction: "analyze one", workspacePath: workspace, intent: "analyze" });
-    const analyzeTwo = supervisor.spawn({ parentId: "parent", instruction: "analyze two", workspacePath: workspace, metadata: { mode: "analyze" } });
+    const second = supervisor.spawn({ parentId: "parent", runId: "run", instruction: "writer two", workspacePath: workspace, metadata: { mode: "change" } });
+    const analyzeOne = supervisor.spawn({ parentId: "parent", runId: "run", instruction: "analyze one", workspacePath: workspace, intent: "analyze" });
+    const analyzeTwo = supervisor.spawn({ parentId: "parent", runId: "run", instruction: "analyze two", workspacePath: workspace, metadata: { mode: "analyze" } });
 
     await until(() => analyzeContexts.length === 2);
     expect(writerContexts).toHaveLength(1);
@@ -285,8 +285,8 @@ describe("AgentSupervisor writer isolation", () => {
       return result(context);
     }, 1, manager);
 
-    const first = supervisor.spawn({ parentId: "parent", instruction: "first", workspacePath: workspace });
-    const second = supervisor.spawn({ parentId: "parent", instruction: "second", workspacePath: workspace });
+    const first = supervisor.spawn({ parentId: "parent", runId: "run", instruction: "first", workspacePath: workspace });
+    const second = supervisor.spawn({ parentId: "parent", runId: "run", instruction: "second", workspacePath: workspace });
     const jobs = await Promise.all([supervisor.join(first.id), supervisor.join(second.id)]);
     expect(started).toHaveLength(2);
     expect(jobs.map((job) => job.status)).toEqual(["failed", "failed"]);
@@ -307,17 +307,47 @@ describe("AgentSupervisor writer isolation", () => {
       });
       return result(context);
     }, 1, isolationManager(path.join(root, "worktrees")));
-    const running = supervisor.spawn({ parentId: "parent", instruction: "running", workspacePath: workspace, intent: "analyze" });
-    const queued = supervisor.spawn({ parentId: "parent", instruction: "queued", workspacePath: workspace, intent: "analyze" });
+    const running = supervisor.spawn({ parentId: "parent", runId: "run", instruction: "running", workspacePath: workspace, intent: "analyze" });
+    const queued = supervisor.spawn({ parentId: "parent", runId: "run", instruction: "queued", workspacePath: workspace, intent: "analyze" });
     await until(() => started.length === 1);
 
     const controller = new AbortController();
-    const joined = supervisor.joinParent("parent", controller.signal);
+    const joined = supervisor.joinParent("parent", "run", controller.signal);
     const startedAt = Date.now();
     controller.abort(new Error("parent deadline"));
     await expect(joined).rejects.toThrow("parent deadline");
     expect(Date.now() - startedAt).toBeLessThan(500);
     await expect(supervisor.join(running.id)).resolves.toMatchObject({ status: "cancelled" });
     await expect(supervisor.join(queued.id)).resolves.toMatchObject({ status: "cancelled" });
+  });
+
+  it("joins only children created by the requested parent run", async () => {
+    const root = await fixture("parent-run-scope");
+    const workspace = path.join(root, "workspace");
+    await mkdir(workspace);
+    const supervisor = new AgentSupervisor(async (context) => ({
+      childId: context.childId,
+      outcome: context.runId === "old-run"
+        ? { kind: "cancelled", reason: "old run failed" }
+        : { kind: "completed", message: "current run done", evidence: [] },
+      report: null
+    }), 2, isolationManager(path.join(root, "worktrees")));
+    const oldChild = supervisor.spawn({
+      parentId: "parent",
+      runId: "old-run",
+      instruction: "old",
+      workspacePath: workspace
+    });
+    const currentChild = supervisor.spawn({
+      parentId: "parent",
+      runId: "current-run",
+      instruction: "current",
+      workspacePath: workspace
+    });
+    await Promise.all([supervisor.join(oldChild.id), supervisor.join(currentChild.id)]);
+
+    await expect(supervisor.joinParent("parent", "current-run")).resolves.toMatchObject([
+      { id: currentChild.id, runId: "current-run", status: "completed" }
+    ]);
   });
 });

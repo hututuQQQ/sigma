@@ -157,6 +157,7 @@ describe("child follow-up lifecycle", () => {
     const instruction = `${"Write first.txt and retain the general requirements. ".repeat(3)}Preserve this trailing constraint.`;
     const child = supervisor.spawn({
       parentId: parent.sessionId,
+      runId: parent.runId,
       instruction,
       workspacePath: repository,
       intent: "write",
