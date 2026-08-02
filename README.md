@@ -6,7 +6,7 @@
 
 <p align="center">
   A durable, evidence-driven coding agent with a unified Pi model gateway.<br>
-  Plan, inspect, edit, execute, validate, review, and resume—all from the terminal.
+  Plan, inspect, edit, execute, validate, review, and resume from the terminal or the Sigma Code desktop app.
 </p>
 
 <p align="center">
@@ -14,16 +14,29 @@
 </p>
 
 <p align="center">
-  <img alt="Status: 0.1.4 stable release" src="https://img.shields.io/badge/status-0.1.4%20stable-2ea44f">
+  <a href="https://github.com/hututuQQQ/sigma/releases/tag/v0.1.4"><img alt="Status: 0.1.4 stable release" src="https://img.shields.io/badge/status-0.1.4%20stable-2ea44f"></a>
   <img alt="Release targets: Linux stable and Windows unsigned preview" src="https://img.shields.io/badge/release%20targets-Linux%20stable%20%2B%20Windows%20unsigned%20preview-0078d4">
   <img alt="Formal evaluation: preregistered" src="https://img.shields.io/badge/formal%20evaluation-preregistered-4cc9c0">
 </p>
 
 <p align="center">
-  <img src="assets/sigma-code-tui.png" alt="Sigma Code terminal UI running in Windows PowerShell" width="960">
+  <a href="https://github.com/hututuQQQ/sigma/releases/tag/v0.1.4"><strong>Download v0.1.4</strong></a>
+  · <a href="https://github.com/hututuQQQ/sigma-code">Desktop client source</a>
+  · <a href="SECURITY.md">Security</a>
 </p>
 
-Sigma Code turns a coding task into a durable stream of typed decisions and evidence. It can explore a repository, make scoped changes, run sandboxed commands, validate the result, ask an independent reviewer, and recover the same session after interruption. The product uses one event-sourced kernel, one session format, and one terminal UI instead of separate execution paths that drift apart.
+<p align="center">
+  <img src="assets/sigma-code-desktop.png" alt="Sigma Code desktop app using Sigma Runtime to analyze a repository" width="1200">
+</p>
+
+<p align="center">
+  <sub>
+    The <a href="https://github.com/hututuQQQ/sigma-code">Sigma Code desktop client</a> is an independently maintained downstream of
+    <a href="https://github.com/pingdotgg/t3code">T3 Code</a> and connects to this runtime over ACP v1.
+  </sub>
+</p>
+
+Sigma Code turns a coding task into a durable stream of typed decisions and evidence. It can explore a repository, make scoped changes, run sandboxed commands, validate the result, ask an independent reviewer, and recover the same session after interruption. This repository owns Sigma Runtime, the CLI, and the TUI; the desktop, Web, and mobile client lives in [hututuQQQ/sigma-code](https://github.com/hututuQQQ/sigma-code). The terminal surfaces use the in-process `RuntimeClient`, while the client's first-party Sigma provider launches the same event-sourced kernel, session store, tools, recovery logic, and outcome protocol through stable ACP v1.
 
 `0.1.4` is the current supported product baseline.
 Linux x64 is the stable release target. Windows x64 remains an explicitly
@@ -31,10 +44,13 @@ unsigned preview until trusted Authenticode signing is available. See the [secur
 policy](SECURITY.md) and [contribution guide](CONTRIBUTING.md) before reporting
 or proposing changes.
 
+> [!TIP]
+> **OpenCode comparison—same model, all 89 tasks:** Sigma Code + DeepSeek completed **51/89 (57.303%)** while OpenCode + DeepSeek completed **49/89 (55.056%)**, a difference of **+2 passes / +2.247 percentage points**. Both agents ran DeepSeek `deepseek-v4-pro` on the same Terminal-Bench 2.1 population; Sigma used one attempt per task, zero retries, and no verifier feedback. Methodology and limitations are documented under [Evaluation and benchmark boundary](#evaluation-and-benchmark-boundary).
+
 > [!IMPORTANT]
 > **Current product boundary**
 >
-> - **Sigma Code 0.1.4 is stable on Linux x64; Windows x64 is an unsigned preview.** The Windows installer contains both the Sigma Code desktop UI and the verified Sigma Runtime, so users do not need a separate Node.js or agent CLI installation. Release candidates must pass native sandbox, packaged-product, checksum, SBOM, and signed-provenance gates. Windows executables do not yet have a trusted Authenticode signature and may trigger Windows security warnings.
+> - **[Sigma Code 0.1.4](https://github.com/hututuQQQ/sigma/releases/tag/v0.1.4) is stable on Linux x64; Windows x64 is an unsigned preview.** The Windows installer contains both the Sigma Code desktop UI and the verified Sigma Runtime, so users do not need a separate Node.js or agent CLI installation. Release candidates must pass native sandbox, packaged-product, checksum, SBOM, and signed-provenance gates. Windows executables do not yet have a trusted Authenticode signature and may trigger Windows security warnings.
 > - **Formal evaluation is preregistered, not provider-coded.** The SHA-bound run manifest freezes the provider, model, source, archive, task selection, network, timeouts, concurrency, attempts, and retries before execution.
 > - Provider comparisons are valid only when their SHA-bound run manifests freeze comparable controls; the harness does not infer comparability from a model name.
 
@@ -46,7 +62,29 @@ or proposing changes.
 | Effects before execution | Every tool declares its possible effects; each call is narrowed to an exact plan before policy, approval, locking, checkpointing, and execution. |
 | Current-state validation before “done” | The runtime completes only when semantic validation covers every net change on the current mutation frontier. |
 | Fail-closed containment | Process execution stays in the required native sandbox even when host reads or networking are authorized. If the sandbox is unhealthy, Sigma refuses to execute. |
-| One product path | CLI automation and the TUI use the same `RuntimeClient`, kernel, store, tools, recovery logic, and outcome protocol. |
+| One runtime, multiple surfaces | CLI automation and the TUI use the same `RuntimeClient`; `sigma acp` exposes that runtime over stable ACP v1 to the Sigma Code desktop client without creating a second Agent path. |
+
+## Sigma Code desktop and T3 integration
+
+The [Sigma Code client](https://github.com/hututuQQQ/sigma-code) is an independently maintained desktop, Web, and mobile downstream of [T3 Code](https://github.com/pingdotgg/t3code). The original T3 Code license and attribution are preserved in that repository; the downstream is not affiliated with or endorsed by T3 Tools, Inc.
+
+The Windows installer published from this repository bundles the client with the exact verified Sigma Runtime from the same release. Its first-party Sigma provider starts the long-lived `sigma acp` server and communicates through newline-delimited JSON-RPC over stdio. The v0.1.4 bridge supports:
+
+- creating, listing, loading, resuming, closing, cancelling, and steering durable sessions;
+- streamed model and reasoning text, plans, tool calls, approvals, usage, context-window status, hooks, and child-agent lifecycle events;
+- image prompts, structured user questions, authoritative persisted history, and append-only message rollback;
+- model and model-specific reasoning-level selection, trusted skill discovery, and client-supplied Streamable HTTP MCP servers.
+
+For the first-party Sigma provider, the client remains a presentation surface: execution, permissions, sandboxing, persistence, validation, review, and recovery stay authoritative in Sigma Runtime.
+
+<details>
+<summary><strong>Terminal UI</strong></summary>
+
+<p align="center">
+  <img src="assets/sigma-code-tui.png" alt="Sigma Code terminal UI running in Windows PowerShell" width="960">
+</p>
+
+</details>
 
 ## Quick start on Linux
 
@@ -73,11 +111,13 @@ export DEEPSEEK_API_KEY="your-api-key"
 > Its executables do not have a trusted Authenticode signature, so Windows SmartScreen
 > or Smart App Control may warn or block execution.
 
-For the complete desktop product, download `Sigma-Code-0.1.4-x64.exe` from
-[GitHub Releases](https://github.com/hututuQQQ/sigma/releases), verify its
+For the complete desktop product, download `Sigma-Code-0.1.4-x64.exe` from the
+[Sigma Code v0.1.4 release](https://github.com/hututuQQQ/sigma/releases/tag/v0.1.4), verify its
 SHA-256 sidecar, and run the installer. It installs the Sigma Code UI together
 with the verified Sigma Runtime; no separate Node.js or agent CLI installation
 is required.
+
+The bundled UI is built from [hututuQQQ/sigma-code](https://github.com/hututuQQQ/sigma-code) and launches the Runtime through `sigma acp`. In Settings, choose a Sigma model connection and authenticate with the method exposed by that provider. The default desktop path uses the experimental ChatGPT/Codex subscription connection; supported Pi providers can expose API-key or OAuth methods through the same Runtime-owned interface.
 
 The `agent-cli-win32-x64.zip` asset remains available for terminal-only and
 portable use. It includes pinned Node.js, the native `sigma-exec` broker, the
@@ -126,7 +166,8 @@ For read-only analysis:
 
 ## What Sigma can do
 
-- **Interactive coding:** use a CJK/IME-aware terminal UI with Markdown responses, activity views, command completion, multiline input, steering, follow-ups, scrolling, and approval overlays.
+- **Desktop and terminal interaction:** use the [Sigma Code desktop client](https://github.com/hututuQQQ/sigma-code) through ACP v1, or a CJK/IME-aware terminal UI with Markdown responses, activity views, command completion, multiline input, steering, follow-ups, scrolling, and approval overlays.
+- **Unified model access:** search the pinned Pi catalog, authenticate provider connections, select model-specific reasoning levels, and retain explicit metered, subscription, or unknown-price billing semantics.
 - **Repository intelligence:** bounded file listing and grep, repository statistics, Git status/diff, stable hash-aware workspace and declared host-input reads, nested `AGENTS.md` discovery, and LSP-backed code intelligence when a supported server is available.
 - **Scoped changes:** write and edit files, apply atomic multi-file patches, delete individual files, detect no-op writes, create mutation checkpoints, and restore the current run's latest sealed checkpoint.
 - **Sandboxed execution:** run direct executables or platform shells, execute semantic validation, manage background/PTY processes through broker-scoped session handles, and explicitly hand off verified Linux deliverable services.
@@ -134,16 +175,19 @@ For read-only analysis:
 - **Evidence-based delivery:** record workspace deltas, commands, validation, diagnostics, reviews, child outcomes, and checkpoints in one typed evidence ledger.
 - **Durable sessions:** list, inspect, replay, resume, cancel, steer, approve, and continue sessions after a process interruption.
 - **Child agents:** delegate plan nodes to bounded child sessions; isolate writers in Git worktrees or narrow single-writer scopes, then explicitly integrate retained changes.
-- **Extensibility:** load skills, profiles, and hooks through frozen/trusted customization boundaries, and connect explicitly trusted read-only MCP stdio servers.
+- **Long-running reliability:** compact context before the provider window is exhausted, recover boundedly from transient stream closures, and isolate reviewer sessions and child runs from later turns.
+- **Extensibility:** load skills, profiles, and hooks through frozen/trusted customization boundaries, connect explicitly trusted read-only MCP stdio servers, and accept read-only Streamable HTTP MCP servers supplied by an ACP client.
 
 ## Architecture
 
-`agent-runtime.createConfiguredRuntime` is the single production composition root. It wires the model routes, context provider, pure kernel, effect-aware tools, MCP clients, segmented event store, checkpoint manager, reviewer, supervisor, execution broker, and in-process `RuntimeClient`. The CLI creates that runtime; the TUI receives the client rather than rebuilding the agent loop.
+`agent-runtime.createConfiguredRuntime` is the single production composition root. It wires the model routes, context provider, pure kernel, effect-aware tools, MCP clients, segmented event store, checkpoint manager, reviewer, supervisor, execution broker, and in-process `RuntimeClient`. The CLI creates that runtime; the TUI receives the client rather than rebuilding the agent loop, and `sigma acp` projects the same runtime to clients such as Sigma Code.
 
 ```mermaid
 flowchart TB
-  USER["User task / TUI input"] --> CLI["agent-cli<br/>commands and configuration"]
+  USER["Terminal user"] --> CLI["agent-cli<br/>commands + TUI"]
+  DESKTOP["Sigma Code desktop<br/>T3 Code downstream"] <--> ACP["sigma acp<br/>stable ACP v1"]
   CLI --> ROOT["agent-runtime<br/>single composition root"]
+  ACP --> ROOT
   ROOT --> CLIENT["RuntimeClient<br/>session command bus"]
   CLIENT --> KERNEL["agent-kernel<br/>pure reducer + effect decisions"]
 
@@ -153,7 +197,7 @@ flowchart TB
   KERNEL --> TOOLS["agent-tools<br/>typed effect plans and receipts"]
   KERNEL --> STORE["agent-store<br/>events, snapshots, artifacts"]
 
-  TOOLS --> MCP["agent-mcp<br/>trusted read-only stdio bridge"]
+  TOOLS --> MCP["agent-mcp<br/>trusted stdio + ACP HTTP bridge"]
   TOOLS --> SUP["agent-supervisor<br/>children, mailboxes, writer isolation"]
   TOOLS --> EXEC["agent-execution<br/>only arbitrary-process boundary"]
   EXEC --> NATIVE["sigma-exec (Rust)<br/>Windows AppContainer / Linux namespace sandbox"]
@@ -166,17 +210,18 @@ flowchart TB
   EVENTS --> KERNEL
   EVENTS --> PRESENT["agent-presentation<br/>incremental projection"]
   PRESENT --> TUI["agent-tui<br/>OpenTUI renderer"]
+  EVENTS --> ACP
 
   EVAL["External evaluation + benchmark harness"] -.->|"launch packaged subject; collect only after run"| CLI
 ```
 
 ### The event loop
 
-1. A CLI/TUI command becomes a typed session command and durable event.
+1. A CLI, TUI, or ACP command becomes a typed session command and durable event.
 2. `agent-kernel` reduces the event stream into state and decides the next effect; it does not perform I/O itself.
 3. `agent-runtime` executes that decision through protocol ports for the model, context, tools, store, review, or supervision.
 4. Before a tool runs, Sigma freezes its exact read/write roots, network mode, process mode, idempotence, and checkpoint scope. Mode policy, approval, locks, and trust checks are evaluated against that plan.
-5. The resulting receipt and evidence are appended as new events. The kernel then decides the next step from durable state, while `agent-presentation` projects the same events into CLI/TUI output.
+5. The resulting receipt and evidence are appended as new events. The kernel then decides the next step from durable state, while `agent-presentation` and the ACP bridge project the same events into terminal or desktop updates.
 6. A run ends only with a typed outcome: `Completed`, `NeedsInput`, `Cancelled`, `RecoverableFailure`, or `Fatal`.
 
 This separation makes replay and recovery part of the normal execution model instead of a special UI feature.
@@ -191,7 +236,7 @@ This separation makes replay and recovery part of the normal execution model ins
 | Capabilities | `agent-tools`, `agent-web`, `agent-mcp` | Repository/file/process/control/supervisor tools, brokered Web research, and the MCP bridge, all behind declared effects. |
 | Safety boundary | `agent-execution`, `agent-platform`, `agent-checkpoint`, `native/sigma-exec` | Path containment, process policy, native sandboxing, output redaction/artifacts, and transactional recovery. |
 | Durability and coordination | `agent-store`, `agent-supervisor`, `agent-runtime` | Event persistence, snapshots, session ownership, child isolation, recovery, review, and composition. |
-| Product surfaces | `agent-presentation`, `agent-tui`, `agent-cli` | Event projection, terminal interaction, automation commands, session administration, and diagnostics. |
+| Product surfaces | `agent-presentation`, `agent-tui`, `agent-cli`; downstream `sigma-code` | Event projection, terminal interaction, automation commands, ACP v1, desktop interaction, session administration, and diagnostics. |
 
 The production package dependency graph is checked for cycles and packages communicate through public exports.
 
@@ -285,6 +330,7 @@ writer worktree keeps the parent open.
 | `agent tui --workspace .` | Open the interactive terminal UI. |
 | `agent run "..." --workspace .` | Run a workspace-changing task. |
 | `agent inspect "..." --workspace .` | Analyze without write-capable tools. |
+| `sigma acp` | Serve stable ACP v1 as newline-delimited JSON-RPC over stdio for clients such as Sigma Code. |
 | `agent sessions --workspace . --json` | List durable sessions. |
 | `agent session show --latest --workspace .` | Inspect the latest session. |
 | `agent replay --latest --workspace . --timeline` | Replay its event timeline. |
@@ -316,6 +362,8 @@ Stable process exit codes are `0` for `Completed`, `2` for `NeedsInput`, `130` f
 ## Configuration
 
 Precedence is **CLI flags → environment → workspace `.agent/config.toml` → home `~/.sigma/config.toml` → defaults**. Unknown flags and TOML keys fail immediately. Workspace-authored MCP servers and executable hooks require an explicit digest-bound trust grant.
+
+The packaged default is the experimental `openai-codex` subscription provider with automatic model selection. The example below explicitly selects DeepSeek for an API-key-based setup:
 
 ```toml
 schema_version = 1
@@ -413,6 +461,12 @@ sigma auth login openai-codex --method device-code --json
 sigma auth logout openai-codex --json
 ```
 
+For Codex transports, Sigma keeps stable prompt prefixes eligible for cached
+WebSocket continuation, falls back to SSE before streaming begins, classifies
+premature stream closure as transient for bounded retry, and keeps solver and
+reviewer transport sessions isolated. Context compaction starts before the
+provider window is exhausted instead of waiting for a hard overflow.
+
 ### Unified Pi provider gateway
 
 All model I/O is owned by `agent-pi`, pinned to
@@ -427,6 +481,12 @@ Provider credentials and the dynamic model cache are stored separately in
 cross-process locks, and current-user-only permissions. Directory/status reads
 are offline; only an explicit model refresh, login completion, or a normal
 model request may access the network.
+
+Outbound model connections honor `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and
+`NO_PROXY`. When a Windows desktop or ACP process starts without proxy
+environment variables, Sigma can use the current user's enabled static Windows
+Internet Settings proxy; explicit environment configuration takes precedence,
+and loopback traffic remains bypassed.
 
 Billing is reported as `metered`, `subscription`, or `unpriced`.
 Subscription and unpriced calls retain token usage with a null monetary cost;
@@ -462,18 +522,18 @@ DeepSeek `deepseek-v4-pro` on the same 89-task Terminal-Bench 2.1 population.
 The Sigma lane used a maximum concurrency of 5, one attempt per task, zero
 retries, and no verifier feedback.
 
-| View | Sigma Code + DeepSeek | OpenCode + DeepSeek | Difference |
-| --- | ---: | ---: | ---: |
-| Raw 89 tasks | 51/89 (57.303%) | 49/89 (55.056%) | Sigma +2 passes / +2.247 pp |
-| Infrastructure-valid subset | 51/83 (61.446%) | 47/83 (56.627%) | Sigma +4 passes / +4.819 pp |
+| Agent | Passed | Pass rate |
+| --- | ---: | ---: |
+| **Sigma Code + DeepSeek** | **51/89** | **57.303%** |
+| OpenCode + DeepSeek | 49/89 | 55.056% |
+| **Difference** | **+2 passes** | **+2.247 pp** |
 
-The raw view keeps six externally caused Sigma infrastructure-invalid
-observations as non-passes. The secondary view removes those same six task
-identities from both agents. Sigma's immutable observation union is
-`49 + 4 + 1 + 9 + 26 = 89`: each source revision ran only the then-unconsumed
-suffix, so this is a mixed-source diagnostic result rather than a score for the
-final PR head. No consumed task was rerun, and the generic lifecycle fix made
-after the final observation is intentionally not included in the score. See
+All 89 tasks remain in the reported denominator, including six externally
+caused Sigma infrastructure-invalid observations counted as non-passes. Each
+source revision ran only previously unconsumed tasks, so this is a mixed-source
+diagnostic result rather than a score for the final PR head. No consumed task
+was rerun, and the generic lifecycle fix made after the final observation is
+intentionally not included in the score. See
 [PR #73](https://github.com/hututuQQQ/sigma/pull/73) for the source-boundary,
 stop-loss, and validation record.
 
@@ -539,4 +599,4 @@ Sigma Code is available under the [MIT License](LICENSE).
 
 ## Direction
 
-Sigma's near-term focus is deliberately narrow: make the Windows product dependable, deepen long-session convergence, improve real task performance, and keep evaluation feedback outside the solving boundary. Broader formal platform/provider claims should follow reproducible preregistration and demonstrated product reliability rather than lead it.
+Sigma's near-term focus is deliberately narrow: keep improving Windows desktop and ACP reliability, deepen long-session convergence, improve real task performance, and keep evaluation feedback outside the solving boundary. Broader formal platform/provider claims should follow reproducible preregistration and demonstrated product reliability rather than lead it.
