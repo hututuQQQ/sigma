@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ContextArchive, ContextItem, ModelMessage } from "../packages/agent-protocol/src/index.js";
 import {
+  blockTokens,
   historyAfterArchive,
   historyBlocks,
   planContext,
@@ -74,6 +75,21 @@ function expectToolPairs(messages: ModelMessage[]): void {
 }
 
 describe("context archive planning", () => {
+  it("accounts for images without treating base64 transport bytes as text", () => {
+    const tokens = (data: string) => blockTokens([{
+      role: "user",
+      content: "Inspect this screenshot",
+      images: [{ mimeType: "image/png", data }]
+    }]);
+
+    const small = tokens(Buffer.alloc(16).toString("base64"));
+    const large = tokens(Buffer.alloc(200_000).toString("base64"));
+
+    expect(large).toBe(small);
+    expect(large).toBeGreaterThan(1_800);
+    expect(large).toBeLessThan(2_000);
+  });
+
   it("does not proactively omit history that fits the provider window", () => {
     const history: ModelMessage[] = [{ role: "user", content: "Keep all recent context." }];
     for (let index = 0; index < 40; index += 1) history.push(...toolLoop(index));

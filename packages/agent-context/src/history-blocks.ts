@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { ModelMessage } from "agent-protocol";
+import { modelImageInputTokenEstimate, type ModelMessage } from "agent-protocol";
 import { approximateTokens } from "./unicode.js";
 
 export interface HistoryBlock {
@@ -11,6 +11,7 @@ export function messageTokens(message: ModelMessage): number {
   return approximateTokens(message.content)
     + approximateTokens(message.reasoningContent ?? "")
     + approximateTokens(JSON.stringify(message.toolCalls ?? []))
+    + modelImageInputTokenEstimate([message])
     + 6;
 }
 

@@ -11,13 +11,16 @@ import type {
   ToolCall as PiToolCall,
   ToolResultMessage
 } from "@earendil-works/pi-ai";
-import type {
-  JsonValue,
-  ModelMessage,
-  ModelRequest,
-  ModelResponse,
-  ModelStreamEvent,
-  ModelToolCall
+import {
+  modelImageInputTokenEstimate,
+  modelMessagesWithoutImagePayloads,
+  type JsonValue,
+  type ModelMessage,
+  type ModelRequest,
+  type ModelResponse,
+  type ModelStreamEvent,
+  type ModelToolCall,
+  type ModelToolDefinition
 } from "agent-protocol";
 import type { PiProviderEventType } from "./errors.js";
 import type { PiBillingMode } from "./models.js";
@@ -287,6 +290,16 @@ export function approximateTokens(value: unknown): number {
     }
   }
   return cjk + Math.ceil(bytes / 4);
+}
+
+export function approximateModelInputTokens(
+  messages: readonly ModelMessage[],
+  tools: readonly ModelToolDefinition[]
+): number {
+  return approximateTokens({
+    messages: modelMessagesWithoutImagePayloads(messages),
+    tools
+  }) + modelImageInputTokenEstimate(messages);
 }
 
 export function deepSeekPayload(payload: unknown, request: ModelRequest): unknown {
