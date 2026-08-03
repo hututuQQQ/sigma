@@ -20,7 +20,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/hututuQQQ/sigma/releases/tag/v0.1.4"><strong>下载 v0.1.4</strong></a>
+  <a href="https://sigmacode.biz"><strong>官方网站</strong></a>
+  · <a href="https://github.com/hututuQQQ/sigma/releases/tag/v0.1.4"><strong>下载 v0.1.4</strong></a>
   · <a href="https://github.com/hututuQQQ/sigma-code">桌面客户端源码</a>
   · <a href="SECURITY.md">安全策略</a>
 </p>

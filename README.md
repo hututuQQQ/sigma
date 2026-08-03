@@ -20,7 +20,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/hututuQQQ/sigma/releases/tag/v0.1.4"><strong>Download v0.1.4</strong></a>
+  <a href="https://sigmacode.biz"><strong>Official website</strong></a>
+  · <a href="https://github.com/hututuQQQ/sigma/releases/tag/v0.1.4"><strong>Download v0.1.4</strong></a>
   · <a href="https://github.com/hututuQQQ/sigma-code">Desktop client source</a>
   · <a href="SECURITY.md">Security</a>
 </p>
