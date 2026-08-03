@@ -14,14 +14,14 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/hututuQQQ/sigma/releases/tag/v0.1.4"><img alt="Status: 0.1.4 stable release" src="https://img.shields.io/badge/status-0.1.4%20stable-2ea44f"></a>
+  <a href="https://github.com/hututuQQQ/sigma/releases/tag/v0.1.5"><img alt="Status: 0.1.5 stable release" src="https://img.shields.io/badge/status-0.1.5%20stable-2ea44f"></a>
   <img alt="Release targets: Linux stable and Windows unsigned preview" src="https://img.shields.io/badge/release%20targets-Linux%20stable%20%2B%20Windows%20unsigned%20preview-0078d4">
   <img alt="Formal evaluation: preregistered" src="https://img.shields.io/badge/formal%20evaluation-preregistered-4cc9c0">
 </p>
 
 <p align="center">
   <a href="https://sigmacode.biz"><strong>Official website</strong></a>
-  · <a href="https://github.com/hututuQQQ/sigma/releases/tag/v0.1.4"><strong>Download v0.1.4</strong></a>
+  · <a href="https://github.com/hututuQQQ/sigma/releases/tag/v0.1.5"><strong>Download v0.1.5</strong></a>
   · <a href="https://github.com/hututuQQQ/sigma-code">Desktop client source</a>
   · <a href="SECURITY.md">Security</a>
 </p>
@@ -39,7 +39,7 @@
 
 Sigma Code is built for coding tasks that must not lose their state or declare victory too early. It runs commands inside a required native sandbox, persists the full working session so it can resume after interruption, and completes only after current changes are validated and any required review is satisfied. This repository owns Sigma Runtime, the CLI, and the TUI; the desktop, Web, and mobile client lives in [hututuQQQ/sigma-code](https://github.com/hututuQQQ/sigma-code). Every surface uses the same event-sourced kernel, session store, tools, recovery logic, and outcome protocol, either in process through `RuntimeClient` or over stable ACP v1.
 
-`0.1.4` is the current supported product baseline.
+`0.1.5` is the current supported product baseline.
 Linux x64 is the stable release target. Windows x64 remains an explicitly
 unsigned preview until trusted Authenticode signing is available. See the [security
 policy](SECURITY.md) and [contribution guide](CONTRIBUTING.md) before reporting
@@ -51,7 +51,7 @@ or proposing changes.
 > [!IMPORTANT]
 > **Current product boundary**
 >
-> - **[Sigma Code 0.1.4](https://github.com/hututuQQQ/sigma/releases/tag/v0.1.4) is stable on Linux x64; Windows x64 is an unsigned preview.** The Windows installer contains both the Sigma Code desktop UI and the verified Sigma Runtime, so users do not need a separate Node.js or agent CLI installation. Release candidates must pass native sandbox, packaged-product, checksum, SBOM, and signed-provenance gates. Windows executables do not yet have a trusted Authenticode signature and may trigger Windows security warnings.
+> - **[Sigma Code 0.1.5](https://github.com/hututuQQQ/sigma/releases/tag/v0.1.5) is stable on Linux x64; Windows x64 is an unsigned preview.** The Windows installer contains both the Sigma Code desktop UI and the verified Sigma Runtime, so users do not need a separate Node.js or agent CLI installation. Release candidates must pass native sandbox, packaged-product, checksum, SBOM, and signed-provenance gates. Windows executables do not yet have a trusted Authenticode signature and may trigger Windows security warnings.
 > - **Formal evaluation is preregistered, not provider-coded.** The SHA-bound run manifest freezes the provider, model, source, archive, task selection, network, timeouts, concurrency, attempts, and retries before execution.
 > - Provider comparisons are valid only when their SHA-bound run manifests freeze comparable controls; the harness does not infer comparability from a model name.
 
@@ -67,7 +67,7 @@ or proposing changes.
 
 The [Sigma Code client](https://github.com/hututuQQQ/sigma-code) is an independently maintained desktop, Web, and mobile downstream of [T3 Code](https://github.com/pingdotgg/t3code). The original T3 Code license and attribution are preserved in that repository; the downstream is not affiliated with or endorsed by T3 Tools, Inc.
 
-The Windows installer published from this repository bundles the client with the exact verified Sigma Runtime from the same release. Its first-party Sigma provider starts the long-lived `sigma acp` server and communicates through newline-delimited JSON-RPC over stdio. The v0.1.4 bridge supports:
+The Windows installer published from this repository bundles the client with the exact verified Sigma Runtime from the same release. Its first-party Sigma provider starts the long-lived `sigma acp` server and communicates through newline-delimited JSON-RPC over stdio. The v0.1.5 bridge supports:
 
 - creating, listing, loading, resuming, closing, cancelling, and steering durable sessions;
 - streamed model and reasoning text, plans, tool calls, approvals, usage, context-window status, hooks, and child-agent lifecycle events;
@@ -87,7 +87,7 @@ For the first-party Sigma provider, the client remains a presentation surface: e
 
 ## Quick start on Linux
 
-Obtain the `0.1.4` Linux x64 stable archive from a verified project release or
+Obtain the `0.1.5` Linux x64 stable archive from a verified project release or
 build it from source, verify its SHA-256 sidecar and signed provenance, and
 extract it:
 
@@ -110,8 +110,8 @@ export DEEPSEEK_API_KEY="your-api-key"
 > Its executables do not have a trusted Authenticode signature, so Windows SmartScreen
 > or Smart App Control may warn or block execution.
 
-For the complete desktop product, download `Sigma-Code-0.1.4-x64.exe` from the
-[Sigma Code v0.1.4 release](https://github.com/hututuQQQ/sigma/releases/tag/v0.1.4), verify its
+For the complete desktop product, download `Sigma-Code-0.1.5-x64.exe` from the
+[Sigma Code v0.1.5 release](https://github.com/hututuQQQ/sigma/releases/tag/v0.1.5), verify its
 SHA-256 sidecar, and run the installer. It installs the Sigma Code UI together
 with the verified Sigma Runtime; no separate Node.js or agent CLI installation
 is required.
@@ -141,7 +141,7 @@ The example sets the key only for the current PowerShell process. Keep secrets o
 
 Published archives include a SHA-256 checksum, CycloneDX SBOM, signed
 provenance, and the public provenance verification key. Linux x64 is stable at
-`0.1.4`; Windows x64 remains an unsigned preview. See
+`0.1.5`; Windows x64 remains an unsigned preview. See
 [SECURITY.md](SECURITY.md) for the trust boundary and
 [RELEASING.md](RELEASING.md) for the maintainer process.
 

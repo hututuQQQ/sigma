@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "productVersion": "0.1.4",
+  "productVersion": "0.1.5",
   "toolchains": {
     "node": "26.4.0",
     "pnpm": "11.7.0",

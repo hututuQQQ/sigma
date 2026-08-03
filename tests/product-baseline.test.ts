@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 import { runAgentCommand } from "../packages/agent-cli/src/index.js";
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const productVersion = "0.1.4";
+const productVersion = "0.1.5";
 const sourceExtensions = new Set([".mjs", ".rs", ".ts"]);
 const externalVersionedDeclarations = new Set([
   "ACCESS_WRITE_ALLOWED_V1",
@@ -43,7 +43,7 @@ async function filesUnder(directory: string): Promise<string[]> {
 }
 
 describe("Sigma Code single baseline", () => {
-  it("keeps every product package, crate, manifest, and CLI help at 0.1.4", async () => {
+  it("keeps every product package, crate, manifest, and CLI help at 0.1.5", async () => {
     const manifest = JSON.parse(await readFile(path.join(rootDir, "sigma-manifest.json"), "utf8")) as {
       productVersion?: unknown;
       schemaVersion?: unknown;

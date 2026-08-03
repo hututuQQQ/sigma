@@ -43,7 +43,7 @@ async function packagedSubject(targetPlatform: "linux" | "win32"): Promise<{
   };
   const packageValue = {
     name: `sigma-agent-cli-${targetPlatform}-${targetArch}`,
-    version: "0.1.4",
+    version: "0.1.5",
     bin: { agent: `./${paths.wrapper}` }
   };
   await writeFile(path.join(root, "package.json"), `${JSON.stringify(packageValue)}\n`, "utf8");
