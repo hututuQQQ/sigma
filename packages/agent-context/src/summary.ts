@@ -24,9 +24,32 @@ function line(message: ModelMessage): string {
 }
 
 function projectionEntries(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => {
+      if (typeof item === "string") return [item];
+      if (!item || typeof item !== "object") return [];
+      const entry = item as Record<string, unknown>;
+      if (typeof entry.artifactId === "string") {
+        return [`${entry.artifactId}${typeof entry.name === "string" ? `:${entry.name}` : ""}`];
+      }
+      if (typeof entry.kind === "string" && typeof entry.status === "string") {
+        return [`${entry.kind}:${entry.status}${typeof entry.summary === "string" ? `:${entry.summary}` : ""}`];
+      }
+      return [];
+    });
+  }
   if (!value || typeof value !== "object" || Array.isArray(value)) return [];
   const entries = (value as { entries?: unknown }).entries;
   return Array.isArray(entries) ? entries.filter((item): item is string => typeof item === "string") : [];
+}
+
+function changedPaths(summary: Record<string, unknown>): string[] {
+  const direct = projectionEntries(summary.changedPaths);
+  if (direct.length > 0) return direct;
+  if (!summary.changes || typeof summary.changes !== "object" || Array.isArray(summary.changes)) return [];
+  const changes = summary.changes as Record<string, unknown>;
+  return ["added", "modified", "deleted"].flatMap((key) =>
+    projectionEntries(changes[key]));
 }
 
 function compactOutput(value: string): string {
@@ -65,7 +88,7 @@ function semanticReceiptProjection(content: string): SemanticReceiptProjection |
   return {
     status: typeof outcome.status === "string" ? outcome.status : "unknown",
     diagnosticCodes: projectionEntries(outcome.diagnosticCodes),
-    changedPaths: projectionEntries(summary.changedPaths),
+    changedPaths: changedPaths(summary),
     output: content.slice(outputStart + outputMarker.length).replace(/\s+/gu, " ").trim(),
     evidence: projectionEntries(summary.evidence),
     artifactRefs: projectionEntries(summary.artifactRefs)

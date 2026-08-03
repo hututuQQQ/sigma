@@ -259,6 +259,71 @@ describe("Sigma architecture", () => {
     expect(gateway.requests).toHaveLength(3);
   });
 
+  it("executes independent workspace reads behind one model-visible batch receipt", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-read-batch-"));
+    await writeFile(path.join(workspace, "first.txt"), "first-value", "utf8");
+    await writeFile(path.join(workspace, "second.txt"), "second-value", "utf8");
+    const gateway = new FakeGateway([
+      {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{
+            id: "inspect-files",
+            name: "batch_read",
+            arguments: {
+              calls: [
+                { name: "read", arguments: { path: "first.txt" } },
+                { name: "read", arguments: { path: "second.txt" } }
+              ]
+            }
+          }]
+        },
+        finishReason: "tool_calls"
+      },
+      { message: { role: "assistant", content: "Inspected both files." }, finishReason: "stop" }
+    ]);
+    const storeRootDir = path.join(workspace, ".agent");
+    const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
+    const runtime = createRuntime({
+      gateway,
+      store,
+      storeRootDir,
+      tools: registerBuiltinTools(new EffectToolRegistry()),
+      permissionMode: "auto",
+      runDeadlineMs: 60_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+    await runtime.command({
+      type: "submit",
+      sessionId: session.sessionId,
+      text: "Inspect first.txt and second.txt."
+    });
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "completed",
+      message: "Inspected both files."
+    });
+
+    expect(gateway.requests[0]?.tools.map((tool) => tool.name)).toContain("batch_read");
+    const modelReceipts = gateway.requests[1]?.messages.filter((message) => message.role === "tool") ?? [];
+    expect(modelReceipts).toHaveLength(1);
+    expect(modelReceipts[0]).toMatchObject({ toolCallId: "inspect-files" });
+    expect(modelReceipts[0]?.content).toContain("first-value");
+    expect(modelReceipts[0]?.content).toContain("second-value");
+
+    const completedCalls: string[] = [];
+    for await (const stored of store.events(session.sessionId)) {
+      if (stored.type !== "tool.completed") continue;
+      const payload = stored.payload as Record<string, unknown>;
+      if (typeof payload.callId === "string") completedCalls.push(payload.callId);
+    }
+    expect(completedCalls).toEqual(expect.arrayContaining([
+      "inspect-files:read:1",
+      "inspect-files:read:2",
+      "inspect-files"
+    ]));
+  });
+
   it("defers completion until final-state validation evidence is durable", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-completion-barrier-"));
     const gateway = new FakeGateway([{

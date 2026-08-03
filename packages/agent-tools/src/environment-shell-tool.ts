@@ -12,10 +12,27 @@ function enclosingContainerRoot(workspacePath: string): string {
 
 export function environmentShellArguments(
   value: JsonValue,
-  workspacePath: string
+  workspacePath: string,
+  validation = false
 ): Record<string, JsonValue> {
   const { target: _target, ...input } = executionArgs(value);
   const root = enclosingContainerRoot(workspacePath);
+  if (validation) {
+    const declaredReadRoots = Array.isArray(input.readRoots)
+      ? input.readRoots.filter((item): item is string => typeof item === "string")
+      : [];
+    const {
+      access: _access,
+      writeRoots: _writeRoots,
+      expectedChanges: _expectedChanges,
+      ...readonlyInput
+    } = input;
+    return {
+      ...readonlyInput,
+      access: "readonly",
+      readRoots: [...new Set([root, ...declaredReadRoots])]
+    };
+  }
   return {
     ...input,
     access: "write",

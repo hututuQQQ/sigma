@@ -115,6 +115,7 @@ export class InProcessRuntimeClient implements RuntimeClient {
       permissionMode: options.permissionMode ?? "ask",
       outputReserveTokens: options.outputReserveTokens ?? Math.min(8_192, options.gateway.capabilities.maxOutputTokens),
       emit: async (session, type, authority, value) => await this.emit(session, type, authority, value),
+      emitBatch: async (session, emissions) => await this.events.emitBatch(session, emissions),
       finish: async (session, outcome, outcomeRevision, suspensionContext) =>
         await this.finish(session, outcome, outcomeRevision, suspensionContext),
       createArtifact: async (sessionId, content) => await this.artifacts.put(sessionId, content),

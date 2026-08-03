@@ -478,6 +478,49 @@ describe("typed workspace mutation contracts", () => {
     });
     expect(fixture.executions[0]?.policy.scratchLease).toBeUndefined();
 
+    const validationCall = request("inspect-outer-environment", "shell", {
+      command: "inspect disposable environment",
+      target: "environment",
+      validation: true
+    });
+    const validationPlan = await tools.prepare(validationCall, preparation(workspace));
+    expect(validationPlan).toMatchObject({
+      exactEffects: expect.arrayContaining([
+        "process.spawn.readonly",
+        "filesystem.read.external",
+        "validation"
+      ]),
+      readPaths: [".", filesystemRoot],
+      writePaths: [],
+      checkpointScope: []
+    });
+    expect(validationPlan.mutationAuthority).toBeUndefined();
+    await expect(tools.execute(validationCall, {
+      ...execution(workspace),
+      callPlan: validationPlan,
+      approval: {
+        callId: validationCall.callId,
+        authority: "runtime",
+        networkApproved: false,
+        externalReadApproved: true,
+        processHandoffApproved: false,
+        openWorldApproved: false
+      }
+    })).resolves.toMatchObject({ ok: true });
+    expect(fixture.executions).toHaveLength(2);
+    expect(fixture.executions[1]?.policy).toMatchObject({
+      readRoots: expect.arrayContaining([workspace, filesystemRoot]),
+      writeRoots: []
+    });
+    expect(fixture.executions[1]?.policy.enclosingContainerRoot).toBeUndefined();
+    if (process.platform === "win32") {
+      expect(fixture.executions[1]?.policy.readOnlyValidationWorkspaceRoot).toBe(workspace);
+      expect(fixture.executions[1]?.policy.disposableWorkspaceRoot).toBeUndefined();
+    } else {
+      expect(fixture.executions[1]?.policy.disposableWorkspaceRoot).toBe(workspace);
+      expect(fixture.executions[1]?.policy.readOnlyValidationWorkspaceRoot).toBeUndefined();
+    }
+
     const deliverable = path.join(workspace, "generated", "artifact.txt");
     const hybridCall = request("prepare-environment-and-deliverable", "shell", {
       command: "prepare environment and generate artifact",
@@ -502,8 +545,8 @@ describe("typed workspace mutation contracts", () => {
         openWorldApproved: false
       }
     })).resolves.toMatchObject({ ok: true });
-    expect(fixture.executions).toHaveLength(2);
-    expect(fixture.executions[1]?.policy).toMatchObject({
+    expect(fixture.executions).toHaveLength(3);
+    expect(fixture.executions[2]?.policy).toMatchObject({
       enclosingContainerRoot: true,
       writeRoots: [filesystemRoot],
       protectedPaths: expect.arrayContaining([
@@ -512,7 +555,7 @@ describe("typed workspace mutation contracts", () => {
         protectedState
       ])
     });
-    expect(fixture.executions[1]?.policy.protectedPaths).not.toContain(workspace);
+    expect(fixture.executions[2]?.policy.protectedPaths).not.toContain(workspace);
 
     await expect(tools.prepare(request("background-hybrid", "shell", {
       command: "start environment service",

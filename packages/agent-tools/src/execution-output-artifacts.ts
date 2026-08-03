@@ -91,6 +91,15 @@ function commandSucceeded(result: ExecutionResult): boolean {
     && result.failure === undefined;
 }
 
+/** Whether the broker successfully delivered an objective command result.
+ * Application exit status is deliberately separate: a completed process that
+ * exits non-zero is still a successful tool observation. */
+function commandDelivered(result: ExecutionResult): boolean {
+  return result.state === "exited" && result.signal === null
+    && !result.timedOut && !result.idleTimedOut && !result.cancelled
+    && result.failure === undefined;
+}
+
 /** Stable, language-level diagnostics only. Package names and command text are
  * deliberately excluded so convergence remains product- and task-invariant. */
 function dependencyDiagnostics(result: ExecutionResult): string[] {
@@ -236,7 +245,7 @@ export async function commandReceipt(
   broker: ExecutionBroker
 ): Promise<ToolReceipt> {
   const completedAt = new Date().toISOString();
-  const ok = commandSucceeded(result);
+  const ok = commandDelivered(result);
   const imported = await importOutputArtifacts(result.outputArtifacts, context);
   const stdout = projectStream(result.stdout);
   const stderr = projectStream(result.stderr);
@@ -262,6 +271,16 @@ export async function commandReceipt(
   return {
     callId: request.callId, ok,
     output,
+    result: {
+      state: result.state,
+      exitCode: result.exitCode,
+      signal: result.signal,
+      durationMs: result.durationMs,
+      timedOut: result.timedOut,
+      idleTimedOut: result.idleTimedOut,
+      cancelled: result.cancelled,
+      commandStatus: commandSucceeded(result) ? "passed" : "failed"
+    },
     outcome: { status: ok ? "succeeded" : "failed", output, diagnosticCodes: diagnostics },
     observedEffects: [...actualEffects], actualEffects: [...actualEffects],
     artifacts: imported.ids, artifactRefs: imported.refs,
@@ -274,15 +293,15 @@ function processOutcome(
   operation: "poll" | "terminate",
   value: ProcessPollResult
 ): { ok: boolean; diagnostics: string[] } {
+  if (value.state === "lost") return { ok: false, diagnostics: ["process_lost"] };
   if (operation === "terminate") return { ok: true, diagnostics: [] };
   if (value.state === "running") return { ok: true, diagnostics: [] };
-  if (value.state === "lost") return { ok: false, diagnostics: ["process_lost"] };
-  if (value.state === "terminated") return { ok: false, diagnostics: ["process_terminated"] };
+  if (value.state === "terminated") return { ok: true, diagnostics: ["process_terminated"] };
   const diagnostics = [
     ...(value.exitCode === 0 ? [] : [`process_exit_nonzero:${String(value.exitCode)}`]),
     ...(value.signal === null ? [] : [`process_signalled:${value.signal}`])
   ];
-  return { ok: diagnostics.length === 0, diagnostics };
+  return { ok: true, diagnostics };
 }
 
 export async function processReceipt(

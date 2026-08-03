@@ -1,9 +1,6 @@
-import { createHash, randomUUID } from "node:crypto";
-import { mkdir, open, readFile, readdir, stat } from "node:fs/promises";
+import { mkdir, open, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
-import { acquireProcessOwnerLease } from "agent-platform";
 import {
-  EVENT_SCHEMA_VERSION,
   SNAPSHOT_SCHEMA_VERSION,
   STORE_LAYOUT_VERSION,
   assertAgentEventEnvelope,
@@ -18,10 +15,8 @@ import type {
   StoreAppendResult
 } from "agent-protocol";
 import { atomicJson, type AtomicReplace } from "./durable-file.js";
-import { inspectDurableEventTail } from "./durable-tail.js";
 import {
   assertCurrentStoreLayout,
-  segmentName,
   sessionDirectory,
   sessionsDirectory,
   snapshotName
@@ -33,16 +28,12 @@ import {
   type StoredSnapshot
 } from "./segmented-store-formats.js";
 import { unsupportedSchemaVersion } from "./schema-error.js";
+import { appendEventBatch, parseStoredEventRecord } from "./segmented-event-appender.js";
 export { isSessionMeta } from "./segmented-store-formats.js";
 export type { SessionMeta } from "./segmented-store-formats.js";
 
 const DEFAULT_SEGMENT_BYTES = 8 * 1024 * 1024;
 const DEFAULT_SEGMENT_EVENTS = 10_000;
-
-interface StoredRecord {
-  checksum: string;
-  event: AnyTypedAgentEvent;
-}
 
 interface EventCursor {
   lastValidSeq: number;
@@ -53,44 +44,6 @@ export interface SegmentedJsonlStoreOptions {
   segmentBytes?: number;
   segmentEvents?: number;
   replaceFile?: AtomicReplace;
-}
-
-function checksum(event: AnyTypedAgentEvent): string {
-  return createHash("sha256").update(JSON.stringify(event)).digest("hex");
-}
-
-function storedLine(event: AnyTypedAgentEvent): string {
-  return `${JSON.stringify({ checksum: checksum(event), event } satisfies StoredRecord)}\n`;
-}
-
-function parseRecord(line: string, sourcePath = "<event record>"): AnyTypedAgentEvent {
-  const parsed = JSON.parse(line) as StoredRecord;
-  if (!parsed || typeof parsed !== "object" || !parsed.event || typeof parsed.checksum !== "string") {
-    throw new Error("Invalid event record envelope.");
-  }
-  const actual = (parsed.event as { schemaVersion?: unknown }).schemaVersion;
-  if (actual !== EVENT_SCHEMA_VERSION) {
-    throw unsupportedSchemaVersion("event", sourcePath, EVENT_SCHEMA_VERSION, actual);
-  }
-  assertAgentEventEnvelope(parsed.event);
-  if (checksum(parsed.event) !== parsed.checksum) throw new Error(`Event checksum mismatch at seq ${parsed.event.seq}.`);
-  return parsed.event;
-}
-
-async function acquireSessionLock(directory: string): Promise<() => Promise<void>> {
-  const lockPath = path.join(directory, ".append.lock");
-  const lease = await acquireProcessOwnerLease(lockPath, {
-    pid: process.pid,
-    instanceId: randomUUID(),
-    startedAt: new Date().toISOString()
-  }, {
-    label: "session append lock",
-    timeoutMs: 10_000,
-    malformedStaleMs: 5_000,
-    retryIntervalMs: 10,
-    activeOwner: "wait"
-  });
-  return lease.release;
 }
 
 export class SegmentedJsonlStore implements RunStore {
@@ -111,55 +64,48 @@ export class SegmentedJsonlStore implements RunStore {
   async append(event: AnyTypedAgentEvent, expectedSeq: number): Promise<StoreAppendResult> {
     await this.ensureCurrentLayout();
     assertAgentEventEnvelope(event);
-    const previous = this.queues.get(event.sessionId) ?? Promise.resolve();
-    const current = previous.then(() => this.appendLocked(event, expectedSeq));
-    this.queues.set(event.sessionId, current.then(() => undefined, () => undefined));
+    return await this.enqueueAppend([event], expectedSeq);
+  }
+
+  async appendBatch(
+    events: readonly AnyTypedAgentEvent[],
+    expectedSeq: number
+  ): Promise<StoreAppendResult> {
+    await this.ensureCurrentLayout();
+    if (events.length === 0) return { rotated: false };
+    for (const event of events) assertAgentEventEnvelope(event);
+    const sessionId = events[0]!.sessionId;
+    if (events.some((event) => event.sessionId !== sessionId)) {
+      throw new Error("A store append batch must contain exactly one session.");
+    }
+    return await this.enqueueAppend(events, expectedSeq);
+  }
+
+  private async enqueueAppend(
+    events: readonly AnyTypedAgentEvent[],
+    expectedSeq: number
+  ): Promise<StoreAppendResult> {
+    const sessionId = events[0]!.sessionId;
+    const previous = this.queues.get(sessionId) ?? Promise.resolve();
+    const current = previous.then(() => this.appendBatchLocked(events, expectedSeq));
+    this.queues.set(sessionId, current.then(() => undefined, () => undefined));
     return await current;
   }
 
-  private async appendLocked(event: AnyTypedAgentEvent, expectedSeq: number): Promise<StoreAppendResult> {
-    const directory = sessionDirectory(this.rootDir, event.sessionId);
-    await mkdir(path.join(directory, "events"), { recursive: true, mode: 0o700 });
-    const release = await acquireSessionLock(directory);
-    try {
-    let meta = await this.readMeta(event.sessionId, event.occurredAt);
-    const tail = await inspectDurableEventTail(directory, (line) => parseRecord(line, directory));
-    if (meta.lastSeq !== expectedSeq || tail.incomplete || tail.lastSeq !== meta.lastSeq || tail.segment !== meta.segment) {
-      meta = await this.reconcileMeta(event.sessionId, event.occurredAt);
-    }
-    if (meta.lastSeq !== expectedSeq) throw new Error(`Session ${event.sessionId} sequence conflict: expected ${expectedSeq}, actual ${meta.lastSeq}.`);
-    if (event.seq !== expectedSeq + 1) throw new Error(`Event seq ${event.seq} must equal ${expectedSeq + 1}.`);
-
-    let segment = meta.segment;
-    let segmentEvents = meta.segmentEvents;
-    let segmentPath = path.join(directory, "events", segmentName(segment));
-    const line = storedLine(event);
-    const size = await stat(segmentPath).then((item) => item.size, () => 0);
-    const rotated = segmentEvents >= this.segmentEvents || size + Buffer.byteLength(line) > this.segmentBytes;
-    if (rotated) {
-      segment += 1;
-      segmentEvents = 0;
-      segmentPath = path.join(directory, "events", segmentName(segment));
-    }
-
-    const handle = await open(segmentPath, "a");
-    try {
-      await handle.write(line, undefined, "utf8");
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-    await atomicJson(path.join(directory, "meta.json"), {
-      ...meta,
-      updatedAt: event.occurredAt,
-      lastSeq: event.seq,
-      segment,
-      segmentEvents: segmentEvents + 1
-    } satisfies SessionMeta, this.replaceFile);
-    return { rotated };
-    } finally {
-      await release();
-    }
+  private async appendBatchLocked(
+    events: readonly AnyTypedAgentEvent[],
+    expectedSeq: number
+  ): Promise<StoreAppendResult> {
+    return await appendEventBatch({
+      rootDir: this.rootDir,
+      segmentBytes: this.segmentBytes,
+      segmentEvents: this.segmentEvents,
+      ...(this.replaceFile ? { replaceFile: this.replaceFile } : {}),
+      events,
+      expectedSeq,
+      readMeta: async (sessionId, now) => await this.readMeta(sessionId, now),
+      reconcileMeta: async (sessionId, now) => await this.reconcileMeta(sessionId, now)
+    });
   }
 
   async *events(sessionId: string, afterSeq = 0, recoverTail = false): AsyncIterable<AnyTypedAgentEvent> {
@@ -200,7 +146,7 @@ export class SegmentedJsonlStore implements RunStore {
         continue;
       }
       try {
-        const event = parseRecord(rawLine.trim(), filePath);
+        const event = parseStoredEventRecord(rawLine.trim(), filePath);
         if (event.seq !== cursor.lastValidSeq + 1) {
           throw new Error(`Event sequence discontinuity: expected ${cursor.lastValidSeq + 1}, actual ${event.seq}.`);
         }

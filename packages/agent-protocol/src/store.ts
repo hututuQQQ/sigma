@@ -18,6 +18,13 @@ export interface StoreAppendResult {
 
 export interface RunStore {
   append(event: AnyTypedAgentEvent, expectedSeq: number): Promise<StoreAppendResult>;
+  /** Append one contiguous session transaction with a single durability
+   * boundary. Stores that do not implement batching remain compatible and the
+   * runtime falls back to append(). */
+  appendBatch?(
+    events: readonly AnyTypedAgentEvent[],
+    expectedSeq: number
+  ): Promise<StoreAppendResult>;
   events(sessionId: string, afterSeq?: number): AsyncIterable<AnyTypedAgentEvent>;
   writeSnapshot(snapshot: SnapshotEnvelope): Promise<void>;
   latestSnapshot(sessionId: string): Promise<SnapshotEnvelope | null>;

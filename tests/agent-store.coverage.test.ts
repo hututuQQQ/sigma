@@ -75,6 +75,38 @@ describe("agent-store durability", () => {
     await expect(store.append(event("rotate", 3) as never, 1)).rejects.toThrow("sequence conflict");
   });
 
+  it("appends a contiguous event transaction with one metadata replacement", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-segment-batch-"));
+    let metadataReplacements = 0;
+    const store = new SegmentedJsonlStore({
+      rootDir: root,
+      segmentEvents: 2,
+      segmentBytes: 1_000_000,
+      replaceFile: async (source, target) => {
+        if (target.endsWith("meta.json")) metadataReplacements += 1;
+        await rename(source, target);
+      }
+    });
+    await expect(store.appendBatch([
+      event("batch", 1, "session.created") as never,
+      event("batch", 2) as never,
+      event("batch", 3) as never
+    ], 0)).resolves.toEqual({ rotated: true });
+    expect(metadataReplacements).toBe(1);
+    expect(await readdir(path.join(sessionDirectory(root, "batch"), "events")))
+      .toEqual(["000001.jsonl", "000002.jsonl"]);
+    const replay: number[] = [];
+    for await (const item of store.events("batch")) replay.push(item.seq);
+    expect(replay).toEqual([1, 2, 3]);
+    await expect(store.appendBatch([
+      event("batch", 5) as never
+    ], 3)).rejects.toThrow("must equal 4");
+    await expect(store.appendBatch([
+      event("batch", 4) as never,
+      event("other", 5) as never
+    ], 3)).rejects.toThrow("exactly one session");
+  });
+
   it("repairs a torn durable tail only while appending", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-tail-"));
     const store = new SegmentedJsonlStore({ rootDir: root });

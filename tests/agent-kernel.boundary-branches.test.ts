@@ -271,7 +271,7 @@ describe("agent-kernel boundary contracts", () => {
     };
     const content = receiptContent(rich);
     expect(content).toContain("Receipt summary (JSON)");
-    expect(content).toContain("workspaceDelta");
+    expect(content).toContain('"changes"');
     expect(content).toContain("artifactRefs");
     expect(receiptContent(receipt("minimal"))).not.toContain("workspaceDelta");
   });
