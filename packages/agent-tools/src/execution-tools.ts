@@ -71,7 +71,11 @@ function foregroundArguments(
         "The broker-attested disposable outer environment is unavailable."
       ), { code: "policy_denied" });
     }
-    return environmentShellArguments(input, workspacePath);
+    return environmentShellArguments(
+      input,
+      workspacePath,
+      kind === "shell" && input.validation === true
+    );
   }
   if (target !== undefined && target !== "workspace") {
     throw Object.assign(new Error(
@@ -235,12 +239,13 @@ function foregroundTool(kind: "exec" | "shell" | "validate", options: ExecutionT
         : {}),
       prepare(value, context) {
         const raw = executionArgs(value);
-        const allowEnclosingContainerDeliverable =
-          kind === "shell" && raw.target === "environment";
         const input = foregroundArguments(
           kind, value, options, context.workspacePath
         );
         const invocationMode = assertForegroundInvocation(kind, input, options);
+        const allowEnclosingContainerDeliverable =
+          kind === "shell" && raw.target === "environment"
+          && !invocationMode.validation;
         return prepareExecutionCallPlan(
           input,
           context,
@@ -254,16 +259,19 @@ function foregroundTool(kind: "exec" | "shell" | "validate", options: ExecutionT
     },
     execute: async (request, context) => {
       const raw = executionArgs(request.arguments);
+      const input = foregroundArguments(
+        kind, request.arguments, options, context.workspacePath
+      );
+      const invocationMode = assertForegroundInvocation(kind, input, options);
       const allowEnclosingContainerDeliverable =
-        kind === "shell" && raw.target === "environment";
+        kind === "shell" && raw.target === "environment"
+        && !invocationMode.validation;
       return await executeForegroundCommand(
         kind,
         options,
         {
           ...request,
-          arguments: foregroundArguments(
-            kind, request.arguments, options, context.workspacePath
-          )
+          arguments: input
         },
         context,
         allowEnclosingContainerDeliverable,

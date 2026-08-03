@@ -487,6 +487,39 @@ describe("agent-code-intel", () => {
     await transport.close();
   });
 
+  it("temporarily downgrades an LSP capability after the server exits", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-lsp-circuit-"));
+    await writeFile(path.join(workspace, "fixture.ts"), "const value = true;", "utf8");
+    class ExitedBroker extends FakeLspBroker {
+      override async poll(handle: ProcessHandle): Promise<ProcessPollResult> {
+        return {
+          handle, state: "exited", exitCode: 1, signal: null, durationMs: 1,
+          stdout: "", stderr: "server failed", stdoutDroppedBytes: 0,
+          stderrDroppedBytes: 0, outputTruncated: false
+        };
+      }
+    }
+    const broker = new ExitedBroker();
+    const tool = codeIntelTool({
+      broker,
+      presets: [{
+        id: "typescript", languages: ["typescript"], executable: process.execPath,
+        args: ["server.mjs", "--stdio"], source: "configured", available: true
+      }]
+    });
+    const execute = async (callId: string) => await tool.execute({
+      callId, name: "lsp", arguments: { operation: "symbols", file: "fixture.ts" }
+    }, {
+      sessionId: "session", runId: "run", workspacePath: workspace, runMode: "analyze",
+      signal: new AbortController().signal, heartbeat() {}, progress: async () => undefined,
+      createArtifact: async () => "artifact"
+    });
+
+    await expect(execute("first")).rejects.toMatchObject({ code: "lsp_server_exited" });
+    await expect(execute("second")).rejects.toMatchObject({ code: "lsp_temporarily_unavailable" });
+    expect(broker.spawnRequests).toHaveLength(1);
+  });
+
   it("applies an LSP rename as one atomic workspace patch", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-lsp-rename-"));
     const target = path.join(workspace, "fixture.ts");

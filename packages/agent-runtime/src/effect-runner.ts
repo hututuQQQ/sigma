@@ -18,7 +18,10 @@ import type { ReviewerPort } from "./reviewer.js";
 import type { RuntimeHookCoordinator } from "./runtime-hooks.js";
 import { ToolExecutionMonitor } from "./tool-execution-monitor.js";
 import { ToolTransactionRunner } from "./tool-transaction-runner.js";
-import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
+import type {
+  RuntimeEventBatchEmitter,
+  RuntimeEventEmitter
+} from "./runtime-event-emitter.js";
 import type { RunSuspensionContext } from "./runtime-session-finish.js";
 import { ToolBatchCoordinator } from "./tool-batch-coordinator.js";
 import { LongHorizonCoordinator } from "./long-horizon-coordinator.js";
@@ -35,6 +38,7 @@ export interface EffectRunnerOptions {
   permissionMode: RuntimePermissionMode;
   outputReserveTokens: number;
   emit: RuntimeEventEmitter;
+  emitBatch?: RuntimeEventBatchEmitter;
   finish(
     session: RuntimeSession,
     outcome: RunOutcome,

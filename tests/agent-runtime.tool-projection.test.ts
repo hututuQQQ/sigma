@@ -5,6 +5,11 @@ import {
   projectModelToolDescriptors,
   sessionSkillProjectionCapabilities
 } from "../packages/agent-runtime/src/effect-helpers.js";
+import {
+  eligibleReadBatchDescriptors,
+  readBatchDescriptor,
+  withReadBatchDescriptor
+} from "../packages/agent-runtime/src/read-batch-tool.js";
 
 describe("session model-tool capability projection", () => {
   const descriptors = registerBuiltinTools(new EffectToolRegistry()).descriptors();
@@ -21,6 +26,43 @@ describe("session model-tool capability projection", () => {
         expect(Object.keys(properties)).toEqual(Object.keys(properties).toSorted());
       }
     }
+  });
+
+  it("offers batching only as a facade over auto-approved read-only tools", () => {
+    const eligible = eligibleReadBatchDescriptors(descriptors);
+    expect(eligible.map((item) => item.name)).toEqual(expect.arrayContaining([
+      "read", "git_status", "git_diff"
+    ]));
+    expect(eligible.map((item) => item.name)).not.toEqual(expect.arrayContaining([
+      "apply_patch", "shell", "write", "lsp"
+    ]));
+    const batch = readBatchDescriptor(descriptors);
+    expect(batch).toMatchObject({
+      name: "batch_read",
+      approval: "auto",
+      possibleEffects: ["filesystem.read", "process.spawn.readonly"]
+    });
+    const schema = JSON.stringify(batch?.inputSchema);
+    expect(schema).toContain('"read"');
+    expect(schema).not.toContain('"apply_patch"');
+    expect(schema).not.toContain('"shell"');
+  });
+
+  it("builds the batch facade only from capability-visible tools", () => {
+    const read = descriptors.find((item) => item.name === "read")!;
+    const projected = projectModelToolDescriptors([
+      ...descriptors.filter((item) => item.name !== "read_plan"),
+      { ...read, name: "read_plan" }
+    ], {
+      skillsAvailable: false,
+      planReadRequired: false
+    });
+    const offered = withReadBatchDescriptor(projected);
+    const schema = JSON.stringify(
+      offered.find((item) => item.name === "batch_read")?.inputSchema
+    );
+    expect(schema).toContain('"read"');
+    expect(schema).not.toContain('"read_plan"');
   });
 
   it("hides skill discovery and execution fields when no skill exists", () => {

@@ -46,9 +46,10 @@ describe("model-visible tool receipts", () => {
       diagnostics: ["executable_not_found"],
       evidence: [evidence]
     }));
-    expect(content).toContain("Failed tool receipt ID: exec");
+    expect(content).toContain("Tool result: failed");
     expect(content).toContain('"diagnosticCodes":["executable_not_found"]');
-    expect(content).toContain('"evidenceId":"diagnostic-proof"');
+    expect(content).toContain("diagnostic:failed:Executable probe failed.");
+    expect(content).not.toContain("diagnostic-proof");
     expect(content).toContain("Output:\nnode was unavailable");
   });
 
@@ -74,7 +75,7 @@ describe("model-visible tool receipts", () => {
     });
     expect(parsed).not.toBeNull();
     const content = receiptContent(parsed!);
-    expect(content.length).toBeLessThan(20_000);
+    expect(content.length).toBeLessThanOrEqual(12_000);
     expect(content).toContain("receipt output omitted");
     expect(content).toContain("artifact-1");
     expect(content).toContain("sha256=");

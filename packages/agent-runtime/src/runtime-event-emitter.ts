@@ -1,4 +1,5 @@
 import type {
+  AgentEventEnvelope,
   AgentEventOf,
   AgentEventPayloadMap,
   AgentEventType,
@@ -22,3 +23,16 @@ export type BoundRuntimeEventEmitter = <TType extends AgentEventType>(
   authority: Exclude<ContextAuthority, "external_verifier">,
   payload: AgentEventPayloadMap[NoInfer<TType>]
 ) => Promise<AgentEventOf<TType>>;
+
+export type RuntimeEventEmission = {
+  [TType in AgentEventType]: {
+    type: TType;
+    authority: Exclude<ContextAuthority, "external_verifier">;
+    payload: AgentEventPayloadMap[TType];
+  }
+}[AgentEventType];
+
+export type RuntimeEventBatchEmitter = (
+  session: RuntimeSession,
+  emissions: readonly RuntimeEventEmission[]
+) => Promise<AgentEventEnvelope[]>;

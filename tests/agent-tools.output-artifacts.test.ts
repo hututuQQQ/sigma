@@ -179,7 +179,11 @@ describe("execution output artifact receipts", () => {
     }), context);
 
     expect(shell.descriptor.inputSchema).toMatchObject({ oneOf: expect.any(Array) });
-    expect(receipt).toMatchObject({ ok: false });
+    expect(receipt).toMatchObject({
+      ok: true,
+      result: { exitCode: 7, commandStatus: "failed" },
+      outcome: { status: "succeeded" }
+    });
     expect(receipt.evidence).toEqual([expect.objectContaining({
       kind: "validation",
       status: "failed",
@@ -334,7 +338,7 @@ describe("execution output artifact receipts", () => {
     expect(released).toEqual([[artifact.brokerArtifactId]]);
   });
 
-  it("reports a background process non-zero exit as a failed poll", async () => {
+  it("reports a background process non-zero exit as a delivered poll result", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-poll-exit-"));
     const execution: ExecutionResult = {
       state: "exited", exitCode: 1, signal: null, durationMs: 5,
@@ -358,7 +362,7 @@ describe("execution output artifact receipts", () => {
       context
     );
 
-    expect(receipt).toMatchObject({ ok: false });
+    expect(receipt).toMatchObject({ ok: true });
     expect(receipt.diagnostics).toContain("process_exit_nonzero:1");
     expect(receipt.output).toContain("listen EACCES");
   });
@@ -410,7 +414,11 @@ describe("execution output artifact receipts", () => {
       context
     );
 
-    expect(receipt).toMatchObject({ ok: false });
+    expect(receipt).toMatchObject({
+      ok: false,
+      result: { exitCode: 0, commandStatus: "failed" },
+      outcome: { status: "failed" }
+    });
     expect(receipt.diagnostics).toContain("process_timed_out");
     expect(receipt.evidence).toEqual([expect.objectContaining({
       kind: "validation",
@@ -448,7 +456,10 @@ describe("execution output artifact receipts", () => {
       context
     );
 
-    expect(receipt).toMatchObject({ ok: false });
+    expect(receipt).toMatchObject({
+      ok: true,
+      result: { exitCode: 1, commandStatus: "failed" }
+    });
     expect(receipt.evidence).toEqual([expect.objectContaining({
       kind: "validation",
       status: "failed",
@@ -494,7 +505,10 @@ describe("execution output artifact receipts", () => {
       context
     );
 
-    expect(receipt).toMatchObject({ ok: false });
+    expect(receipt).toMatchObject({
+      ok: true,
+      result: { exitCode: 1, commandStatus: "failed" }
+    });
     expect(receipt.diagnostics).toContain("command_dependency_missing");
     expect(receipt.diagnostics).not.toContain("dependency_missing");
   });
@@ -524,7 +538,10 @@ describe("execution output artifact receipts", () => {
       context
     );
 
-    expect(receipt).toMatchObject({ ok: false });
+    expect(receipt).toMatchObject({
+      ok: true,
+      result: { exitCode: 1, commandStatus: "failed" }
+    });
     expect(receipt.diagnostics).toContain("command_readonly_filesystem");
     expect(receipt.output).toContain("re-run with expectedChanges");
     expect(receipt.output).toContain("process temp directory");
@@ -557,7 +574,10 @@ describe("execution output artifact receipts", () => {
     const callPlan = await shell.descriptor.prepare!(call.arguments, context);
     const receipt = await shell.execute(call, { ...context, callPlan });
 
-    expect(receipt).toMatchObject({ ok: false });
+    expect(receipt).toMatchObject({
+      ok: true,
+      result: { exitCode: 1, commandStatus: "failed" }
+    });
     expect(receipt.diagnostics).not.toContain("command_readonly_filesystem");
     expect(receipt.output).not.toContain("re-run with expectedChanges");
   });

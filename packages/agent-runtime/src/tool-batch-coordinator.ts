@@ -1,4 +1,4 @@
-import type { ModelToolCall, ToolDescriptor, ToolOutcome, ToolReceipt } from "agent-protocol";
+import type { ModelToolCall, ToolDescriptor, ToolReceipt } from "agent-protocol";
 import type { ActiveModelTurn } from "agent-kernel";
 import { loadNestedInstructions } from "agent-context";
 import { isToolAllowed } from "agent-tools";
@@ -18,33 +18,12 @@ import { profileAllowsTool } from "./profile-policy.js";
 import type { ReviewCoordinator } from "./review-coordinator.js";
 import type { ToolTransactionRunner } from "./tool-transaction-runner.js";
 import type { RuntimeSession } from "./types.js";
-
-type DurableToolReceipt = ToolReceipt & { outcome: ToolOutcome };
-
-function durableToolReceipt(receipt: ToolReceipt): DurableToolReceipt {
-  const diagnosticCodes = [...new Set([
-    ...(receipt.outcome?.diagnosticCodes ?? []),
-    ...receipt.diagnostics
-  ])];
-  return {
-    ...receipt,
-    outcome: {
-      status: receipt.ok ? "succeeded" : "failed",
-      output: receipt.output,
-      diagnosticCodes
-    }
-  };
-}
-
-function receiptToolName(
-  session: RuntimeSession,
-  receipt: ToolReceipt,
-  modelTurn: ActiveModelTurn
-): string {
-  return session.durable.state.pendingTools.find((item) => item.request.callId === receipt.callId
-    && item.modelTurn.turnId === modelTurn.turnId
-    && item.modelTurn.effectRevision === modelTurn.effectRevision)?.request.name ?? "tool";
-}
+import {
+  READ_BATCH_TOOL_NAME,
+  withReadBatchDescriptor
+} from "./read-batch-tool.js";
+import { ReadBatchExecutor } from "./read-batch-executor.js";
+import { ToolReceiptRecorder } from "./tool-receipt-recorder.js";
 
 function settledReviewRequestReceipt(session: RuntimeSession, receipt: ToolReceipt): ToolReceipt {
   const candidateDigest = completionCandidate(session)?.digest;
@@ -97,21 +76,20 @@ function settledReviewRequestReceipt(session: RuntimeSession, receipt: ToolRecei
   return receipt;
 }
 
-function projectedToolNames(
+function projectedDirectTools(
   session: RuntimeSession,
   descriptors: readonly ToolDescriptor[]
-): Set<string> {
-  const allowed = descriptors.filter((descriptor) =>
-    isToolAllowed(descriptor, session.durable.mode)
-    && profileAllowsTool(session, descriptor));
-  return new Set(projectModelToolDescriptors(
-    allowed,
+): ToolDescriptor[] {
+  return projectModelToolDescriptors(
+    descriptors.filter((descriptor) =>
+      isToolAllowed(descriptor, session.durable.mode)
+      && profileAllowsTool(session, descriptor)),
     sessionModelToolProjectionCapabilities(session)
-  ).map((descriptor) => descriptor.name));
+  );
 }
 
 const TERMINAL_TOOL_NAMES = new Set(["report_blocked", "request_user_input"]);
-const BARRIER_TOOL_NAMES = new Set(["request_review"]);
+const BARRIER_TOOL_NAMES = new Set(["request_review", READ_BATCH_TOOL_NAME]);
 
 function violatesToolProjection(
   attempts: readonly ToolAttempt[],
@@ -135,11 +113,22 @@ interface InstructionPreparation {
 }
 
 export class ToolBatchCoordinator {
+  private readonly receipts: ToolReceiptRecorder;
+  private readonly readBatches: ReadBatchExecutor;
+
   constructor(
     private readonly options: EffectRunnerOptions,
     private readonly reviews: ReviewCoordinator,
     private readonly transactions: ToolTransactionRunner
-  ) {}
+  ) {
+    this.receipts = new ToolReceiptRecorder(options, transactions);
+    this.readBatches = new ReadBatchExecutor(
+      options,
+      transactions,
+      this.receipts,
+      async (session, call, descriptor) => await this.loadInstructions(session, call, descriptor)
+    );
+  }
 
   async execute(session: RuntimeSession, attempts: ToolAttempt[], signal: AbortSignal): Promise<void> {
     const turnController = session.execution.turnController ?? new AbortController();
@@ -149,11 +138,21 @@ export class ToolBatchCoordinator {
     try {
       const descriptors = new Map(this.options.runtime.tools.descriptors().map((item) => [item.name, item]));
       const modelDescriptors = this.options.runtime.tools.modelDescriptors?.() ?? [...descriptors.values()];
+      const projectedDescriptors = projectedDirectTools(session, modelDescriptors);
       if (violatesToolProjection(
         attempts,
-        projectedToolNames(session, modelDescriptors)
+        new Set(withReadBatchDescriptor(projectedDescriptors).map((item) => item.name))
       )) {
         await this.rejectProjection(session, attempts);
+        return;
+      }
+      if (attempts.length === 1 && attempts[0]!.call.name === READ_BATCH_TOOL_NAME) {
+        await this.readBatches.execute(
+          session,
+          attempts[0]!,
+          projectedDescriptors,
+          turnSignal
+        );
         return;
       }
       const instructions = await this.prepareInstructions(session, attempts, descriptors);
@@ -342,52 +341,6 @@ export class ToolBatchCoordinator {
     receipt: ToolReceipt,
     modelTurn: ActiveModelTurn
   ): Promise<void> {
-    const name = receiptToolName(session, receipt, modelTurn);
-    await this.emitDurableReceipt(session, receipt, modelTurn, name);
-    try {
-      await this.dispatchPostTool(session, receipt, name);
-    } finally {
-      await this.transactions.settleBudgetsAfterReceipt(session);
-    }
-  }
-
-  private async emitDurableReceipt(
-    session: RuntimeSession,
-    receipt: ToolReceipt,
-    modelTurn: ActiveModelTurn,
-    name: string
-  ): Promise<void> {
-    await this.options.emit(session, receipt.ok ? "tool.completed" : "tool.failed", "tool", {
-      ...durableToolReceipt(receipt), name, ...turnPayload(modelTurn)
-    });
-    for (const evidence of receipt.evidence ?? []) {
-      await this.options.emit(
-        session,
-        "evidence.recorded",
-        evidence.producer.authority === "runtime" ? "runtime" : "tool",
-        evidence
-      );
-    }
-    await this.options.emit(session, "diagnostic", "runtime", {
-      kind: "tool.batch_settled",
-      callId: receipt.callId,
-      ok: receipt.ok,
-      evidenceIds: (receipt.evidence ?? []).map((item) => item.evidenceId),
-      diagnosticCodes: [...new Set([...receipt.diagnostics, ...(receipt.outcome?.diagnosticCodes ?? [])])]
-    });
-  }
-
-  private async dispatchPostTool(session: RuntimeSession, receipt: ToolReceipt, name: string): Promise<void> {
-    await this.options.hooks.dispatch(session, "post_tool", {
-      sessionId: session.identity.sessionId,
-      runId: session.durable.runId,
-      callId: receipt.callId,
-      toolName: name,
-      ok: receipt.ok,
-      diagnostics: receipt.diagnostics,
-      actualEffects: receipt.actualEffects ?? receipt.observedEffects,
-      evidenceIds: (receipt.evidence ?? []).map((item) => item.evidenceId),
-      artifactRefs: receipt.artifactRefs ?? []
-    }, session.execution.controller?.signal ?? new AbortController().signal);
+    await this.receipts.record(session, receipt, modelTurn);
   }
 }

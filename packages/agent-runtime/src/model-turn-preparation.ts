@@ -15,7 +15,10 @@ import {
 } from "agent-context";
 import { isToolAllowed } from "agent-tools";
 import { refreshContextArchive } from "./context-archive-refresh.js";
-import { sessionModelToolProjectionCapabilities } from "./effect-helpers.js";
+import {
+  projectModelToolDescriptors,
+  sessionModelToolProjectionCapabilities
+} from "./effect-helpers.js";
 import type { EffectRunnerOptions } from "./effect-runner.js";
 import {
   budgetFailure,
@@ -32,6 +35,7 @@ import type { ModelSummarizer } from "./model-summarizer.js";
 import { profileAllowsTool } from "./profile-policy.js";
 import { progressCheckpoints } from "./progress-checkpoint.js";
 import type { RuntimeSession } from "./types.js";
+import { withReadBatchDescriptor } from "./read-batch-tool.js";
 
 export interface PreparedModelAttempt {
   turn?: PreparedModelTurn;
@@ -159,8 +163,12 @@ export async function prepareModelAttempt(
 ): Promise<PreparedModelAttempt> {
   const modelDescriptors = options.runtime.tools.modelDescriptors?.()
     ?? options.runtime.tools.descriptors();
-  const descriptors = modelDescriptors.filter((item) =>
-    isToolAllowed(item, session.durable.mode) && profileAllowsTool(session, item));
+  const capabilities = sessionModelToolProjectionCapabilities(session);
+  const descriptors = withReadBatchDescriptor(projectModelToolDescriptors(
+    modelDescriptors.filter((item) =>
+      isToolAllowed(item, session.durable.mode) && profileAllowsTool(session, item)),
+    capabilities
+  ));
   const query = [...session.durable.state.messages].reverse()
     .find((message) => message.role === "user")?.content ?? "";
   const dynamic = await repositoryContext.collect(
@@ -178,7 +186,6 @@ export async function prepareModelAttempt(
       `Session '${session.identity.sessionId}' is missing its schema 1 customization bundle.`
     ), { code: "unsupported_schema_version" });
   }
-  const capabilities = sessionModelToolProjectionCapabilities(session);
   const projected = await projectedModelHistory(options, session);
   const preparation: TurnPreparationInput = {
     session,

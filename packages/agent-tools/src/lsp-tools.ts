@@ -126,19 +126,37 @@ interface LspClientLease {
 }
 
 const LSP_CLIENT_IDLE_TIMEOUT_MS = 1_000;
+const LSP_FAILURE_COOLDOWN_MS = 60_000;
+
+interface LspFailureCooldown {
+  until: number;
+  message: string;
+}
 
 class LspClientPool {
   private readonly clients = new Map<string, PooledLspClient>();
+  private readonly cooldowns = new Map<string, LspFailureCooldown>();
 
   constructor(private readonly options: CodeIntelToolOptions) {}
 
-  acquire(workspacePath: string, preset: LanguageServerPreset): LspClientLease {
-    const key = [
+  private key(workspacePath: string, preset: LanguageServerPreset): string {
+    return [
       path.resolve(workspacePath),
       preset.id,
       path.resolve(preset.executable),
       ...preset.args
     ].join("\0");
+  }
+
+  acquire(workspacePath: string, preset: LanguageServerPreset): LspClientLease {
+    const key = this.key(workspacePath, preset);
+    const cooldown = this.cooldowns.get(key);
+    if (cooldown && cooldown.until > Date.now()) {
+      throw Object.assign(new Error(
+        `Language server '${preset.id}' is temporarily unavailable after exiting: ${cooldown.message}`
+      ), { code: "lsp_temporarily_unavailable" });
+    }
+    if (cooldown) this.cooldowns.delete(key);
     let entry = this.clients.get(key);
     if (!entry) {
       entry = {
@@ -185,6 +203,14 @@ class LspClientPool {
         entry!.idleTimer.unref();
       }
     };
+  }
+
+  recordFailure(workspacePath: string, preset: LanguageServerPreset, error: unknown): void {
+    if ((error as { code?: unknown } | undefined)?.code !== "lsp_server_exited") return;
+    this.cooldowns.set(this.key(workspacePath, preset), {
+      until: Date.now() + LSP_FAILURE_COOLDOWN_MS,
+      message: error instanceof Error ? error.message : String(error)
+    });
   }
 
   private close(client: LspClient): void {
@@ -363,6 +389,9 @@ export function codeIntelTool(options: CodeIntelToolOptions): RegisteredEffectTo
           workspaceDelta: applied.delta, artifacts: [], diagnostics: [], startedAt, completedAt,
           evidence: []
         };
+      } catch (error) {
+        clients.recordFailure(context.workspacePath, preset, error);
+        throw error;
       } finally {
         lease.release(discard);
       }

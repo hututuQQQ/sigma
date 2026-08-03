@@ -186,9 +186,10 @@ const runSuspended: EventReducer = (state, _event, payload) => {
   const proposedInput = Number.isInteger(payload.outcomeRevision)
     && acceptsOutcomeRevision(state, payload)
     && state.proposedOutcome?.kind === "needs_input";
+  const callBound = typeof payload.callId === "string";
   const runtimeSuspension = payload.outcomeRevision === undefined
     && (isApprovalSuspension(state, payload) || isRecoverySuspension(state, payload)
-      || typeof payload.requestId === "string");
+      || (!callBound && typeof payload.requestId === "string"));
   if (!proposedInput && !runtimeSuspension) return state;
   return {
     ...state,
