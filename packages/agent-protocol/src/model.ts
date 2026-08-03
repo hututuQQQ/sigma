@@ -30,6 +30,33 @@ export interface ModelMessage {
   providerState?: ModelProviderState;
 }
 
+/**
+ * Conservative model-visible cost for one auto/high-detail image input.
+ * Inline base64 is a transport representation, not text consumed by the
+ * model. The estimate mirrors the resized-image heuristic used by Codex:
+ * 7,373 model-visible bytes at four bytes per token, rounded up.
+ */
+export const MODEL_IMAGE_INPUT_TOKEN_ESTIMATE = 1_844;
+
+export function modelImageInputTokenEstimate(messages: readonly ModelMessage[]): number {
+  return messages.reduce(
+    (total, message) => total + (message.images?.length ?? 0) * MODEL_IMAGE_INPUT_TOKEN_ESTIMATE,
+    0
+  );
+}
+
+/** Preserve image block metadata while excluding transport-only base64 from text tokenizers. */
+export function modelMessagesWithoutImagePayloads(
+  messages: readonly ModelMessage[]
+): ModelMessage[] {
+  return messages.map((message) => message.images?.length
+    ? {
+        ...message,
+        images: message.images.map((image) => ({ ...image, data: "" }))
+      }
+    : message);
+}
+
 export interface ModelToolDefinition {
   name: string;
   description: string;

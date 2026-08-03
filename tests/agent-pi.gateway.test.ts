@@ -255,6 +255,25 @@ describe("Pi image context mapping", () => {
       })
     ]);
   });
+
+  it("estimates model-visible image cost instead of base64 transport size", async () => {
+    const gateway = new PiModelGateway({
+      provider: OPENAI_CODEX_PROVIDER_ID,
+      model: OPENAI_CODEX_DEFAULT_MODEL
+    });
+    const estimate = async (data: string) => await gateway.countTokens([{
+      role: "user",
+      content: "Inspect this screenshot",
+      images: [{ mimeType: "image/png", data }]
+    }]);
+
+    const small = await estimate(Buffer.alloc(16).toString("base64"));
+    const large = await estimate(Buffer.alloc(200_000).toString("base64"));
+
+    expect(large).toBe(small);
+    expect(large).toBeGreaterThan(1_800);
+    expect(large).toBeLessThan(2_000);
+  });
 });
 
 function completedTextEvents(text: string, responseId = "resp_text"): Record<string, unknown>[] {

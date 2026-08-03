@@ -666,6 +666,34 @@ describe("capability-aware model routing", () => {
     }));
   });
 
+  it("routes image prompts by model-visible cost instead of base64 transport size", async () => {
+    const imageModel = spec("deepseek/image", {
+      capabilities: {
+        ...capabilities,
+        contextWindowTokens: 10_000,
+        maxOutputTokens: 2_000,
+        imageInput: true
+      }
+    });
+    const router = new ModelRouter(
+      [imageModel],
+      [route({ candidates: [imageModel.id], maxAttempts: 1 })],
+      (item) => gateway(item.id, async () => response("image accepted"))
+    );
+
+    const result = await router.complete("orchestrator", "main", {
+      messages: [{
+        role: "user",
+        content: "Inspect this screenshot",
+        images: [{ mimeType: "image/png", data: "A".repeat(40_000) }]
+      }],
+      maxOutputTokens: 2_000,
+      signal: new AbortController().signal
+    });
+
+    expect(result.message.content).toBe("image accepted");
+  });
+
   it("reserves the complete eligible fallback chain before execution", async () => {
     const cheap = spec("deepseek/a", { pricing: {
       inputMicroUsdPerMillion: 100_000,

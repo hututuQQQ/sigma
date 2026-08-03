@@ -23,7 +23,7 @@ import {
   type PiModelErrorDiagnostics
 } from "./errors.js";
 import {
-  approximateTokens,
+  approximateModelInputTokens,
   deepSeekPayload,
   mapPiStreamEvent,
   piContext
@@ -270,7 +270,7 @@ export class PiModelGateway implements ModelGateway {
   }
 
   async countTokens(messages: ModelMessage[], tools = []): Promise<number> {
-    return approximateTokens({ messages, tools });
+    return approximateModelInputTokens(messages, tools);
   }
 
   releaseSession(sessionId: string): void {

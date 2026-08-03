@@ -1,4 +1,11 @@
-import type { ModelRequest, ModelResponse, ModelResponseUsage, UsageRecord } from "agent-protocol";
+import {
+  modelImageInputTokenEstimate,
+  modelMessagesWithoutImagePayloads,
+  type ModelRequest,
+  type ModelResponse,
+  type ModelResponseUsage,
+  type UsageRecord
+} from "agent-protocol";
 import type { ModelPricing, ModelRole, ModelSpec, TokenizerMetadata } from "./catalog.js";
 import { modelPricingRates } from "./pricing.js";
 
@@ -47,7 +54,10 @@ export function approximateTokenCount(value: unknown): number {
 }
 
 export function estimatedRequestTokens(request: Pick<ModelRequest, "messages" | "tools">): number {
-  return approximateTokenCount({ messages: request.messages, tools: request.tools ?? [] });
+  return approximateTokenCount({
+    messages: modelMessagesWithoutImagePayloads(request.messages),
+    tools: request.tools ?? []
+  }) + modelImageInputTokenEstimate(request.messages);
 }
 
 export function estimatedResponseTokens(response: Pick<UnnormalizedModelResponse, "message">): number {
