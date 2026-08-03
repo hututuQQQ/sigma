@@ -1,4 +1,4 @@
-# Sigma Code 0.1.4 validation
+# Sigma Code 0.1.5 validation
 
 Run release checks from the repository root with Node `26.4.0`. The exact pin is shared by `.node-version`, the root package, CI, and the portable packager. TUI checks also require `--experimental-ffi`; a lower local Node may run some tests but is not release evidence.
 
@@ -63,7 +63,7 @@ What these commands prove:
   reducer replay, snapshot rebuild, and tail replay over 100,000 events.
 - `package:harbor-runtime`: packages the already-built CLI archive with the external Harbor adapter; it does not add Harbor behavior to the solving runtime.
 - `product:readiness`: evaluates generated smoke/package evidence and derives
-  readiness from the product SemVer and target trust evidence. For `0.1.4`,
+  readiness from the product SemVer and target trust evidence. For `0.1.5`,
   Linux x64 must be release-ready while unsigned Windows x64 must be
   preview-ready.
 
