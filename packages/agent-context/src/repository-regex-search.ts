@@ -3,12 +3,28 @@ import { textLines } from "agent-platform";
 
 export const MAX_REPOSITORY_REGEX_CHARACTERS = 4_096;
 
+export interface RepositoryRegexPattern {
+  source: string;
+  flags: string;
+}
+
+/** Accept the leading inline flags commonly emitted for PCRE/Python regexes
+ * while retaining JavaScript's bounded worker execution. */
+export function repositoryRegexPattern(query: string): RepositoryRegexPattern {
+  const inline = /^\(\?([ims]+)\)/u.exec(query);
+  const requested = inline?.[1] ?? "";
+  return {
+    source: inline ? query.slice(inline[0].length) : query,
+    flags: [...new Set(`${requested}u`)].join("")
+  };
+}
+
 const workerSource = String.raw`
 const { parentPort, workerData } = require("node:worker_threads");
 let matcher;
 let initializationError;
 try {
-  matcher = new RegExp(workerData.query, "u");
+  matcher = new RegExp(workerData.source, workerData.flags);
 } catch (error) {
   initializationError = error instanceof Error ? error.message : String(error);
 }
@@ -102,7 +118,10 @@ export class BoundedRegexMatcher {
         `Regex exceeds the ${MAX_REPOSITORY_REGEX_CHARACTERS}-character safety limit.`
       );
     }
-    this.worker = new Worker(workerSource, { eval: true, workerData: { query } });
+    this.worker = new Worker(workerSource, {
+      eval: true,
+      workerData: repositoryRegexPattern(query)
+    });
   }
 
   async search(

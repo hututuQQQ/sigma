@@ -46,6 +46,7 @@ import {
   environmentShellArguments,
   environmentShellAvailable
 } from "./environment-shell-tool.js";
+import { MAXIMUM_PROCESS_YIELD_MS } from "./process-wait.js";
 export type { ExecutionToolOptions } from "./execution-tool-types.js";
 export { unavailableExecutionBroker } from "./execution-tool-receipts.js";
 function networkProperty(options: ExecutionToolOptions): JsonValue {
@@ -53,6 +54,22 @@ function networkProperty(options: ExecutionToolOptions): JsonValue {
     type: "string",
     enum: availableNetworkModes(options),
     description: `Per-call network policy; configured default is '${options.networkMode}'. none denies sockets, loopback is limited to local test services when supported, and full always requires fresh approval.`
+  };
+}
+
+function normalizedBackgroundTiming(
+  input: Record<string, JsonValue>
+): Record<string, JsonValue> {
+  if (input.background !== true
+    || typeof input.timeoutMs !== "number"
+    || !Number.isSafeInteger(input.timeoutMs)
+    || input.timeoutMs < 1) return input;
+  const { timeoutMs, ...backgroundInput } = input;
+  return {
+    ...backgroundInput,
+    ...(backgroundInput.yieldMs === undefined
+      ? { yieldMs: Math.min(MAXIMUM_PROCESS_YIELD_MS, timeoutMs) }
+      : {})
   };
 }
 
@@ -71,11 +88,11 @@ function foregroundArguments(
         "The broker-attested disposable outer environment is unavailable."
       ), { code: "policy_denied" });
     }
-    return environmentShellArguments(
+    return normalizedBackgroundTiming(environmentShellArguments(
       input,
       workspacePath,
       kind === "shell" && input.validation === true
-    );
+    ));
   }
   if (target !== undefined && target !== "workspace") {
     throw Object.assign(new Error(
@@ -83,7 +100,7 @@ function foregroundArguments(
     ), { code: "tool_arguments_invalid" });
   }
   const { target: _target, ...workspaceInput } = input;
-  return workspaceInput;
+  return normalizedBackgroundTiming(workspaceInput);
 }
 
 interface ForegroundExecution {

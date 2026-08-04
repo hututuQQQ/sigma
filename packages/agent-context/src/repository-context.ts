@@ -55,6 +55,11 @@ export interface RepositoryContextCollectionOptions {
   workspaceStateVersion?: string;
 }
 
+export interface RepositoryToolCapabilities {
+  gitReadAvailable?: boolean;
+  repositoryInspectionAvailable?: boolean;
+}
+
 function digest(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -112,8 +117,37 @@ async function snippets(workspace: string, files: string[], query: string, signa
 export class RepositoryContextProvider {
   private readonly hostSnapshots = new Map<string, CachedHostSnapshot>();
   private readonly contexts = new Map<string, CachedRepositoryContext>();
+  private readonly repositoryToolCapabilities = new Map<string, RepositoryToolCapabilities>();
 
   constructor(private readonly execution?: ProcessExecutionPort) {}
+
+  toolCapabilities(workspace: string): RepositoryToolCapabilities {
+    return { ...(this.repositoryToolCapabilities.get(path.resolve(workspace)) ?? {}) };
+  }
+
+  private async inspectToolCapabilities(
+    workspace: string,
+    signal: AbortSignal
+  ): Promise<RepositoryToolCapabilities> {
+    try {
+      const topology = await repositoryTopology(workspace, signal);
+      if (!topology?.worktreeRoot) {
+        return {
+          gitReadAvailable: false,
+          repositoryInspectionAvailable: false
+        };
+      }
+      return {
+        gitReadAvailable: topology.trust === "workspace",
+        repositoryInspectionAvailable: true
+      };
+    } catch {
+      signal.throwIfAborted();
+      // An uncertain probe must not remove a capability that could still be
+      // authorized by the execution broker. Only a proven non-repository does.
+      return {};
+    }
+  }
 
   private async hostSnapshot(
     workspace: string,
@@ -208,7 +242,11 @@ export class RepositoryContextProvider {
     signal: AbortSignal,
     options: RepositoryContextCollectionOptions = {}
   ): Promise<ContextItem[]> {
-    const resolved = await resolveWorkspacePath(path.resolve(workspace), ".");
+    const requested = path.resolve(workspace);
+    const resolved = await resolveWorkspacePath(requested, ".");
+    const toolCapabilities = await this.inspectToolCapabilities(resolved, signal);
+    this.repositoryToolCapabilities.set(requested, toolCapabilities);
+    this.repositoryToolCapabilities.set(resolved, toolCapabilities);
     const policy = await this.cachePolicy(
       resolved, signal, options.workspaceStateVersion
     );

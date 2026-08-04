@@ -1,4 +1,5 @@
 import type {
+  BudgetAmounts,
   ContextItem,
   ModelGateway,
   ModelMessage,
@@ -6,7 +7,10 @@ import type {
   ModelResponse,
   UsageRecord
 } from "agent-protocol";
-import type { ModelRouteConstraints } from "agent-model";
+import {
+  APPROXIMATE_TOKEN_RESERVATION_MARGIN,
+  type ModelRouteConstraints
+} from "agent-model";
 import { summarizeHistory } from "agent-context";
 import type { EffectRunnerOptions } from "./effect-runner.js";
 import {
@@ -34,6 +38,26 @@ const SUMMARY_HEADINGS = [
 ] as const;
 const MAX_SUMMARY_OUTPUT_TOKENS = 4_096;
 const MIN_ORCHESTRATOR_OUTPUT_RESERVE = 256;
+const MIN_ORCHESTRATOR_INPUT_RESERVE = 8_192;
+const MAX_ORCHESTRATOR_INPUT_RESERVE = 32_768;
+
+export function continuationInputReserve(
+  gateway: ModelGateway,
+  available: Pick<BudgetAmounts, "inputTokens" | "modelTurns">
+): number {
+  if (available.modelTurns <= 1 || available.inputTokens <= 0) return 0;
+  const margin = gateway.capabilities.tokenizer === "approximate"
+    ? APPROXIMATE_TOKEN_RESERVATION_MARGIN
+    : 1;
+  const desired = Math.min(
+    MAX_ORCHESTRATOR_INPUT_RESERVE,
+    Math.max(
+      MIN_ORCHESTRATOR_INPUT_RESERVE,
+      Math.ceil(gateway.capabilities.contextWindowTokens * 0.1 * margin)
+    )
+  );
+  return Math.min(desired, Math.floor(available.inputTokens / 2));
+}
 
 export interface ModelSummaryInput {
   sourceDigest: string;
@@ -160,11 +184,24 @@ export class ModelSummarizer {
       || available.outputTokens <= MIN_ORCHESTRATOR_OUTPUT_RESERVE) return undefined;
     const gateway = this.options.runtime.gatewayForRole?.("summarizer", session.services.profile)
       ?? session.services.gateway;
+    const inputReserve = continuationInputReserve(gateway, available);
+    const summaryAvailable: BudgetAmounts = {
+      ...available,
+      inputTokens: Math.max(0, available.inputTokens - inputReserve),
+      outputTokens: Math.max(
+        0,
+        available.outputTokens - MIN_ORCHESTRATOR_OUTPUT_RESERVE
+      ),
+      modelTurns: Math.max(0, available.modelTurns - 1)
+    };
+    if (summaryAvailable.inputTokens <= 0
+      || summaryAvailable.outputTokens <= 0
+      || summaryAvailable.modelTurns <= 0) return undefined;
     const messages = summaryPrompt(input, gateway);
     const maxOutputTokens = Math.min(
       MAX_SUMMARY_OUTPUT_TOKENS,
       gateway.capabilities.maxOutputTokens,
-      Math.max(1, available.outputTokens - MIN_ORCHESTRATOR_OUTPUT_RESERVE)
+      summaryAvailable.outputTokens
     );
     let prepared: PreparedModelBudget;
     try {
@@ -174,7 +211,7 @@ export class ModelSummarizer {
     } catch {
       return undefined;
     }
-    const fitted = fitPreparedBudget(prepared, available, 1);
+    const fitted = fitPreparedBudget(prepared, summaryAvailable, 1);
     if (!fitted) return undefined;
     const requestId = `summary:${session.durable.runId}:${input.sourceDigest}`;
     try {

@@ -274,6 +274,34 @@ describe("Standard and Strict completion policy", () => {
     });
   });
 
+  it("offers one non-binding repair turn when a passing check is too narrow", () => {
+    const session = candidateSession("advisory");
+    session.durable.state.mutationFrontier.changedPaths = ["src/index.ts"];
+    const passed = validation(session, "passed");
+    if (passed.kind !== "validation" || !passed.data.claim) {
+      throw new Error("Expected typed validation evidence.");
+    }
+    passed.data.coveredPaths = ["src/index.ts"];
+    passed.data.claim.kind = "acceptance";
+    passed.data.claim.subject.exactFiles = ["src/index.ts"];
+    session.durable.state.evidence.push(passed);
+
+    const first = completionGateDecision(session);
+    expect(first).toMatchObject({
+      action: "continue",
+      message: expect.stringContaining("inferred behavioral coverage: typecheck")
+    });
+    if (first.action !== "continue") throw new Error("Expected a coverage advisory.");
+    session.durable.state.messages.push({ role: "developer", content: first.message });
+    expect(completionGateDecision(session)).toMatchObject({
+      action: "complete",
+      validationStatus: "passed",
+      statusNote: expect.stringContaining(
+        "Validation coverage advisory: inferred typecheck behavior remains unestablished."
+      )
+    });
+  });
+
   it("keeps explicit review advisory in Standard and binding in Strict", () => {
     const session = candidateSession("advisory");
     session.durable.state.evidence.push(

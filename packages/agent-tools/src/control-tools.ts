@@ -149,7 +149,7 @@ function readArtifactTool(): RegisteredEffectTool {
   return {
     descriptor: descriptor(
       "read_artifact",
-      "Read a byte range from a large artifact referenced by a receipt in this session. Continue with nextOffset until eof.",
+      "Read a byte range from a large artifact referenced by a receipt in this session. Pass exactly the artifactId field from artifactRefs, without appending its name or size. Continue with nextOffset until eof.",
       {
         artifactId: { type: "string" },
         offsetBytes: { type: "number", minimum: 0 },

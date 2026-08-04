@@ -59,6 +59,7 @@ export function modelMessage(value: JsonValue | undefined): ModelMessage | null 
     ...(images.length > 0 ? { images } : {}),
     ...(typeof item.reasoningContent === "string" ? { reasoningContent: item.reasoningContent } : {}),
     ...(typeof item.toolCallId === "string" ? { toolCallId: item.toolCallId } : {}),
+    ...(typeof item.isError === "boolean" ? { isError: item.isError } : {}),
     ...(toolCalls.length > 0 ? { toolCalls } : {}),
     ...(providerState ? { providerState } : {})
   };

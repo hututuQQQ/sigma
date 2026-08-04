@@ -5,8 +5,11 @@ export interface ModelToolProjectionCapabilities {
   skillsAvailable: boolean;
   environmentMutationAvailable?: boolean;
   processControlsAvailable?: boolean;
+  processHandoffAvailable?: boolean;
   childControlsAvailable?: boolean;
   planReadRequired?: boolean;
+  gitReadAvailable?: boolean;
+  repositoryInspectionAvailable?: boolean;
 }
 
 /** Frozen sessions never acquire capabilities from changed live state. */
@@ -41,6 +44,8 @@ export function sessionModelToolProjectionCapabilities(
     ...skillCapabilities,
     environmentMutationAvailable: session.durable.mode === "change",
     processControlsAvailable: state.activeProcessIds.length > 0,
+    processHandoffAvailable: [...session.execution.processHandles.values()]
+      .some((handle) => handle.lifecycle === "deliverable"),
     childControlsAvailable,
     planReadRequired: state.plan.nodes.length > 32
   };
@@ -52,6 +57,10 @@ const PROCESS_CONTROL_TOOLS = new Set([
 const CHILD_CONTROL_TOOLS = new Set([
   "message_agent", "join_agent", "list_agents", "integrate_agent"
 ]);
+const GIT_READ_TOOLS = new Set(["git_status", "git_diff"]);
+const REPOSITORY_INSPECTION_TOOLS = new Set([
+  "repository_inspect", "git_transaction"
+]);
 const WORKSPACE_WRITE_GUIDANCE =
   " Workspace commands are read-only by default; to create, modify, or delete workspace paths, provide expectedChanges with exact files or narrow directories.";
 
@@ -62,8 +71,14 @@ function projectedDescriptorVisible(
   if (!capabilities.skillsAvailable && descriptor.name === "load_skill") return false;
   if (PROCESS_CONTROL_TOOLS.has(descriptor.name)
     && capabilities.processControlsAvailable === false) return false;
+  if (descriptor.name === "process_handoff"
+    && capabilities.processHandoffAvailable === false) return false;
   if (CHILD_CONTROL_TOOLS.has(descriptor.name)
     && capabilities.childControlsAvailable === false) return false;
+  if (GIT_READ_TOOLS.has(descriptor.name)
+    && capabilities.gitReadAvailable === false) return false;
+  if (REPOSITORY_INSPECTION_TOOLS.has(descriptor.name)
+    && capabilities.repositoryInspectionAvailable === false) return false;
   return descriptor.name !== "read_plan" || capabilities.planReadRequired !== false;
 }
 
@@ -71,6 +86,7 @@ interface DescriptorPresentation {
   skillFieldsUnavailable: boolean;
   environmentUnavailable: boolean;
   unifiedShell: boolean;
+  lowLevelWriteFieldsUnavailable: boolean;
 }
 
 function projectedInputSchema(
@@ -88,6 +104,10 @@ function projectedInputSchema(
     delete properties.skillScript;
   }
   if (presentation.environmentUnavailable) delete properties.target;
+  if (presentation.lowLevelWriteFieldsUnavailable) {
+    delete properties.access;
+    delete properties.writeRoots;
+  }
   if (presentation.unifiedShell) {
     if (capabilities.environmentMutationAvailable === false) {
       delete properties.expectedChanges;
@@ -95,7 +115,8 @@ function projectedInputSchema(
   }
   const required = Array.isArray(descriptor.inputSchema.required)
     ? descriptor.inputSchema.required.filter((item) =>
-      item !== "skill" && item !== "skillScript")
+      item !== "skill" && item !== "skillScript"
+      && item !== "access" && item !== "writeRoots")
     : undefined;
   return {
     ...descriptor.inputSchema,
@@ -130,11 +151,14 @@ function projectDescriptorPresentation(
     environmentUnavailable: (descriptor.name === "shell"
       || descriptor.name === "process_spawn")
       && capabilities.environmentMutationAvailable === false,
-    unifiedShell: descriptor.name === "shell"
+    unifiedShell: descriptor.name === "shell",
+    lowLevelWriteFieldsUnavailable:
+      ["exec", "shell", "validate", "process_spawn"].includes(descriptor.name)
   };
   if (!presentation.skillFieldsUnavailable
     && !presentation.environmentUnavailable
-    && !presentation.unifiedShell) return descriptor;
+    && !presentation.unifiedShell
+    && !presentation.lowLevelWriteFieldsUnavailable) return descriptor;
   const inputSchema = projectedInputSchema(descriptor, presentation, capabilities);
   if (!inputSchema) return descriptor;
   return {

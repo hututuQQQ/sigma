@@ -36,6 +36,7 @@ import {
   piBillingMode,
   type PiReasoningEffort
 } from "./models.js";
+import { hasKnownPricing } from "./model-pricing.js";
 import { FileModelsStore } from "./models-store.js";
 import { piReasoningStreamOptions } from "./reasoning.js";
 import { monitoredPiStream } from "./stream-timeout.js";
@@ -149,6 +150,7 @@ export class PiModelGateway implements ModelGateway {
   private readonly idleTimeoutMs: number;
   private readonly activeStreamTimeoutMs?: number;
   private readonly reasoningEffort?: PiReasoningEffort;
+  private readonly hasKnownCatalogPrice: boolean;
   private readonly codexInstructionNonce = randomUUID();
 
   constructor(options: PiModelGatewayOptions) {
@@ -170,6 +172,7 @@ export class PiModelGateway implements ModelGateway {
       ? undefined
       : Math.max(1, Math.trunc(options.activeStreamTimeoutMs));
     this.reasoningEffort = options.reasoningEffort;
+    this.hasKnownCatalogPrice = hasKnownPricing(this.piModel);
     this.capabilities = options.capabilities ?? {
       contextWindowTokens: piModel.contextWindow,
       maxOutputTokens: piModel.maxTokens,
@@ -241,7 +244,9 @@ export class PiModelGateway implements ModelGateway {
           : { activeTimeoutMs: this.activeStreamTimeoutMs })
       });
       for await (const event of stream) {
-        const mapped = mapPiStreamEvent(event, toolIndex, startedAt, billingMode, responseStatus);
+        const mapped = mapPiStreamEvent(
+          event, toolIndex, startedAt, billingMode, responseStatus, this.hasKnownCatalogPrice
+        );
         toolIndex = mapped.nextToolIndex;
         if (mapped.error) {
           lifecycle.lastEventType = "error";

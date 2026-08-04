@@ -379,6 +379,19 @@ function sumReports(reports, pathParts) {
   }, 0);
 }
 
+function optionalSumReports(reports, pathParts) {
+  const values = reports.flatMap((report) => {
+    let value = report;
+    for (const part of pathParts) value = value?.[part];
+    if (value === null || value === undefined || value === "") return [];
+    const number = Number(value);
+    return Number.isFinite(number) ? [number] : [];
+  });
+  if (values.length === 0) return null;
+  const total = values.reduce((sum, value) => sum + value, 0);
+  return Math.round(total * 1_000_000) / 1_000_000;
+}
+
 function aggregateNumericObjects(reports, key) {
   const keys = new Set(reports.flatMap((report) => Object.keys(report?.[key] ?? {})));
   return Object.fromEntries([...keys].sort().map((item) => [
@@ -432,6 +445,32 @@ export function aggregateFormalReports(manifest, batchRecords) {
     });
   const status = allBatchesRecorded ? executionComplete ? "complete" : "incomplete" : "running";
   const usage = aggregateNumericObjects(reports, "usage");
+  const billedCostUsd = optionalSumReports(reports, ["cost_usd"]);
+  const apiEquivalentCostUsd = optionalSumReports(reports, ["api_equivalent_cost_usd"]);
+  const billingModes = [...new Set(reports.flatMap((report) =>
+    report.cost_accounting?.billed?.billing_modes ?? []))].sort();
+  const pricingCatalogs = [...new Map(reports.flatMap((report) =>
+    (report.cost_accounting?.api_equivalent?.pricing_catalogs ?? []).map((catalog) => [
+      `${catalog.id}:${catalog.effective_at ?? ""}`,
+      catalog
+    ]))).values()].sort((left, right) => String(left.id).localeCompare(String(right.id)));
+  const billedKnownRecords = sumReports(reports, ["cost_accounting", "billed", "known_records"]);
+  const billedUnknownRecords = sumReports(reports, ["cost_accounting", "billed", "unknown_records"]);
+  const apiEquivalentPricedRecords = sumReports(
+    reports, ["cost_accounting", "api_equivalent", "priced_records"]
+  );
+  const apiEquivalentTotalRecords = sumReports(
+    reports, ["cost_accounting", "api_equivalent", "total_records"]
+  );
+  const apiEquivalentComponentRecords = sumReports(
+    reports, ["cost_accounting", "api_equivalent", "component_records"]
+  );
+  const apiEquivalentComponentsUsd = Object.fromEntries([
+    "input", "output", "cache_read", "cache_write", "unattributed"
+  ].map((component) => [
+    component,
+    sumReports(reports, ["cost_accounting", "api_equivalent", "components_usd", component])
+  ]));
   return {
     schemaVersion: 1,
     kind: "SigmaFormalRunReport",
@@ -452,7 +491,43 @@ export function aggregateFormalReports(manifest, batchRecords) {
     failure_categories: aggregateFailureCategories(reports),
     lane_metrics: laneMetrics(tasks, reports[0]?.evaluation_lane ?? null),
     usage,
-    cost_usd: sumReports(reports, ["cost_usd"]),
+    cost_usd: billedCostUsd,
+    api_equivalent_cost_usd: apiEquivalentCostUsd,
+    cost_accounting: {
+      billed: {
+        amount_usd: billedCostUsd,
+        status: billedKnownRecords === 0 && billedUnknownRecords === 0
+          ? billedCostUsd === null ? "unavailable" : "reported_aggregate"
+          : billedUnknownRecords === 0
+            ? "complete"
+            : billedKnownRecords === 0
+              && billingModes.length === 1 && billingModes[0] === "subscription"
+              ? "subscription_not_attributed"
+              : billedKnownRecords > 0 ? "partial" : "unavailable",
+        known_records: billedKnownRecords,
+        unknown_records: billedUnknownRecords,
+        billing_modes: billingModes
+      },
+      api_equivalent: {
+        amount_usd: apiEquivalentCostUsd,
+        status: apiEquivalentTotalRecords === 0
+          ? apiEquivalentCostUsd === null ? "unavailable" : "reported_aggregate"
+          : apiEquivalentPricedRecords === 0
+            ? "unavailable"
+            : apiEquivalentPricedRecords === apiEquivalentTotalRecords ? "complete" : "partial",
+        priced_records: apiEquivalentPricedRecords,
+        total_records: apiEquivalentTotalRecords,
+        coverage: apiEquivalentTotalRecords > 0
+          ? apiEquivalentPricedRecords / apiEquivalentTotalRecords : null,
+        component_records: apiEquivalentComponentRecords,
+        component_coverage: apiEquivalentPricedRecords > 0
+          ? apiEquivalentComponentRecords / apiEquivalentPricedRecords : null,
+        components_usd: apiEquivalentCostUsd !== null
+          ? apiEquivalentComponentsUsd : null,
+        basis: "bundled_model_catalog_list_price_estimate_not_billed_charge",
+        pricing_catalogs: pricingCatalogs
+      }
+    },
     tasks
   };
 }
@@ -473,7 +548,13 @@ function formalMarkdown(report) {
     `- Verifier reach/pass rate: ${report.lane_metrics.verifier_reached}/${report.lane_metrics.verifier_pass_rate ?? "n/a"}`,
     `- Counts: ${JSON.stringify(report.counts)}`,
     `- Failure categories: ${JSON.stringify(report.failure_categories)}`,
-    `- Cost USD: ${report.cost_usd}`,
+    `- Attributed/billed cost USD: ${report.cost_usd ?? "unavailable"}`,
+    `- Billed cost status: ${report.cost_accounting?.billed?.status ?? "unknown"}`,
+    `- API-equivalent estimated cost USD: ${report.api_equivalent_cost_usd ?? "unavailable"}`,
+    `- API-equivalent estimate coverage: ${report.cost_accounting?.api_equivalent?.coverage ?? "unknown"}`,
+    `- API-equivalent component coverage: ${report.cost_accounting?.api_equivalent?.component_coverage ?? "unknown"}`,
+    `- API-equivalent cost components USD: ${JSON.stringify(report.cost_accounting?.api_equivalent?.components_usd ?? {})}`,
+    `- Pricing catalogs: ${JSON.stringify(report.cost_accounting?.api_equivalent?.pricing_catalogs ?? [])}`,
     ""
   ];
   return lines.join("\n");

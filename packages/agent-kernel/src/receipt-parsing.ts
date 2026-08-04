@@ -119,10 +119,13 @@ export function receiptContent(receipt: ToolReceipt): string {
     ...receipt.outcome.diagnosticCodes,
     ...receipt.diagnostics
   ])].slice(0, 12).map((code) => compactString(code, 96));
-  const artifacts = (receipt.artifactRefs ?? []).slice(0, 6).map((artifact) =>
-    [compactString(artifact.artifactId, 128), compactString(artifact.name, 96), artifact.sizeBytes]
-      .filter((item) => item !== undefined)
-      .join(":"));
+  const artifacts = (receipt.artifactRefs ?? []).slice(0, 6).map((artifact) => ({
+    // artifactId is an opaque capability. Keep it exact and separate from
+    // presentation metadata so the model can pass it back to read_artifact.
+    artifactId: artifact.artifactId,
+    name: compactString(artifact.name, 96),
+    ...(artifact.sizeBytes === undefined ? {} : { sizeBytes: artifact.sizeBytes })
+  }));
   const delta = receipt.workspaceDelta;
   const changes = delta ? {
     added: delta.added.slice(0, 6).map((item) => compactString(item, 120)),

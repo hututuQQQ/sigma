@@ -12,11 +12,14 @@ import {
   type JsonValue,
   type ModelCapabilities,
   type ModelGateway,
+  type ModelMessage,
   type ModelRequest,
   type ModelResponse,
   type ModelStreamEvent,
+  type ModelToolDefinition,
   type ToolReceipt
 } from "../packages/agent-protocol/src/index.js";
+import type { ModelRouteConstraints } from "../packages/agent-model/src/index.js";
 import { evolve } from "../packages/agent-kernel/src/index.js";
 import { BudgetController } from "../packages/agent-runtime/src/budget-controller.js";
 import {
@@ -210,6 +213,38 @@ class StrategistGateway implements ModelGateway {
   }
 
   async countTokens(): Promise<number> { return 100; }
+}
+
+class RetryChainStrategistGateway extends StrategistGateway {
+  async budgetPlan(
+    _messages: ModelMessage[],
+    _tools: ModelToolDefinition[],
+    _maxOutputTokens: number,
+    remainingBudgetMicroUsd: number
+  ) {
+    const attemptReservations = Array.from({ length: 11 }, () => ({
+      inputTokens: 100,
+      outputTokens: 4_096,
+      costMicroUsd: 0
+    }));
+    return {
+      estimatedInputTokens: 100,
+      reservedInputTokens: 1_100,
+      reservedOutputTokens: 45_056,
+      reservedCostMicroUsd: 0,
+      reservedModelTurns: 11,
+      attemptReservations,
+      constraints: {
+        estimatedInputTokens: 100,
+        maxOutputTokens: 4_096,
+        remainingBudgetMicroUsd
+      } satisfies ModelRouteConstraints
+    };
+  }
+
+  routingIdentity(): { role: "planner"; routeId: string } {
+    return { role: "planner", routeId: "retry-chain" };
+  }
 }
 
 function coordinatorHarness(
@@ -794,5 +829,29 @@ describe("objective long-horizon triggers", () => {
     expect(gateway.calls).toBe(0);
     expect(session.durable.state.longHorizon.strategy).toBeUndefined();
     expect(session.durable.state.longHorizon.assurance.strategistCalls).toBe(0);
+  });
+
+  it("fits one strategist attempt instead of charging the full route retry chain", async () => {
+    const session = runtimeSessionFixture();
+    session.durable.state.messages.push({ role: "user", content: "Investigate." });
+    refresh(session);
+    for (let index = 0; index < 3; index += 1) {
+      addBatch(session, index, {
+        arguments: { path: "same.ts" },
+        output: "same result"
+      });
+      refresh(session);
+    }
+    const gateway = new RetryChainStrategistGateway();
+
+    await coordinatorHarness(session, gateway)
+      .prepareForMainModel(session, new AbortController().signal);
+
+    expect(gateway.calls).toBe(1);
+    expect(session.durable.state.longHorizon.assurance.strategistCalls).toBe(1);
+    expect(session.durable.state.longHorizon.strategy).toMatchObject({
+      trigger: "duplicate_result",
+      decision: "revise_plan"
+    });
   });
 });

@@ -77,6 +77,25 @@ function maximumCost(spec: ModelSpec | undefined, inputTokens: number, outputTok
   ) / 1_000_000);
 }
 
+function maximumInputCost(spec: ModelSpec | undefined, inputTokens: number): number | undefined {
+  const pricing = spec?.apiEquivalentPricing ?? spec?.pricing;
+  if (!pricing) return undefined;
+  const rates = modelPricingRates(pricing, inputTokens);
+  return Math.ceil(inputTokens * rates.inputMicroUsdPerMillion / 1_000_000);
+}
+
+function summedApiEquivalentInputCost(
+  attempts: readonly ModelReservationEstimate[]
+): number | undefined {
+  if (attempts.some((attempt) => attempt.apiEquivalentInputCostMicroUsd === undefined)) {
+    return undefined;
+  }
+  return attempts.reduce(
+    (total, attempt) => total + (attempt.apiEquivalentInputCostMicroUsd ?? 0),
+    0
+  );
+}
+
 export async function prepareModelBudget(
   gateway: ModelGateway,
   messages: ModelMessage[],
@@ -237,6 +256,9 @@ function record(
     cacheReadTokens: usage.cacheReadTokens,
     cacheWriteTokens: usage.cacheWriteTokens,
     costMicroUsd: usage.costMicroUsd,
+    ...(usage.apiEquivalentCostMicroUsd === undefined
+      ? {}
+      : { apiEquivalentCostMicroUsd: usage.apiEquivalentCostMicroUsd }),
     ...(usage.billingMode ? { billingMode: usage.billingMode } : {}),
     latencyMs: usage.latencyMs,
     attempt: usage.retryAttempt + 1,
@@ -265,13 +287,20 @@ export function successfulModelUsage(
   );
   const priorAttempts = prepared.attemptReservations?.slice(0, Math.max(0, usage.attempt - 1)) ?? [];
   if (priorAttempts.length === 0) return usage;
+  const priorApiEquivalentCost = summedApiEquivalentInputCost(priorAttempts);
+  const apiEquivalentCostMicroUsd = usage.apiEquivalentCostMicroUsd === undefined
+    || priorApiEquivalentCost === undefined
+    ? undefined
+    : usage.apiEquivalentCostMicroUsd + priorApiEquivalentCost;
+  const { apiEquivalentCostMicroUsd: _successfulAttemptCost, ...usageWithoutApiEquivalentCost } = usage;
   return {
-    ...usage,
+    ...usageWithoutApiEquivalentCost,
     inputTokens: usage.inputTokens + priorAttempts.reduce((total, item) => total + item.inputTokens, 0),
     costMicroUsd: usage.billingMode === "subscription" || usage.billingMode === "unpriced"
       ? null
       : (usage.costMicroUsd ?? 0)
         + priorAttempts.reduce((total, item) => total + (item.costMicroUsd ?? 0), 0),
+    ...(apiEquivalentCostMicroUsd === undefined ? {} : { apiEquivalentCostMicroUsd }),
     providerReported: false
   };
 }
@@ -308,6 +337,9 @@ export function failedModelUsage(
   const inputTokens = attemptedReservations.length > 0
     ? attemptedReservations.reduce((total, item) => total + item.inputTokens, 0)
     : prepared.estimatedInputTokens;
+  const apiEquivalentCostMicroUsd = attemptedReservations.length > 0
+    ? summedApiEquivalentInputCost(attemptedReservations)
+    : maximumInputCost(prepared.spec, inputTokens);
   return record(session, gateway, requestId, prepared, {
     inputTokens,
     outputTokens: 0,
@@ -316,6 +348,7 @@ export function failedModelUsage(
     cacheWriteTokens: 0,
     providerReported: false,
     costMicroUsd: failedUsageCost(prepared, inputTokens, attemptedReservations),
+    ...(apiEquivalentCostMicroUsd === undefined ? {} : { apiEquivalentCostMicroUsd }),
     ...(prepared.spec ? { billingMode: prepared.spec.billingMode } : {}),
     latencyMs: Math.max(0, Math.round(latencyMs)),
     retryAttempt: Math.max(0, attempt - 1)

@@ -35,7 +35,7 @@ export function processHandoffTool(
   return {
     descriptor: executionToolSchema(
       "process_handoff",
-      "Transfer a verified running deliverable process to the outer environment so it survives successful task completion. The process can no longer be polled, written, or terminated through this session.",
+      "Transfer a verified running process that was explicitly started with lifecycle=deliverable to the outer environment so it survives successful task completion. Session-lifecycle processes cannot be handed off. The process can no longer be polled, written, or terminated through this session.",
       handleProperties,
       ["handleId", "brokerInstanceId"],
       ["process.handoff"]

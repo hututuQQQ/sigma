@@ -1970,11 +1970,15 @@ describe("benchmark report generation", () => {
             type: "usage.recorded",
             payload: {
               role: "orchestrator",
+              providerId: "openai-codex",
+              modelId: "openai-codex/gpt-5.6-luna",
               providerReported: true,
               inputTokens: 10,
               outputTokens: 3,
               cacheReadTokens: 1,
-              cacheWriteTokens: 0
+              cacheWriteTokens: 0,
+              costMicroUsd: null,
+              billingMode: "subscription"
             }
           }
         }),
@@ -1989,7 +1993,10 @@ describe("benchmark report generation", () => {
               inputTokens: 20,
               outputTokens: 1,
               cacheReadTokens: 18,
-              cacheWriteTokens: 0
+              cacheWriteTokens: 0,
+              costMicroUsd: null,
+              apiEquivalentCostMicroUsd: 2_000,
+              billingMode: "subscription"
             }
           }
         }),
@@ -2004,7 +2011,10 @@ describe("benchmark report generation", () => {
               inputTokens: 30,
               outputTokens: 0,
               cacheReadTokens: 0,
-              cacheWriteTokens: 0
+              cacheWriteTokens: 0,
+              costMicroUsd: null,
+              apiEquivalentCostMicroUsd: 3_000,
+              billingMode: "subscription"
             }
           }
         }),
@@ -2049,11 +2059,30 @@ describe("benchmark report generation", () => {
       warm_provider_input_tokens: 20,
       warm_provider_cache_read_tokens: 18,
       provider_reported_model_records: 2,
+      cost_usd: null,
+      api_equivalent_cost_usd: 0.005028,
       failure_category: "agent_timeout"
     });
     expect(report).toMatchObject({
       provider_cache_read_ratio: 19 / 30,
-      warm_provider_cache_read_ratio: 18 / 20
+      warm_provider_cache_read_ratio: 18 / 20,
+      cost_usd: null,
+      api_equivalent_cost_usd: 0.005028,
+      cost_accounting: {
+        billed: { status: "subscription_not_attributed" },
+        api_equivalent: {
+          status: "complete",
+          coverage: 1,
+          component_coverage: 1 / 3,
+          components_usd: {
+            input: 0.000009,
+            output: 0.000018,
+            cache_read: 0,
+            cache_write: 0,
+            unattributed: 0.005001
+          }
+        }
+      }
     });
   });
 

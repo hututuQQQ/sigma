@@ -339,10 +339,57 @@ describe("formal benchmark controller", () => {
       trial_accounting: { expected: 3, observed: 3, scored: 2 },
       counts: { passed: 2, structured_blocker: 1 },
       failure_categories: { structured_blocker: 1 },
-      lane_metrics: { verifier_reached: 2, verifier_passed: 2 }
+      lane_metrics: { verifier_reached: 2, verifier_passed: 2 },
+      cost_usd: 0.03,
+      cost_accounting: { billed: { status: "reported_aggregate" } }
     });
     expect(aggregate).not.toHaveProperty("acceptance");
     expect(aggregate).not.toHaveProperty("minimum_passes");
+  });
+
+  it("keeps subscription charges unknown while aggregating catalog-price estimates", () => {
+    const value = manifest();
+    const pricedReport = (taskCount: number, amountUsd: number) => ({
+      ...report(taskCount, taskCount),
+      cost_usd: null,
+      api_equivalent_cost_usd: amountUsd,
+      cost_accounting: {
+        billed: {
+          amount_usd: null,
+          status: "subscription_not_attributed",
+          known_records: 0,
+          unknown_records: taskCount,
+          billing_modes: ["subscription"]
+        },
+        api_equivalent: {
+          amount_usd: amountUsd,
+          status: "complete",
+          priced_records: taskCount,
+          total_records: taskCount,
+          coverage: 1,
+          component_records: 0,
+          components_usd: null,
+          pricing_catalogs: [{ id: "catalog@1", effective_at: "2026-08-01" }]
+        }
+      }
+    });
+    const aggregate = aggregateFormalReports(value, [
+      { batch: "001", report: pricedReport(2, 0.2), docker_cleanup: { clean: true } },
+      { batch: "002", report: pricedReport(1, 0.1), docker_cleanup: { clean: true } }
+    ]);
+
+    expect(aggregate).toMatchObject({
+      cost_usd: null,
+      api_equivalent_cost_usd: 0.3,
+      cost_accounting: {
+        billed: { status: "subscription_not_attributed", unknown_records: 3 },
+        api_equivalent: {
+          status: "complete",
+          coverage: 1,
+          pricing_catalogs: [{ id: "catalog@1", effective_at: "2026-08-01" }]
+        }
+      }
+    });
   });
 
   it("treats fully observed valid agent timeouts as completed outcomes", () => {

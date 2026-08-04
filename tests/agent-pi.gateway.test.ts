@@ -562,6 +562,7 @@ describe("OpenAI Codex subscription gateway", () => {
         cacheReadTokens: 2,
         cacheWriteTokens: 1,
         costMicroUsd: null,
+        apiEquivalentCostMicroUsd: 117,
         billingMode: "subscription"
       }
     });

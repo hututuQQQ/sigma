@@ -65,6 +65,22 @@ describe("session model-tool capability projection", () => {
     expect(schema).not.toContain('"read_plan"');
   });
 
+  it("does not advertise Git operations when the workspace is known not to be a repository", () => {
+    const projected = withReadBatchDescriptor(projectModelToolDescriptors(descriptors, {
+      skillsAvailable: false,
+      gitReadAvailable: false,
+      repositoryInspectionAvailable: false
+    }));
+    const names = projected.map((item) => item.name);
+    expect(names).not.toEqual(expect.arrayContaining([
+      "git_status", "git_diff", "repository_inspect", "git_transaction"
+    ]));
+    expect(JSON.stringify(
+      projected.find((item) => item.name === "batch_read")?.inputSchema
+    )).not.toMatch(/git_status|git_diff/u);
+    expect(names).toContain("read");
+  });
+
   it("hides skill discovery and execution fields when no skill exists", () => {
     const projected = projectModelToolDescriptors(descriptors, {
       skillsAvailable: false
@@ -123,6 +139,9 @@ describe("session model-tool capability projection", () => {
     expect(modelProperties).not.toHaveProperty("criterionIds");
     expect(modelShell?.description).toContain("process temp directory");
     expect(modelShell?.description).toContain("validation=true");
+    expect(modelShell?.description).toContain("Keep commands that write workspace deliverables");
+    expect((modelProperties as Record<string, { description?: string }>).background?.description)
+      .toContain("read-only long-running commands");
 
     const analyzeShell = projectModelToolDescriptors(tools.modelDescriptors(), {
       skillsAvailable: false,
@@ -193,6 +212,15 @@ describe("session model-tool capability projection", () => {
     ]) {
       expect(available.some((item) => item.name === name)).toBe(true);
     }
+
+    const sessionOnly = projectModelToolDescriptors(lifecycleDescriptors, {
+      skillsAvailable: false,
+      processControlsAvailable: true,
+      processHandoffAvailable: false
+    });
+    expect(sessionOnly.some((item) => item.name === "process_poll")).toBe(true);
+    expect(sessionOnly.some((item) => item.name === "process_terminate")).toBe(true);
+    expect(sessionOnly.some((item) => item.name === "process_handoff")).toBe(false);
   });
 
   it("retains direct execution when no shell exists", () => {
@@ -206,6 +234,12 @@ describe("session model-tool capability projection", () => {
     expect(projected.some((item) => item.name === "exec")).toBe(true);
     expect(projected.find((item) => item.name === "exec")?.inputSchema.properties)
       .not.toHaveProperty("skill");
+    expect(projected.find((item) => item.name === "exec")?.inputSchema.properties)
+      .not.toHaveProperty("access");
+    expect(projected.find((item) => item.name === "exec")?.inputSchema.properties)
+      .not.toHaveProperty("writeRoots");
+    expect(projected.find((item) => item.name === "exec")?.inputSchema.properties)
+      .toHaveProperty("expectedChanges");
   });
 
   it("projects frozen skills without widening profile capabilities", () => {

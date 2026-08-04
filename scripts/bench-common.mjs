@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import spawn from "cross-spawn";
 import {
   assertUniqueHarborTaskExecutionIdentities,
@@ -49,6 +49,44 @@ export const defaultAgentTimeoutLeniencyMinExtraSec = 600;
 export const defaultBenchmarkTurnCadenceSec = 5;
 export const defaultBenchmarkMaxTurnsCap = 1000;
 export const defaultConcurrentTrials = 5;
+
+let benchmarkPricingCatalogPromise;
+
+async function benchmarkPricingCatalog() {
+  if (benchmarkPricingCatalogPromise) return await benchmarkPricingCatalogPromise;
+  benchmarkPricingCatalogPromise = (async () => {
+    const packagePath = path.join(rootDir, "packages", "agent-pi", "package.json");
+    let catalogId = "@earendil-works/pi-ai";
+    try {
+      const packageJson = JSON.parse(readFileSync(packagePath, "utf8"));
+      const version = packageJson?.dependencies?.["@earendil-works/pi-ai"];
+      if (typeof version === "string" && version) catalogId += `@${version}`;
+      const providerPackageDir = path.join(
+        path.dirname(packagePath),
+        "node_modules",
+        "@earendil-works",
+        "pi-ai"
+      );
+      const providerModulePath = path.join(providerPackageDir, "dist", "providers", "all.js");
+      const providerModule = await import(pathToFileURL(providerModulePath).href);
+      const providers = providerModule.builtinProviders();
+      const models = new Map();
+      for (const provider of providers) {
+        for (const model of provider.getModels()) {
+          models.set(`${provider.id}/${model.id}`, model);
+        }
+      }
+      const generatedAt = providerModule.getBuiltinModelDataGeneratedAt?.();
+      const effectiveAt = generatedAt === undefined
+        ? null
+        : new Date(generatedAt).toISOString().slice(0, 10);
+      return { catalogId, effectiveAt, models };
+    } catch {
+      return { catalogId, effectiveAt: null, models: new Map() };
+    }
+  })();
+  return await benchmarkPricingCatalogPromise;
+}
 export const terminalBenchCliFlags = Object.freeze([
   "agent-profile",
   "agent-timeout-grace-sec",
@@ -1501,7 +1539,108 @@ async function listNamedFiles(dir, fileName) {
   return files;
 }
 
-function summarizeTraceEvents(events) {
+function optionalFiniteNumber(...values) {
+  for (const value of values) {
+    if (value === null || value === undefined || value === "") continue;
+    const number = Number(value);
+    if (Number.isFinite(number)) return number;
+  }
+  return undefined;
+}
+
+function usageBilledCostMicroUsd(usage) {
+  const microUsd = optionalFiniteNumber(usage.costMicroUsd, usage.cost_micro_usd);
+  if (microUsd !== undefined) return Math.max(0, Math.round(microUsd));
+  const usd = optionalFiniteNumber(usage.costUsd, usage.cost_usd);
+  return usd === undefined ? undefined : Math.max(0, Math.round(usd * 1_000_000));
+}
+
+function modelCatalogKey(usage) {
+  let provider = usage.providerId ?? usage.provider_id;
+  let model = usage.modelId ?? usage.model_id;
+  if (typeof model === "string" && model.includes("/")) {
+    const separator = model.indexOf("/");
+    provider = provider ?? model.slice(0, separator);
+    if (provider === model.slice(0, separator)) model = model.slice(separator + 1);
+  }
+  return typeof provider === "string" && typeof model === "string"
+    ? `${provider}/${model}`
+    : null;
+}
+
+function apiEquivalentUsageCost(usage, catalog) {
+  const explicit = optionalFiniteNumber(
+    usage.apiEquivalentCostMicroUsd,
+    usage.api_equivalent_cost_micro_usd
+  );
+  const key = modelCatalogKey(usage);
+  const model = key ? catalog.models.get(key) : undefined;
+  if (!model?.cost) {
+    return explicit === undefined ? undefined : {
+      microUsd: Math.max(0, Math.round(explicit)),
+      catalogId: catalog.catalogId,
+      effectiveAt: catalog.effectiveAt
+    };
+  }
+  const inputTokens = Math.max(0, Math.round(optionalFiniteNumber(
+    usage.inputTokens, usage.input_tokens
+  ) ?? 0));
+  const outputTokens = Math.max(0, Math.round(optionalFiniteNumber(
+    usage.outputTokens, usage.output_tokens
+  ) ?? 0));
+  const cacheReadTokens = Math.min(inputTokens, Math.max(0, Math.round(optionalFiniteNumber(
+    usage.cacheReadTokens, usage.cache_read_tokens
+  ) ?? 0)));
+  const cacheWriteTokens = Math.min(
+    inputTokens - cacheReadTokens,
+    Math.max(0, Math.round(optionalFiniteNumber(
+      usage.cacheWriteTokens, usage.cache_write_tokens
+    ) ?? 0))
+  );
+  const uncachedInputTokens = Math.max(0, inputTokens - cacheReadTokens - cacheWriteTokens);
+  let rates = model.cost;
+  let matchedThreshold = -1;
+  for (const tier of model.cost.tiers ?? []) {
+    if (inputTokens > tier.inputTokensAbove && tier.inputTokensAbove > matchedThreshold) {
+      rates = tier;
+      matchedThreshold = tier.inputTokensAbove;
+    }
+  }
+  const componentsMicroUsd = {
+    input: uncachedInputTokens * rates.input,
+    output: outputTokens * rates.output,
+    cache_read: cacheReadTokens * rates.cacheRead,
+    cache_write: cacheWriteTokens * rates.cacheWrite
+  };
+  const calculatedMicroUsd = Math.ceil(
+    Object.values(componentsMicroUsd).reduce((total, value) => total + value, 0)
+  );
+  const microUsd = explicit === undefined
+    ? calculatedMicroUsd
+    : Math.max(0, Math.round(explicit));
+  if (!Number.isFinite(microUsd) || microUsd < 0) return undefined;
+  const componentsMatchExplicit = explicit === undefined
+    || Math.abs(calculatedMicroUsd - microUsd) <= 1;
+  if (explicit !== undefined && componentsMatchExplicit) {
+    const componentTotal = Object.values(componentsMicroUsd)
+      .reduce((total, value) => total + value, 0);
+    // Provider helpers round the aggregate, whereas component arithmetic can
+    // retain a fractional micro-dollar. Attribute only that rounding residue
+    // to input so a complete component breakdown reconciles exactly.
+    componentsMicroUsd.input += microUsd - componentTotal;
+  }
+  return {
+    microUsd,
+    ...(componentsMatchExplicit ? { componentsMicroUsd } : {}),
+    catalogId: catalog.catalogId,
+    effectiveAt: catalog.effectiveAt
+  };
+}
+
+async function summarizeTraceEvents(events) {
+  const pricingCatalog = await benchmarkPricingCatalog();
+  const billingModes = new Set();
+  const pricingCatalogs = new Map();
   const summary = {
     status: undefined,
     finish_reason: undefined,
@@ -1512,10 +1651,28 @@ function summarizeTraceEvents(events) {
     cache_tokens: 0,
     cache_read_tokens: 0,
     provider_reported_input_tokens: 0,
+    provider_reported_output_tokens: 0,
+    provider_reported_reasoning_tokens: 0,
     provider_reported_cache_read_tokens: 0,
+    provider_reported_cache_write_tokens: 0,
     warm_provider_input_tokens: 0,
     warm_provider_cache_read_tokens: 0,
     provider_reported_model_records: 0,
+    model_usage_records: 0,
+    billed_cost_records: 0,
+    unknown_billed_cost_records: 0,
+    api_equivalent_cost_records: 0,
+    api_equivalent_component_records: 0,
+    billed_cost_micro_usd: 0,
+    api_equivalent_cost_micro_usd: 0,
+    api_equivalent_input_cost_micro_usd: 0,
+    api_equivalent_output_cost_micro_usd: 0,
+    api_equivalent_cache_read_cost_micro_usd: 0,
+    api_equivalent_cache_write_cost_micro_usd: 0,
+    api_equivalent_cost_usd: null,
+    api_equivalent_cost_components_usd: null,
+    billing_modes: [],
+    pricing_catalogs: [],
     length_finish_count: 0,
     converge_turns: 0,
     cost_usd: null,
@@ -1542,21 +1699,54 @@ function summarizeTraceEvents(events) {
         ? metadata.payload : {};
     if (event?.type === "usage") {
       const usage = metadata.usage ?? payload;
+      summary.model_usage_records += 1;
       summary.input_tokens += Number(usage.inputTokens ?? usage.input_tokens ?? 0);
       summary.output_tokens += Number(usage.outputTokens ?? usage.output_tokens ?? 0);
       summary.reasoning_tokens += Number(usage.reasoningTokens ?? usage.reasoning_tokens ?? 0);
       summary.cache_tokens += Number(usage.cacheTokens ?? usage.cache_tokens
         ?? Number(usage.cacheReadTokens ?? 0) + Number(usage.cacheWriteTokens ?? 0));
       summary.cache_read_tokens += Number(usage.cacheReadTokens ?? usage.cache_read_tokens ?? 0);
-      const usageCost = Number(usage.costUsd ?? usage.cost_usd
-        ?? (Number.isFinite(Number(usage.costMicroUsd)) ? Number(usage.costMicroUsd) / 1_000_000 : NaN));
-      if (Number.isFinite(usageCost)) summary.cost_usd = (summary.cost_usd ?? 0) + usageCost;
+      const billingMode = usage.billingMode ?? usage.billing_mode;
+      if (typeof billingMode === "string") billingModes.add(billingMode);
+      const billedCost = usageBilledCostMicroUsd(usage);
+      if (billedCost === undefined) {
+        summary.unknown_billed_cost_records += 1;
+      } else {
+        summary.billed_cost_records += 1;
+        summary.billed_cost_micro_usd += billedCost;
+      }
+      const apiEquivalentCost = apiEquivalentUsageCost(usage, pricingCatalog);
+      if (apiEquivalentCost) {
+        summary.api_equivalent_cost_records += 1;
+        summary.api_equivalent_cost_micro_usd += apiEquivalentCost.microUsd;
+        if (apiEquivalentCost.componentsMicroUsd) {
+          summary.api_equivalent_component_records += 1;
+          summary.api_equivalent_input_cost_micro_usd
+            += apiEquivalentCost.componentsMicroUsd.input;
+          summary.api_equivalent_output_cost_micro_usd
+            += apiEquivalentCost.componentsMicroUsd.output;
+          summary.api_equivalent_cache_read_cost_micro_usd
+            += apiEquivalentCost.componentsMicroUsd.cache_read;
+          summary.api_equivalent_cache_write_cost_micro_usd
+            += apiEquivalentCost.componentsMicroUsd.cache_write;
+        }
+        pricingCatalogs.set(apiEquivalentCost.catalogId, {
+          id: apiEquivalentCost.catalogId,
+          effective_at: apiEquivalentCost.effectiveAt
+        });
+      }
       if (usage.providerReported === true && usage.role === "orchestrator") {
         const input = Number(usage.inputTokens ?? usage.input_tokens ?? 0);
+        const output = Number(usage.outputTokens ?? usage.output_tokens ?? 0);
+        const reasoning = Number(usage.reasoningTokens ?? usage.reasoning_tokens ?? 0);
         const cacheRead = Number(usage.cacheReadTokens ?? usage.cache_read_tokens ?? 0);
+        const cacheWrite = Number(usage.cacheWriteTokens ?? usage.cache_write_tokens ?? 0);
         summary.provider_reported_model_records += 1;
         summary.provider_reported_input_tokens += input;
+        summary.provider_reported_output_tokens += output;
+        summary.provider_reported_reasoning_tokens += reasoning;
         summary.provider_reported_cache_read_tokens += cacheRead;
+        summary.provider_reported_cache_write_tokens += cacheWrite;
         if (summary.provider_reported_model_records > 1) {
           summary.warm_provider_input_tokens += input;
           summary.warm_provider_cache_read_tokens += cacheRead;
@@ -1598,8 +1788,10 @@ function summarizeTraceEvents(events) {
       );
       summary.length_finish_count = Number(result.length_finish_count ?? summary.length_finish_count);
       summary.converge_turns = Number(result.converge_turns ?? summary.converge_turns);
-      const resultCost = Number(result.usage?.costUsd ?? result.cost_usd ?? summary.cost_usd);
-      summary.cost_usd = Number.isFinite(resultCost) ? resultCost : summary.cost_usd;
+      const resultCost = optionalFiniteNumber(result.usage?.costUsd, result.cost_usd);
+      if (summary.model_usage_records === 0 && resultCost !== undefined) {
+        summary.cost_usd = resultCost;
+      }
       summary.duration_ms = Number(result.durationMs ?? result.duration_ms ?? summary.duration_ms);
       summary.suspension_to_exit_ms = result.suspension_to_exit_ms ?? summary.suspension_to_exit_ms;
       summary.terminal_origin = result.terminal_origin ?? summary.terminal_origin;
@@ -1611,6 +1803,24 @@ function summarizeTraceEvents(events) {
       summary.last_error = result.lastError ?? result.last_error ?? summary.last_error;
     }
   }
+
+  if (summary.billed_cost_records > 0) {
+    summary.cost_usd = summary.billed_cost_micro_usd / 1_000_000;
+  }
+  if (summary.api_equivalent_cost_records > 0) {
+    summary.api_equivalent_cost_usd = summary.api_equivalent_cost_micro_usd / 1_000_000;
+  }
+  if (summary.api_equivalent_component_records > 0) {
+    summary.api_equivalent_cost_components_usd = {
+      input: summary.api_equivalent_input_cost_micro_usd / 1_000_000,
+      output: summary.api_equivalent_output_cost_micro_usd / 1_000_000,
+      cache_read: summary.api_equivalent_cache_read_cost_micro_usd / 1_000_000,
+      cache_write: summary.api_equivalent_cache_write_cost_micro_usd / 1_000_000
+    };
+  }
+  summary.billing_modes = [...billingModes].sort();
+  summary.pricing_catalogs = [...pricingCatalogs.values()]
+    .sort((left, right) => left.id.localeCompare(right.id));
 
   return summary;
 }
@@ -1628,7 +1838,7 @@ async function readTrialTraceFallback(runDir, trialDir) {
   const events = await readTraceEvents(preferred);
   return {
     agent_trace_path: relativePathOrNull(runDir, preferred),
-    agent_trace_summary: summarizeTraceEvents(events),
+    agent_trace_summary: await summarizeTraceEvents(events),
     agent_trace_events: events
   };
 }
@@ -2133,6 +2343,8 @@ function mergeHarborTrialResult(task, trialResult) {
     ...(trialResult?.agent_trace_summary ?? {})
   };
   const verifierFailedTests = Array.isArray(trialResult?.verifier_failed_tests) ? trialResult.verifier_failed_tests : [];
+  const traceHasUsage = Number(traceSummary.model_usage_records ?? 0) > 0;
+  const fallbackCostUsd = optionalFiniteNumber(agentResult.cost_usd, task.cost_usd);
   const next = {
     ...task,
     task_id: trialResult?.task_name ?? task.task_id,
@@ -2154,12 +2366,28 @@ function mergeHarborTrialResult(task, trialResult) {
       || 0
     ),
     provider_reported_input_tokens: Number(traceSummary.provider_reported_input_tokens ?? 0),
+    provider_reported_output_tokens: Number(traceSummary.provider_reported_output_tokens ?? 0),
+    provider_reported_reasoning_tokens: Number(traceSummary.provider_reported_reasoning_tokens ?? 0),
     provider_reported_cache_read_tokens: Number(
       traceSummary.provider_reported_cache_read_tokens ?? 0
+    ),
+    provider_reported_cache_write_tokens: Number(
+      traceSummary.provider_reported_cache_write_tokens ?? 0
     ),
     warm_provider_input_tokens: Number(traceSummary.warm_provider_input_tokens ?? 0),
     warm_provider_cache_read_tokens: Number(traceSummary.warm_provider_cache_read_tokens ?? 0),
     provider_reported_model_records: Number(traceSummary.provider_reported_model_records ?? 0),
+    model_usage_records: Number(traceSummary.model_usage_records ?? 0),
+    billed_cost_records: Number(traceSummary.billed_cost_records ?? 0),
+    unknown_billed_cost_records: Number(traceSummary.unknown_billed_cost_records ?? 0),
+    api_equivalent_cost_records: Number(traceSummary.api_equivalent_cost_records ?? 0),
+    api_equivalent_component_records: Number(
+      traceSummary.api_equivalent_component_records ?? 0
+    ),
+    api_equivalent_cost_components_usd:
+      traceSummary.api_equivalent_cost_components_usd ?? null,
+    billing_modes: Array.isArray(traceSummary.billing_modes) ? traceSummary.billing_modes : [],
+    pricing_catalogs: Array.isArray(traceSummary.pricing_catalogs) ? traceSummary.pricing_catalogs : [],
     output_tokens: Number(agentResult.n_output_tokens ?? (task.output_tokens || traceSummary.output_tokens || 0)),
     reasoning_tokens: Number(
       task.reasoning_tokens || traceSummary.reasoning_tokens || agentResult.n_reasoning_tokens || 0
@@ -2168,9 +2396,8 @@ function mergeHarborTrialResult(task, trialResult) {
       task.length_finish_count || traceSummary.length_finish_count || agentResult.length_finish_count || 0
     ),
     converge_turns: Number(task.converge_turns || traceSummary.converge_turns || agentResult.converge_turns || 0),
-    cost_usd: Number.isFinite(Number(agentResult.cost_usd ?? task.cost_usd ?? traceSummary.cost_usd))
-      ? Number(agentResult.cost_usd ?? task.cost_usd ?? traceSummary.cost_usd)
-      : null,
+    cost_usd: traceHasUsage ? traceSummary.cost_usd ?? null : fallbackCostUsd ?? null,
+    api_equivalent_cost_usd: optionalFiniteNumber(traceSummary.api_equivalent_cost_usd) ?? null,
     duration_ms: task.duration_ms || Number(traceSummary.duration_ms ?? 0),
     suspension_to_exit_ms: task.suspension_to_exit_ms
       ?? traceSummary.suspension_to_exit_ms ?? agentMetadata.suspension_to_exit_ms ?? null,
@@ -2313,6 +2540,7 @@ async function taskReportFromDir(runDir, taskDir, index, config, globalLogText) 
   const metadata = await readJsonSafe(metadataPath);
   const summary = await readJsonSafe(summaryPath);
   const traceEvents = await readTraceEvents(tracePath);
+  const traceUsageSummary = await summarizeTraceEvents(traceEvents);
   const localLogText = [
     await readTextSafe(agentLogPath),
     await readTextSafe(verifierLogPath),
@@ -2370,9 +2598,47 @@ async function taskReportFromDir(runDir, taskDir, index, config, globalLogText) 
     reasoning_tokens: Number(summary.reasoning_tokens ?? metadata.n_reasoning_tokens ?? 0),
     length_finish_count: Number(summary.length_finish_count ?? metadata.length_finish_count ?? 0),
     converge_turns: Number(summary.converge_turns ?? metadata.converge_turns ?? 0),
-    cost_usd: Number.isFinite(Number(summary.cost_usd ?? metadata.cost_usd))
-      ? Number(summary.cost_usd ?? metadata.cost_usd)
-      : null,
+    cost_usd: Number(traceUsageSummary.model_usage_records ?? 0) > 0
+      ? traceUsageSummary.cost_usd ?? null
+      : optionalFiniteNumber(summary.cost_usd, metadata.cost_usd) ?? null,
+    api_equivalent_cost_usd: optionalFiniteNumber(
+      traceUsageSummary.api_equivalent_cost_usd
+    ) ?? null,
+    model_usage_records: Number(traceUsageSummary.model_usage_records ?? 0),
+    billed_cost_records: Number(traceUsageSummary.billed_cost_records ?? 0),
+    unknown_billed_cost_records: Number(traceUsageSummary.unknown_billed_cost_records ?? 0),
+    api_equivalent_cost_records: Number(traceUsageSummary.api_equivalent_cost_records ?? 0),
+    api_equivalent_component_records: Number(
+      traceUsageSummary.api_equivalent_component_records ?? 0
+    ),
+    api_equivalent_cost_components_usd:
+      traceUsageSummary.api_equivalent_cost_components_usd ?? null,
+    billing_modes: Array.isArray(traceUsageSummary.billing_modes)
+      ? traceUsageSummary.billing_modes : [],
+    pricing_catalogs: Array.isArray(traceUsageSummary.pricing_catalogs)
+      ? traceUsageSummary.pricing_catalogs : [],
+    provider_reported_input_tokens: Number(
+      traceUsageSummary.provider_reported_input_tokens ?? 0
+    ),
+    provider_reported_output_tokens: Number(
+      traceUsageSummary.provider_reported_output_tokens ?? 0
+    ),
+    provider_reported_reasoning_tokens: Number(
+      traceUsageSummary.provider_reported_reasoning_tokens ?? 0
+    ),
+    provider_reported_cache_read_tokens: Number(
+      traceUsageSummary.provider_reported_cache_read_tokens ?? 0
+    ),
+    provider_reported_cache_write_tokens: Number(
+      traceUsageSummary.provider_reported_cache_write_tokens ?? 0
+    ),
+    warm_provider_input_tokens: Number(traceUsageSummary.warm_provider_input_tokens ?? 0),
+    warm_provider_cache_read_tokens: Number(
+      traceUsageSummary.warm_provider_cache_read_tokens ?? 0
+    ),
+    provider_reported_model_records: Number(
+      traceUsageSummary.provider_reported_model_records ?? 0
+    ),
     duration_ms: Number(summary.duration_ms ?? metadata.duration_ms ?? 0),
     suspension_to_exit_ms: summary.suspension_to_exit_ms ?? metadata.suspension_to_exit_ms ?? null,
     terminal_origin: summary.terminal_origin ?? metadata.terminal_origin ?? null,
@@ -2546,6 +2812,13 @@ export function laneMetrics(tasks, evaluationLane) {
 }
 
 export function formatMarkdownReport(report) {
+  const billedCost = report.cost_usd === null || report.cost_usd === undefined
+    ? "unavailable"
+    : `$${Number(report.cost_usd).toFixed(2)}`;
+  const apiEquivalentCost = report.api_equivalent_cost_usd === null
+    || report.api_equivalent_cost_usd === undefined
+    ? "unavailable"
+    : `$${Number(report.api_equivalent_cost_usd).toFixed(2)}`;
   const lines = [
     `# Terminal-Bench Run ${report.run_id}`,
     "",
@@ -2574,7 +2847,9 @@ export function formatMarkdownReport(report) {
     `- Scored: ${report.trial_accounting?.scored ?? "unknown"}`,
     `- Errored: ${report.trial_accounting?.errored ?? "unknown"}`,
     `- Missing: ${report.trial_accounting?.missing ?? "unknown"}`,
-    `- Mean reward: ${report.trial_accounting?.meanReward ?? "unknown"}`,
+    `- Mean reward (scored trials only): ${report.trial_accounting?.meanReward ?? "unknown"}`,
+    `- Observed pass rate (all observed trials): ${report.observed_correctness?.pass_rate ?? "unknown"} (${report.observed_correctness?.passed ?? 0}/${report.observed_correctness?.total ?? 0})`,
+    `- Effective pass rate (excluding infra-invalid trials): ${report.effective_correctness?.pass_rate ?? "unknown"} (${report.effective_correctness?.passed ?? 0}/${report.effective_correctness?.total ?? 0})`,
     `- Input tokens: ${report.usage?.input_tokens ?? 0}`,
     `- Cache tokens: ${report.usage?.cache_tokens ?? 0}`,
     `- Cache read ratio: ${report.cache_read_ratio ?? "unknown"}`,
@@ -2585,7 +2860,13 @@ export function formatMarkdownReport(report) {
     `- Reasoning/output ratio: ${report.reasoning_output_ratio ?? "unknown"}`,
     `- Length finishes: ${report.length_finish_count ?? 0}`,
     `- Converge turns: ${report.converge_turns ?? 0}`,
-    `- Cost USD: ${report.cost_usd ?? 0}`,
+    `- Attributed/billed cost USD: ${billedCost}`,
+    `- Billed cost status: ${report.cost_accounting?.billed?.status ?? "unknown"}`,
+    `- API-equivalent estimated cost USD: ${apiEquivalentCost}`,
+    `- API-equivalent estimate coverage: ${report.cost_accounting?.api_equivalent?.coverage ?? "unknown"}`,
+    `- API-equivalent component coverage: ${report.cost_accounting?.api_equivalent?.component_coverage ?? "unknown"}`,
+    `- API-equivalent cost components USD: ${markdownEscape(JSON.stringify(report.cost_accounting?.api_equivalent?.components_usd ?? {}))}`,
+    `- Pricing catalogs: ${markdownEscape(JSON.stringify(report.cost_accounting?.api_equivalent?.pricing_catalogs ?? []))}`,
     `- Lane metrics: ${markdownEscape(JSON.stringify(report.lane_metrics ?? {}))}`,
     "",
     "## Timeout Plan",
@@ -2606,8 +2887,8 @@ export function formatMarkdownReport(report) {
     "",
     "## Tasks",
     "",
-    "| task | status | failure_category | suggested_owner | warnings | verifier_status | failure_signals | commands | input_tokens | cache_tokens | output_tokens | cost_usd | duration_ms | harbor_deadline_sec | sigma_deadline_sec | termination_source | execution_mode | agent_profile | last_error |",
-    "| --- | --- | --- | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | --- |"
+    "| task | status | failure_category | suggested_owner | warnings | verifier_status | failure_signals | commands | input_tokens | cache_tokens | output_tokens | billed_cost_usd | api_equivalent_cost_usd | duration_ms | harbor_deadline_sec | sigma_deadline_sec | termination_source | execution_mode | agent_profile | last_error |",
+    "| --- | --- | --- | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | --- |"
   ];
 
   for (const task of report.tasks) {
@@ -2615,7 +2896,7 @@ export function formatMarkdownReport(report) {
     const suggestedOwner = task.suggested_owner ?? suggestedOwnerForTask(task.status, task.failure_category, task.failure_signals) ?? "";
     const warningCount = Array.isArray(task.infra_warnings) ? task.infra_warnings.length : 0;
     lines.push(
-      `| ${markdownEscape(task.task_id)} | ${task.status} | ${task.failure_category ?? ""} | ${markdownEscape(suggestedOwner)} | ${warningCount} | ${task.verifier_status ?? ""} | ${markdownEscape(failureSignals)} | ${task.commands_executed} | ${task.input_tokens} | ${task.cache_tokens ?? 0} | ${task.output_tokens} | ${task.cost_usd ?? ""} | ${task.duration_ms} | ${task.harbor_deadline_sec ?? ""} | ${task.sigma_deadline_sec ?? ""} | ${task.termination_source ?? ""} | ${task.execution_mode ?? ""} | ${task.agent_profile ?? ""} | ${markdownEscape(task.last_error ?? "")} |`
+      `| ${markdownEscape(task.task_id)} | ${task.status} | ${task.failure_category ?? ""} | ${markdownEscape(suggestedOwner)} | ${warningCount} | ${task.verifier_status ?? ""} | ${markdownEscape(failureSignals)} | ${task.commands_executed} | ${task.input_tokens} | ${task.cache_tokens ?? 0} | ${task.output_tokens} | ${task.cost_usd ?? ""} | ${task.api_equivalent_cost_usd ?? ""} | ${task.duration_ms} | ${task.harbor_deadline_sec ?? ""} | ${task.sigma_deadline_sec ?? ""} | ${task.termination_source ?? ""} | ${task.execution_mode ?? ""} | ${task.agent_profile ?? ""} | ${markdownEscape(task.last_error ?? "")} |`
     );
   }
 
@@ -2828,14 +3109,21 @@ export async function generateBenchReport(runDir) {
     cache_read_tokens: total.cache_read_tokens + Number(task.cache_read_tokens ?? 0),
     provider_reported_input_tokens: total.provider_reported_input_tokens
       + Number(task.provider_reported_input_tokens ?? 0),
+    provider_reported_output_tokens: total.provider_reported_output_tokens
+      + Number(task.provider_reported_output_tokens ?? 0),
+    provider_reported_reasoning_tokens: total.provider_reported_reasoning_tokens
+      + Number(task.provider_reported_reasoning_tokens ?? 0),
     provider_reported_cache_read_tokens: total.provider_reported_cache_read_tokens
       + Number(task.provider_reported_cache_read_tokens ?? 0),
+    provider_reported_cache_write_tokens: total.provider_reported_cache_write_tokens
+      + Number(task.provider_reported_cache_write_tokens ?? 0),
     warm_provider_input_tokens: total.warm_provider_input_tokens
       + Number(task.warm_provider_input_tokens ?? 0),
     warm_provider_cache_read_tokens: total.warm_provider_cache_read_tokens
       + Number(task.warm_provider_cache_read_tokens ?? 0),
     provider_reported_model_records: total.provider_reported_model_records
       + Number(task.provider_reported_model_records ?? 0),
+    model_usage_records: total.model_usage_records + Number(task.model_usage_records ?? 0),
     output_tokens: total.output_tokens + Number(task.output_tokens ?? 0),
     reasoning_tokens: total.reasoning_tokens + Number(task.reasoning_tokens ?? 0)
   }), {
@@ -2843,10 +3131,14 @@ export async function generateBenchReport(runDir) {
     cache_tokens: 0,
     cache_read_tokens: 0,
     provider_reported_input_tokens: 0,
+    provider_reported_output_tokens: 0,
+    provider_reported_reasoning_tokens: 0,
     provider_reported_cache_read_tokens: 0,
+    provider_reported_cache_write_tokens: 0,
     warm_provider_input_tokens: 0,
     warm_provider_cache_read_tokens: 0,
     provider_reported_model_records: 0,
+    model_usage_records: 0,
     output_tokens: 0,
     reasoning_tokens: 0
   });
@@ -2862,10 +3154,82 @@ export async function generateBenchReport(runDir) {
     (total, task) => total + Number(task.length_finish_count ?? 0), 0
   );
   const convergeTurns = tasks.reduce((total, task) => total + Number(task.converge_turns ?? 0), 0);
-  const costUsd = tasks.reduce((total, task) => {
-    const value = Number(task.cost_usd);
-    return total + (Number.isFinite(value) ? value : 0);
-  }, 0);
+  const billedCostRecords = tasks.reduce(
+    (total, task) => total + Number(task.billed_cost_records ?? 0), 0
+  );
+  const unknownBilledCostRecords = tasks.reduce(
+    (total, task) => total + Number(task.unknown_billed_cost_records ?? 0), 0
+  );
+  const apiEquivalentCostRecords = tasks.reduce(
+    (total, task) => total + Number(task.api_equivalent_cost_records ?? 0), 0
+  );
+  const apiEquivalentComponentRecords = tasks.reduce(
+    (total, task) => total + Number(task.api_equivalent_component_records ?? 0), 0
+  );
+  const apiEquivalentComponentsUsdRaw = tasks.reduce((total, task) => {
+    const components = task.api_equivalent_cost_components_usd ?? {};
+    return {
+      input: total.input + Number(components.input ?? 0),
+      output: total.output + Number(components.output ?? 0),
+      cache_read: total.cache_read + Number(components.cache_read ?? 0),
+      cache_write: total.cache_write + Number(components.cache_write ?? 0)
+    };
+  }, { input: 0, output: 0, cache_read: 0, cache_write: 0 });
+  const apiEquivalentComponentsUsd = Object.fromEntries(
+    Object.entries(apiEquivalentComponentsUsdRaw).map(([component, value]) => [
+      component,
+      Math.round(value * 1_000_000) / 1_000_000
+    ])
+  );
+  const billedCostValues = tasks.flatMap((task) => {
+    const value = optionalFiniteNumber(task.cost_usd);
+    return value === undefined ? [] : [value];
+  });
+  const apiEquivalentCostValues = tasks.flatMap((task) => {
+    const value = optionalFiniteNumber(task.api_equivalent_cost_usd);
+    return value === undefined ? [] : [value];
+  });
+  const costUsd = billedCostValues.length > 0
+    ? billedCostValues.reduce((total, value) => total + value, 0)
+    : null;
+  const apiEquivalentCostUsd = apiEquivalentCostValues.length > 0
+    ? apiEquivalentCostValues.reduce((total, value) => total + value, 0)
+    : null;
+  const attributedApiEquivalentComponentsUsd = Object.values(apiEquivalentComponentsUsdRaw)
+    .reduce((total, value) => total + value, 0);
+  const apiEquivalentUnattributedUsd = apiEquivalentCostUsd === null
+    ? null
+    : Math.round((apiEquivalentCostUsd - attributedApiEquivalentComponentsUsd) * 1_000_000)
+      / 1_000_000;
+  if (apiEquivalentUnattributedUsd !== null) {
+    apiEquivalentComponentsUsd.unattributed = apiEquivalentUnattributedUsd;
+  }
+  const billingModes = [...new Set(tasks.flatMap((task) =>
+    Array.isArray(task.billing_modes) ? task.billing_modes : []))].sort();
+  const pricingCatalogs = [...new Map(tasks.flatMap((task) =>
+    Array.isArray(task.pricing_catalogs)
+      ? task.pricing_catalogs.map((catalog) => [`${catalog.id}:${catalog.effective_at ?? ""}`, catalog])
+      : [])).values()].sort((left, right) => String(left.id).localeCompare(String(right.id)));
+  const billedCostStatus = usage.model_usage_records === 0
+    ? costUsd === null ? "unavailable" : "reported_aggregate"
+    : unknownBilledCostRecords === 0
+      ? "complete"
+      : billedCostRecords === 0 && billingModes.length === 1 && billingModes[0] === "subscription"
+        ? "subscription_not_attributed"
+        : billedCostRecords === 0
+          ? "unavailable"
+          : "partial";
+  const apiEquivalentCoverage = usage.model_usage_records > 0
+    ? apiEquivalentCostRecords / usage.model_usage_records
+    : null;
+  const apiEquivalentComponentCoverage = apiEquivalentCostRecords > 0
+    ? apiEquivalentComponentRecords / apiEquivalentCostRecords
+    : null;
+  const apiEquivalentCostStatus = usage.model_usage_records === 0
+    ? apiEquivalentCostUsd === null ? "unavailable" : "reported_aggregate"
+    : apiEquivalentCostRecords === 0
+      ? "unavailable"
+      : apiEquivalentCostRecords === usage.model_usage_records ? "complete" : "partial";
   const report = {
     run_id: config.run_id ?? path.basename(runDir),
     started_at: config.started_at ?? null,
@@ -2894,6 +3258,11 @@ export async function generateBenchReport(runDir) {
     n_concurrent_trials: resolvedJobConfig?.n_concurrent_trials ?? config.n_concurrent_trials ?? null,
     trial_accounting: accounting,
     validity,
+    observed_correctness: {
+      passed: counts.passed,
+      total: tasks.length,
+      pass_rate: tasks.length > 0 ? counts.passed / tasks.length : null
+    },
     effective_correctness: {
       passed: effectivePassed,
       total: effectiveTasks.length,
@@ -2910,6 +3279,29 @@ export async function generateBenchReport(runDir) {
     length_finish_count: lengthFinishCount,
     converge_turns: convergeTurns,
     cost_usd: costUsd,
+    api_equivalent_cost_usd: apiEquivalentCostUsd,
+    cost_accounting: {
+      billed: {
+        amount_usd: costUsd,
+        status: billedCostStatus,
+        known_records: billedCostRecords,
+        unknown_records: unknownBilledCostRecords,
+        billing_modes: billingModes
+      },
+      api_equivalent: {
+        amount_usd: apiEquivalentCostUsd,
+        status: apiEquivalentCostStatus,
+        priced_records: apiEquivalentCostRecords,
+        total_records: usage.model_usage_records,
+        coverage: apiEquivalentCoverage,
+        component_records: apiEquivalentComponentRecords,
+        component_coverage: apiEquivalentComponentCoverage,
+        components_usd: apiEquivalentCostUsd !== null
+          ? apiEquivalentComponentsUsd : null,
+        basis: "bundled_model_catalog_list_price_estimate_not_billed_charge",
+        pricing_catalogs: pricingCatalogs
+      }
+    },
     incomplete_reason: incompleteReason.length > 0 ? incompleteReason : null,
     exit_code: exitCode,
     harbor_exit_code: exitCode,

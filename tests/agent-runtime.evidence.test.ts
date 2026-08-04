@@ -548,7 +548,7 @@ describe("assurance-coordinated mutation completion", () => {
     });
   });
 
-  it("keeps goal-derived command classification out of model-visible completion authority", () => {
+  it("shows goal-derived command classification only as model-visible telemetry", () => {
     const active = frontierSession();
     active.durable.state.plan = {
       ...active.durable.state.plan,
@@ -557,7 +557,9 @@ describe("assurance-coordinated mutation completion", () => {
     active.durable.state.mutationFrontier.changedPaths = ["service.mjs"];
 
     expect(assuranceRequirement(active)).toMatchObject({ requiredClaims: ["acceptance"] });
-    expect(evidenceLedger(active).content).not.toContain("inferred validation claim gaps");
+    expect(evidenceLedger(active).content).toContain(
+      "telemetry-only inferred validation claim gaps: acceptance"
+    );
 
     active.durable.state.plan = {
       ...active.durable.state.plan,
@@ -658,7 +660,7 @@ describe("assurance-coordinated mutation completion", () => {
     expect(frontierValidationReadiness(active)).toMatchObject({
       ready: false,
       executionReady: true,
-      missingClaims: [],
+      missingClaims: ["acceptance"],
       latestFailed: { evidenceId: "node-check-failed" }
     });
     expect(currentFrontierValidationStatus(active)).toMatchObject({
@@ -674,7 +676,7 @@ describe("assurance-coordinated mutation completion", () => {
     });
   });
 
-  it("does not derive a required semantic claim from a test-like file path", () => {
+  it("reports a test-path unit expectation as non-binding telemetry", () => {
     const active = frontierSession();
     active.durable.state.mutationFrontier.changedPaths = ["tests/fixtures/data.json"];
 
@@ -682,7 +684,7 @@ describe("assurance-coordinated mutation completion", () => {
       ready: false,
       coveredPaths: [],
       missingPaths: ["tests/fixtures/data.json"],
-      missingClaims: []
+      missingClaims: ["unit"]
     });
   });
 

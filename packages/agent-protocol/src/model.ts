@@ -26,6 +26,8 @@ export interface ModelMessage {
   images?: ModelImage[];
   reasoningContent?: string;
   toolCallId?: string;
+  /** Provider-native tool result status. Only meaningful for tool messages. */
+  isError?: boolean;
   toolCalls?: ModelToolCall[];
   providerState?: ModelProviderState;
 }
@@ -100,6 +102,9 @@ export interface ModelResponseUsage {
   cacheWriteTokens: number;
   providerReported: boolean;
   costMicroUsd: number | null;
+  /** Catalog-price estimate for the same usage. This is not an attributed
+   * charge when billingMode is subscription or unpriced. */
+  apiEquivalentCostMicroUsd?: number;
   billingMode?: ModelBillingMode;
   latencyMs: number;
   /** Zero-based retry index within the selected provider/model. */

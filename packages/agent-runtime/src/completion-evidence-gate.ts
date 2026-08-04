@@ -9,7 +9,8 @@ import {
 import { strictCompletionDecision } from "./completion-gate-strict.js";
 import {
   currentFrontierReview,
-  currentFrontierValidationStatus
+  currentFrontierValidationStatus,
+  frontierValidationReadiness
 } from "./mutation-evidence.js";
 import type { RuntimeSession } from "./types.js";
 import { substantiveReview } from "./review-coordinator-support.js";
@@ -109,7 +110,8 @@ function standardBasisDigest(
   session: RuntimeSession,
   incompleteNodes: readonly PlanNode[],
   validationKind: StandardValidationKind,
-  validation: FrontierValidation
+  validation: FrontierValidation,
+  claimGaps: readonly string[]
 ): string {
   const frontier = session.durable.state.mutationFrontier;
   return digest({
@@ -121,14 +123,16 @@ function standardBasisDigest(
     frontierRevision: frontier.revision,
     stateDigest: frontier.currentStateDigest,
     validationKind,
-    latestValidationId: validation.validations.at(-1)?.evidenceId ?? null
+    latestValidationId: validation.validations.at(-1)?.evidenceId ?? null,
+    claimGaps
   });
 }
 
 function repairIssues(
   incompleteNodes: readonly PlanNode[],
   validationKind: StandardValidationKind,
-  validation: FrontierValidation
+  validation: FrontierValidation,
+  claimGaps: readonly string[]
 ): string[] {
   const issues: string[] = [];
   if (incompleteNodes.length > 0) {
@@ -143,6 +147,11 @@ function repairIssues(
   } else if (validationKind === "incomplete") {
     issues.push("current-frontier validation records are incomplete");
   }
+  if (claimGaps.length > 0 && validationKind === "passed") {
+    issues.push(
+      `the passing validation does not yet establish the inferred behavioral coverage: ${claimGaps.join(", ")}`
+    );
+  }
   return issues;
 }
 
@@ -150,7 +159,8 @@ function completionStatusNote(
   session: RuntimeSession,
   incompleteNodes: readonly PlanNode[],
   validationKind: StandardValidationKind,
-  validation: FrontierValidation
+  validation: FrontierValidation,
+  claimGaps: readonly string[]
 ): string | undefined {
   const planNote = incompleteNodes.length > 0
     ? `Plan status: incomplete (${incompleteNodes.length} unfinished node(s)).`
@@ -166,11 +176,14 @@ function completionStatusNote(
   } else if (validationKind === "unverified") {
     validationNote = "Validation status: not run for the current mutation frontier.";
   }
+  const coverageNote = claimGaps.length > 0 && validationKind === "passed"
+    ? `Validation coverage advisory: inferred ${claimGaps.join(", ")} behavior remains unestablished.`
+    : undefined;
   const review = currentFrontierReview(session);
   const reviewNote = review && substantiveReview(review) && review.data.verdict !== "approved"
     ? `Independent advisory review status: ${review.data.verdict}; unresolved findings remain.`
     : undefined;
-  const note = [planNote, validationNote, reviewNote].filter(Boolean).join(" ");
+  const note = [planNote, validationNote, coverageNote, reviewNote].filter(Boolean).join(" ");
   return note || undefined;
 }
 
@@ -184,6 +197,7 @@ function publicValidationStatus(
 function standardUncheckedDecision(session: RuntimeSession): CompletionGateDecision {
   const frontier = session.durable.state.mutationFrontier;
   const validation = currentFrontierValidationStatus(session);
+  const claimGaps = frontierValidationReadiness(session).missingClaims;
   const incompleteNodes = session.durable.state.plan.nodes.filter((node) =>
     node.status === "pending" || node.status === "in_progress" || node.status === "blocked");
   const validationKind = standardValidationKind(
@@ -191,14 +205,17 @@ function standardUncheckedDecision(session: RuntimeSession): CompletionGateDecis
     validation
   );
   const needsRepair = incompleteNodes.length > 0
-    || !["not_needed", "passed"].includes(validationKind);
-  const basisDigest = standardBasisDigest(session, incompleteNodes, validationKind, validation);
+    || !["not_needed", "passed"].includes(validationKind)
+    || claimGaps.length > 0;
+  const basisDigest = standardBasisDigest(
+    session, incompleteNodes, validationKind, validation, claimGaps
+  );
   const available = rawAvailableBudget(session);
   const repairTurnAvailable = available.inputTokens > 0
     && available.outputTokens > 0
     && available.modelTurns > 0;
   if (needsRepair && repairTurnAvailable && !hasAdvisory(session, basisDigest)) {
-    const issues = repairIssues(incompleteNodes, validationKind, validation);
+    const issues = repairIssues(incompleteNodes, validationKind, validation, claimGaps);
     return advisory(
       basisDigest,
       `Before natural completion, ${issues.join("; ")}. This is one repair opportunity for this unchanged plan/frontier basis. `
@@ -210,7 +227,8 @@ function standardUncheckedDecision(session: RuntimeSession): CompletionGateDecis
     session,
     incompleteNodes,
     validationKind,
-    validation
+    validation,
+    claimGaps
   );
   const boundaryStatus = needsRepair && !repairTurnAvailable
     ? "Model-turn budget exhausted; unresolved Standard advisory items are reported without an impossible repair turn."

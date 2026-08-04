@@ -280,6 +280,10 @@ describe("capability-aware model routing", () => {
     const terra = BUILTIN_MODEL_SPECS.find((item) => item.id === "openai-codex/gpt-5.6-terra");
     expect(terra).toMatchObject({ billingMode: "subscription" });
     expect(terra?.pricing).toBeUndefined();
+    expect(terra?.apiEquivalentPricing).toMatchObject({
+      inputMicroUsdPerMillion: 2_500_000,
+      outputMicroUsdPerMillion: 15_000_000
+    });
     expect(BUILTIN_MODEL_SPECS.find((item) => item.id === "openai/gpt-5.4")?.pricing)
       .toMatchObject({
         tiers: [expect.objectContaining({
@@ -652,7 +656,8 @@ describe("capability-aware model routing", () => {
     });
     expect(modelReservationEstimate(first, { estimatedInputTokens: 100, maxOutputTokens: 50 })).toMatchObject({
       inputTokens: 150,
-      outputTokens: 75
+      outputTokens: 75,
+      apiEquivalentInputCostMicroUsd: 150
     });
 
     const cumulative = router.resolve("main", {
@@ -935,6 +940,97 @@ describe("capability-aware model routing", () => {
     });
   });
 
+  it("retries one opaque protocol failure on the same model before committed output", async () => {
+    const only = spec("deepseek/a");
+    let completeAttempts = 0;
+    const completeGateway = gateway(only.id, async () => {
+      completeAttempts += 1;
+      if (completeAttempts === 1) {
+        throw Object.assign(new Error("opaque response failure"), {
+          category: "protocol",
+          diagnostics: { doneReceived: false, lastEventType: "error" }
+        });
+      }
+      return response("recovered");
+    });
+    const completeRouter = new ModelRouter(
+      [only],
+      [route({ candidates: [only.id], maxAttempts: 1 })],
+      () => completeGateway,
+      { maxRetriesPerCandidate: 3 }
+    );
+
+    await expect(completeRouter.complete("orchestrator", "main", request()))
+      .resolves.toMatchObject({ attempt: 1, message: { content: "recovered" } });
+    expect(completeAttempts).toBe(2);
+
+    let streamAttempts = 0;
+    const streamGateway: ModelGateway = {
+      ...gateway(only.id, async () => response("unused")),
+      async *stream() {
+        streamAttempts += 1;
+        yield { type: "reasoning", delta: "uncommitted reasoning" } as const;
+        if (streamAttempts === 1) {
+          throw Object.assign(new Error("opaque stream failure"), {
+            category: "protocol",
+            diagnostics: { doneReceived: false, lastEventType: "error" }
+          });
+        }
+        yield { type: "done", response: response("stream recovered") } as const;
+      }
+    };
+    const streamRouter = new ModelRouter(
+      [only],
+      [route({ candidates: [only.id], maxAttempts: 1 })],
+      () => streamGateway,
+      { maxRetriesPerCandidate: 3 }
+    );
+    const events = [];
+    for await (const event of streamRouter.stream("orchestrator", "main", request())) events.push(event);
+    expect(streamAttempts).toBe(2);
+    expect(events.at(-1)).toMatchObject({
+      type: "done",
+      response: { attempt: 1, message: { content: "stream recovered" } }
+    });
+  });
+
+  it("does not retry structured or repeatedly failing protocol responses", async () => {
+    const only = spec("deepseek/a");
+    let structuredAttempts = 0;
+    const structured = new ModelRouter(
+      [only],
+      [route({ candidates: [only.id], maxAttempts: 1 })],
+      () => gateway(only.id, async () => {
+        structuredAttempts += 1;
+        throw Object.assign(new Error("invalid request"), {
+          category: "protocol",
+          diagnostics: { providerErrorCode: "invalid_prompt", httpStatus: 400 }
+        });
+      }),
+      { maxRetriesPerCandidate: 3 }
+    );
+    await expect(structured.complete("orchestrator", "main", request()))
+      .rejects.toMatchObject({ category: "protocol", attempts: 1 });
+    expect(structuredAttempts).toBe(1);
+
+    let opaqueAttempts = 0;
+    const opaque = new ModelRouter(
+      [only],
+      [route({ candidates: [only.id], maxAttempts: 1 })],
+      () => gateway(only.id, async () => {
+        opaqueAttempts += 1;
+        throw Object.assign(new Error("opaque response failure"), {
+          category: "protocol",
+          diagnostics: { doneReceived: false, lastEventType: "error" }
+        });
+      }),
+      { maxRetriesPerCandidate: 3 }
+    );
+    await expect(opaque.complete("orchestrator", "main", request()))
+      .rejects.toMatchObject({ category: "protocol", attempts: 2 });
+    expect(opaqueAttempts).toBe(2);
+  });
+
   it("uses abortable exponential backoff only between same-provider retries", async () => {
     vi.useFakeTimers();
     try {
@@ -1153,7 +1249,10 @@ describe("normalized model usage", () => {
     expect(modelReservationEstimate(tiered, {
       estimatedInputTokens: 1_000,
       maxOutputTokens: 100
-    }).costMicroUsd).toBe(3_400);
+    })).toMatchObject({
+      costMicroUsd: 3_400,
+      apiEquivalentInputCostMicroUsd: 3_000
+    });
   });
 
   it("always supplies token, cost, latency, and reporting fields", () => {
@@ -1255,6 +1354,80 @@ describe("normalized model usage", () => {
     });
     expect(consumedBudget(firstFailure, prepared).modelTurns).toBe(1);
     expect(consumedBudget(secondFailure, prepared).modelTurns).toBe(2);
+  });
+
+  it("keeps retry API estimates separate from subscription billing", async () => {
+    const subscriptionSpec = BUILTIN_MODEL_SPECS.find(
+      (item) => item.id === "openai-codex/gpt-5.6-terra"
+    )!;
+    const representative: ModelGateway = {
+      ...gateway(subscriptionSpec.id, async () => response("unused")),
+      provider: subscriptionSpec.providerId,
+      model: subscriptionSpec.upstreamModel
+    };
+    const router = new ModelRouter(
+      [subscriptionSpec],
+      [route({ candidates: [subscriptionSpec.id], maxAttempts: 1 })],
+      () => representative,
+      { maxRetriesPerCandidate: 1 }
+    );
+    const routed = new RoutedModelGateway({
+      router,
+      role: "orchestrator",
+      routeId: "main",
+      representative
+    });
+    const prepared = await prepareModelBudget(
+      routed,
+      request().messages,
+      [],
+      100,
+      10_000
+    );
+    const result = response("ok");
+    result.usage = {
+      ...result.usage,
+      inputTokens: 10,
+      outputTokens: 2,
+      costMicroUsd: null,
+      apiEquivalentCostMicroUsd: 14,
+      billingMode: "subscription",
+      retryAttempt: 1
+    };
+    const usage = successfulModelUsage(
+      { sessionId: "session", runId: "run" },
+      routed,
+      "retried-request",
+      { messages: request().messages, tools: [] },
+      result,
+      prepared,
+      5
+    );
+    const priorInputCost = prepared.attemptReservations![0]!.apiEquivalentInputCostMicroUsd!;
+
+    expect(usage).toMatchObject({
+      costMicroUsd: null,
+      apiEquivalentCostMicroUsd: 14 + priorInputCost,
+      billingMode: "subscription",
+      providerReported: false,
+      attempt: 2
+    });
+    expect(failedModelUsage(
+      { sessionId: "session", runId: "run" },
+      routed,
+      "failed-retried-request",
+      prepared,
+      5,
+      "orchestrator",
+      2
+    )).toMatchObject({
+      costMicroUsd: null,
+      apiEquivalentCostMicroUsd: prepared.attemptReservations!
+        .slice(0, 2)
+        .reduce((total, attempt) => total + attempt.apiEquivalentInputCostMicroUsd!, 0),
+      billingMode: "subscription",
+      attempt: 2
+    });
   });
 
   it("persists subscription usage as null cost while charging zero to the budget ledger", async () => {

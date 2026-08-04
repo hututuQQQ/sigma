@@ -6,6 +6,7 @@ import {
   type ToolCallPlan, type ToolDescriptor, type ToolReceipt, type WorkspaceDelta
 } from "agent-protocol";
 import { planContext, type ContextPlan, type PlanContextOptions } from "agent-context";
+import { APPROXIMATE_TOKEN_RESERVATION_MARGIN } from "agent-model";
 import { canonicalWorkspacePath, isInside, resolveWorkspacePath } from "agent-platform";
 import type { RuntimeSession } from "./types.js";
 import { failed } from "./tool-receipt.js";
@@ -54,18 +55,33 @@ export async function providerSizedPlan(
 ): Promise<ContextPlan> {
   const providerLimit = gateway.capabilities.contextWindowTokens;
   const { maxInputTokens, ...contextInput } = input;
-  const inputLimit = Math.min(providerLimit - input.outputReserveTokens, maxInputTokens ?? providerLimit);
-  // Keep replayable history below the provider's final context headroom so
-  // the existing archive path activates before a very large request reaches
-  // transport. Exact mandatory context still gets one full-window attempt.
+  const reservationMargin = gateway.capabilities.tokenizer === "approximate"
+    ? APPROXIMATE_TOKEN_RESERVATION_MARGIN
+    : 1;
+  // Route selection margins locally counted input while reserving the exact
+  // provider output limit. Planning against the raw provider window used to create
+  // requests which fit the planner but were rejected by that later route
+  // check, before the archive path had a chance to compact history.
+  const safeInputTokens = Math.floor(
+    (providerLimit - input.outputReserveTokens)
+      / reservationMargin
+  );
+  const safeProviderLimit = safeInputTokens + input.outputReserveTokens;
+  const inputLimit = Math.min(
+    safeInputTokens,
+    maxInputTokens ?? safeInputTokens
+  );
+  // Keep replayable history below the final safe context headroom so the
+  // archive path activates before route selection. Provider-tokenized
+  // mandatory context still gets one full-window attempt.
   const proactiveLimit = Math.floor(
-    providerLimit * PROACTIVE_CONTEXT_WINDOW_PERCENT / 100
+    safeProviderLimit * PROACTIVE_CONTEXT_WINDOW_PERCENT / 100
   );
   let planningLimit = Math.min(
-    providerLimit,
+    safeProviderLimit,
     Math.max(input.outputReserveTokens + 1, proactiveLimit)
   );
-  let usedMandatoryFallback = planningLimit === providerLimit;
+  let usedMandatoryFallback = planningLimit === safeProviderLimit;
   while (planningLimit > input.outputReserveTokens) {
     let plan: ContextPlan;
     try {
@@ -76,7 +92,7 @@ export async function providerSizedPlan(
       });
     } catch (error) {
       if (!usedMandatoryFallback && contextOverflowError(error)) {
-        planningLimit = providerLimit;
+        planningLimit = safeProviderLimit;
         usedMandatoryFallback = true;
         continue;
       }
@@ -88,7 +104,9 @@ export async function providerSizedPlan(
       planningLimit - input.outputReserveTokens
     );
     if (tokens <= planningInputLimit
-      && tokens + input.outputReserveTokens <= planningLimit) return plan;
+      && tokens + input.outputReserveTokens <= planningLimit
+      && Math.ceil(tokens * reservationMargin)
+        + input.outputReserveTokens <= providerLimit) return plan;
     const ratio = Math.min(
       planningInputLimit / Math.max(1, tokens),
       planningLimit / (tokens + input.outputReserveTokens)

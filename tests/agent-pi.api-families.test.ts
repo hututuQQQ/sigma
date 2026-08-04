@@ -234,7 +234,8 @@ function replayMessages(model: PiModel<Api>): ModelMessage[] {
     {
       role: "tool",
       content: "gateway matches",
-      toolCallId: "prior_search"
+      toolCallId: "prior_search",
+      isError: true
     },
     { role: "user", content: "Continue." }
   ];
@@ -338,6 +339,11 @@ describe.each(apiFamilies)("Pi %s API family contract", (api) => {
       "toolResult",
       "user"
     ]);
+    expect(call.context.messages.filter((message) => message.role === "toolResult"))
+      .toEqual([
+        expect.objectContaining({ toolCallId: "prior_read", isError: false }),
+        expect.objectContaining({ toolCallId: "prior_search", isError: true })
+      ]);
     const replay = call.context.messages[1] as AssistantMessage;
     expect(replay).toMatchObject({
       api,

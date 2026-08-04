@@ -203,7 +203,7 @@ async function indirectRepositoryTopology(
 export async function repositoryTopology(
   workspace: string,
   signal: AbortSignal | undefined,
-  _execution: ProcessExecutionPort,
+  _execution?: ProcessExecutionPort,
   options: { allowExternalMetadata?: boolean } = {}
 ): Promise<RepositoryTopology | null> {
   signal?.throwIfAborted();

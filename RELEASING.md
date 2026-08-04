@@ -77,10 +77,18 @@ The tag workflow verifies that the tag exactly equals the root package version.
 It independently verifies the Linux x64 stable candidate and Windows x64
 unsigned Runtime preview, checks out the exact same tag from `sigma-code`, and
 builds an unsigned Windows installer containing that verified Runtime. If every
-job passes, it creates one GitHub Release with the Runtime archives, checksums,
-SBOMs, signed provenance, public verification key, desktop installer, blockmap,
-and update manifest. A version without a prerelease suffix is published as the
-latest formal release; a suffixed version is published as a prerelease.
+job passes, it creates one GitHub Release with seven project-owned assets: the
+two Runtime archives, desktop installer, consolidated `SHA256SUMS`, compact
+`release-evidence.zip`, blockmap, and update manifest. The evidence archive
+contains both CycloneDX SBOMs, both signed provenance envelopes, the public
+verification key, and any authorized release-exception record. A version
+without a prerelease suffix is published as the latest formal release; a
+suffixed version is published as a prerelease.
+
+CI candidate packages and the cross-job Runtime and desktop transfer artifacts
+are retained for seven days. Compact release-candidate reports are retained for
+fourteen days. Do not put package caches, extracted Runtime trees, smoke-test
+workspaces, or duplicate release archives in the candidate evidence artifact.
 
 Never replace assets on an existing release. If a published candidate is wrong,
 publish a new version so checksums and provenance remain immutable.
@@ -104,9 +112,10 @@ gh variable set RELEASE_LIVE_EVAL_OVERRIDE_TAG --body $Tag
 gh variable set RELEASE_LIVE_EVAL_OVERRIDE_REASON --body "<approved reason>"
 ```
 
-The tag workflow publishes `release-live-evaluation-override.json` and includes
-the reason in the Release notes. Delete both repository variables immediately
-after the Release is verified so every later tag returns to the default gate:
+The tag workflow includes `release-live-evaluation-override.json` inside
+`release-evidence.zip` and includes the reason in the Release notes. Delete both
+repository variables immediately after the Release is verified so every later
+tag returns to the default gate:
 
 ```powershell
 gh variable delete RELEASE_LIVE_EVAL_OVERRIDE_TAG
@@ -129,8 +138,10 @@ tag; a source-only GitHub prerelease remains the only fallback.
 
 ## After publication
 
-- Download every asset from GitHub and compare it with its `.sha256` sidecar.
-- Confirm provenance verification succeeds with the published public key.
+- Download the project-owned assets from GitHub and run
+  `sha256sum --check SHA256SUMS` in the download directory.
+- Extract `release-evidence.zip` and confirm both provenance envelopes verify
+  with the included public key and match their corresponding Runtime archives.
 - Confirm the Linux archive is labeled stable and passes
   `agent doctor` plus a packaged-product smoke run on a clean machine.
 - Confirm the Windows archive, package metadata, bundle README, and Release asset label all say unsigned preview, and confirm its executables have no Authenticode signer.

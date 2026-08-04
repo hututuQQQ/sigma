@@ -25,6 +25,7 @@ import {
 import type { PiProviderEventType } from "./errors.js";
 import type { PiBillingMode } from "./models.js";
 import { codexInstructionSentinel } from "./codex-instructions.js";
+import { responseUsage } from "./usage.js";
 
 interface ReplayState {
   responseId?: string;
@@ -189,7 +190,7 @@ function contextParts(
       toolCallId: message.toolCallId,
       toolName: toolNames.get(message.toolCallId) ?? "tool",
       content: [{ type: "text", text: message.content }],
-      isError: false,
+      isError: message.isError === true,
       timestamp: Date.now()
     };
     result.push(toolResult);
@@ -254,28 +255,6 @@ function finishReason(message: AssistantMessage): ModelResponse["finishReason"] 
   if (message.stopReason === "length") return "length";
   if (message.stopReason === "toolUse") return "tool_calls";
   return "stop";
-}
-
-function responseUsage(
-  message: AssistantMessage,
-  startedAt: number,
-  billingMode: PiBillingMode
-): ModelResponse["usage"] {
-  const costMicroUsd = billingMode === "metered"
-    ? Math.max(0, Math.ceil(message.usage.cost.total * 1_000_000))
-    : null;
-  return {
-    inputTokens: message.usage.input + message.usage.cacheRead + message.usage.cacheWrite,
-    outputTokens: message.usage.output,
-    reasoningTokens: message.usage.reasoning ?? 0,
-    cacheReadTokens: message.usage.cacheRead,
-    cacheWriteTokens: message.usage.cacheWrite,
-    providerReported: true,
-    costMicroUsd,
-    billingMode,
-    latencyMs: Math.max(0, Math.round(performance.now() - startedAt)),
-    retryAttempt: 0
-  };
 }
 
 export function approximateTokens(value: unknown): number {
@@ -347,7 +326,8 @@ export function mapPiStreamEvent(
   toolIndex: number,
   startedAt: number,
   billingMode: PiBillingMode,
-  responseStatus: number | undefined
+  responseStatus: number | undefined,
+  hasKnownCatalogPrice: boolean
 ): MappedPiStreamEvent {
   switch (event.type) {
     case "text_delta":
@@ -369,7 +349,12 @@ export function mapPiStreamEvent(
         nextToolIndex: toolIndex + 1
       };
     case "done": {
-      const usage = responseUsage(event.message, startedAt, billingMode);
+      const usage = responseUsage(
+        event.message,
+        startedAt,
+        billingMode,
+        hasKnownCatalogPrice
+      );
       return {
         events: [
           { type: "usage", inputTokens: usage.inputTokens, outputTokens: usage.outputTokens },

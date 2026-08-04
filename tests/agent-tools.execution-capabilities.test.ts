@@ -484,6 +484,13 @@ describe("execution tool capability closure", () => {
       processMode: "background",
       exactEffects: expect.not.arrayContaining(["validation"])
     });
+    await expect(tools.prepare(request("shell", {
+      executable: "runtime",
+      background: true,
+      timeoutMs: 120_000
+    }), preparation(root))).resolves.toMatchObject({
+      processMode: "background"
+    });
 
     const backgroundCall = request("shell", {
       executable: "runtime",

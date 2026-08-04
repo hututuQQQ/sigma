@@ -167,8 +167,7 @@ async function backgroundExecutionReceipt(
       options.broker,
       processHandle,
       processYieldMs(input, DEFAULT_EXECUTION_YIELD_MS),
-      context.signal,
-      false
+      context.signal
     );
   } catch (error) {
     return await rejectFailedProcessWait(options.broker, processHandle, error);

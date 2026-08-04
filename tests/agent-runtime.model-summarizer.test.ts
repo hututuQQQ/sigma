@@ -13,6 +13,7 @@ import type {
 } from "../packages/agent-protocol/src/index.js";
 import type { BudgetController } from "../packages/agent-runtime/src/budget-controller.js";
 import {
+  continuationInputReserve,
   deterministicArchiveFallback,
   ModelSummarizer,
   type ModelSummaryInput
@@ -150,6 +151,22 @@ function harness(gateway: SummaryGateway) {
 }
 
 describe("ModelSummarizer", () => {
+  it("reserves input capacity for the orchestrator after an archive call", () => {
+    const gateway = new SummaryGateway(summaryContent());
+    expect(continuationInputReserve(gateway, {
+      inputTokens: 100_000,
+      modelTurns: 2
+    })).toBeGreaterThanOrEqual(8_192);
+    expect(continuationInputReserve(gateway, {
+      inputTokens: 10_000,
+      modelTurns: 2
+    })).toBe(5_000);
+    expect(continuationInputReserve(gateway, {
+      inputTokens: 100_000,
+      modelTurns: 1
+    })).toBe(0);
+  });
+
   it("uses the summarizer role with no tools and records measured usage", async () => {
     const gateway = new SummaryGateway(summaryContent());
     const test = harness(gateway);

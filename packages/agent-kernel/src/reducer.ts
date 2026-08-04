@@ -157,7 +157,8 @@ const toolFinished: EventReducer = (state, event) => {
   const messages = [...state.messages, {
     role: "tool" as const,
     content: receiptContent(receipt),
-    toolCallId: receipt.callId
+    toolCallId: receipt.callId,
+    isError: !receipt.ok
   }];
   const next: KernelState = {
     ...state,

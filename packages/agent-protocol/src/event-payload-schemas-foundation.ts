@@ -41,6 +41,7 @@ export const modelMessageSchema = z.object({
   images: z.array(modelImageSchema).optional(),
   reasoningContent: z.string().optional(),
   toolCallId: z.string().optional(),
+  isError: z.boolean().optional(),
   toolCalls: z.array(modelToolCallSchema).optional(),
   providerState: z.object({
     provider: nonEmptyStringSchema,

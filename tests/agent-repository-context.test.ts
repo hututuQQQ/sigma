@@ -104,6 +104,27 @@ function gitSubcommand(args: readonly string[]): string | undefined {
 }
 
 describe("host repository context", () => {
+  it("reports repository tool capabilities from validated filesystem topology", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-context-capabilities-"));
+    try {
+      const provider = new RepositoryContextProvider();
+      await provider.collect(workspace, "", new AbortController().signal);
+      expect(provider.toolCapabilities(workspace)).toEqual({
+        gitReadAvailable: false,
+        repositoryInspectionAvailable: false
+      });
+
+      await writeSyntheticGitDirectory(workspace);
+      await provider.collect(workspace, "", new AbortController().signal);
+      expect(provider.toolCapabilities(workspace)).toEqual({
+        gitReadAvailable: true,
+        repositoryInspectionAvailable: true
+      });
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
   it("does not reinterpret a host filename separator as repository structure", () => {
     expect(safeAutomaticFileName("literal\\nested.ts")).toBe(false);
     expect(safeAutomaticFileName("literal/nested.ts")).toBe(false);
@@ -390,6 +411,14 @@ describe("host repository context", () => {
       });
       expect(regex.complete).toBe(true);
       expect(regex.matches.map((match) => match.text)).toEqual(["alpha123", "alpha456"]);
+
+      const inlineFlags = await searchRepositoryText(
+        workspace,
+        new AbortController().signal,
+        { query: "(?i)^ALPHA[0-9]+$", regex: true, glob: "src/**/*.ts", limit: 10 }
+      );
+      expect(inlineFlags.matches.map((match) => match.text))
+        .toEqual(["alpha123", "alpha456"]);
 
       const outputLimited = await searchRepositoryText(workspace, new AbortController().signal, {
         query: "alpha",
@@ -1064,5 +1093,10 @@ describe("host repository context", () => {
     expect(gateway.requests).toHaveLength(1);
     expect(gateway.requests[0]!.messages.map((message) => message.content).join("\n"))
       .toContain("src/value.ts");
+    expect(gateway.requests[0]!.tools.map((tool) => tool.name)).not.toEqual(
+      expect.arrayContaining([
+        "git_status", "git_diff", "repository_inspect", "git_transaction"
+      ])
+    );
   });
 });
