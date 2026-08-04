@@ -7,7 +7,10 @@ import type {
 } from "../packages/agent-protocol/src/index.js";
 import { createKernelState } from "../packages/agent-kernel/src/index.js";
 import { completionGateDecision } from "../packages/agent-runtime/src/completion-evidence-gate.js";
-import { terminateRunProcesses } from "../packages/agent-runtime/src/process-cleanup.js";
+import {
+  settleSessionProcessesForCompletion,
+  terminateRunProcesses
+} from "../packages/agent-runtime/src/process-cleanup.js";
 import {
   settleBudgetBoundaryProcesses,
   terminateUnhandedBudgetBoundaryProcesses
@@ -576,6 +579,109 @@ describe("durable process lifecycle events", () => {
     if (decision.action !== "continue") throw new Error("Expected a completion advisory.");
     expect(decision.message).toContain("service");
     expect(decision.message).toContain("helper");
+  });
+
+  it("settles ordinary session processes before completion but preserves deliverables", async () => {
+    const state = createKernelState({
+      sessionId: "session", runId: "run", mode: "change",
+      startedAt: "2026-01-01T00:00:00.000Z", deadlineAt: "2026-01-01T01:00:00.000Z"
+    });
+    state.activeProcessIds.push("service", "helper");
+    const target = runtimeSessionFixture({
+      state,
+      execution: {
+        processHandles: new Map([
+          ["service", { id: "service", brokerInstanceId: "broker-1", lifecycle: "deliverable" }],
+          ["helper", { id: "helper", brokerInstanceId: "broker-1", lifecycle: "session" }]
+        ])
+      }
+    });
+    const terminate = vi.fn(async (handle) => ({
+      handle,
+      state: "terminated" as const,
+      exitCode: null,
+      durationMs: 1,
+      stdout: "",
+      stderr: "",
+      stdoutDroppedBytes: 0,
+      stderrDroppedBytes: 0,
+      outputTruncated: false
+    }));
+    const execution = {
+      execute: async () => { throw new Error("not used"); },
+      terminate
+    } satisfies ProcessExecutionPort;
+    const emit = async (
+      _session: typeof target,
+      type: AgentEventType,
+      _authority: "runtime",
+      payload: unknown
+    ) => {
+      if (type === "process.exited" || type === "process.lost") {
+        const processId = (payload as { processId: string }).processId;
+        target.durable.state.activeProcessIds = target.durable.state.activeProcessIds
+          .filter((id) => id !== processId);
+      }
+      return {} as never;
+    };
+
+    await settleSessionProcessesForCompletion(
+      target, execution, emit, new AbortController().signal
+    );
+
+    expect(terminate).toHaveBeenCalledTimes(1);
+    expect(terminate.mock.calls[0]?.[0]).toMatchObject({ id: "helper" });
+    expect([...target.execution.processHandles.keys()]).toEqual(["service"]);
+    const decision = completionGateDecision(target);
+    expect(decision).toMatchObject({ action: "continue" });
+    if (decision.action !== "continue") throw new Error("Expected a completion advisory.");
+    expect(decision.message).toContain("service");
+    expect(decision.message).not.toContain("helper");
+  });
+
+  it("terminates independent process trees concurrently and records them deterministically", async () => {
+    const handles = ["first", "second"].map((id) =>
+      [id, { id, brokerInstanceId: "broker-1" }] as const);
+    const target = runtimeSessionFixture({
+      execution: { processHandles: new Map(handles) }
+    });
+    const recorded = recorder();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let started = 0;
+    let bothStarted!: () => void;
+    const ready = new Promise<void>((resolve) => { bothStarted = resolve; });
+    const execution = {
+      execute: async () => { throw new Error("not used"); },
+      terminate: async (handle) => {
+        started += 1;
+        if (started === handles.length) bothStarted();
+        await gate;
+        return {
+          handle,
+          state: "terminated" as const,
+          exitCode: null,
+          durationMs: 1,
+          stdout: "",
+          stderr: "",
+          stdoutDroppedBytes: 0,
+          stderrDroppedBytes: 0,
+          outputTruncated: false
+        };
+      }
+    } satisfies ProcessExecutionPort;
+
+    const settling = terminateRunProcesses(
+      target, { kind: "cancelled", reason: "user" }, execution, recorded.emit
+    );
+    await ready;
+    release();
+    await settling;
+
+    expect(started).toBe(2);
+    expect(recorded.events.filter((event) => event.type === "process.exited")
+      .map((event) => (event.payload as { processId: string }).processId))
+      .toEqual(["first", "second"]);
   });
 
   it("terminates runtime-local process trees before a terminal outcome", async () => {

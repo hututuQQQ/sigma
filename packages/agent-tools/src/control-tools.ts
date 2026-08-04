@@ -1,6 +1,7 @@
 import type {
   JsonValue,
   ModelPlanUpdate,
+  ModelPlanUpdateResult,
   ToolCallPlan,
   ToolDescriptor,
   ToolReceipt,
@@ -119,8 +120,27 @@ function updatePlanTool(): RegisteredEffectTool {
           : {}),
         plan: input.plan
       } as unknown as ModelPlanUpdate);
-      return receipt(request, startedAt, updated, ["runtime.control"]);
+      return receipt(
+        request,
+        startedAt,
+        compactPlanUpdateResult(updated),
+        ["runtime.control"]
+      );
     }
+  };
+}
+
+function compactPlanUpdateResult(updated: ModelPlanUpdateResult): JsonValue {
+  return {
+    status: updated.status,
+    revision: updated.plan.revision,
+    stepCount: updated.plan.plan.length,
+    ...(updated.plan.activeStepId ? { activeStepId: updated.plan.activeStepId } : {}),
+    warnings: updated.warnings.map((warning) => ({
+      code: warning.code,
+      message: warning.message,
+      ...(warning.stepId ? { stepId: warning.stepId } : {})
+    }))
   };
 }
 

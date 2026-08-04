@@ -26,6 +26,8 @@ function candidateSession(reviewMode: "off" | "advisory" | "required") {
       } as never
     }
   });
+  delete session.durable.state.deadlineAt;
+  delete session.durable.state.deadlineRemainingMs;
   session.durable.state.mutationFrontier = {
     revision: 1,
     baselineManifestDigest: "0".repeat(64),
@@ -274,7 +276,7 @@ describe("Standard and Strict completion policy", () => {
     });
   });
 
-  it("offers one non-binding repair turn when a passing check is too narrow", () => {
+  it("reports inferred coverage gaps without forcing another Standard turn", () => {
     const session = candidateSession("advisory");
     session.durable.state.mutationFrontier.changedPaths = ["src/index.ts"];
     const passed = validation(session, "passed");
@@ -286,13 +288,6 @@ describe("Standard and Strict completion policy", () => {
     passed.data.claim.subject.exactFiles = ["src/index.ts"];
     session.durable.state.evidence.push(passed);
 
-    const first = completionGateDecision(session);
-    expect(first).toMatchObject({
-      action: "continue",
-      message: expect.stringContaining("inferred behavioral coverage: typecheck")
-    });
-    if (first.action !== "continue") throw new Error("Expected a coverage advisory.");
-    session.durable.state.messages.push({ role: "developer", content: first.message });
     expect(completionGateDecision(session)).toMatchObject({
       action: "complete",
       validationStatus: "passed",

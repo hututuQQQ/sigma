@@ -19,6 +19,7 @@ export {
   projectModelToolDescriptors,
   sessionModelToolProjectionCapabilities,
   sessionSkillProjectionCapabilities,
+  stableSessionModelToolProjectionCapabilities,
   type ModelToolProjectionCapabilities
 } from "./model-tool-projection.js";
 

@@ -24,6 +24,7 @@ import {
   availableModelBudget,
   fitPreparedBudget
 } from "./model-budget-convergence.js";
+import { deterministicSamplingOptions } from "./model-request-policy.js";
 import type { RuntimeSession } from "./types.js";
 
 const SUMMARY_HEADINGS = [
@@ -146,7 +147,7 @@ async function complete(
     messages,
     tools: [],
     toolChoice: "none",
-    temperature: 0,
+    ...deterministicSamplingOptions(gateway),
     maxOutputTokens
   };
   const constrained = gateway as ModelGateway & {

@@ -32,11 +32,11 @@ type IgnoreMatcher = ReturnType<typeof createIgnore>;
 
 export interface HostSnapshotOptions {
   deadline?: number;
+  consumerReserveMs?: number;
   afterDirectoryResolved?: (relative: string, directory: string) => Promise<void>;
   beforeDirectoryScanned?: (relative: string, directory: string) => Promise<void>;
   afterDirectoryScanned?: (relative: string, directory: string) => Promise<void>;
 }
-
 export type HostSnapshotConsumer<T> = (
   snapshot: RepositorySnapshot,
   access: RepositorySnapshotAccess
@@ -337,8 +337,8 @@ export async function withHostRepositorySnapshot<T>(
   signal.throwIfAborted();
   const repositoryRoot = await resolveWorkspacePath(workspace, ".");
   signal.throwIfAborted();
-  const reserve = process.platform === "win32"
-    ? WINDOWS_POST_SCAN_RESERVE_MS : POSIX_POST_SCAN_RESERVE_MS;
+  const cleanupReserve = process.platform === "win32" ? WINDOWS_POST_SCAN_RESERVE_MS : POSIX_POST_SCAN_RESERVE_MS;
+  const reserve = Math.max(cleanupReserve, Math.max(0, options.consumerReserveMs ?? 0));
   const state: HostScanState = {
     files: [], nextQueue: [], scannedEntries: 0, lockedDirectories: 0, truncated: false, deadlineReached: false,
     deadline: Math.max(performance.now(), requestedDeadline - reserve),

@@ -35,6 +35,11 @@ class FakeTransport implements LspTransport {
       if (message.method === "textDocument/documentSymbol") {
         this.push({ jsonrpc: "2.0", id: message.id, result: [{ name: "answer", kind: 12 }] });
       }
+      if (message.method === "workspace/symbol") {
+        this.push({ jsonrpc: "2.0", id: message.id, result: [{
+          name: "answer", kind: 12, location: { uri: "file:///fixture.ts", range: range() }
+        }] });
+      }
       if (message.method === "textDocument/definition") {
         this.push({ jsonrpc: "2.0", id: message.id, result: { uri: "file:///fixture.ts", range: range() } });
       }
@@ -168,6 +173,11 @@ class FakeLspBroker implements ExecutionBroker {
       const message = JSON.parse(body) as { id?: number; method?: string; params?: unknown };
       if (message.method === "initialize") this.respond(message.id, { capabilities: {} });
       if (message.method === "textDocument/documentSymbol") this.respond(message.id, [{ name: "brokered", kind: 12 }]);
+      if (message.method === "workspace/symbol") {
+        this.respond(message.id, [{
+          name: "brokered", kind: 12, location: { uri: "file:///fixture.ts", range: range() }
+        }]);
+      }
       if (message.method === "textDocument/definition") {
         this.respond(message.id, { uri: "file:///definition", range: range() });
       }
@@ -222,6 +232,9 @@ describe("agent-code-intel", () => {
     const transport = new FakeTransport();
     const client = new LspClient({ rootPath: workspace, transport });
     await expect(client.symbols("fixture.ts")).resolves.toEqual([{ name: "answer", kind: 12 }]);
+    await expect(client.workspaceSymbols("fixture.ts", "answer")).resolves.toMatchObject([
+      { name: "answer", kind: 12 }
+    ]);
     await expect(client.definition("fixture.ts", { line: 0, character: 7 })).resolves.toMatchObject({ uri: "file:///fixture.ts" });
     await expect(client.references("fixture.ts", { line: 0, character: 7 })).resolves.toHaveLength(1);
     await expect(client.hover("fixture.ts", { line: 0, character: 7 })).resolves.toMatchObject({ contents: "fixture hover" });
@@ -310,6 +323,9 @@ describe("agent-code-intel", () => {
     const client = new LspClient({ rootPath: workspace, transport, requestTimeoutMs: 15_000 });
     const position = { line: 1, character: 47 };
     expect(await client.symbols("fixture.ts")).toBeTruthy();
+    expect(await client.workspaceSymbols("fixture.ts", "readAnswer")).toMatchObject([
+      expect.objectContaining({ name: "readAnswer" })
+    ]);
     expect(await client.definition("fixture.ts", position)).toBeTruthy();
     expect((await client.references("fixture.ts", position)).length).toBeGreaterThanOrEqual(2);
     expect(await client.hover("fixture.ts", position)).toBeTruthy();
@@ -447,7 +463,12 @@ describe("agent-code-intel", () => {
       expect.objectContaining({ ok: true }),
       expect.objectContaining({ ok: true })
     ]);
-    expect(tool.descriptor).toMatchObject({ executionMode: "parallel", resourceKeys: [] });
+    expect(tool.descriptor).toMatchObject({
+      executionMode: "parallel", resourceKeys: [], approval: "auto"
+    });
+    expect(broker.spawnRequests).toHaveLength(1);
+    await delay(1_100);
+    await expect(execute("later-symbols", "first.ts")).resolves.toMatchObject({ ok: true });
     expect(broker.spawnRequests).toHaveLength(1);
   });
 
@@ -568,7 +589,9 @@ describe("agent-code-intel", () => {
         name: "lsp",
         arguments: {
           operation, file,
-          ...(operation === "symbols" || operation === "diagnostics" ? {} : { line: 0, character: 6 }),
+          ...(operation === "workspace_symbols" ? { query: "oldName" } : {}),
+          ...(["symbols", "workspace_symbols", "diagnostics"].includes(operation)
+            ? {} : { line: 0, character: 6 }),
           ...(operation === "rename" ? { newName: "newName" } : {})
         }
       }, {
@@ -576,7 +599,7 @@ describe("agent-code-intel", () => {
         signal: controller.signal, heartbeat() {}, progress: async () => undefined,
         createArtifact: async () => "artifact"
       });
-    for (const operation of ["symbols", "definition", "references", "hover", "diagnostics"]) {
+    for (const operation of ["symbols", "workspace_symbols", "definition", "references", "hover", "diagnostics"]) {
       await expect(execute(operation)).resolves.toMatchObject({ ok: true });
     }
     await expect(execute("rename", "change")).resolves.toMatchObject({ ok: true });

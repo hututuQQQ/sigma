@@ -36,6 +36,7 @@ import {
   type PreparedModelBudget
 } from "./model-accounting.js";
 import { fitPreparedBudget } from "./model-budget-convergence.js";
+import { deterministicSamplingOptions } from "./model-request-policy.js";
 import { currentFrontierReview } from "./mutation-evidence.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 import type { RuntimeOptions, RuntimeSession } from "./types.js";
@@ -302,7 +303,7 @@ export class LongHorizonCoordinator {
         signal,
         tools: [],
         toolChoice: "none",
-        temperature: 0,
+        ...deterministicSamplingOptions(prepared.gateway),
         maxOutputTokens: prepared.maximumOutput,
         messages: prepared.messages
       };

@@ -188,6 +188,19 @@ describe("ModelSummarizer", () => {
     expect(test.usage[0]).toMatchObject({ role: "summarizer" });
   });
 
+  it("omits temperature when the provider wire profile rejects that control", async () => {
+    const gateway = new SummaryGateway(summaryContent());
+    gateway.capabilities.temperatureControl = false;
+    const test = harness(gateway);
+    await expect(test.summarizer.summarize(
+      test.session,
+      summaryInput(),
+      new AbortController().signal
+    )).resolves.toBeDefined();
+    expect(gateway.requests).toHaveLength(1);
+    expect(Object.hasOwn(gateway.requests[0]!, "temperature")).toBe(false);
+  });
+
   it("rejects malformed output after one attempt so the caller can fall back", async () => {
     const gateway = new SummaryGateway("A free-form answer without the required sections.");
     const test = harness(gateway);

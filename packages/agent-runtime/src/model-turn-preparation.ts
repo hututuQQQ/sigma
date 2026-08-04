@@ -17,7 +17,8 @@ import { isToolAllowed } from "agent-tools";
 import { refreshContextArchive } from "./context-archive-refresh.js";
 import {
   projectModelToolDescriptors,
-  sessionModelToolProjectionCapabilities
+  sessionModelToolProjectionCapabilities,
+  stableSessionModelToolProjectionCapabilities
 } from "./effect-helpers.js";
 import type { EffectRunnerOptions } from "./effect-runner.js";
 import {
@@ -144,7 +145,8 @@ async function repositoryTurnContext(
     query,
     signal,
     {
-      workspaceStateVersion: session.durable.state.mutationFrontier.currentStateDigest
+      workspaceStateVersion: session.durable.state.mutationFrontier.currentStateDigest,
+      focusPaths: session.durable.state.mutationFrontier.changedPaths
     }
   );
   return {
@@ -163,6 +165,7 @@ async function applyProjectedResourceBoundary(
   available: BudgetAmounts,
   initial: BudgetedModelTurn
 ): Promise<BudgetedModelTurn> {
+  if (preparation.modelTurnBoundaryStage === "final") return initial;
   const prepareBoundaryTurn = async (
     stage: ModelTurnBoundaryStage
   ): Promise<BudgetedModelTurn> => {
@@ -194,13 +197,15 @@ export async function prepareModelAttempt(
   session: RuntimeSession,
   turnId: number,
   signal: AbortSignal,
-  hookContext: readonly ContextItem[]
+  hookContext: readonly ContextItem[],
+  modelTurnBoundaryStage?: ModelTurnBoundaryStage
 ): Promise<PreparedModelAttempt> {
   const modelDescriptors = options.runtime.tools.modelDescriptors?.()
     ?? options.runtime.tools.descriptors();
-  const { dynamic, capabilities } = await repositoryTurnContext(
-    repositoryContext, session, signal
-  );
+  const { dynamic } = modelTurnBoundaryStage === "final"
+    ? { dynamic: [] as ContextItem[] }
+    : await repositoryTurnContext(repositoryContext, session, signal);
+  const capabilities = stableSessionModelToolProjectionCapabilities(session);
   const descriptors = withReadBatchDescriptor(projectModelToolDescriptors(
     modelDescriptors.filter((item) =>
       isToolAllowed(item, session.durable.mode) && profileAllowsTool(session, item)),
@@ -225,7 +230,8 @@ export async function prepareModelAttempt(
     available,
     defaultOutputReserveTokens: options.outputReserveTokens,
     history: projected.history,
-    archive: projected.archiveProjection.archive?.item
+    archive: projected.archiveProjection.archive?.item,
+    ...(modelTurnBoundaryStage ? { modelTurnBoundaryStage } : {})
   };
   let prepared: BudgetedModelTurn;
   try {

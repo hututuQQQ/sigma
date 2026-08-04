@@ -7,7 +7,7 @@ import {
   projectModelToolDescriptors,
   requestTargets,
   requiresInstructionReplan,
-  sessionModelToolProjectionCapabilities,
+  stableSessionModelToolProjectionCapabilities,
   steeringRestart
 } from "./effect-helpers.js";
 import { turnPayload, type ToolAttempt } from "./effect-runner-helpers.js";
@@ -84,7 +84,7 @@ function projectedDirectTools(
     descriptors.filter((descriptor) =>
       isToolAllowed(descriptor, session.durable.mode)
       && profileAllowsTool(session, descriptor)),
-    sessionModelToolProjectionCapabilities(session)
+    stableSessionModelToolProjectionCapabilities(session)
   );
 }
 

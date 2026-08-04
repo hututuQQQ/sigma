@@ -115,6 +115,10 @@ export function toolReceipt(value: unknown): ToolReceipt | null {
 
 export function receiptContent(receipt: ToolReceipt): string {
   const heading = `Tool result: ${receipt.ok ? "succeeded" : "failed"}`;
+  const serializedResult = receipt.result === undefined
+    ? undefined : JSON.stringify(receipt.result);
+  const outputAlreadyProjectsResult = serializedResult !== undefined
+    && serializedResult === receipt.output;
   const diagnostics = [...new Set([
     ...receipt.outcome.diagnosticCodes,
     ...receipt.diagnostics
@@ -142,7 +146,8 @@ export function receiptContent(receipt: ToolReceipt): string {
       evidence: receipt.evidence.slice(0, 6).map((item) =>
         `${item.kind}:${item.status}:${compactString(item.summary, 120)}`)
     } : {}),
-    ...(receipt.result === undefined ? {} : { result: boundedJson(receipt.result) }),
+    ...(receipt.result === undefined || outputAlreadyProjectsResult
+      ? {} : { result: boundedJson(receipt.result) }),
     ...(changes ? { changes } : {}),
     ...(receipt.artifacts.length > 0 && artifacts.length === 0
       ? { artifactIds: receipt.artifacts.slice(0, 6).map((item) => compactString(item, 128)) } : {}),

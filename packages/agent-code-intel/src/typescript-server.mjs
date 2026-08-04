@@ -193,6 +193,10 @@ function documentSymbols(fileName) {
   return flatten(tree?.childItems);
 }
 
+function workspaceSymbols(query) {
+  return (service.getNavigateToItems(String(query ?? ""), 50, undefined, true) ?? []).filter((item) => withinRoot(path.resolve(item.fileName))).map((item) => ({ name: item.name, kind: symbolKinds.get(item.kind) ?? 13, location: location(path.resolve(item.fileName), item.textSpan), ...(item.containerName ? { containerName: item.containerName } : {}) }));
+}
+
 function definition(fileName, position) {
   const values = service.getDefinitionAtPosition(fileName, offset(fileName, position)) ?? [];
   return values.map((item) => location(path.resolve(item.fileName), item.textSpan));
@@ -320,7 +324,7 @@ function capabilities(params) {
       documentSymbolProvider: true,
       hoverProvider: true,
       referencesProvider: true,
-      renameProvider: true,
+      renameProvider: true, workspaceSymbolProvider: true,
       textDocumentSync: { openClose: true, change: 1 }
     },
     serverInfo: {
@@ -335,7 +339,7 @@ function request(method, params) {
   if (method === "initialize") return capabilities(params);
   if (method === "shutdown") { shuttingDown = true; return null; }
   if (projectConfigurationError) throw projectConfigurationError;
-  if (method === "textDocument/documentSymbol") return documentSymbols(fileName);
+  if (method === "textDocument/documentSymbol") return documentSymbols(fileName); if (method === "workspace/symbol") return workspaceSymbols(params.query);
   if (method === "textDocument/definition") return definition(fileName, params.position);
   if (method === "textDocument/references") return references(fileName, params.position);
   if (method === "textDocument/hover") return hover(fileName, params.position);

@@ -11,13 +11,15 @@ import {
 } from "agent-protocol";
 import { approximateTokens, messageTokens } from "agent-context";
 import { currentAuxiliaryUsage } from "./assurance-budget.js";
+import {
+  batchMadeMarginalProgress,
+  emptyMarginalProgressHistory,
+  recordMarginalProgress,
+  type ProgressBatch
+} from "./long-horizon-progress.js";
 import type { RuntimeSession } from "./types.js";
 
-interface SettledBatch {
-  assistant: ModelMessage;
-  calls: NonNullable<ModelMessage["toolCalls"]>;
-  receipts: ToolReceipt[];
-}
+type SettledBatch = ProgressBatch;
 export interface EvidenceAttentionWindow {
   basisDigest: string;
   tokenCount: number;
@@ -37,10 +39,6 @@ export interface EvidenceAttentionWindow {
 const MINIMUM_EVIDENCE_ATTENTION_TOKENS = 8_192;
 const MAXIMUM_EVIDENCE_ATTENTION_TOKENS = 12_288;
 const MAXIMUM_RESULT_ATTENTION_TOKENS = 3_072;
-const COMMITMENT_EVIDENCE_KINDS = new Set([
-  "workspace_delta", "repository_delta", "validation", "review",
-  "user_waiver", "restoration", "checkpoint", "child_outcome"
-]);
 const SUMMARY_ARGUMENT_KEYS = new Set([
   "command", "executable", "args", "path", "paths", "query", "pattern",
   "purpose", "subjects", "cwd", "offset", "limit", "message"
@@ -143,56 +141,6 @@ function actionOutcome(batch: SettledBatch, index: number): LongHorizonActionOut
   };
 }
 
-function nonemptyWorkspaceDelta(receipt: ToolReceipt): boolean {
-  const delta = receipt.workspaceDelta;
-  return Boolean(delta
-    && delta.added.length + delta.modified.length + delta.deleted.length > 0);
-}
-
-function enclosingContainerMutation(receipt: ToolReceipt): boolean {
-  return (receipt.evidence ?? []).some((evidence) => {
-    if (evidence.kind !== "diagnostic"
-      || !evidence.data
-      || typeof evidence.data !== "object"
-      || Array.isArray(evidence.data)) return false;
-    return (evidence.data as Record<string, unknown>).source
-      === "enclosing_container_mutation";
-  });
-}
-
-function objectiveEvidence(receipt: ToolReceipt): boolean {
-  return (receipt.evidence ?? []).some((evidence) =>
-    COMMITMENT_EVIDENCE_KINDS.has(evidence.kind));
-}
-
-/**
- * Identify objective commitment transitions without deciding whether an
- * experiment was semantically useful. With an active plan, observations and
- * arbitrary mutations consume attention until the plan or evidence advances.
- */
-function advancesCommitmentBasis(batch: SettledBatch, activePlan: boolean): boolean {
-  return batch.calls.some((call, index) => {
-    const receipt = batch.receipts[index]!;
-    if (call.name === "update_plan") return receipt.ok;
-    if (call.name === "validate" || call.name === "request_review") return true;
-    if (activePlan) {
-      // The plan is the model-declared work contract. Do not classify paths or
-      // commands to decide whether a mutation advanced it; the one permitted
-      // strategist reset remains advisory.
-      return (receipt.evidence ?? []).some((evidence) =>
-        COMMITMENT_EVIDENCE_KINDS.has(evidence.kind)
-        && evidence.kind !== "workspace_delta"
-        && evidence.kind !== "repository_delta");
-    }
-    return nonemptyWorkspaceDelta(receipt)
-      || enclosingContainerMutation(receipt)
-      || objectiveEvidence(receipt)
-      || (receipt.actualEffects ?? receipt.observedEffects)
-        .some((effect) =>
-          effect === "filesystem.write" || effect === "repository.write");
-  });
-}
-
 function resultAttentionTokens(receipt: ToolReceipt): number {
   return Math.min(MAXIMUM_RESULT_ATTENTION_TOKENS, approximateTokens(receipt.output));
 }
@@ -228,12 +176,14 @@ export function evidenceAttentionWindow(
   session: RuntimeSession
 ): EvidenceAttentionWindow {
   const batches = settledLongHorizonBatches(session);
-  const activePlan = session.durable.state.plan.nodes.some((node) =>
-    node.status === "pending" || node.status === "in_progress"
-    || node.status === "blocked");
   let lastCommitment = -1;
+  const progressHistory = emptyMarginalProgressHistory();
   for (const [index, batch] of batches.entries()) {
-    if (advancesCommitmentBasis(batch, activePlan)) lastCommitment = index;
+    const outcome = actionOutcome(batch, index + 1);
+    if (batchMadeMarginalProgress(batch, outcome, progressHistory)) {
+      lastCommitment = index;
+    }
+    recordMarginalProgress(progressHistory, batch, outcome);
   }
   const deliberation = batches.slice(lastCommitment + 1);
   const outcomes = deliberation.map((batch, index) =>
@@ -356,15 +306,6 @@ export function withAccountedAssurance(
   };
 }
 
-function sameObjectiveOutcome(
-  left: LongHorizonActionOutcome | undefined,
-  right: LongHorizonActionOutcome
-): boolean {
-  return Boolean(left
-    && left.callDigest === right.callDigest
-    && left.resultDigest === right.resultDigest);
-}
-
 export function nextLongHorizonState(session: RuntimeSession): LongHorizonState {
   const current = withAccountedAssurance(session, session.durable.state.longHorizon);
   const batches = settledLongHorizonBatches(session);
@@ -380,13 +321,18 @@ export function nextLongHorizonState(session: RuntimeSession): LongHorizonState 
   }
   if (current.settledBatchCount === batches.length) return current;
   let next = { ...current };
+  const progressHistory = emptyMarginalProgressHistory();
+  const historyStart = Math.max(0, current.settledBatchCount - 8);
+  for (let index = historyStart; index < current.settledBatchCount; index += 1) {
+    const batch = batches[index]!;
+    recordMarginalProgress(progressHistory, batch, actionOutcome(batch, index + 1));
+  }
   for (let index = current.settledBatchCount; index < batches.length; index += 1) {
     const batch = batches[index]!;
     const outcome = actionOutcome(batch, index + 1);
-    const prior = next.recentOutcomes.at(-1);
-    const duplicateStreak = sameObjectiveOutcome(prior, outcome)
-      ? next.duplicateStreak + 1
-      : 1;
+    const progressed = batchMadeMarginalProgress(batch, outcome, progressHistory);
+    const duplicateStreak = progressed ? 0 : next.duplicateStreak + 1;
+    recordMarginalProgress(progressHistory, batch, outcome);
     next = {
       ...next,
       settledBatchCount: index + 1,

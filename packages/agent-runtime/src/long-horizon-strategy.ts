@@ -43,7 +43,7 @@ export function strategyMessages(
     role: "system",
     content: [
       "You are Sigma's fresh-context long-horizon strategist.",
-      "A strategy reset was requested by the main model, a proposed user-input suspension, an exact repeated action/result, a bounded evidence-attention window, or an objective resource band.",
+      "A strategy reset was requested by the main model, a proposed user-input suspension, consecutive settled batches without durable marginal progress, a bounded evidence-attention window, or an objective resource band.",
       "Use only the supplied user instructions, checklist, mutation frontier, evidence, and bounded receipt summaries.",
       "Receipt summaries are ordered oldest to newest. Treat recentOutcomes as the authoritative current window; when an older evidence-attention summary conflicts with a newer receipt, use the newer receipt.",
       "The runtime cannot judge task semantics. Decide whether the evidence supports more exploration, implementing the best current candidate, revising the plan, validating the current result, or requesting user input.",
@@ -219,7 +219,11 @@ export function strategistTrigger(session: RuntimeSession): StrategyTrigger | un
       : "model_request";
   }
   if (state.assurance.strategistMode !== "adaptive") return undefined;
-  if (state.duplicateStreak >= state.assurance.duplicateThreshold) {
+  // The first observation establishes a result baseline. Match OpenCode's
+  // three-call doom-loop boundary by resetting after the following two
+  // no-progress batches under the default duplicateThreshold=3 policy.
+  const noProgressThreshold = Math.max(2, state.assurance.duplicateThreshold - 1);
+  if (state.duplicateStreak >= noProgressThreshold) {
     return "duplicate_result";
   }
   if (evidenceAttentionWindow(session).saturated) return "evidence_window";

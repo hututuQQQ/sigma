@@ -1,4 +1,5 @@
 import type { RunOutcome } from "agent-protocol";
+import type { ProcessHandle, ProcessPollResult } from "agent-execution";
 import type { ProcessExecutionPort } from "agent-platform";
 import type { RuntimeSession } from "./types.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
@@ -15,6 +16,96 @@ async function emitOutput(
   return 1;
 }
 
+interface TerminationAttempt {
+  handle: ProcessHandle;
+  result?: ProcessPollResult;
+  error?: unknown;
+}
+
+async function terminateConcurrently(
+  handles: readonly ProcessHandle[],
+  execution: ProcessExecutionPort,
+  signal?: AbortSignal
+): Promise<TerminationAttempt[]> {
+  return await Promise.all(handles.map(async (handle) => {
+    try {
+      const result = await execution.terminate!(handle, {
+        timeoutMs: 10_000,
+        ...(signal ? { signal } : {})
+      });
+      const artifactIds = result.outputArtifacts?.map((item) => item.brokerArtifactId) ?? [];
+      if (artifactIds.length > 0) {
+        await execution.releaseOutputArtifacts?.(artifactIds).catch(() => undefined);
+      }
+      return { handle, result };
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      return { handle, error };
+    }
+  }));
+}
+
+async function recordTerminations(
+  session: RuntimeSession,
+  attempts: readonly TerminationAttempt[],
+  reason: string,
+  emit: RuntimeEventEmitter
+): Promise<number> {
+  let emitted = 0;
+  for (const { handle, result, error } of attempts) {
+    if (result) {
+      emitted += await emitOutput(session, handle.id, "stdout", result.stdout, emit);
+      emitted += await emitOutput(session, handle.id, "stderr", result.stderr, emit);
+      await emit(session, "process.exited", "runtime", {
+        processId: handle.id,
+        exitCode: result.exitCode,
+        ...(result.signal ? { signal: result.signal } : {}),
+        state: result.state,
+        reason
+      });
+    } else {
+      await emit(session, "process.lost", "runtime", {
+        processId: handle.id,
+        reason: `${reason} failed: ${error instanceof Error ? error.message : String(error)}`
+      });
+    }
+    emitted += 1;
+    session.execution.processHandles.delete(handle.id);
+  }
+  return emitted;
+}
+
+async function terminateHandles(
+  session: RuntimeSession,
+  handles: readonly ProcessHandle[],
+  execution: ProcessExecutionPort,
+  emit: RuntimeEventEmitter,
+  reason: string,
+  signal?: AbortSignal
+): Promise<number> {
+  const attempts = await terminateConcurrently(handles, execution, signal);
+  return await recordTerminations(session, attempts, reason, emit);
+}
+
+/**
+ * Natural completion owns cleanup of ordinary session-lifecycle processes.
+ * Deliverables remain model-owned until an explicit verified handoff, so the
+ * completion gate can still reject an accidentally abandoned service.
+ */
+export async function settleSessionProcessesForCompletion(
+  session: RuntimeSession,
+  execution: ProcessExecutionPort | undefined,
+  emit: RuntimeEventEmitter,
+  signal: AbortSignal
+): Promise<number> {
+  const handles = [...session.execution.processHandles.values()]
+    .filter((handle) => (handle.lifecycle ?? "session") === "session");
+  if (handles.length === 0 || !execution?.terminate) return 0;
+  return await terminateHandles(
+    session, handles, execution, emit, "run_completed_session_settlement", signal
+  );
+}
+
 /** Ensures a terminal run never leaves runtime-local background work behind. */
 export async function terminateRunProcesses(
   session: RuntimeSession,
@@ -28,33 +119,11 @@ export async function terminateRunProcesses(
       code: "process_termination_unavailable"
     });
   }
-  let emitted = 0;
-  for (const handle of [...session.execution.processHandles.values()]) {
-    try {
-      const result = await execution.terminate(handle, { timeoutMs: 10_000 });
-      const artifactIds = result.outputArtifacts?.map((item) => item.brokerArtifactId) ?? [];
-      if (artifactIds.length > 0) {
-        await execution.releaseOutputArtifacts?.(artifactIds).catch(() => undefined);
-      }
-      emitted += await emitOutput(session, handle.id, "stdout", result.stdout, emit);
-      emitted += await emitOutput(session, handle.id, "stderr", result.stderr, emit);
-      await emit(session, "process.exited", "runtime", {
-        processId: handle.id,
-        exitCode: result.exitCode,
-        ...(result.signal ? { signal: result.signal } : {}),
-        state: result.state,
-        reason: `run_${outcome.kind}`
-      });
-      emitted += 1;
-    } catch (error) {
-      await emit(session, "process.lost", "runtime", {
-        processId: handle.id,
-        reason: `Termination during ${outcome.kind} failed: ${error instanceof Error ? error.message : String(error)}`
-      });
-      emitted += 1;
-    } finally {
-      session.execution.processHandles.delete(handle.id);
-    }
-  }
-  return emitted;
+  return await terminateHandles(
+    session,
+    [...session.execution.processHandles.values()],
+    execution,
+    emit,
+    `run_${outcome.kind}`
+  );
 }

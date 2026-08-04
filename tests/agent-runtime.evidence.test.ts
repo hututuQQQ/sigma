@@ -79,7 +79,9 @@ function session(evidence: EvidenceRecord[]): RuntimeSession {
   });
   state.receipts = [receipt()];
   state.evidence = [proofEvidence(), ...evidence];
-  return runtimeSessionFixture({ state, seq: 1 });
+  const active = runtimeSessionFixture({ state, seq: 1 });
+  delete active.durable.state.deadlineAt;
+  return active;
 }
 
 const validationPlan: ToolCallPlan = {

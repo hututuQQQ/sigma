@@ -33,6 +33,10 @@ import {
 } from "../packages/agent-runtime/src/long-horizon-strategy.js";
 import { longHorizonLedger } from "../packages/agent-runtime/src/long-horizon-ledger.js";
 import { progressCheckpoints } from "../packages/agent-runtime/src/progress-checkpoint.js";
+import {
+  emptyMarginalProgressHistory,
+  marginalProgressSignals
+} from "../packages/agent-runtime/src/long-horizon-progress.js";
 import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
 import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
 
@@ -46,6 +50,9 @@ function addBatch(
     ok?: boolean;
     reasoningContent?: string;
     actualEffects?: ToolReceipt["actualEffects"];
+    workspaceDelta?: ToolReceipt["workspaceDelta"];
+    artifacts?: string[];
+    evidence?: ToolReceipt["evidence"];
   } = {}
 ): void {
   const callId = `call-${index}`;
@@ -76,9 +83,10 @@ function addBatch(
     },
     observedEffects: ["filesystem.read"],
     actualEffects: options.actualEffects ?? ["filesystem.read"],
-    artifacts: [],
+    artifacts: options.artifacts ?? [],
     diagnostics: [],
-    evidence: [],
+    evidence: options.evidence ?? [],
+    ...(options.workspaceDelta ? { workspaceDelta: options.workspaceDelta } : {}),
     startedAt: "2026-01-01T00:00:00.000Z",
     completedAt: "2026-01-01T00:00:01.000Z"
   };
@@ -281,6 +289,72 @@ function coordinatorHarness(
 }
 
 describe("objective long-horizon triggers", () => {
+  it("forms marginal progress only from durable vector components", () => {
+    const calls = [{ id: "progress-call", name: "update_plan", arguments: {} }];
+    const assistant: ModelMessage = { role: "assistant", content: "", toolCalls: calls };
+    const receipt: ToolReceipt = {
+      callId: "progress-call",
+      ok: true,
+      output: "same result",
+      outcome: { status: "succeeded", output: "same result", diagnosticCodes: [] },
+      observedEffects: ["filesystem.read"],
+      actualEffects: ["filesystem.read"],
+      workspaceDelta: { added: [], modified: ["src/current.ts"], deleted: [] },
+      artifacts: ["artifact-1"],
+      diagnostics: [],
+      evidence: [{
+        evidenceId: "validation-1",
+        sessionId: "session",
+        runId: "run",
+        kind: "validation",
+        status: "failed",
+        createdAt: "2026-01-01T00:00:01.000Z",
+        producer: { authority: "runtime" },
+        summary: "Validation failed.",
+        data: {
+          schemaVersion: 1,
+          validator: "test",
+          exitCode: 1,
+          frontierRevision: 1,
+          stateDigest: "a".repeat(64),
+          coveredPaths: ["src/current.ts"]
+        }
+      }],
+      startedAt: "2026-01-01T00:00:00.000Z",
+      completedAt: "2026-01-01T00:00:01.000Z"
+    };
+    const seen = emptyMarginalProgressHistory();
+    seen.resultDigests.add("seen");
+    expect(marginalProgressSignals(
+      { assistant, calls, receipts: [receipt] },
+      { batch: 1, toolNames: ["update_plan"], callDigest: "call", resultDigest: "seen", summary: "" },
+      seen
+    )).toEqual([
+      "workspace_revision", "plan_revision", "validation_evidence", "artifact"
+    ]);
+    seen.validationEvidenceIds.add("validation-1");
+    seen.artifactIds.add("artifact-1");
+    expect(marginalProgressSignals(
+      { assistant, calls, receipts: [receipt] },
+      { batch: 2, toolNames: ["update_plan"], callDigest: "call", resultDigest: "seen", summary: "" },
+      seen
+    )).toEqual(["workspace_revision", "plan_revision"]);
+    expect(marginalProgressSignals(
+      {
+        assistant,
+        calls: [{ id: "progress-call", name: "read", arguments: {} }],
+        receipts: [{
+          ...receipt,
+          workspaceDelta: { added: [], modified: [], deleted: [] },
+          artifacts: [],
+          evidence: []
+        }]
+      },
+      { batch: 3, toolNames: ["read"], callDigest: "next", resultDigest: "new", summary: "" },
+      seen
+    )).toEqual(["discriminating_result"]);
+  });
+
   it("keeps pure settled-batch telemetry out of the model-visible prompt identity", () => {
     const session = runtimeSessionFixture();
     const before = longHorizonLedger(session);
@@ -306,7 +380,7 @@ describe("objective long-horizon triggers", () => {
     expect(session.durable.state.longHorizon).toMatchObject({
       schemaVersion: 1,
       settledBatchCount: 12,
-      duplicateStreak: 1,
+      duplicateStreak: 0,
       strategyRequested: false
     });
     expect(strategistTrigger(session)).toBeUndefined();
@@ -314,7 +388,7 @@ describe("objective long-horizon triggers", () => {
     expect(session.durable.state.outcome).toBeUndefined();
   });
 
-  it("asks a fresh model for semantic judgement after distinct exploration fills an evidence-attention window", () => {
+  it("treats distinct results as progress instead of charging an evidence-window reset", () => {
     const session = runtimeSessionFixture();
     session.durable.state.messages.push({ role: "user", content: "Investigate." });
     refresh(session);
@@ -329,12 +403,12 @@ describe("objective long-horizon triggers", () => {
 
     const attention = evidenceAttentionWindow(session);
     expect(attention).toMatchObject({
-      saturated: true,
-      batchCount: 3
+      saturated: false,
+      batchCount: 0
     });
-    expect(attention.tokenCount).toBeGreaterThanOrEqual(attention.tokenLimit);
-    expect(session.durable.state.longHorizon.duplicateStreak).toBe(1);
-    expect(strategistTrigger(session)).toBe("evidence_window");
+    expect(attention.tokenCount).toBe(0);
+    expect(session.durable.state.longHorizon.duplicateStreak).toBe(0);
+    expect(strategistTrigger(session)).toBeUndefined();
     expect(progressCheckpoints(session)).toEqual([]);
     expect(session.durable.state.outcome).toBeUndefined();
   });
@@ -351,6 +425,7 @@ describe("objective long-horizon triggers", () => {
       output: "{\"status\":\"accepted\"}"
     });
     addBatch(plan, 2, {
+      output: "observed-0",
       reasoningContent: "reason about different evidence ".repeat(600)
     });
     refresh(plan);
@@ -363,14 +438,21 @@ describe("objective long-horizon triggers", () => {
     mutation.durable.state.messages.push({ role: "user", content: "Investigate." });
     refresh(mutation);
     addBatch(mutation, 0, {
+      name: "shell",
+      actualEffects: ["filesystem.write"],
+      output: "same mutation result",
       reasoningContent: "reason about evidence ".repeat(600)
     });
     addBatch(mutation, 1, {
       name: "shell",
-      actualEffects: ["process.spawn", "filesystem.write"],
-      output: "changed"
+      actualEffects: ["filesystem.write"],
+      output: "same mutation result",
+      workspaceDelta: { added: [], modified: ["src/current.ts"], deleted: [] }
     });
     addBatch(mutation, 2, {
+      name: "shell",
+      actualEffects: ["filesystem.write"],
+      output: "same mutation result",
       reasoningContent: "reason about different evidence ".repeat(600)
     });
     refresh(mutation);
@@ -391,6 +473,7 @@ describe("objective long-horizon triggers", () => {
       ok: false
     });
     addBatch(validation, 2, {
+      output: "observed-0",
       reasoningContent: "reason about different evidence ".repeat(600)
     });
     refresh(validation);
@@ -400,7 +483,7 @@ describe("objective long-horizon triggers", () => {
     });
   });
 
-  it("does not let arbitrary mutations hide a stale active plan from the token attention boundary", () => {
+  it("does not let a declared write effect without a workspace revision manufacture progress", () => {
     const session = runtimeSessionFixture();
     session.durable.state.messages.push({ role: "user", content: "Implement the plan." });
     session.durable.state.plan = {
@@ -431,20 +514,21 @@ describe("objective long-horizon triggers", () => {
         name: "shell",
         arguments: { command: `generate-probe ${index}` },
         actualEffects: ["process.spawn", "filesystem.write"],
-        output: `created distinct probe ${index}`,
+        output: "no observable workspace revision",
         reasoningContent: `${String(index)}:${"reason about evidence ".repeat(700)}`
       });
       refresh(session);
     }
 
     expect(evidenceAttentionWindow(session)).toMatchObject({
-      saturated: true,
-      batchCount: 3
+      saturated: false,
+      batchCount: 2
     });
-    expect(strategistTrigger(session)).toBe("evidence_window");
+    expect(session.durable.state.longHorizon.duplicateStreak).toBe(2);
+    expect(strategistTrigger(session)).toBe("duplicate_result");
   });
 
-  it("triggers only after the configured number of exactly repeated calls and results", () => {
+  it("triggers after two post-baseline batches make no marginal progress", () => {
     const repeated = runtimeSessionFixture();
     repeated.durable.state.messages.push({ role: "user", content: "Investigate." });
     refresh(repeated);
@@ -455,7 +539,7 @@ describe("objective long-horizon triggers", () => {
       });
       refresh(repeated);
     }
-    expect(repeated.durable.state.longHorizon.duplicateStreak).toBe(3);
+    expect(repeated.durable.state.longHorizon.duplicateStreak).toBe(2);
     expect(strategistTrigger(repeated)).toBe("duplicate_result");
 
     const merelySimilar = runtimeSessionFixture();
@@ -468,7 +552,7 @@ describe("objective long-horizon triggers", () => {
       });
       refresh(merelySimilar);
     }
-    expect(merelySimilar.durable.state.longHorizon.duplicateStreak).toBe(1);
+    expect(merelySimilar.durable.state.longHorizon.duplicateStreak).toBe(0);
     expect(strategistTrigger(merelySimilar)).toBeUndefined();
   });
 
@@ -616,15 +700,15 @@ describe("objective long-horizon triggers", () => {
     const session = runtimeSessionFixture();
     session.durable.state.messages.push({ role: "user", content: "Investigate." });
     refresh(session);
-    for (let index = 0; index < 3; index += 1) {
+    for (let index = 0; index < 2; index += 1) {
       addBatch(session, index, {
         name: "shell",
         arguments: {
           command: `inspect --candidate ${index}`,
           env: { API_TOKEN: "do-not-project-secret-values" }
         },
-        output: `signal-${index}`,
-        reasoningContent: `${String(index)}:${"reason about evidence ".repeat(700)}`
+        output: "same signal",
+        reasoningContent: `${String(index)}:${"reason about evidence ".repeat(index === 0 ? 10 : 3_000)}`
       });
       refresh(session);
     }

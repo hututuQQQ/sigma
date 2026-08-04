@@ -25,7 +25,7 @@ export function longHorizonLedger(session: RuntimeSession): ContextItem {
   });
   const lines = [
     "Durable long-horizon state (objective action/resource signals; never wall-clock based):",
-    `- exact same call-and-result streak: ${state.duplicateStreak}/${state.assurance.duplicateThreshold}`,
+    `- settled batches without durable marginal progress: ${state.duplicateStreak}/${Math.max(2, state.assurance.duplicateThreshold - 1)}`,
     `- main model requested strategy help: ${state.strategyRequested ? "yes" : "no"}`,
     `- configured resource band crossed: ${state.resourceBandTriggered ? "yes" : "no"}`,
     ...(strategy && strategyCurrent

@@ -11,106 +11,23 @@ import {
   type LspWorkspaceEdit
 } from "agent-code-intel";
 import type { ExecutionBroker } from "agent-execution";
-import type { EvidenceRecord, JsonValue, ToolCallPlan, ToolDescriptor, ToolReceipt, ToolRequest } from "agent-protocol";
+import type { EvidenceRecord, JsonValue, ToolReceipt, ToolRequest } from "agent-protocol";
 import { applyUnifiedPatch } from "./atomic-patch.js";
+import {
+  lspObject,
+  lspOperation,
+  lspPosition,
+  lspString,
+  lspToolDescriptor,
+  selectLspPreset,
+  type LspOperation
+} from "./lsp-tool-definition.js";
 import type { RegisteredEffectTool } from "./registry.js";
 
 export interface CodeIntelToolOptions {
   broker: ExecutionBroker;
   presets: LanguageServerPreset[];
   additionalReadRoots?: string[];
-}
-
-type Operation = "symbols" | "definition" | "references" | "hover" | "diagnostics" | "rename";
-
-function object(value: JsonValue): Record<string, JsonValue> {
-  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
-}
-
-function string(input: Record<string, JsonValue>, name: string): string {
-  const value = input[name];
-  if (typeof value !== "string" || !value) throw new Error(`Tool argument '${name}' must be a non-empty string.`);
-  return value;
-}
-
-function operation(input: Record<string, JsonValue>): Operation {
-  const value = string(input, "operation");
-  if (!["symbols", "definition", "references", "hover", "diagnostics", "rename"].includes(value)) {
-    throw new Error(`Unsupported LSP operation '${value}'.`);
-  }
-  return value as Operation;
-}
-
-function position(input: Record<string, JsonValue>): LspPosition {
-  const line = input.line;
-  const character = input.character;
-  if (!Number.isSafeInteger(line) || (line as number) < 0 || !Number.isSafeInteger(character) || (character as number) < 0) {
-    throw new Error("line and character must be non-negative integers.");
-  }
-  return { line: line as number, character: character as number };
-}
-
-function languageFor(file: string): string {
-  return ({
-    ".ts": "typescript", ".tsx": "typescriptreact", ".js": "javascript", ".jsx": "javascriptreact",
-    ".py": "python", ".rs": "rust", ".go": "go"
-  } as Record<string, string>)[path.extname(file).toLowerCase()] ?? "";
-}
-
-function selectPreset(presets: LanguageServerPreset[], file: string): LanguageServerPreset {
-  const language = languageFor(file);
-  const preset = presets.find((candidate) => candidate.available && candidate.languages.includes(language));
-  if (preset) return preset;
-  const reason = presets.find((candidate) => candidate.languages.includes(language))?.unavailableReason;
-  throw Object.assign(new Error(reason ?? `No language server is configured for '${file}'.`), { code: "lsp_unavailable" });
-}
-
-function callPlan(value: JsonValue, runMode: "analyze" | "change"): ToolCallPlan {
-  const input = object(value);
-  const op = operation(input);
-  const file = string(input, "file");
-  if (op === "rename" && runMode !== "change") throw new Error("LSP rename is available only in change mode.");
-  const effects: ToolCallPlan["exactEffects"] = ["filesystem.read", "process.spawn.readonly"];
-  if (op === "rename") effects.push("filesystem.write");
-  return {
-    exactEffects: effects,
-    readPaths: [file],
-    writePaths: op === "rename" ? ["."] : [],
-    network: "none",
-    processMode: "background",
-    checkpointScope: op === "rename" ? ["."] : [],
-    idempotence: op === "rename" ? "non_replayable" : "read_only"
-  };
-}
-
-function descriptor(): ToolDescriptor {
-  return {
-    name: "lsp",
-    description: "Query a sandboxed language server for symbols, definitions, references, hover, diagnostics, or an atomic rename.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        operation: { type: "string", enum: ["symbols", "definition", "references", "hover", "diagnostics", "rename"] },
-        file: { type: "string" },
-        line: { type: "integer", minimum: 0 },
-        character: { type: "integer", minimum: 0 },
-        newName: { type: "string" }
-      },
-      required: ["operation", "file"],
-      additionalProperties: false
-    },
-    possibleEffects: ["filesystem.read", "filesystem.write", "process.spawn.readonly"],
-    maximumEffects: ["filesystem.read", "filesystem.write", "process.spawn.readonly"],
-    availableModes: ["analyze", "change"],
-    executionMode: "parallel",
-    resourceKeys: [],
-    contextPathArguments: ["file"],
-    approval: "prompt",
-    idempotent: false,
-    workspaceDeltaAuthority: "structured_tool_receipt",
-    timeoutMs: 120_000,
-    prepare: (value, context) => callPlan(value, context.runMode)
-  };
 }
 
 interface PooledLspClient {
@@ -125,7 +42,10 @@ interface LspClientLease {
   release(discard?: boolean): void;
 }
 
-const LSP_CLIENT_IDLE_TIMEOUT_MS = 1_000;
+// Model turns routinely take longer than a second. Keep the indexed server
+// warm across several tool turns so navigation does not repeatedly pay the
+// spawn, project discovery, and indexing cost.
+const LSP_CLIENT_IDLE_TIMEOUT_MS = 120_000;
 const LSP_FAILURE_COOLDOWN_MS = 60_000;
 
 interface LspFailureCooldown {
@@ -314,20 +234,24 @@ async function applyRename(workspace: string, edit: LspWorkspaceEdit): Promise<A
   return await applyUnifiedPatch(workspace, patches.join("\n"));
 }
 
-async function query(client: LspClient, op: Operation, input: Record<string, JsonValue>, signal: AbortSignal): Promise<unknown> {
-  const file = string(input, "file");
+async function query(client: LspClient, op: LspOperation, input: Record<string, JsonValue>, signal: AbortSignal): Promise<unknown> {
+  const file = lspString(input, "file");
   if (op === "symbols") return await client.symbols(file, signal);
+  if (op === "workspace_symbols") {
+    const result = await client.workspaceSymbols(file, lspString(input, "query"), signal);
+    return Array.isArray(result) ? result.slice(0, 100) : result;
+  }
   if (op === "diagnostics") return await client.documentDiagnostics(file, signal);
-  const at = position(input);
+  const at = lspPosition(input);
   if (op === "definition") return await client.definition(file, at, signal);
   if (op === "references") return await client.references(file, at, signal);
   if (op === "hover") return await client.hover(file, at, signal);
-  return await client.rename(file, at, string(input, "newName"), signal);
+  return await client.rename(file, at, lspString(input, "newName"), signal);
 }
 
 function evidence(
   request: ToolRequest,
-  op: Operation,
+  op: LspOperation,
   output: unknown,
   completedAt: string,
   scope: { sessionId: string; runId: string }
@@ -344,7 +268,7 @@ function evidence(
 function receipt(
   request: ToolRequest,
   startedAt: string,
-  op: Operation,
+  op: LspOperation,
   output: unknown,
   scope: { sessionId: string; runId: string }
 ): ToolReceipt {
@@ -362,12 +286,12 @@ function receipt(
 export function codeIntelTool(options: CodeIntelToolOptions): RegisteredEffectTool {
   const clients = new LspClientPool(options);
   return {
-    descriptor: descriptor(),
+    descriptor: lspToolDescriptor(),
     async execute(request, context) {
       const startedAt = new Date().toISOString();
-      const input = object(request.arguments);
-      const op = operation(input);
-      const preset = selectPreset(options.presets, string(input, "file"));
+      const input = lspObject(request.arguments);
+      const op = lspOperation(input);
+      const preset = selectLspPreset(options.presets, lspString(input, "file"));
       const lease = clients.acquire(context.workspacePath, preset);
       let discard = true;
       try {
