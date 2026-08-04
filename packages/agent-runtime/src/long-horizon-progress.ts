@@ -21,13 +21,19 @@ export interface MarginalProgressHistory {
   resultDigests: Set<string>;
   validationEvidenceIds: Set<string>;
   artifactIds: Set<string>;
+  /** Novel diagnostic output is useful while exploring, but it cannot reset
+   * convergence forever. A durable commitment starts a fresh bounded window. */
+  discriminatingResultsSinceCommit: number;
 }
+
+const MAX_DISCRIMINATING_RESULT_CREDITS = 2;
 
 export function emptyMarginalProgressHistory(): MarginalProgressHistory {
   return {
     resultDigests: new Set(),
     validationEvidenceIds: new Set(),
-    artifactIds: new Set()
+    artifactIds: new Set(),
+    discriminatingResultsSinceCommit: 0
   };
 }
 
@@ -69,8 +75,9 @@ function hasNewArtifact(receipt: ToolReceipt, history: MarginalProgressHistory):
 /**
  * A task-neutral progress vector. It deliberately uses only durable runtime
  * facts: workspace revisions, plan revisions, validation evidence, artifacts,
- * and a result shape not observed in the bounded comparison history. Reworded
- * model text, new call IDs, timestamps, and elapsed time cannot manufacture progress.
+ * and a bounded number of result shapes not observed in the comparison
+ * history. Reworded model text, new call IDs, timestamps, elapsed time, and an
+ * unbounded stream of novel stdout cannot manufacture progress.
  */
 export function marginalProgressSignals(
   batch: ProgressBatch,
@@ -89,7 +96,8 @@ export function marginalProgressSignals(
   if (batch.receipts.some((receipt) => hasNewArtifact(receipt, history))) {
     signals.add("artifact");
   }
-  if (!history.resultDigests.has(outcome.resultDigest)) {
+  if (!history.resultDigests.has(outcome.resultDigest)
+    && history.discriminatingResultsSinceCommit < MAX_DISCRIMINATING_RESULT_CREDITS) {
     signals.add("discriminating_result");
   }
   return [...signals];
@@ -108,6 +116,18 @@ export function recordMarginalProgress(
   batch: ProgressBatch,
   outcome: LongHorizonActionOutcome
 ): void {
+  const strongProgress = batch.receipts.some(workspaceRevision)
+    || batch.calls.some((call, index) =>
+      call.name === "update_plan" && batch.receipts[index]?.ok)
+    || batch.receipts.some((receipt) => hasNewValidationEvidence(receipt, history))
+    || batch.receipts.some((receipt) => hasNewArtifact(receipt, history));
+  const novelResult = !history.resultDigests.has(outcome.resultDigest);
+  if (strongProgress) {
+    history.discriminatingResultsSinceCommit = 0;
+  } else if (novelResult
+    && history.discriminatingResultsSinceCommit < MAX_DISCRIMINATING_RESULT_CREDITS) {
+    history.discriminatingResultsSinceCommit += 1;
+  }
   history.resultDigests.add(outcome.resultDigest);
   for (const receipt of batch.receipts) {
     for (const evidence of receiptEvidence(receipt)) {

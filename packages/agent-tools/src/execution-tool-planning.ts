@@ -164,6 +164,11 @@ async function plannedCall(
 ): Promise<ToolCallPlan> {
   assertBackgroundExecutionAvailable(input, options, skillResource, background);
   const networkMode = network(input, options);
+  if (background && input.lifecycle === "deliverable" && networkMode !== "full") {
+    throw Object.assign(new Error(
+      "Deliverable services require network='full' so readiness can be verified from the outer delivery boundary."
+    ), { code: "tool_arguments_invalid" });
+  }
   const mutation = await processMutationContract(
     input,
     context.workspacePath,

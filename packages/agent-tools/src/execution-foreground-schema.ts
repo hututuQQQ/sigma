@@ -3,6 +3,7 @@ import type { ExecutionToolOptions } from "./execution-tool-types.js";
 import {
   assertAvailableExecutable,
   assertAvailableShell,
+  availableNetworkModes,
   availableShells,
   executableCapabilitySchema,
   executionToolSchema
@@ -10,6 +11,10 @@ import {
 import { environmentShellAvailable } from "./environment-shell-tool.js";
 
 type ForegroundKind = "exec" | "shell" | "validate";
+
+function deliverableHandoffAvailable(options: ExecutionToolOptions): boolean {
+  return options.handoff === true && availableNetworkModes(options).includes("full");
+}
 
 export interface ForegroundInvocation {
   shellCommand: boolean;
@@ -54,8 +59,10 @@ function assertShellBackgroundMode(
   if (background && options.background === false) {
     invalidArguments("shell background execution is unavailable for this execution broker.");
   }
-  if (input.lifecycle === "deliverable" && options.handoff !== true) {
-    invalidArguments("Deliverable process handoff is unavailable for this execution broker.");
+  if (input.lifecycle === "deliverable" && !deliverableHandoffAvailable(options)) {
+    invalidArguments(
+      "Deliverable process handoff requires broker support and the full network mode."
+    );
   }
 }
 
@@ -277,12 +284,12 @@ function unifiedExecutionProperties(
           description: "Allocate a PTY for background execution."
         }
       }),
-      ...(options.handoff === true ? {
+      ...(deliverableHandoffAvailable(options) ? {
         lifecycle: {
           type: "string",
           enum: ["session", "deliverable"],
           description:
-            "Defaults to session. Use deliverable only for a verified service that must survive successful completion, then call process_handoff."
+            "Defaults to session. Use deliverable only for a TCP service started with network=full that must survive successful completion; process_handoff verifies its delivery-boundary endpoint."
         }
       } : {})
     })

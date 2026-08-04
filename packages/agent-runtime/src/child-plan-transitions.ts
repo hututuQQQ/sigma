@@ -13,18 +13,22 @@ function returnedNode(
 ): PlanGraph["nodes"][number] {
   const returned: PlanGraph["nodes"][number] = {
     ...node,
-    owner: { kind: "root" },
-    evidence: node.evidence.some((item) => item.evidenceId === input.evidence.evidenceId)
-      ? [...node.evidence]
-      : [...node.evidence, input.evidence]
+    owner: { kind: "root" }
   };
   if (input.outcome === "completed") {
     returned.status = "in_progress";
+    returned.evidence = node.evidence.some((item) => item.evidenceId === input.evidence.evidenceId)
+      ? [...node.evidence]
+      : [...node.evidence, input.evidence];
     delete returned.blockedReason;
     return returned;
   }
-  returned.status = "blocked";
-  returned.blockedReason = `Child ${input.childId} ${input.outcome}.`;
+  // A failed delegate is an observation for the parent, not a permanent
+  // failure of the work item. Keep its failed evidence in the durable ledger,
+  // but do not attach that evidence to the Plan node: doing so would make an
+  // independently completed parent repair impossible to certify.
+  returned.status = "pending";
+  delete returned.blockedReason;
   return returned;
 }
 

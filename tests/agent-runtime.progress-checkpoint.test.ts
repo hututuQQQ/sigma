@@ -369,17 +369,17 @@ describe("objective long-horizon triggers", () => {
     expect(after.content).not.toContain("settled tool batches");
   });
 
-  it("does not turn a finite diverse sequence below the attention boundary into a semantic checkpoint", () => {
+  it("allows a bounded pair of diverse diagnostic results before requesting a pivot", () => {
     const session = runtimeSessionFixture();
     session.durable.state.messages.push({ role: "user", content: "Investigate." });
     refresh(session);
-    for (let index = 0; index < 12; index += 1) {
+    for (let index = 0; index < 2; index += 1) {
       addBatch(session, index);
       refresh(session);
     }
     expect(session.durable.state.longHorizon).toMatchObject({
       schemaVersion: 1,
-      settledBatchCount: 12,
+      settledBatchCount: 2,
       duplicateStreak: 0,
       strategyRequested: false
     });
@@ -388,15 +388,14 @@ describe("objective long-horizon triggers", () => {
     expect(session.durable.state.outcome).toBeUndefined();
   });
 
-  it("treats distinct results as progress instead of charging an evidence-window reset", () => {
+  it("does not let an unbounded stream of distinct diagnostics manufacture progress", () => {
     const session = runtimeSessionFixture();
     session.durable.state.messages.push({ role: "user", content: "Investigate." });
     refresh(session);
-    for (let index = 0; index < 3; index += 1) {
+    for (let index = 0; index < 4; index += 1) {
       addBatch(session, index, {
         arguments: { command: `inspect --candidate ${index}` },
-        output: `distinct-result-${index}`,
-        reasoningContent: `${String(index)}:${"reason about evidence ".repeat(700)}`
+        output: `distinct-result-${index}`
       });
       refresh(session);
     }
@@ -404,11 +403,11 @@ describe("objective long-horizon triggers", () => {
     const attention = evidenceAttentionWindow(session);
     expect(attention).toMatchObject({
       saturated: false,
-      batchCount: 0
+      batchCount: 2
     });
-    expect(attention.tokenCount).toBe(0);
-    expect(session.durable.state.longHorizon.duplicateStreak).toBe(0);
-    expect(strategistTrigger(session)).toBeUndefined();
+    expect(attention.tokenCount).toBeGreaterThan(0);
+    expect(session.durable.state.longHorizon.duplicateStreak).toBe(2);
+    expect(strategistTrigger(session)).toBe("duplicate_result");
     expect(progressCheckpoints(session)).toEqual([]);
     expect(session.durable.state.outcome).toBeUndefined();
   });
@@ -470,7 +469,25 @@ describe("objective long-horizon triggers", () => {
     addBatch(validation, 1, {
       name: "validate",
       output: "failed validation",
-      ok: false
+      ok: false,
+      evidence: [{
+        evidenceId: "validation-commitment",
+        sessionId: "session",
+        runId: "run",
+        kind: "validation",
+        status: "failed",
+        createdAt: "2026-01-01T00:00:01.000Z",
+        producer: { authority: "runtime" },
+        summary: "Validation failed.",
+        data: {
+          schemaVersion: 1,
+          validator: "test",
+          exitCode: 1,
+          frontierRevision: 1,
+          stateDigest: "a".repeat(64),
+          coveredPaths: ["src/current.ts"]
+        }
+      }]
     });
     addBatch(validation, 2, {
       output: "observed-0",
@@ -545,7 +562,7 @@ describe("objective long-horizon triggers", () => {
     const merelySimilar = runtimeSessionFixture();
     merelySimilar.durable.state.messages.push({ role: "user", content: "Investigate." });
     refresh(merelySimilar);
-    for (let index = 0; index < 3; index += 1) {
+    for (let index = 0; index < 2; index += 1) {
       addBatch(merelySimilar, index, {
         arguments: { path: "same.ts", offset: 0 },
         output: `same-looking result with objective revision ${index}`

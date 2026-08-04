@@ -65,6 +65,10 @@ function environmentProcessAvailable(options: ExecutionToolOptions): boolean {
     && Boolean(options.enclosingContainerAttestationDigest);
 }
 
+function handoffAvailable(options: ExecutionToolOptions): boolean {
+  return options.handoff === true && availableNetworkModes(options).includes("full");
+}
+
 function environmentProcessArguments(
   value: JsonValue,
   workspacePath: string
@@ -148,11 +152,11 @@ function spawnTool(
           network: networkProperty(options),
           env: { type: "object", additionalProperties: { type: "string" } },
           ...(options.pty === false ? {} : { pty: { type: "boolean" } }),
-          ...(options.handoff === true ? {
+          ...(handoffAvailable(options) ? {
             lifecycle: {
               type: "string",
               enum: ["session", "deliverable"],
-              description: "Use deliverable only for a service that must survive successful task completion; verify it through a separate interface probe, then call process_handoff."
+              description: "Use deliverable only for a TCP service that must survive successful task completion. It requires network=full; process_handoff performs the delivery-boundary readiness probe."
             }
           } : {}),
           readRoots: {
@@ -309,7 +313,7 @@ function processControlTools(
     ...(options.stdin === false
       ? [] : [processWriteTool(options, handleProperties)]),
     processTerminateTool(options, handleProperties),
-    ...(options.handoff === true
+    ...(handoffAvailable(options)
     ? [processHandoffTool(options, handleProperties)]
     : [])
   ];

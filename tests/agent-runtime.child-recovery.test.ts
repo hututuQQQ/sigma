@@ -181,7 +181,7 @@ async function sessionEvents(store: SegmentedJsonlStore, sessionId: string): Pro
 }
 
 describe("durable child identity and crash recovery", () => {
-  it("releases an orphan child allocation and durably blocks its delegated Plan nodes", async () => {
+  it("releases an orphan child allocation and returns its delegated Plan nodes to root", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-orphan-child-reservation-"));
     fixtures.push(root);
     const store = new SegmentedJsonlStore({ rootDir: root });
@@ -243,10 +243,11 @@ describe("durable child identity and crash recovery", () => {
     expect(session.durable.state.budget.consumed).toEqual(emptyBudgetAmounts());
     expect(session.durable.state.budget.reservations[0]?.status).toBe("released");
     expect(session.durable.state.plan.nodes[0]).toMatchObject({
-      status: "blocked",
+      status: "pending",
       owner: { kind: "root" },
-      blockedReason: `Child ${childId} failed.`
+      evidence: []
     });
+    expect(session.durable.state.plan.nodes[0]).not.toHaveProperty("blockedReason");
     expect(session.durable.state.evidence).toContainEqual(expect.objectContaining({
       kind: "child_outcome",
       status: "failed",
@@ -321,7 +322,7 @@ describe("durable child identity and crash recovery", () => {
     })).rejects.toMatchObject({ code: "budget_increase_root_only" });
   });
 
-  it("settles an interrupted child once, charges its durable in-flight usage, and blocks its Plan node", async () => {
+  it("settles an interrupted child once, charges its usage, and returns its Plan node", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-child-crash-recovery-"));
     fixtures.push(root);
     const store = new SegmentedJsonlStore({ rootDir: root });
@@ -487,11 +488,11 @@ describe("durable child identity and crash recovery", () => {
     expect(session.durable.state.budget.consumed).toMatchObject({ inputTokens: 128, toolCalls: 3, children: 2 });
     expect(session.durable.state.budget.reservations[0]?.status).toBe("committed");
     expect(session.durable.state.plan.nodes[0]).toMatchObject({
-      status: "blocked",
+      status: "pending",
       owner: { kind: "root" },
-      blockedReason: `Child ${childId} failed.`
+      evidence: []
     });
-    expect(session.durable.state.plan.nodes[0]?.evidence).toHaveLength(1);
+    expect(session.durable.state.plan.nodes[0]).not.toHaveProperty("blockedReason");
     expect(session.durable.state.evidence[0]).toMatchObject({ kind: "child_outcome", status: "failed" });
 
     await expect(reconcileInterruptedChildren(store, session, control, emit)).resolves.toBe(0);
