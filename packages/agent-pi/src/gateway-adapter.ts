@@ -58,9 +58,15 @@ function replayState(
   if (!Array.isArray(data.content)) return undefined;
   if (data.model !== model.id) return undefined;
   if (data.api !== model.api) return undefined;
+  const content = data.content as unknown as AssistantMessage["content"];
   return {
     ...(typeof data.responseId === "string" ? { responseId: data.responseId } : {}),
-    content: data.content as unknown as AssistantMessage["content"]
+    // Signed reasoning is required to continue a thinking tool call, but an
+    // ordinary completed answer can preserve its native text identity without
+    // replaying the private trajectory on every later turn.
+    content: (message.toolCalls?.length ?? 0) > 0
+      ? content
+      : content.filter((item) => item.type !== "thinking")
   };
 }
 
@@ -232,10 +238,13 @@ function responseMessage(message: AssistantMessage): ModelMessage {
   const calls = message.content
     .filter((item): item is PiToolCall => item.type === "toolCall")
     .map(modelToolCall);
+  const replayContent = calls.length > 0
+    ? message.content
+    : message.content.filter((item) => item.type !== "thinking");
   const replay: Record<string, JsonValue> = {
     api: message.api,
     model: message.model,
-    content: message.content as unknown as JsonValue
+    content: replayContent as unknown as JsonValue
   };
   if (message.responseId) replay.responseId = message.responseId;
   return {

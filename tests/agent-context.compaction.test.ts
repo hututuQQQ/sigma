@@ -4,8 +4,10 @@ import {
   blockTokens,
   historyAfterArchive,
   historyBlocks,
+  messageTokens,
   planContext,
-  stableHistoryDigest
+  stableHistoryDigest,
+  withoutUnneededHistoricalReasoning
 } from "../packages/agent-context/src/index.js";
 
 function toolLoop(index: number, output = `observation-${index}`): ModelMessage[] {
@@ -75,6 +77,49 @@ function expectToolPairs(messages: ModelMessage[]): void {
 }
 
 describe("context archive planning", () => {
+  it("counts provider-native replay state as model-visible history", () => {
+    const base: ModelMessage = {
+      role: "assistant",
+      content: "I inspected the repository.",
+      toolCalls: [{ id: "call-opaque", name: "read", arguments: { path: "README.md" } }]
+    };
+    const replayed: ModelMessage = {
+      ...base,
+      providerState: {
+        provider: "fake",
+        version: 1,
+        data: {
+          api: "responses",
+          model: "reasoning-model",
+          content: [{ type: "thinking", thinkingSignature: "x".repeat(8_000) }]
+        }
+      }
+    };
+
+    expect(messageTokens(replayed) - messageTokens(base)).toBeGreaterThan(1_900);
+  });
+
+  it("removes neutral ordinary reasoning without discarding provider replay identity", () => {
+    const message: ModelMessage = {
+      role: "assistant",
+      content: "The change is complete.",
+      reasoningContent: "private reasoning summary",
+      providerState: {
+        provider: "fake",
+        version: 1,
+        data: {
+          content: [{ type: "thinking", thinkingSignature: "opaque" }]
+        }
+      }
+    };
+
+    expect(withoutUnneededHistoricalReasoning(message)).toEqual({
+      role: "assistant",
+      content: "The change is complete.",
+      providerState: message.providerState
+    });
+  });
+
   it("accounts for images without treating base64 transport bytes as text", () => {
     const tokens = (data: string) => blockTokens([{
       role: "user",

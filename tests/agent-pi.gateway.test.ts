@@ -25,6 +25,7 @@ import {
   hydratePiModelCache,
   refreshPiProviderModels,
   sanitizePiModelError,
+  type AssistantMessage,
   type Credential,
   type CredentialInfo,
   type CredentialStore,
@@ -33,7 +34,10 @@ import {
   type Provider
 } from "../packages/agent-pi/src/index.js";
 import { monitoredPiStream } from "../packages/agent-pi/src/stream-timeout.js";
-import { piContext } from "../packages/agent-pi/src/gateway-adapter.js";
+import {
+  mapPiStreamEvent,
+  piContext
+} from "../packages/agent-pi/src/gateway-adapter.js";
 import type { JsonValue, ModelMessage } from "../packages/agent-protocol/src/index.js";
 
 class MemoryCredentialStore implements CredentialStore {
@@ -233,6 +237,95 @@ describe("Pi stream timeout policy", () => {
 });
 
 describe("Pi image context mapping", () => {
+  it("omits ordinary native reasoning while preserving replayable text identity", () => {
+    const model = getPiModel(OPENAI_CODEX_PROVIDER_ID, OPENAI_CODEX_DEFAULT_MODEL);
+    expect(model).toBeDefined();
+    const legacy: ModelMessage = {
+      role: "assistant",
+      content: "Done.",
+      providerState: {
+        provider: model!.provider,
+        version: 1,
+        data: {
+          api: model!.api,
+          model: model!.id,
+          responseId: "response-id",
+          content: [{
+            type: "thinking",
+            thinking: "private trajectory",
+            thinkingSignature: "opaque-reasoning"
+          }, {
+            type: "text",
+            text: "Done.",
+            textSignature: "native-text-id"
+          }]
+        }
+      }
+    };
+
+    const context = piContext({
+      messages: [legacy],
+      signal: new AbortController().signal
+    }, model!);
+
+    expect(context.messages).toEqual([expect.objectContaining({
+      role: "assistant",
+      responseId: "response-id",
+      content: [{ type: "text", text: "Done.", textSignature: "native-text-id" }]
+    })]);
+  });
+
+  it("stores ordinary native state without its private reasoning trajectory", () => {
+    const model = getPiModel(OPENAI_CODEX_PROVIDER_ID, OPENAI_CODEX_DEFAULT_MODEL);
+    expect(model).toBeDefined();
+    const message: AssistantMessage = {
+      role: "assistant",
+      api: model!.api,
+      provider: model!.provider,
+      model: model!.id,
+      content: [{
+        type: "thinking",
+        thinking: "private trajectory",
+        thinkingSignature: "opaque-reasoning"
+      }, {
+        type: "text",
+        text: "Done.",
+        textSignature: "native-text-id"
+      }],
+      usage: {
+        input: 1,
+        output: 1,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 2,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
+      },
+      stopReason: "stop",
+      timestamp: Date.now()
+    };
+    const mapped = mapPiStreamEvent(
+      { type: "done", reason: "stop", message },
+      0,
+      performance.now(),
+      "subscription",
+      undefined,
+      true
+    );
+    const done = mapped.events.find((event) => event.type === "done");
+
+    expect(done).toMatchObject({
+      type: "done",
+      response: {
+        message: {
+          content: "Done.",
+          reasoningContent: "private trajectory"
+        }
+      }
+    });
+    expect(JSON.stringify(done)).toContain("native-text-id");
+    expect(JSON.stringify(done)).not.toContain("opaque-reasoning");
+  });
+
   it("maps durable user images to Pi image content blocks", () => {
     const model = getPiModel(OPENAI_CODEX_PROVIDER_ID, OPENAI_CODEX_DEFAULT_MODEL);
     expect(model).toBeDefined();
