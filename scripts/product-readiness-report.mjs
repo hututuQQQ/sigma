@@ -135,7 +135,9 @@ function lspSandboxSmokeReleaseChecks(lspSmoke, lspSmokePath, targetPlatform, ta
   const actualPyrightDigest = String(lspSmoke?.assets?.pyrightSha256 ?? "");
   const expectedManifestDigest = String(packageVerify?.integrity?.manifestDigest ?? "");
   const actualManifestDigest = String(lspSmoke?.integrityManifestSha256 ?? "");
-  const brokerPlatforms = targetPlatform === "win32" ? ["win32", "windows"] : ["linux"];
+  const brokerPlatforms = targetPlatform === "win32"
+    ? ["win32", "windows"]
+    : targetPlatform === "darwin" ? ["darwin", "macos"] : ["linux"];
   const brokerArchitectures = targetArch === "x64" ? ["x64", "x86_64", "amd64"] : [targetArch];
   const targetMatches = lspSmoke?.targetPlatform === targetPlatform && lspSmoke?.targetArch === targetArch
     && brokerPlatforms.includes(String(lspSmoke?.brokerPlatform ?? "").toLowerCase())
@@ -367,9 +369,10 @@ export async function buildProductReadinessReport(options = {}) {
     || packageVerify?.signing?.policyVerified === true;
   const windowsUnsigned = targetPlatform === "win32"
     && packageVerify?.signing?.authenticodeVerified === false;
+  const macosPreview = targetPlatform === "darwin";
   const prerelease = expectedProductVersion.split("-", 2)[1];
   const isPrerelease = Boolean(prerelease);
-  const expectedReleaseChannel = windowsUnsigned
+  const expectedReleaseChannel = windowsUnsigned || macosPreview
     ? "preview"
     : isPrerelease
       ? prerelease.split(".", 1)[0]
@@ -393,6 +396,13 @@ export async function buildProductReadinessReport(options = {}) {
       packageVerify?.metadata?.releaseChannel === expectedReleaseChannel,
       `expected=${expectedReleaseChannel}, package=${String(packageVerify?.metadata?.releaseChannel ?? "missing")}`
     ),
+    ...(targetPlatform === "darwin" ? [check(
+      "package:darwinCompatibility",
+      packageVerify?.checks?.darwinCompatibility === true
+        && packageVerify?.metadata?.darwinCompatibility?.minimumSystemVersion
+          === sigmaManifest.release.macosMinimumSystemVersion,
+      `minimumSystemVersion=${String(packageVerify?.metadata?.darwinCompatibility?.minimumSystemVersion ?? "missing")}`
+    )] : []),
     ...sandboxSmokeReleaseChecks(sandboxSmoke, sandboxSmokePath, targetPlatform, targetArch, packageVerify),
     ...lspSandboxSmokeReleaseChecks(lspSandboxSmoke, lspSandboxSmokePath, targetPlatform, targetArch, packageVerify),
     ...replayPerformanceReleaseChecks(replayPerformance, replayPerformancePath),
@@ -401,9 +411,9 @@ export async function buildProductReadinessReport(options = {}) {
   ];
   const internalReady = checks.every((item) => item.ok);
   const releaseChecksPassed = releaseChecks.every((item) => item.ok);
-  const releaseReady = !isPrerelease && internalReady && releaseChecksPassed;
+  const releaseReady = !isPrerelease && !macosPreview && internalReady && releaseChecksPassed;
   const unsignedWindowsPreview = targetPlatform === "win32" && windowsUnsigned && provenanceTrusted;
-  const previewReady = (isPrerelease || unsignedWindowsPreview) && internalReady
+  const previewReady = (isPrerelease || unsignedWindowsPreview || macosPreview) && internalReady
     && releaseChecks.every((item) =>
       item.name === "package:windowsSignerPolicy" && unsignedWindowsPreview
         ? true

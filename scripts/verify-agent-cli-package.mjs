@@ -18,6 +18,7 @@ import {
   defaultRootDir,
   inspectWindowsAuthenticode,
   inspectSigmaExecBinary,
+  verifyDarwinRuntimeMachO,
   normalizeTargetPlatform,
   pinnedNodeVersion,
   normalizeTargetArch,
@@ -474,7 +475,7 @@ export function runTargetWrapperVersion(bundleDir, targetPlatformOrArch, targetA
   let targetPlatform = "linux";
   let targetArch = targetPlatformOrArch;
   let options = targetArchOrOptions;
-  if (targetPlatformOrArch === "linux" || targetPlatformOrArch === "win32") {
+  if (["linux", "win32", "darwin"].includes(targetPlatformOrArch)) {
     targetPlatform = targetPlatformOrArch;
     targetArch = targetArchOrOptions;
     options = maybeOptions;
@@ -482,6 +483,14 @@ export function runTargetWrapperVersion(bundleDir, targetPlatformOrArch, targetA
 
   if (targetPlatform === "win32") return runWindowsTargetWrapperVersion(bundleDir, targetArch, options);
   const platform = options.platform ?? process.platform;
+  if (targetPlatform === "darwin") {
+    if (platform === "darwin") return runNativeTargetWrapperVersion(bundleDir, targetArch, options);
+    return {
+      ok: false,
+      status: "skipped",
+      reason: `target wrapper smoke requires macOS; current platform is ${platform}`
+    };
+  }
   if (platform === "linux") return runNativeTargetWrapperVersion(bundleDir, targetArch, options);
   if (platform === "win32") {
     return windowsLinuxTargetTransport(options) === "wsl"
@@ -677,6 +686,29 @@ async function verifyLinuxCompatibility(bundleDir, metadata, manifest, entries, 
   return true;
 }
 
+async function verifyDarwinCompatibility(bundleDir, metadata, manifest, targetPlatform, targetArch) {
+  if (targetPlatform !== "darwin") {
+    if (metadata.darwinCompatibility !== undefined || manifest.darwinCompatibility !== undefined) {
+      throw new Error("Darwin compatibility evidence must not appear on another target.");
+    }
+    return false;
+  }
+  if (targetArch !== "arm64") throw new Error("The supported Darwin Runtime target is ARM64 only.");
+  const record = metadata.darwinCompatibility;
+  if (!record || record.minimumSystemVersion !== sigmaManifest.release.macosMinimumSystemVersion
+    || record.sandbox !== "seatbelt+sandbox-exec+forkpty" || record.validated !== true) {
+    throw new Error("Darwin compatibility metadata is missing or invalid.");
+  }
+  assertExactJson(manifest.darwinCompatibility, record, "Integrity Darwin compatibility evidence");
+  const inspected = await verifyDarwinRuntimeMachO(
+    bundleDir,
+    path.join(bundleDir, "bin", "node"),
+    path.join(bundleDir, "bin", "sigma-exec")
+  );
+  assertExactJson(inspected, record.machO, "Darwin ARM64 Mach-O inventory");
+  return true;
+}
+
 async function verifyIntegrityManifest(bundleDir, metadata, targetPlatform, targetArch, linuxCompatibilityRequired = false) {
   const descriptor = metadata.integrity;
   if (descriptor?.algorithm !== "sha256" || descriptor?.manifest !== "integrity-manifest.json") {
@@ -771,6 +803,9 @@ async function verifyIntegrityManifest(bundleDir, metadata, targetPlatform, targ
   if (targetPlatform !== "linux" && (metadata.linuxCompatibility !== undefined || manifest.linuxCompatibility !== undefined)) {
     throw new Error("Linux compatibility evidence must not appear on another target.");
   }
+  const darwinCompatibilityVerified = await verifyDarwinCompatibility(
+    bundleDir, metadata, manifest, targetPlatform, targetArch
+  );
   const metadataAssets = [
     [metadata.assets?.languageServers, "typescript", portableLanguageAssets.typescriptServer],
     [metadata.assets?.languageServiceEngines, "typescript", portableLanguageAssets.typescriptEngine],
@@ -797,6 +832,7 @@ async function verifyIntegrityManifest(bundleDir, metadata, targetPlatform, targ
     languageServerAssetsVerified: true,
     nodeCompatibilityVerified,
     linuxCompatibilityVerified,
+    darwinCompatibilityVerified,
     languageServerAssetPaths: portableLanguageAssets
   };
 }
@@ -942,6 +978,11 @@ export function verifyPortableSbomComponents(sbom, integrityManifest, metadata, 
       }
     }
   }
+  if (targetPlatform === "darwin"
+    && node.properties.get("sigma:minimum-system-version")
+      !== metadata.darwinCompatibility?.minimumSystemVersion) {
+    throw new Error("CycloneDX Darwin minimum system version does not match package metadata.");
+  }
   return { portableAssets: requiredAssets.length, tokenizerAssets: tokenizerEntries.length };
 }
 
@@ -1000,6 +1041,15 @@ function verifyPortableProvenance(
     );
     if (Object.keys(buildDefinition.internalParameters ?? {}).length !== 1) {
       throw new Error("Portable provenance has unexpected Linux internal parameters.");
+    }
+  } else if (targetPlatform === "darwin" && metadata.darwinCompatibility) {
+    assertExactJson(
+      buildDefinition.internalParameters?.darwinCompatibility,
+      metadata.darwinCompatibility,
+      "Portable provenance Darwin compatibility evidence"
+    );
+    if (Object.keys(buildDefinition.internalParameters ?? {}).length !== 1) {
+      throw new Error("Portable provenance has unexpected Darwin internal parameters.");
     }
   } else if (buildDefinition.internalParameters !== undefined) {
     throw new Error("Portable provenance has unexpected internal parameters for a non-Windows target.");
@@ -1202,7 +1252,11 @@ export async function verifyAgentCliPackage(options = {}) {
     `${bundleName}/packages/agent-cli/dist/bin.js`,
     ...baseWorkspacePackages.map((name) => `${bundleName}/packages/${name}/dist/index.js`),
     ...baseWorkspacePackages.filter((name) => name !== "agent-cli")
-      .map((name) => `${bundleName}/node_modules/${name}/package.json`)
+      .map((name) => `${bundleName}/node_modules/${name}/package.json`),
+    ...(targetPlatform === "darwin" ? [
+      `${bundleName}/THIRD_PARTY_NOTICES.md`,
+      `${bundleName}/LICENSES/Apache-2.0.txt`
+    ] : [])
   ];
   const spawn = options.spawnSync ?? spawnSync;
   const archiveBytes = await readFile(archive);
@@ -1225,6 +1279,9 @@ export async function verifyAgentCliPackage(options = {}) {
     const wrapper = await readFile(path.join(bundleDir, "bin", targetPlatform === "win32" ? "agent.cmd" : "agent"), "utf8");
     const readme = await readFile(path.join(bundleDir, "README.md"), "utf8");
     const license = await readFile(path.join(bundleDir, "LICENSE"), "utf8");
+    const thirdPartyNotices = targetPlatform === "darwin"
+      ? await readFile(path.join(bundleDir, "THIRD_PARTY_NOTICES.md"), "utf8")
+      : null;
     const packageJson = await readJson(path.join(bundleDir, "package.json"));
     const metadata = await readJson(path.join(bundleDir, "package-metadata.json"));
     if (metadata.schemaVersion !== 1) {
@@ -1268,6 +1325,10 @@ export async function verifyAgentCliPackage(options = {}) {
     assertContains("README.md", readme, "never falls back to a system `node`");
     assertContains("README.md", readme, "benchmark identity, verifier output, rewards, scores, and hidden test details must not be fed back");
     assertContains("LICENSE", license, "MIT License");
+    if (thirdPartyNotices !== null) {
+      assertContains("THIRD_PARTY_NOTICES.md", thirdPartyNotices, "OpenAI Codex");
+      assertContains("THIRD_PARTY_NOTICES.md", thirdPartyNotices, "Apache License, Version 2.0");
+    }
 
     if (packageJson.name !== `sigma-agent-cli-${targetPlatform}-${targetArch}`) {
       throw new Error(`bundle package.json has unexpected name: ${String(packageJson.name)}`);
@@ -1359,7 +1420,7 @@ export async function verifyAgentCliPackage(options = {}) {
     return {
       ok: true,
       archive,
-      tarball: targetPlatform === "linux" ? archive : null,
+      tarball: targetPlatform !== "win32" ? archive : null,
       zip: targetPlatform === "win32" ? archive : null,
       bundleName,
       targetPlatform,
@@ -1383,6 +1444,9 @@ export async function verifyAgentCliPackage(options = {}) {
         archiveChecksum: true,
         linuxCompatibility: targetPlatform === "linux"
           ? integrity?.linuxCompatibilityVerified === true
+          : null,
+        darwinCompatibility: targetPlatform === "darwin"
+          ? integrity?.darwinCompatibilityVerified === true
           : null,
         windowsSignerPolicy: targetPlatform !== "win32" || observedSigning?.policyVerified === true,
         hostCli: hostCli !== null,

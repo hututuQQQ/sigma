@@ -488,7 +488,7 @@ fn set_private_permissions(_path: &Path) -> Result<(), RpcError> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn session_home_destination(_root: &Path) -> PathBuf {
     use std::ffi::CStr;
     let mut pwd = unsafe { std::mem::zeroed::<libc::passwd>() };
@@ -515,7 +515,7 @@ fn session_home_destination(_root: &Path) -> PathBuf {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn session_home_destination(root: &Path) -> PathBuf {
     root.join("home")
 }

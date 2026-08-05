@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "productVersion": "0.1.5",
+  "productVersion": "0.1.6",
   "toolchains": {
     "node": "26.4.0",
     "pnpm": "11.7.0",
@@ -8,7 +8,9 @@
     "rustCoverage": "nightly-2026-07-01"
   },
   "release": {
-    "targets": ["linux-x64", "win32-x64"],
+    "targets": ["linux-x64", "win32-x64", "darwin-arm64"],
+    "macosMinimumSystemVersion": "13.5",
+    "githubPrerelease": true,
     "windowsNodePatch": {
       "kind": "windows_appcontainer_node",
       "patchId": "node-v26.4.0-win-x64-libuv-local-pipe-v2",

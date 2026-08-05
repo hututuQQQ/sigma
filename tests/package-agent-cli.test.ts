@@ -25,7 +25,7 @@ async function writeBuiltPackage(
   rootDir: string,
   packageName: string,
   dependencies: Record<string, string> = {},
-  version = "0.1.5"
+  version = "0.1.6"
 ) {
   const packageDir = path.join(rootDir, "packages", packageName);
   await mkdir(path.join(packageDir, "dist"), { recursive: true });
@@ -101,7 +101,7 @@ async function writeFakeNodeRuntimeTarball(tmpDir: string, arch = "x64") {
   const nodePath = path.join(runtimeDir, "bin", "node");
   await writeFile(nodePath, `#!/usr/bin/env sh
 if [ "$1" = "--version" ]; then echo "${pinnedNodeVersion}"; exit 0; fi
-if [ "$2" = "version" ]; then echo '{"product":"Sigma Code","package":{"name":"agent-cli","version":"0.1.5"},"runtime":{"node":"${pinnedNodeVersion}"}}'; exit 0; fi
+if [ "$2" = "version" ]; then echo '{"product":"Sigma Code","package":{"name":"agent-cli","version":"0.1.6"},"runtime":{"node":"${pinnedNodeVersion}"}}'; exit 0; fi
 exec "${process.execPath}" "$@"
 `, "utf8");
   await chmod(nodePath, 0o755);
@@ -183,7 +183,7 @@ async function writePackageFixture() {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), "sigma-package-agent-cli-"));
   await writeFile(
     path.join(rootDir, "package.json"),
-    `${JSON.stringify({ name: "sigma", version: "0.1.5", private: true, license: "MIT" })}\n`,
+    `${JSON.stringify({ name: "sigma", version: "0.1.6", private: true, license: "MIT" })}\n`,
     "utf8"
   );
   await writeFile(path.join(rootDir, "LICENSE"), "MIT License\n", "utf8");
@@ -270,7 +270,7 @@ async function writePackagingWorkspace(
   brokerArch: "x64" | "arm64" = "x64"
 ) {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), "sigma-package-agent-cli-"));
-  const version = "0.1.5";
+  const version = "0.1.6";
   await writeFile(
     path.join(rootDir, "package.json"),
     `${JSON.stringify({ name: "sigma", version, private: true, license: "MIT" })}\n`,
@@ -294,8 +294,12 @@ async function writePackagingWorkspace(
 }
 
 describe("package-agent-cli", () => {
-  it("rejects non-Tier-1 architectures", async () => {
-    await expect(packageAgentCli({ rootDir: process.cwd(), targetArch: "arm64" })).rejects.toThrow("AGENT_TARGET_ARCH");
+  it("accepts the Darwin archive name and rejects non-Tier-1 target pairs", async () => {
+    expect(nodeRuntimeArchiveName("darwin", "arm64"))
+      .toBe(`node-${pinnedNodeVersion}-darwin-arm64.tar.gz`);
+    await expect(packageAgentCli({
+      rootDir: process.cwd(), targetPlatform: "linux", targetArch: "arm64"
+    })).rejects.toThrow("Unsupported Sigma Code release target 'linux-arm64'");
   });
 
   it("rejects a workspace product version that differs from the manifest", async () => {

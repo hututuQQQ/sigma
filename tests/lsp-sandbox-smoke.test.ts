@@ -37,9 +37,12 @@ describe("bundled LSP sandbox smoke", () => {
       pyrightEntry: path.resolve("release", "node_modules", "pyright", "langserver.index.js"),
       mcpModule: path.resolve("release", "node_modules", "agent-mcp", "dist", "index.js")
     });
-    expect(() => parseArguments([
+    expect(parseArguments([
       "--bundle", "release", "--broker", "broker", "--target-platform", "darwin", "--output", "out"
-    ])).toThrow("--target-platform must be 'linux' or 'win32'");
+    ])).toMatchObject({ targetPlatform: "darwin" });
+    expect(() => parseArguments([
+      "--bundle", "release", "--broker", "broker", "--target-platform", "freebsd", "--output", "out"
+    ])).toThrow("--target-platform must be 'linux', 'win32', or 'darwin'");
   });
 
   it("binds the exact bundled Node runtime to its Windows compatibility proof", () => {
@@ -115,7 +118,7 @@ describe("bundled LSP sandbox smoke", () => {
     const digest = "a".repeat(64);
     const metadata = {
       schemaVersion: 1,
-      productVersion: "0.1.5",
+      productVersion: "0.1.6",
       targetPlatform: "win32",
       targetArch: "x64",
       sigmaExec: { path: "bin/sigma-exec.exe", sha256: digest }
@@ -126,7 +129,7 @@ describe("bundled LSP sandbox smoke", () => {
     )).toThrow("unsupported_schema_version");
     expect(() => assertMetadata(
       { ...metadata, productVersion: "0.1.1" }, "win32", broker, digest, layout
-    )).toThrow("must match sigma-manifest.json productVersion '0.1.5'");
+    )).toThrow("must match sigma-manifest.json productVersion '0.1.6'");
   });
 
   it("rejects unknown package metadata without rewriting the artifact", async () => {
@@ -134,7 +137,7 @@ describe("bundled LSP sandbox smoke", () => {
     const metadataPath = path.join(root, "package-metadata.json");
     const metadata = {
       schemaVersion: 999,
-      productVersion: "0.1.5",
+      productVersion: "0.1.6",
       targetPlatform: "win32",
       targetArch: "x64",
       sigmaExec: { path: "bin/sigma-exec.exe", sha256: "a".repeat(64) }

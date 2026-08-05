@@ -302,3 +302,100 @@ jobs:
             .artifacts/sigma-exec-branch-coverage.json
             .artifacts/replay-100k.json
             .artifacts/product-readiness-win32-x64.*
+
+  macos-release:
+    name: macOS ARM64 Seatbelt, PTY, and portable release checks
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Require a native Apple Silicon runner
+        shell: bash
+        run: |
+          test "$(uname -s)" = "Darwin"
+          test "$(uname -m)" = "arm64"
+          test "$(node -p process.arch)" = "arm64"
+      - name: Install pinned pnpm
+        shell: bash
+        run: |
+          npm install --global "pnpm@${PNPM_VERSION}"
+          test "$(pnpm --version)" = "${PNPM_VERSION}"
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal --component rustfmt --component clippy
+          rustup default "${RUST_VERSION}"
+          rustup toolchain install "${RUST_COVERAGE_TOOLCHAIN}" --profile minimal --component llvm-tools-preview
+          cargo install cargo-llvm-cov --version "${CARGO_LLVM_COV_VERSION}" --locked
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Native broker tests and lint
+        shell: bash
+        run: |
+          cargo fmt --manifest-path native/sigma-exec/Cargo.toml -- --check
+          cargo test --locked --manifest-path native/sigma-exec/Cargo.toml
+          cargo clippy --locked --manifest-path native/sigma-exec/Cargo.toml --all-targets -- -D warnings
+          cargo build --locked --manifest-path native/sigma-exec/Cargo.toml
+          mkdir -p .artifacts
+          pnpm test:coverage:native-protocol
+      - name: Build
+        run: pnpm build
+      - name: Lint
+        run: pnpm lint
+      - name: Test with coverage
+        run: pnpm test:coverage
+      - name: Product and TUI smoke
+        shell: bash
+        run: |
+          pnpm smoke:local:fake
+          pnpm smoke:tui-product
+      - name: Sandbox boundary
+        run: pnpm verify:containment
+      - name: Verify portable macOS ARM64 Runtime and wrapper
+        env:
+          AGENT_REQUIRE_TARGET_WRAPPER: "1"
+        run: pnpm verify:package:agent-cli:macos
+      - name: Required Seatbelt, network, forkpty, timeout, and process-tree test
+        run: >-
+          python3 scripts/ci/macos-sandbox-smoke.py
+          --broker .artifacts/agent-cli-darwin-arm64/bin/sigma-exec
+          --output .artifacts/sandbox-smoke-darwin-arm64.json
+      - name: Required bundled TypeScript, Pyright, and MCP sandbox smoke
+        run: >-
+          node scripts/ci/lsp-sandbox-smoke.mjs
+          --bundle .artifacts/agent-cli-darwin-arm64
+          --broker .artifacts/agent-cli-darwin-arm64/bin/sigma-exec
+          --target-platform darwin
+          --output .artifacts/lsp-sandbox-smoke-darwin-arm64.json
+      - name: Real forkpty /quit smoke on packaged CLI
+        run: >-
+          python3 scripts/ci/tui-real-terminal-smoke.py
+          --node .artifacts/agent-cli-darwin-arm64/bin/node
+          --cli .artifacts/agent-cli-darwin-arm64/packages/agent-cli/dist/index.js
+      - name: 100k-event replay and snapshot gate
+        run: pnpm perf:replay-100k
+      - name: Product readiness
+        run: pnpm product:readiness -- --target-platform darwin --target-arch arm64
+      - name: Upload macOS ARM64 Runtime evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: sigma-code-darwin-arm64-preview
+          if-no-files-found: error
+          include-hidden-files: true
+          path: |
+            .artifacts/agent-cli-darwin-arm64.tgz
+            .artifacts/agent-cli-darwin-arm64.tgz.sha256
+            .artifacts/agent-cli-darwin-arm64.sbom.cdx.json
+            .artifacts/agent-cli-darwin-arm64.provenance.json
+            .artifacts/agent-cli-package-verify-darwin-arm64.json
+            .artifacts/sandbox-smoke-darwin-arm64.json
+            .artifacts/lsp-sandbox-smoke-darwin-arm64.json
+            .artifacts/sigma-exec-branch-coverage.json
+            .artifacts/replay-100k.json
+            .artifacts/product-readiness-darwin-arm64.*

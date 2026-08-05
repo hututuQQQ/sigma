@@ -82,10 +82,29 @@ const windowsRelease = [
     "--target-arch", "x64", "--require-preview-ready", "--require-provider-smoke")
 ] as const;
 
+const macosRelease = [
+  ...releaseQuality,
+  stage("package", "pnpm", "verify:package:agent-cli:macos"),
+  stage("sandbox", "python3", "scripts/ci/macos-sandbox-smoke.py", "--broker",
+    ".artifacts/agent-cli-darwin-arm64/bin/sigma-exec", "--output",
+    ".artifacts/sandbox-smoke-darwin-arm64.json"),
+  stage("lsp-sandbox", "node", "scripts/ci/lsp-sandbox-smoke.mjs", "--bundle",
+    ".artifacts/agent-cli-darwin-arm64", "--broker",
+    ".artifacts/agent-cli-darwin-arm64/bin/sigma-exec", "--target-platform", "darwin",
+    "--output", ".artifacts/lsp-sandbox-smoke-darwin-arm64.json"),
+  providerStage(
+    ".artifacts/agent-cli-darwin-arm64/bin/sigma-exec",
+    ".artifacts/agent-cli-darwin-arm64/bin/node"
+  ),
+  stage("readiness", "node", "scripts/product-readiness-report.mjs", "--target-platform", "darwin",
+    "--target-arch", "arm64", "--require-preview-ready", "--require-provider-smoke")
+] as const;
+
 export const releaseStageGraphs = Object.freeze({
   product: [...neutral, stage("internal-readiness", "pnpm", "product:readiness", "--", "--internal-only")],
   "release-linux": linuxRelease,
   "release-windows": windowsRelease,
+  "release-macos": macosRelease,
   "package-linux": [
     stage("build", "pnpm", "build"), stage("native-build", "pnpm", "build:native:sigma-exec:linux"),
     stage("package", "node", "scripts/package-agent-cli.mjs", "--target-platform", "linux", "--target-arch", "x64")
@@ -93,6 +112,10 @@ export const releaseStageGraphs = Object.freeze({
   "package-windows": [
     stage("build", "pnpm", "build"), stage("native-build", "pnpm", "build:native:sigma-exec"),
     stage("package", "node", "scripts/package-agent-cli.mjs", "--target-platform", "win32", "--target-arch", "x64")
+  ],
+  "package-macos": [
+    stage("build", "pnpm", "build"), stage("native-build", "pnpm", "build:native:sigma-exec"),
+    stage("package", "node", "scripts/package-agent-cli.mjs", "--target-platform", "darwin", "--target-arch", "arm64")
   ],
   "verify-package-linux": [
     stage("package", "pnpm", "package:agent-cli:linux"),
@@ -107,6 +130,11 @@ export const releaseStageGraphs = Object.freeze({
     stage("package", "pnpm", "package:agent-cli:windows"),
     stage("verify", "node", "scripts/verify-agent-cli-package.mjs", "--target-platform", "win32",
       "--target-arch", "x64", "--require-target-wrapper")
+  ],
+  "verify-package-macos": [
+    stage("package", "pnpm", "package:agent-cli:macos"),
+    stage("verify", "node", "scripts/verify-agent-cli-package.mjs", "--target-platform", "darwin",
+      "--target-arch", "arm64", "--require-target-wrapper")
   ]
 });
 

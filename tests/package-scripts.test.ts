@@ -53,14 +53,18 @@ describe("package script semantics", () => {
       "package", "sandbox", "lsp-sandbox", "provider-smoke", "readiness"
     ]);
     expect(stageIds("release-windows")).toEqual(stageIds("release-linux"));
+    expect(stageIds("release-macos")).toEqual(stageIds("release-linux"));
     const linux = releaseStageGraph("release-linux");
     const windows = releaseStageGraph("release-windows");
+    const macos = releaseStageGraph("release-macos");
     expect(linux.find((stage) => stage.id === "package")?.args).toContain("verify:package:agent-cli:linux");
     expect(windows.find((stage) => stage.id === "package")?.args).toContain("verify:package:agent-cli:windows");
+    expect(macos.find((stage) => stage.id === "package")?.args).toContain("verify:package:agent-cli:macos");
     expect(linux.find((stage) => stage.id === "readiness")?.args).toContain("--require-release-ready");
     expect(linux.find((stage) => stage.id === "readiness")?.args).not.toContain("--require-preview-ready");
     expect(windows.find((stage) => stage.id === "readiness")?.args).toContain("--require-preview-ready");
     expect(windows.find((stage) => stage.id === "readiness")?.args).not.toContain("--require-release-ready");
+    expect(macos.find((stage) => stage.id === "readiness")?.args).toContain("--require-preview-ready");
     expect(linux.find((stage) => stage.id === "provider-smoke")?.environment).toEqual({
       SIGMA_EXEC_PATH: ".artifacts/agent-cli-linux-x64/bin/sigma-exec",
       SIGMA_RUNTIME_NODE_PATH: path.resolve(".artifacts/agent-cli-linux-x64/bin/node"),
@@ -69,11 +73,16 @@ describe("package script semantics", () => {
       SIGMA_EXEC_PATH: ".artifacts/agent-cli-win32-x64/bin/sigma-exec.exe",
       SIGMA_RUNTIME_NODE_PATH: path.resolve(".artifacts/agent-cli-win32-x64/bin/node.exe"),
     });
+    expect(macos.find((stage) => stage.id === "provider-smoke")?.environment).toEqual({
+      SIGMA_EXEC_PATH: ".artifacts/agent-cli-darwin-arm64/bin/sigma-exec",
+      SIGMA_RUNTIME_NODE_PATH: path.resolve(".artifacts/agent-cli-darwin-arm64/bin/node"),
+    });
     expect(releaseStageGraph("verify-package-linux").at(-1)?.args).toContain("--require-target-wrapper");
     expect(releaseStageGraph("verify-package-windows").at(-1)?.args).toContain("--require-target-wrapper");
     expect(releaseStageGraph("verify-package-windows-structure").at(-1)?.args)
       .not.toContain("--require-target-wrapper");
-    for (const stage of [...linux, ...windows]) {
+    expect(releaseStageGraph("verify-package-macos").at(-1)?.args).toContain("--require-target-wrapper");
+    for (const stage of [...linux, ...windows, ...macos]) {
       if (stage.id === "provider-smoke") expect(stage.secretEnvironment.length).toBeGreaterThan(0);
       else expect(stage.secretEnvironment).toEqual([]);
     }

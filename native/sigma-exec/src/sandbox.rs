@@ -14,7 +14,7 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -302,7 +302,7 @@ pub fn doctor_report() -> Value {
             "foreground": true,
             "background": true,
             "stdin": true,
-            "pty": cfg!(any(target_os = "linux", target_os = "windows")) && status.available,
+            "pty": cfg!(any(target_os = "linux", target_os = "macos", target_os = "windows")) && status.available,
             "processHandoff": cfg!(target_os = "linux") && status.available && status.self_test_passed,
             "networkModes": network_modes,
             "webRequest": true,
@@ -312,7 +312,7 @@ pub fn doctor_report() -> Value {
             "runtimeCommandSnapshotComplete": runtime_commands.complete,
             // The sandbox, rather than a client-side command-name allowlist,
             // resolves and pins each requested executable before launch.
-            "directExecutableResolution": cfg!(target_os = "linux")
+            "directExecutableResolution": cfg!(any(target_os = "linux", target_os = "macos"))
                 && status.available
                 && status.self_test_passed,
             "enclosingContainerRoot": enclosing_container_root,
@@ -473,8 +473,77 @@ fn verified_shells(status: &SandboxStatus) -> Value {
             },
         )
     }
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(target_os = "macos")]
+    {
+        macos_verified_zsh().map_or_else(
+            || json!([]),
+            |path| {
+                json!([{
+                    "kind": "zsh",
+                    "executable": path,
+                    "verified": true,
+                    "supportsChildProcesses": true,
+                }])
+            },
+        )
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     json!([])
+}
+
+#[cfg(target_os = "macos")]
+fn macos_verified_zsh() -> Option<PathBuf> {
+    let zsh = PathBuf::from("/bin/zsh").canonicalize().ok()?;
+    let sequence = PROTECTED_GUARD_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!(
+        "sigma-zsh-self-test-{}-{sequence}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&root).ok()?;
+    let marker = "sigma-zsh-sandbox-ok";
+    let params = ProcessParams {
+        command: CommandSpec {
+            executable: zsh.to_string_lossy().into_owned(),
+            args: vec!["-f".into(), "-c".into(), format!("printf {marker}")],
+            cwd: root.clone(),
+            env: BTreeMap::new(),
+            stdin: None,
+        },
+        policy: ExecutionPolicy {
+            sandbox: SandboxMode::Required,
+            network: NetworkMode::None,
+            network_approved: false,
+            read_roots: vec![root.clone()],
+            write_roots: Vec::new(),
+            execution_roots: Vec::new(),
+            executable_sha256: None,
+            protected_paths: Vec::new(),
+            enclosing_container_root: false,
+            disposable_workspace_root: None,
+            read_only_validation_workspace_root: None,
+            repository_metadata_lease_id: None,
+            scratch_lease_id: None,
+            scratch_session_id: None,
+            repository_metadata_roots: Vec::new(),
+            repository_workspace_root: None,
+            session_scratch_roots: Vec::new(),
+            #[cfg(test)]
+            unsafe_host_exec_approved: false,
+        },
+        max_output_bytes: 4 * 1024,
+        timeout_ms: Some(5_000),
+        idle_timeout_ms: None,
+        lifecycle: ProcessLifecycle::Session,
+        pty: false,
+        pty_columns: 80,
+        pty_rows: 24,
+    };
+    let output = build_sandboxed_command(&params, None, None)
+        .and_then(|mut prepared| prepared.command.output().map_err(RpcError::from))
+        .ok();
+    let _ = std::fs::remove_dir_all(&root);
+    let output = output?;
+    (output.status.success() && output.stdout == marker.as_bytes()).then_some(zsh)
 }
 
 #[cfg(target_os = "linux")]
@@ -684,7 +753,7 @@ fn validate(params: &ProcessParams, _allow_unsafe: bool) -> Result<(), RpcError>
             "deliverable processes require the native sandbox and detached stdio",
         ));
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     if params.pty {
         return Err(RpcError::new(
             "pty_unavailable",
@@ -951,7 +1020,7 @@ fn validate_roots(params: &ProcessParams) -> Result<(), RpcError> {
     Ok(())
 }
 
-fn protected_path_candidates(params: &ProcessParams) -> Result<Vec<PathBuf>, RpcError> {
+pub(crate) fn protected_path_candidates(params: &ProcessParams) -> Result<Vec<PathBuf>, RpcError> {
     let read_roots = canonical_roots(&params.policy.read_roots)?;
     let mut candidates = params.policy.protected_paths.clone();
     candidates.extend(
@@ -1150,8 +1219,8 @@ fn secret_key(key: &str) -> bool {
         .any(|pair| matches!(pair, ["api", "key"] | ["private", "key"]))
 }
 
-#[cfg(any(target_os = "linux", test))]
-fn configure_common(command: &mut Command, params: &ProcessParams) {
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+pub(crate) fn configure_common(command: &mut Command, params: &ProcessParams) {
     command.current_dir(&params.command.cwd);
     command.env_clear();
     command.envs(&params.command.env);
@@ -1621,7 +1690,16 @@ fn build_sandboxed_command(
     crate::windows_sandbox::prepare_command(params)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(target_os = "macos")]
+fn build_sandboxed_command(
+    params: &ProcessParams,
+    scratch: Option<&ScratchLease>,
+    disposable_workspace: Option<&DisposableWorkspace>,
+) -> Result<PreparedCommand, RpcError> {
+    crate::macos_seatbelt::prepare_command(params, scratch, disposable_workspace)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn build_sandboxed_command(
     _params: &ProcessParams,
     _scratch: Option<&ScratchLease>,
@@ -2278,7 +2356,41 @@ fn detect_sandbox() -> SandboxStatus {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(target_os = "macos")]
+fn detect_sandbox() -> SandboxStatus {
+    match crate::macos_seatbelt::detect() {
+        Ok(()) => SandboxStatus {
+            available: true,
+            backend: "seatbelt+sandbox-exec+forkpty",
+            self_test_passed: true,
+            setup_required: false,
+            reason: None,
+            landlock_abi: None,
+            no_new_privileges: false,
+            seccomp_filter: false,
+            less_privileged_appcontainer: false,
+            mount_namespace: false,
+            pid_namespace: false,
+            network_namespace: false,
+        },
+        Err(error) => SandboxStatus {
+            available: false,
+            backend: "seatbelt+sandbox-exec+forkpty",
+            self_test_passed: false,
+            setup_required: false,
+            reason: Some(error.message),
+            landlock_abi: None,
+            no_new_privileges: false,
+            seccomp_filter: false,
+            less_privileged_appcontainer: false,
+            mount_namespace: false,
+            pid_namespace: false,
+            network_namespace: false,
+        },
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn detect_sandbox() -> SandboxStatus {
     SandboxStatus {
         available: false,
