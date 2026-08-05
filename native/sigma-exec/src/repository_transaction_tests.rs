@@ -4,6 +4,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+#[test]
+fn invalid_process_identifiers_are_never_live() {
+    assert!(!process_alive(0));
+    assert!(!process_alive(u32::MAX));
+}
+
 fn test_root(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "sigma-repository-transaction-{label}-{}-{}",

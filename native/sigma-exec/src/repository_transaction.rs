@@ -3038,8 +3038,17 @@ fn process_alive(pid: u32) -> bool {
 
 #[cfg(all(unix, not(target_os = "linux")))]
 fn process_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
     // Signal zero performs existence/permission checking without changing state.
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(windows)]
