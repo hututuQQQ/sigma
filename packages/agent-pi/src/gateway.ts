@@ -82,6 +82,15 @@ function newPiStreamLifecycle(): PiStreamLifecycle {
   };
 }
 
+function piSamplingOptions(
+  capabilities: ModelCapabilities,
+  request: ModelRequest
+): Partial<Pick<ModelRequest, "temperature">> {
+  return capabilities.temperatureControl === false || request.temperature === undefined
+    ? {}
+    : { temperature: request.temperature };
+}
+
 function observePiStreamEvent(
   lifecycle: PiStreamLifecycle,
   event: ModelStreamEvent
@@ -170,7 +179,7 @@ export class PiModelGateway implements ModelGateway {
       ? undefined
       : Math.max(1, Math.trunc(options.activeStreamTimeoutMs));
     this.reasoningEffort = options.reasoningEffort;
-    this.capabilities = options.capabilities ?? {
+    const capabilities = options.capabilities ?? {
       contextWindowTokens: piModel.contextWindow,
       maxOutputTokens: piModel.maxTokens,
       tools: true,
@@ -181,6 +190,11 @@ export class PiModelGateway implements ModelGateway {
       promptCache: true,
       tokenizer: "approximate",
       imageInput: piModel.input.includes("image")
+    };
+    this.capabilities = {
+      ...capabilities,
+      temperatureControl: capabilities.temperatureControl
+        ?? piModel.api !== "openai-codex-responses"
     };
   }
 
@@ -205,7 +219,7 @@ export class PiModelGateway implements ModelGateway {
         const options = {
           signal,
           maxTokens: request.maxOutputTokens,
-          temperature: request.temperature,
+          ...piSamplingOptions(this.capabilities, request),
           toolChoice: request.toolChoice,
           maxRetries: 0,
           ...(request.sessionId ? { sessionId: request.sessionId } : {}),

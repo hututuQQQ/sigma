@@ -77,7 +77,10 @@ describe("model-visible tool receipts", () => {
     const content = receiptContent(parsed!);
     expect(content.length).toBeLessThanOrEqual(12_000);
     expect(content).toContain("receipt output omitted");
-    expect(content).toContain("artifact-1");
+    expect(content).toContain(
+      '"artifactRefs":[{"artifactId":"artifact-1","name":"stdout.log","sizeBytes":123456}]'
+    );
+    expect(content).not.toContain("artifact-1:stdout.log:123456");
     expect(content).toContain("sha256=");
     expect(content).toContain("tail");
   });

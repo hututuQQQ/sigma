@@ -50,6 +50,17 @@ interface ProjectedModelHistory {
 
 type BudgetedModelTurn = Awaited<ReturnType<typeof prepareBudgetedModelTurn>>;
 
+function contextBudgetExhausted(error: unknown): boolean {
+  return Boolean(error && typeof error === "object"
+    && (error as { code?: unknown }).code === "context_overflow");
+}
+
+function contextBudgetFailure(): PreparedModelAttempt {
+  return { failure: budgetFailure(
+    "The remaining input-token ledger cannot fit mandatory context and the newest user turn."
+  ) };
+}
+
 async function projectedToolHistory(
   options: EffectRunnerOptions,
   session: RuntimeSession,
@@ -152,6 +163,97 @@ async function applyProjectedResourceBoundary(
   return prepared;
 }
 
+async function prepareTerminalContextFallback(
+  options: EffectRunnerOptions,
+  session: RuntimeSession,
+  preparation: TurnPreparationInput
+): Promise<{ prepared: BudgetedModelTurn; available: BudgetAmounts } | undefined> {
+  const available = availableOrchestratorBudget(session);
+  const projection = await projectedModelHistory(options, session);
+  try {
+    const prepared = await prepareBudgetedModelTurn({
+      ...preparation,
+      // The ordinary turn has already failed its provider or aggregate input
+      // boundary. Drop optional repository context and tool schemas, then use
+      // at most one final text-only turn instead of failing without a reply.
+      descriptors: [],
+      dynamic: [],
+      available,
+      history: projection.history,
+      archive: projection.archiveProjection.archive?.item,
+      modelTurnBoundaryStage: "final"
+    });
+    return { prepared, available };
+  } catch (error) {
+    if (contextBudgetExhausted(error)) return undefined;
+    throw error;
+  }
+}
+
+async function prepareOrdinaryModelTurn(
+  options: EffectRunnerOptions,
+  session: RuntimeSession,
+  preparation: TurnPreparationInput,
+  projection: ProjectedModelHistory,
+  available: BudgetAmounts,
+  signal: AbortSignal,
+  summarizer: ModelSummarizer
+): Promise<{ prepared: BudgetedModelTurn; available: BudgetAmounts }> {
+  let prepared = await prepareBudgetedModelTurn(preparation);
+  ({ prepared, available } = await refreshContextArchive({
+    session,
+    preparation,
+    initial: prepared,
+    initialProjection: projection.archiveProjection,
+    available,
+    signal,
+    summarizer,
+    emit: options.emit
+  }));
+  prepared = await applyProjectedResourceBoundary(
+    options, session, preparation, available, prepared
+  );
+  return { prepared, available };
+}
+
+async function fitPreparedModelTurn(
+  options: EffectRunnerOptions,
+  session: RuntimeSession,
+  preparation: TurnPreparationInput,
+  initial: BudgetedModelTurn,
+  initialAvailable: BudgetAmounts,
+  usedTerminalFallback: boolean
+): Promise<PreparedModelAttempt> {
+  let prepared = initial;
+  let available = initialAvailable;
+  let fittedBudget = fitPreparedBudget(
+    prepared.turn.budget,
+    available,
+    Number.MAX_SAFE_INTEGER
+  );
+  if (!fittedBudget && !usedTerminalFallback) {
+    const fallback = await prepareTerminalContextFallback(options, session, preparation);
+    if (fallback) {
+      prepared = fallback.prepared;
+      available = fallback.available;
+      fittedBudget = fitPreparedBudget(
+        prepared.turn.budget,
+        available,
+        Number.MAX_SAFE_INTEGER
+      );
+    }
+  }
+  if (!fittedBudget) {
+    return { failure: budgetFailure(
+      "The hard resource ledger cannot fund another model request after bounded context compaction."
+    ) };
+  }
+  return {
+    turn: { ...prepared.turn, budget: fittedBudget },
+    plan: prepared.plan
+  };
+}
+
 export async function prepareModelAttempt(
   options: EffectRunnerOptions,
   repositoryContext: RepositoryContextProvider,
@@ -201,34 +303,21 @@ export async function prepareModelAttempt(
     history: projected.history,
     archive: projected.archiveProjection.archive?.item
   };
-  let prepared = await prepareBudgetedModelTurn(preparation);
-  ({ prepared, available } = await refreshContextArchive({
-    session,
-    preparation,
-    initial: prepared,
-    initialProjection: projected.archiveProjection,
-    available,
-    signal,
-    summarizer,
-    emit: options.emit
-  }));
-  prepared = await applyProjectedResourceBoundary(
-    options, session, preparation, available, prepared
-  );
-  const fittedBudget = fitPreparedBudget(
-    prepared.turn.budget,
-    available,
-    Number.MAX_SAFE_INTEGER
-  );
-  if (!fittedBudget) {
-    return {
-      failure: budgetFailure(
-        "The hard resource ledger cannot fund another model request after bounded context compaction."
-      )
-    };
+  let prepared: BudgetedModelTurn;
+  let usedTerminalFallback = false;
+  try {
+    ({ prepared, available } = await prepareOrdinaryModelTurn(
+      options, session, preparation, projected, available, signal, summarizer
+    ));
+  } catch (error) {
+    if (!contextBudgetExhausted(error)) throw error;
+    const fallback = await prepareTerminalContextFallback(options, session, preparation);
+    if (!fallback) return contextBudgetFailure();
+    prepared = fallback.prepared;
+    available = fallback.available;
+    usedTerminalFallback = true;
   }
-  return {
-    turn: { ...prepared.turn, budget: fittedBudget },
-    plan: prepared.plan
-  };
+  return await fitPreparedModelTurn(
+    options, session, preparation, prepared, available, usedTerminalFallback
+  );
 }

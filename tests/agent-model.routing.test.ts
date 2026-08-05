@@ -935,6 +935,97 @@ describe("capability-aware model routing", () => {
     });
   });
 
+  it("retries one opaque protocol failure on the same model before committed output", async () => {
+    const only = spec("deepseek/a");
+    let completeAttempts = 0;
+    const completeGateway = gateway(only.id, async () => {
+      completeAttempts += 1;
+      if (completeAttempts === 1) {
+        throw Object.assign(new Error("opaque response failure"), {
+          category: "protocol",
+          diagnostics: { doneReceived: false, lastEventType: "error" }
+        });
+      }
+      return response("recovered");
+    });
+    const completeRouter = new ModelRouter(
+      [only],
+      [route({ candidates: [only.id], maxAttempts: 1 })],
+      () => completeGateway,
+      { maxRetriesPerCandidate: 3 }
+    );
+
+    await expect(completeRouter.complete("orchestrator", "main", request()))
+      .resolves.toMatchObject({ attempt: 1, message: { content: "recovered" } });
+    expect(completeAttempts).toBe(2);
+
+    let streamAttempts = 0;
+    const streamGateway: ModelGateway = {
+      ...gateway(only.id, async () => response("unused")),
+      async *stream() {
+        streamAttempts += 1;
+        yield { type: "reasoning", delta: "uncommitted reasoning" } as const;
+        if (streamAttempts === 1) {
+          throw Object.assign(new Error("opaque stream failure"), {
+            category: "protocol",
+            diagnostics: { doneReceived: false, lastEventType: "error" }
+          });
+        }
+        yield { type: "done", response: response("stream recovered") } as const;
+      }
+    };
+    const streamRouter = new ModelRouter(
+      [only],
+      [route({ candidates: [only.id], maxAttempts: 1 })],
+      () => streamGateway,
+      { maxRetriesPerCandidate: 3 }
+    );
+    const events = [];
+    for await (const event of streamRouter.stream("orchestrator", "main", request())) events.push(event);
+    expect(streamAttempts).toBe(2);
+    expect(events.at(-1)).toMatchObject({
+      type: "done",
+      response: { attempt: 1, message: { content: "stream recovered" } }
+    });
+  });
+
+  it("does not retry structured or repeatedly failing protocol responses", async () => {
+    const only = spec("deepseek/a");
+    let structuredAttempts = 0;
+    const structured = new ModelRouter(
+      [only],
+      [route({ candidates: [only.id], maxAttempts: 1 })],
+      () => gateway(only.id, async () => {
+        structuredAttempts += 1;
+        throw Object.assign(new Error("invalid request"), {
+          category: "protocol",
+          diagnostics: { providerErrorCode: "invalid_prompt", httpStatus: 400 }
+        });
+      }),
+      { maxRetriesPerCandidate: 3 }
+    );
+    await expect(structured.complete("orchestrator", "main", request()))
+      .rejects.toMatchObject({ category: "protocol", attempts: 1 });
+    expect(structuredAttempts).toBe(1);
+
+    let opaqueAttempts = 0;
+    const opaque = new ModelRouter(
+      [only],
+      [route({ candidates: [only.id], maxAttempts: 1 })],
+      () => gateway(only.id, async () => {
+        opaqueAttempts += 1;
+        throw Object.assign(new Error("opaque response failure"), {
+          category: "protocol",
+          diagnostics: { doneReceived: false, lastEventType: "error" }
+        });
+      }),
+      { maxRetriesPerCandidate: 3 }
+    );
+    await expect(opaque.complete("orchestrator", "main", request()))
+      .rejects.toMatchObject({ category: "protocol", attempts: 2 });
+    expect(opaqueAttempts).toBe(2);
+  });
+
   it("uses abortable exponential backoff only between same-provider retries", async () => {
     vi.useFakeTimers();
     try {

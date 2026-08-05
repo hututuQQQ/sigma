@@ -189,7 +189,7 @@ function contextParts(
       toolCallId: message.toolCallId,
       toolName: toolNames.get(message.toolCallId) ?? "tool",
       content: [{ type: "text", text: message.content }],
-      isError: false,
+      isError: message.isError === true,
       timestamp: Date.now()
     };
     result.push(toolResult);

@@ -2192,6 +2192,73 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                 module.MAX_PARTIAL_ARTIFACT_CHARS,
             )
 
+    async def test_stream_and_state_snapshots_are_coalesced_then_flushed(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            recorder = module._OutputRecorder(Path(tmp) / "logs")
+            first = {
+                "kind": "event",
+                "event": {
+                    "eventId": "event-1",
+                    "sessionId": "session",
+                    "seq": 1,
+                    "type": "model.reasoning_delta",
+                    "payload": {"delta": "first"},
+                },
+            }
+            second = {
+                "kind": "event",
+                "event": {
+                    "eventId": "event-2",
+                    "sessionId": "session",
+                    "seq": 2,
+                    "type": "model.reasoning_delta",
+                    "payload": {"delta": "second"},
+                },
+            }
+
+            recorder.record(json.dumps(first) + "\n", "stdout")
+            first_stdout = recorder.stdout_path.read_text(encoding="utf-8")
+            first_state = json.loads(recorder.state_path.read_text(encoding="utf-8"))
+            recorder.record(json.dumps(second) + "\n", "stdout")
+
+            self.assertEqual(recorder.stdout_path.read_text(encoding="utf-8"), first_stdout)
+            self.assertEqual(first_state["last_event"]["eventId"], "event-1")
+            self.assertEqual(
+                json.loads(recorder.state_path.read_text(encoding="utf-8"))["last_event"]["eventId"],
+                "event-1",
+            )
+
+            recorder.finish_artifacts()
+            self.assertIn('"eventId": "event-2"', recorder.stdout_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                json.loads(recorder.state_path.read_text(encoding="utf-8"))["last_event"]["eventId"],
+                "event-2",
+            )
+
+    async def test_high_frequency_stream_uses_bounded_snapshot_writes(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            writes: list[Path] = []
+            original_write = module._write_utf8_artifact
+
+            def record_write(path: Path, value: str) -> None:
+                writes.append(path)
+                original_write(path, value)
+
+            with patch.object(module, "_write_utf8_artifact", side_effect=record_write):
+                recorder = module._OutputRecorder(Path(tmp) / "logs")
+                for _index in range(100):
+                    recorder.record("stream chunk\n", "stderr")
+                recorder.finish_artifacts()
+
+            stderr_writes = [path for path in writes if path == recorder.stderr_path]
+            self.assertEqual(len(stderr_writes), 2)
+            self.assertEqual(
+                recorder.stderr_path.read_text(encoding="utf-8"),
+                "stream chunk\n" * 100,
+            )
+
     async def test_incremental_trace_is_bounded_and_keeps_stable_prefix(self):
         module = import_portable_agent_module()
         with TemporaryDirectory() as tmp:
@@ -2206,6 +2273,30 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             trace_lines = trace_path.read_text(encoding="utf-8").splitlines()
             self.assertTrue(any(json.loads(line).get("type") == "trace_truncated" for line in trace_lines))
             self.assertEqual(json.loads(trace_lines[-1]).get("type"), "trace_truncated")
+
+    async def test_incremental_trace_batches_nonterminal_records_until_flush(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.jsonl"
+            writer = module._BoundedJsonlWriter(
+                trace_path,
+                16_384,
+                reset=True,
+                flush_bytes=16_384,
+                flush_interval_seconds=60,
+            )
+            writer.append({"type": "event", "seq": 0})
+            first_size = trace_path.stat().st_size
+            writer.append({"type": "event", "seq": 1})
+            writer.append({"type": "event", "seq": 2})
+
+            self.assertEqual(trace_path.stat().st_size, first_size)
+            self.assertTrue(writer.flush())
+            records = [
+                json.loads(line)
+                for line in trace_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual([record["seq"] for record in records], [0, 1, 2])
 
     async def test_stream_trace_buffers_transient_host_lock_without_aborting_callback(self):
         module = import_portable_agent_module()

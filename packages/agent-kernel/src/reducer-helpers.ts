@@ -88,6 +88,7 @@ export function supersededToolMessages(state: KernelState): ModelMessage[] {
   return state.pendingTools.map((pending) => ({
     role: "tool",
     toolCallId: pending.request.callId,
+    isError: true,
     content: `Failed tool receipt ID: ${pending.request.callId}\n`
       + "Superseded by a newer user instruction; no successful receipt or side effect may be inferred."
   }));

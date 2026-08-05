@@ -1,4 +1,8 @@
-import type { ModelFailureCategory, ModelSpec } from "./catalog.js";
+import {
+  failureDiagnostics,
+  type ModelFailureCategory,
+  type ModelSpec
+} from "./catalog.js";
 import type { ModelResolution } from "./route-policy.js";
 
 function retrySameProvider(category: ModelFailureCategory, spec: ModelSpec | undefined): boolean {
@@ -6,6 +10,7 @@ function retrySameProvider(category: ModelFailureCategory, spec: ModelSpec | und
     || category === "network"
     || category === "server"
     || category === "timeout"
+    || category === "protocol"
     || (category === "capacity" && spec?.providerId === "deepseek");
 }
 
@@ -80,4 +85,27 @@ export function nextExecutionIndex(
   const nextProvider = attempts.findIndex((spec, index) =>
     index > currentIndex && spec.id !== current?.id);
   return nextProvider < 0 ? undefined : nextProvider;
+}
+
+export function safeProtocolRetry(
+  error: unknown,
+  category: ModelFailureCategory,
+  attempts: readonly ModelSpec[],
+  currentIndex: number,
+  nextIndex: number | undefined,
+  semanticOutputCommitted: boolean
+): boolean {
+  if (category !== "protocol" || semanticOutputCommitted || nextIndex === undefined) return false;
+  const current = attempts[currentIndex];
+  const next = attempts[nextIndex];
+  if (!current || next?.id !== current.id) return false;
+  // Protocol failures are frequently deterministic. Allow only one recovery
+  // attempt for an otherwise opaque, pre-commit stream failure; structured
+  // provider 4xx/policy failures remain terminal and cross-model fallback is
+  // still prohibited.
+  if (currentIndex > 0 && attempts[currentIndex - 1]?.id === current.id) return false;
+  const diagnostics = failureDiagnostics(error);
+  return diagnostics?.doneReceived === false
+    && diagnostics.providerErrorCode === undefined
+    && diagnostics.httpStatus === undefined;
 }
