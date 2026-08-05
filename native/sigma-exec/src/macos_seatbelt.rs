@@ -64,7 +64,10 @@ fn run_internal_probe(arguments: Vec<OsString>) -> i32 {
         }
     };
 
-    if std::fs::read_to_string(readable.join("allowed.txt")).as_deref() != Ok("allowed") {
+    if !matches!(
+        std::fs::read_to_string(readable.join("allowed.txt")).as_deref(),
+        Ok("allowed")
+    ) {
         eprintln!("Seatbelt probe could not read the declared readable root");
         return 3;
     }

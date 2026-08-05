@@ -2,7 +2,6 @@ use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
-use std::ptr::{null, null_mut};
 
 const INTERNAL_PTY_LAUNCHER: &str = "--internal-unix-pty-launcher";
 
@@ -37,14 +36,14 @@ fn run_pty(arguments: Vec<OsString>) -> io::Result<i32> {
     let executable = &arguments[2];
     let argv0 = &arguments[3];
     let command_arguments = &arguments[4..];
-    let size = libc::winsize {
+    let mut size = libc::winsize {
         ws_row: rows,
         ws_col: columns,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
     let mut master = -1;
-    let child = unsafe { libc::forkpty(&mut master, null_mut(), null(), &size) };
+    let child = fork_pty(&mut master, &mut size);
     if child < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -75,6 +74,17 @@ fn run_pty(arguments: Vec<OsString>) -> io::Result<i32> {
         libc::close(master);
     }
     wait_for_child(child)
+}
+
+fn fork_pty(master: &mut libc::c_int, size: &mut libc::winsize) -> libc::pid_t {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::forkpty(master, std::ptr::null_mut(), std::ptr::null(), size)
+    }
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::forkpty(master, std::ptr::null_mut(), std::ptr::null_mut(), size)
+    }
 }
 
 fn dimension(value: &OsStr, label: &str) -> io::Result<u16> {
