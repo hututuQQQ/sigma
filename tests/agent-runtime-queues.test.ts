@@ -1025,7 +1025,18 @@ describe("runtime queues and non-blocking instruction steering", () => {
       tools: registerBuiltinTools(new EffectToolRegistry()),
       permissionMode: "auto",
       runDeadlineMs: 60_000,
-      joinChildren: async () => ({ evidence: [{ childId: "durable-child", status: "completed" }], failures: [] })
+      joinChildren: async () => ({
+        evidence: [
+          { childId: "durable-child", status: "completed" },
+          {
+            childId: "reconciled-child",
+            status: "failed",
+            outcome: "recoverable_failure",
+            metadata: { planNodeIds: ["returned-analysis"] }
+          }
+        ],
+        failures: []
+      })
     });
     const session = await first.createSession({ workspacePath: workspace, mode: "analyze" });
     await first.command({ type: "submit", sessionId: session.sessionId, text: "inspect with child evidence" });
@@ -1035,6 +1046,14 @@ describe("runtime queues and non-blocking instruction steering", () => {
         kind: "child_outcome",
         status: "passed",
         data: expect.objectContaining({ childId: "durable-child", outcome: "completed" })
+      }), expect.objectContaining({
+        kind: "child_outcome",
+        status: "failed",
+        data: expect.objectContaining({
+          childId: "reconciled-child",
+          outcome: "failed",
+          planNodeIds: ["returned-analysis"]
+        })
       })])
     });
 
@@ -1053,6 +1072,10 @@ describe("runtime queues and non-blocking instruction steering", () => {
         kind: "child_outcome",
         status: "passed",
         data: expect.objectContaining({ childId: "durable-child", outcome: "completed" })
+      }), expect.objectContaining({
+        kind: "child_outcome",
+        status: "failed",
+        data: expect.objectContaining({ childId: "reconciled-child", outcome: "failed" })
       })])
     });
   });
@@ -1321,6 +1344,94 @@ describe("runtime queues and non-blocking instruction steering", () => {
     });
     await append("child.message", { kind: "integrated" });
     await expect(auditDurableChildren(store, parentSessionId, "parent-run")).resolves.toMatchObject({ failures: [] });
+  });
+
+  it("does not permanently block a clean failed child after its terminal outcome is reconciled", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-reconciled-child-"));
+    const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
+    const parentSessionId = "parent-session";
+    const parentRunId = "parent-run";
+    const childId = "failed-analysis";
+    let seq = 0;
+    const append = async (type: AgentEventEnvelope["type"], payload: AgentEventEnvelope["payload"]): Promise<void> => {
+      const event = {
+        schemaVersion: EVENT_SCHEMA_VERSION,
+        seq: seq + 1,
+        eventId: `reconciled-child-${seq + 1}`,
+        sessionId: parentSessionId,
+        runId: parentRunId,
+        occurredAt: new Date(Date.now() + seq).toISOString(),
+        type,
+        authority: "runtime" as const,
+        payload
+      } as AgentEventEnvelope;
+      await store.append(event, seq);
+      seq += 1;
+    };
+    await append("child.spawned", {
+      childId,
+      payload: {
+        detached: false,
+        metadata: { mode: "analyze", planNodeIds: ["analysis-node"] }
+      }
+    });
+    await append("child.completed", {
+      childId,
+      payload: {
+        status: "failed",
+        outcome: { kind: "recoverable_failure", code: "child_budget", message: "Child budget ended." },
+        metadata: { mode: "analyze", planNodeIds: ["analysis-node"] },
+        isolation: { kind: "shared_read", cleanup: "not_required" }
+      }
+    });
+    await expect(auditDurableChildren(store, parentSessionId, parentRunId)).resolves.toMatchObject({
+      failures: [expect.stringContaining("durably reconciled")]
+    });
+
+    await append("evidence.recorded", {
+      evidenceId: `child-terminal:${parentRunId}:${childId}`,
+      sessionId: parentSessionId,
+      runId: parentRunId,
+      kind: "child_outcome",
+      status: "failed",
+      createdAt: new Date().toISOString(),
+      producer: { authority: "runtime", id: childId },
+      summary: "The child failed and its delegated Plan node returned to the parent.",
+      data: {
+        childId,
+        outcome: "failed",
+        planNodeIds: ["analysis-node"]
+      }
+    });
+    await expect(auditDurableChildren(store, parentSessionId, parentRunId)).resolves.toMatchObject({
+      failures: [expect.stringContaining("Plan ownership")]
+    });
+    await append("plan.updated", {
+      previousRevision: 1,
+      plan: {
+        revision: 2,
+        goal: "Finish the parent goal.",
+        activeNodeId: "analysis-node",
+        nodes: [{
+          id: "analysis-node",
+          title: "Continue after the failed analysis.",
+          dependencies: [],
+          status: "in_progress",
+          owner: { kind: "root" },
+          acceptanceCriteria: [],
+          evidence: []
+        }]
+      }
+    });
+    await expect(auditDurableChildren(store, parentSessionId, parentRunId)).resolves.toMatchObject({
+      evidence: [expect.objectContaining({
+        childId,
+        status: "failed",
+        outcome: "recoverable_failure",
+        planReconciled: true
+      })],
+      failures: []
+    });
   });
 
   it("does not carry a cancelled child from an earlier run into the current run gate", async () => {

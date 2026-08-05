@@ -17,7 +17,8 @@ import { isToolAllowed } from "agent-tools";
 import { refreshContextArchive } from "./context-archive-refresh.js";
 import {
   projectModelToolDescriptors,
-  sessionModelToolProjectionCapabilities
+  sessionModelToolProjectionCapabilities,
+  stableSessionModelToolProjectionCapabilities
 } from "./effect-helpers.js";
 import type { EffectRunnerOptions } from "./effect-runner.js";
 import {
@@ -49,6 +50,17 @@ interface ProjectedModelHistory {
 }
 
 type BudgetedModelTurn = Awaited<ReturnType<typeof prepareBudgetedModelTurn>>;
+
+function contextBudgetExhausted(error: unknown): boolean {
+  return Boolean(error && typeof error === "object"
+    && (error as { code?: unknown }).code === "context_overflow");
+}
+
+function contextBudgetFailure(): PreparedModelAttempt {
+  return { failure: budgetFailure(
+    "The remaining input-token ledger cannot fit mandatory context and the newest user turn."
+  ) };
+}
 
 async function projectedToolHistory(
   options: EffectRunnerOptions,
@@ -121,6 +133,31 @@ async function projectedModelHistory(
   return { history, archiveProjection };
 }
 
+async function repositoryTurnContext(
+  repositoryContext: RepositoryContextProvider,
+  session: RuntimeSession,
+  signal: AbortSignal
+) {
+  const query = [...session.durable.state.messages].reverse()
+    .find((message) => message.role === "user")?.content ?? "";
+  const dynamic = await repositoryContext.collect(
+    session.identity.workspacePath,
+    query,
+    signal,
+    {
+      workspaceStateVersion: session.durable.state.mutationFrontier.currentStateDigest,
+      focusPaths: session.durable.state.mutationFrontier.changedPaths
+    }
+  );
+  return {
+    dynamic,
+    capabilities: {
+      ...sessionModelToolProjectionCapabilities(session),
+      ...repositoryContext.toolCapabilities(session.identity.workspacePath)
+    }
+  };
+}
+
 async function applyProjectedResourceBoundary(
   options: EffectRunnerOptions,
   session: RuntimeSession,
@@ -128,6 +165,7 @@ async function applyProjectedResourceBoundary(
   available: BudgetAmounts,
   initial: BudgetedModelTurn
 ): Promise<BudgetedModelTurn> {
+  if (preparation.modelTurnBoundaryStage === "final") return initial;
   const prepareBoundaryTurn = async (
     stage: ModelTurnBoundaryStage
   ): Promise<BudgetedModelTurn> => {
@@ -159,27 +197,20 @@ export async function prepareModelAttempt(
   session: RuntimeSession,
   turnId: number,
   signal: AbortSignal,
-  hookContext: readonly ContextItem[]
+  hookContext: readonly ContextItem[],
+  modelTurnBoundaryStage?: ModelTurnBoundaryStage
 ): Promise<PreparedModelAttempt> {
   const modelDescriptors = options.runtime.tools.modelDescriptors?.()
     ?? options.runtime.tools.descriptors();
-  const capabilities = sessionModelToolProjectionCapabilities(session);
+  const { dynamic } = modelTurnBoundaryStage === "final"
+    ? { dynamic: [] as ContextItem[] }
+    : await repositoryTurnContext(repositoryContext, session, signal);
+  const capabilities = stableSessionModelToolProjectionCapabilities(session);
   const descriptors = withReadBatchDescriptor(projectModelToolDescriptors(
     modelDescriptors.filter((item) =>
       isToolAllowed(item, session.durable.mode) && profileAllowsTool(session, item)),
     capabilities
   ));
-  const query = [...session.durable.state.messages].reverse()
-    .find((message) => message.role === "user")?.content ?? "";
-  const dynamic = await repositoryContext.collect(
-    session.identity.workspacePath,
-    query,
-    signal,
-    {
-      workspaceStateVersion:
-        session.durable.state.mutationFrontier.currentStateDigest
-    }
-  );
   let available = availableOrchestratorBudget(session);
   if (!session.durable.frozenCustomization) {
     throw Object.assign(new Error(
@@ -199,26 +230,35 @@ export async function prepareModelAttempt(
     available,
     defaultOutputReserveTokens: options.outputReserveTokens,
     history: projected.history,
-    archive: projected.archiveProjection.archive?.item
+    archive: projected.archiveProjection.archive?.item,
+    ...(modelTurnBoundaryStage ? { modelTurnBoundaryStage } : {})
   };
-  let prepared = await prepareBudgetedModelTurn(preparation);
-  ({ prepared, available } = await refreshContextArchive({
-    session,
-    preparation,
-    initial: prepared,
-    initialProjection: projected.archiveProjection,
-    available,
-    signal,
-    summarizer,
-    emit: options.emit
-  }));
-  prepared = await applyProjectedResourceBoundary(
-    options, session, preparation, available, prepared
-  );
+  let prepared: BudgetedModelTurn;
+  try {
+    prepared = await prepareBudgetedModelTurn(preparation);
+    // Boundary turns preserve the remaining request; their initial plan already has a bounded summary.
+    if (!prepared.turn.boundaryStage) {
+      ({ prepared, available } = await refreshContextArchive({
+        session,
+        preparation,
+        initial: prepared,
+        initialProjection: projected.archiveProjection,
+        available,
+        signal,
+        summarizer,
+        emit: options.emit
+      }));
+    }
+    prepared = await applyProjectedResourceBoundary(options, session, preparation, available, prepared);
+  } catch (error) {
+    if (!contextBudgetExhausted(error)) throw error;
+    return contextBudgetFailure();
+  }
   const fittedBudget = fitPreparedBudget(
     prepared.turn.budget,
     available,
-    Number.MAX_SAFE_INTEGER
+    // A boundary request is one logical step; retries must not erase its protected final response.
+    prepared.turn.boundaryStage ? 1 : Number.MAX_SAFE_INTEGER
   );
   if (!fittedBudget) {
     return {

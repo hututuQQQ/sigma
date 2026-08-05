@@ -26,6 +26,8 @@ function candidateSession(reviewMode: "off" | "advisory" | "required") {
       } as never
     }
   });
+  delete session.durable.state.deadlineAt;
+  delete session.durable.state.deadlineRemainingMs;
   session.durable.state.mutationFrontier = {
     revision: 1,
     baselineManifestDigest: "0".repeat(64),
@@ -271,6 +273,27 @@ describe("Standard and Strict completion policy", () => {
       action: "complete",
       authority: "user_policy",
       validationStatus: "passed"
+    });
+  });
+
+  it("reports inferred coverage gaps without forcing another Standard turn", () => {
+    const session = candidateSession("advisory");
+    session.durable.state.mutationFrontier.changedPaths = ["src/index.ts"];
+    const passed = validation(session, "passed");
+    if (passed.kind !== "validation" || !passed.data.claim) {
+      throw new Error("Expected typed validation evidence.");
+    }
+    passed.data.coveredPaths = ["src/index.ts"];
+    passed.data.claim.kind = "acceptance";
+    passed.data.claim.subject.exactFiles = ["src/index.ts"];
+    session.durable.state.evidence.push(passed);
+
+    expect(completionGateDecision(session)).toMatchObject({
+      action: "complete",
+      validationStatus: "passed",
+      statusNote: expect.stringContaining(
+        "Validation coverage advisory: inferred typecheck behavior remains unestablished."
+      )
     });
   });
 

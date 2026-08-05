@@ -42,7 +42,7 @@ function commandEvidence(sessionId: string, runId: string): CommandEvidence {
   };
 }
 
-function receipt(artifactId: string): ToolReceipt {
+function receipt(artifactId: string, sizeBytes?: number): ToolReceipt {
   return {
     callId: "large-output",
     ok: true,
@@ -55,7 +55,8 @@ function receipt(artifactId: string): ToolReceipt {
       artifactId,
       name: "large.txt",
       digest: artifactId,
-      mediaType: "text/plain; charset=utf-8"
+      mediaType: "text/plain; charset=utf-8",
+      ...(sizeBytes === undefined ? {} : { sizeBytes })
     }],
     diagnostics: [],
     evidence: [],
@@ -247,12 +248,19 @@ describe("runtime control tools", () => {
     const content = Buffer.from("你好，Sigma🙂", "utf8");
     const artifactId = createHash("sha256").update(content).digest("hex");
     const session = runtimeSessionFixture();
-    session.durable.state.receipts.push(receipt(artifactId));
+    session.durable.state.receipts.push(receipt(artifactId, content.length));
     const service = new RuntimeControlService({
       readArtifact: async () => content.toString("utf8"),
       readArtifactBytes: async () => content
     } as RuntimeControlServiceOptions);
     const control = service.forSession(session);
+    await expect(control.readArtifact({
+      artifactId: `${artifactId}:large.txt:${content.length}`
+    })).resolves.toMatchObject({
+      artifactId,
+      digest: artifactId,
+      eof: true
+    });
     const pieces: Buffer[] = [];
     let offset: number | undefined;
     do {

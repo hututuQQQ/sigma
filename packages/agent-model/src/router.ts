@@ -28,7 +28,8 @@ import {
   abortableDelay,
   executionCandidates,
   nextExecutionIndex,
-  retryDelay
+  retryDelay,
+  safeProtocolRetry
 } from "./router-retry.js";
 import {
   incompleteRoutedStreamError,
@@ -272,7 +273,16 @@ export class ModelRouter {
         const category = classifyModelFailure(error);
         const semanticDelta = errorSemanticDelta(error);
         const nextIndex = nextExecutionIndex(planned, index, category);
-        if (!canFallback(resolution.route, category, semanticDelta) || nextIndex === undefined) {
+        const retryProtocol = safeProtocolRetry(
+          error,
+          category,
+          planned,
+          index,
+          nextIndex,
+          semanticDelta
+        );
+        if ((!retryProtocol && !canFallback(resolution.route, category, semanticDelta))
+          || nextIndex === undefined) {
           throw new ModelRouteExecutionError(
             routeId,
             spec.id,
@@ -334,7 +344,16 @@ export class ModelRouter {
         lifecycle.semanticDelta ||= errorSemanticDelta(error);
         const nextIndex = nextExecutionIndex(planned, index, category);
         const next = nextIndex === undefined ? undefined : planned[nextIndex];
-        if (!canFallback(resolution.route, category, blocksStreamRetry(lifecycle, spec, next))
+        const blocksRetry = blocksStreamRetry(lifecycle, spec, next);
+        const retryProtocol = safeProtocolRetry(
+          error,
+          category,
+          planned,
+          index,
+          nextIndex,
+          blocksRetry
+        );
+        if ((!retryProtocol && !canFallback(resolution.route, category, blocksRetry))
           || nextIndex === undefined) {
           throw new ModelRouteExecutionError(
             routeId,

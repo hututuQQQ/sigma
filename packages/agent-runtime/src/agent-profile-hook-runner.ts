@@ -21,6 +21,7 @@ import {
   prepareModelBudget,
   successfulModelUsage
 } from "./model-accounting.js";
+import { deterministicSamplingOptions } from "./model-request-policy.js";
 import type { RuntimeSession } from "./types.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 
@@ -297,7 +298,7 @@ export class ModelAgentProfileHookRunner implements HookRunnerPort {
         messages: hookMessages,
         tools: [],
         maxOutputTokens,
-        temperature: 0,
+        ...deterministicSamplingOptions(gateway),
         signal
       }, prepared.routeConstraints);
     } catch (error) {

@@ -9,11 +9,13 @@ import {
 import { strictCompletionDecision } from "./completion-gate-strict.js";
 import {
   currentFrontierReview,
-  currentFrontierValidationStatus
+  currentFrontierValidationStatus,
+  frontierValidationReadiness
 } from "./mutation-evidence.js";
 import type { RuntimeSession } from "./types.js";
 import { substantiveReview } from "./review-coordinator-support.js";
 import { rawAvailableBudget } from "./assurance-budget.js";
+import { deadlineForecast } from "./convergence-policy.js";
 
 export { completionCandidate } from "./completion-gate-common.js";
 export { completionFailure } from "./completion-terminal-gate.js";
@@ -150,7 +152,8 @@ function completionStatusNote(
   session: RuntimeSession,
   incompleteNodes: readonly PlanNode[],
   validationKind: StandardValidationKind,
-  validation: FrontierValidation
+  validation: FrontierValidation,
+  claimGaps: readonly string[]
 ): string | undefined {
   const planNote = incompleteNodes.length > 0
     ? `Plan status: incomplete (${incompleteNodes.length} unfinished node(s)).`
@@ -166,11 +169,14 @@ function completionStatusNote(
   } else if (validationKind === "unverified") {
     validationNote = "Validation status: not run for the current mutation frontier.";
   }
+  const coverageNote = claimGaps.length > 0 && validationKind === "passed"
+    ? `Validation coverage advisory: inferred ${claimGaps.join(", ")} behavior remains unestablished.`
+    : undefined;
   const review = currentFrontierReview(session);
   const reviewNote = review && substantiveReview(review) && review.data.verdict !== "approved"
     ? `Independent advisory review status: ${review.data.verdict}; unresolved findings remain.`
     : undefined;
-  const note = [planNote, validationNote, reviewNote].filter(Boolean).join(" ");
+  const note = [planNote, validationNote, coverageNote, reviewNote].filter(Boolean).join(" ");
   return note || undefined;
 }
 
@@ -184,6 +190,7 @@ function publicValidationStatus(
 function standardUncheckedDecision(session: RuntimeSession): CompletionGateDecision {
   const frontier = session.durable.state.mutationFrontier;
   const validation = currentFrontierValidationStatus(session);
+  const claimGaps = frontierValidationReadiness(session).missingClaims;
   const incompleteNodes = session.durable.state.plan.nodes.filter((node) =>
     node.status === "pending" || node.status === "in_progress" || node.status === "blocked");
   const validationKind = standardValidationKind(
@@ -192,11 +199,15 @@ function standardUncheckedDecision(session: RuntimeSession): CompletionGateDecis
   );
   const needsRepair = incompleteNodes.length > 0
     || !["not_needed", "passed"].includes(validationKind);
-  const basisDigest = standardBasisDigest(session, incompleteNodes, validationKind, validation);
+  const basisDigest = standardBasisDigest(
+    session, incompleteNodes, validationKind, validation
+  );
   const available = rawAvailableBudget(session);
+  const deadline = deadlineForecast(session);
   const repairTurnAvailable = available.inputTokens > 0
     && available.outputTokens > 0
-    && available.modelTurns > 0;
+    && available.modelTurns > 0
+    && (deadline.stage === "unbounded" || deadline.stage === "normal");
   if (needsRepair && repairTurnAvailable && !hasAdvisory(session, basisDigest)) {
     const issues = repairIssues(incompleteNodes, validationKind, validation);
     return advisory(
@@ -210,10 +221,11 @@ function standardUncheckedDecision(session: RuntimeSession): CompletionGateDecis
     session,
     incompleteNodes,
     validationKind,
-    validation
+    validation,
+    claimGaps
   );
   const boundaryStatus = needsRepair && !repairTurnAvailable
-    ? "Model-turn budget exhausted; unresolved Standard advisory items are reported without an impossible repair turn."
+    ? "No bounded repair turn remains; unresolved Standard advisory items are reported without an impossible repair turn."
     : undefined;
   const statusNote = [ordinaryStatus, boundaryStatus].filter(Boolean).join(" ") || undefined;
   return {

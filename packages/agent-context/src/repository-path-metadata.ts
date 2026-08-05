@@ -18,9 +18,9 @@ const languageByExtension = new Map([
   [".css", "CSS"], [".dart", "Dart"], [".ex", "Elixir"], [".exs", "Elixir"],
   [".fs", "F#"], [".fsx", "F#"],
   [".go", "Go"], [".h", "C/C++"], [".hpp", "C++"], [".java", "Java"],
-  [".html", "HTML"], [".js", "JavaScript"], [".jsx", "JavaScript"], [".kt", "Kotlin"], [".kts", "Kotlin"],
+  [".html", "HTML"], [".cjs", "JavaScript"], [".js", "JavaScript"], [".jsx", "JavaScript"], [".kt", "Kotlin"], [".kts", "Kotlin"],
   [".lua", "Lua"],
-  [".mjs", "JavaScript"], [".php", "PHP"], [".py", "Python"], [".r", "R"], [".rb", "Ruby"],
+  [".mjs", "JavaScript"], [".cts", "TypeScript"], [".mts", "TypeScript"], [".php", "PHP"], [".py", "Python"], [".r", "R"], [".rb", "Ruby"],
   [".rs", "Rust"], [".scala", "Scala"], [".sh", "Shell"], [".sql", "SQL"],
   [".swift", "Swift"], [".ts", "TypeScript"], [".tsx", "TypeScript"],
   [".vb", "Visual Basic"], [".vue", "Vue"], [".zig", "Zig"]

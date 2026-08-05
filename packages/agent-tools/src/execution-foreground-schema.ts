@@ -3,6 +3,7 @@ import type { ExecutionToolOptions } from "./execution-tool-types.js";
 import {
   assertAvailableExecutable,
   assertAvailableShell,
+  availableNetworkModes,
   availableShells,
   executableCapabilitySchema,
   executionToolSchema
@@ -10,6 +11,10 @@ import {
 import { environmentShellAvailable } from "./environment-shell-tool.js";
 
 type ForegroundKind = "exec" | "shell" | "validate";
+
+function deliverableHandoffAvailable(options: ExecutionToolOptions): boolean {
+  return options.handoff === true && availableNetworkModes(options).includes("full");
+}
 
 export interface ForegroundInvocation {
   shellCommand: boolean;
@@ -54,11 +59,10 @@ function assertShellBackgroundMode(
   if (background && options.background === false) {
     invalidArguments("shell background execution is unavailable for this execution broker.");
   }
-  if (background && input.timeoutMs !== undefined) {
-    invalidArguments("shell timeoutMs is foreground-only; use yieldMs for background startup.");
-  }
-  if (input.lifecycle === "deliverable" && options.handoff !== true) {
-    invalidArguments("Deliverable process handoff is unavailable for this execution broker.");
+  if (input.lifecycle === "deliverable" && !deliverableHandoffAvailable(options)) {
+    invalidArguments(
+      "Deliverable process handoff requires broker support and the full network mode."
+    );
   }
 }
 
@@ -265,7 +269,7 @@ function unifiedExecutionProperties(
       background: {
         type: "boolean",
         description:
-          "Set true only for a long-running service or interactive process. The runtime waits up to yieldMs before returning a live handle."
+          "Set true for read-only long-running commands, services, or interactive processes when a live handle is needed. Commands that create or modify workspace deliverables must stay foreground and may use timeoutMs up to 600000. The runtime returns terminal status if a background command finishes within yieldMs and a live handle otherwise."
       },
       yieldMs: {
         type: "integer",
@@ -280,12 +284,12 @@ function unifiedExecutionProperties(
           description: "Allocate a PTY for background execution."
         }
       }),
-      ...(options.handoff === true ? {
+      ...(deliverableHandoffAvailable(options) ? {
         lifecycle: {
           type: "string",
           enum: ["session", "deliverable"],
           description:
-            "Defaults to session. Use deliverable only for a verified service that must survive successful completion, then call process_handoff."
+            "Defaults to session. Use deliverable only for a TCP service started with network=full that must survive successful completion; process_handoff verifies its delivery-boundary endpoint."
         }
       } : {})
     })
@@ -321,7 +325,7 @@ function executionDescription(
     return `Run a sandboxed ${kind} command. With skill and skillScript, the frozen script is prepended to interpreter args.`;
   }
   return [
-    "Run one sandboxed command using exactly one form: {command,shell?} or {executable,args?,skill?,skillScript?}. Foreground is the default. Workspace commands are read-only by default; to create, modify, or delete workspace paths, provide expectedChanges with exact files or narrow directories. Put disposable outputs in the process temp directory ($TMPDIR on POSIX, %TEMP% or $env:TEMP on Windows). Set validation=true only for a completed check; validation uses a disposable workspace view and cannot persist deliverables. background=true is only for a long-running service or interactive process. Background startup waits up to yieldMs and returns either terminal status or a live handle.",
+    "Run one sandboxed command using exactly one form: {command,shell?} or {executable,args?,skill?,skillScript?}. Foreground is the default. Workspace commands are read-only by default; to create, modify, or delete workspace paths, provide expectedChanges with exact files or narrow directories. Put disposable outputs in the process temp directory ($TMPDIR on POSIX, %TEMP% or $env:TEMP on Windows). Set validation=true only for a completed check; validation uses a disposable workspace view and cannot persist deliverables. Keep commands that write workspace deliverables in the foreground and use timeoutMs up to 600000 for long builds, tests, or package operations. Use background=true only for read-only long-running commands, services, or interactive processes that need a live handle, then poll that handle to completion. Background startup waits up to yieldMs and returns either terminal status or a live handle.",
     ...(environmentShellAvailable(options)
       ? ["Set target=environment only when the command needs system-level changes in the broker-attested disposable outer environment. Use target=environment again to inspect or control processes, sockets, and temporary files created there; workspace-target calls use a separate sandbox view. If that same foreground command must also create or modify workspace deliverables, declare those workspace paths in expectedChanges so they remain checkpointed. Background environment commands cannot write the workspace."]
       : [])

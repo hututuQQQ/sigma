@@ -123,7 +123,8 @@ function batchPaths(outputDir, batchId) {
   return {
     started: path.join(outputDir, `batch-${safeId}.started.json`),
     completed: path.join(outputDir, `batch-${safeId}.completed.json`),
-    tasks: path.join(outputDir, `batch-${safeId}.tasks.json`)
+    tasks: path.join(outputDir, `batch-${safeId}.tasks.json`),
+    bootstrapPreflight: path.join(outputDir, `batch-${safeId}.bootstrap-preflight.json`)
   };
 }
 
@@ -379,6 +380,19 @@ function sumReports(reports, pathParts) {
   }, 0);
 }
 
+function optionalSumReports(reports, pathParts) {
+  const values = reports.flatMap((report) => {
+    let value = report;
+    for (const part of pathParts) value = value?.[part];
+    if (value === null || value === undefined || value === "") return [];
+    const number = Number(value);
+    return Number.isFinite(number) ? [number] : [];
+  });
+  if (values.length === 0) return null;
+  const total = values.reduce((sum, value) => sum + value, 0);
+  return Math.round(total * 1_000_000) / 1_000_000;
+}
+
 function aggregateNumericObjects(reports, key) {
   const keys = new Set(reports.flatMap((report) => Object.keys(report?.[key] ?? {})));
   return Object.fromEntries([...keys].sort().map((item) => [
@@ -432,6 +446,89 @@ export function aggregateFormalReports(manifest, batchRecords) {
     });
   const status = allBatchesRecorded ? executionComplete ? "complete" : "incomplete" : "running";
   const usage = aggregateNumericObjects(reports, "usage");
+  const billedCostUsd = optionalSumReports(reports, ["cost_usd"]);
+  const apiEquivalentCostUsd = optionalSumReports(reports, ["api_equivalent_cost_usd"]);
+  const billingModes = [...new Set(reports.flatMap((report) =>
+    report.cost_accounting?.billed?.billing_modes ?? []))].sort();
+  const pricingCatalogs = [...new Map(reports.flatMap((report) =>
+    (report.cost_accounting?.api_equivalent?.pricing_catalogs ?? []).map((catalog) => [
+      `${catalog.id}:${catalog.effective_at ?? ""}`,
+      catalog
+    ]))).values()].sort((left, right) => String(left.id).localeCompare(String(right.id)));
+  const billedKnownRecords = sumReports(reports, ["cost_accounting", "billed", "known_records"]);
+  const billedUnknownRecords = sumReports(reports, ["cost_accounting", "billed", "unknown_records"]);
+  const apiEquivalentPricedRecords = sumReports(
+    reports, ["cost_accounting", "api_equivalent", "priced_records"]
+  );
+  const apiEquivalentTotalRecords = sumReports(
+    reports, ["cost_accounting", "api_equivalent", "total_records"]
+  );
+  const apiEquivalentComponentRecords = sumReports(
+    reports, ["cost_accounting", "api_equivalent", "component_records"]
+  );
+  const apiEquivalentComponentsUsd = Object.fromEntries([
+    "input", "output", "cache_read", "cache_write", "unattributed"
+  ].map((component) => [
+    component,
+    sumReports(reports, ["cost_accounting", "api_equivalent", "components_usd", component])
+  ]));
+  const observedTasks = batchRecords.flatMap((record) => {
+    const reportedTasks = Array.isArray(record.report?.tasks) ? record.report.tasks : [];
+    const observedCount = Math.max(0, Number(record.report?.trial_accounting?.observed ?? 0));
+    return reportedTasks.slice(0, observedCount);
+  });
+  const validTasks = observedTasks.filter((task) => task.validity === "valid");
+  const knownPassed = observedTasks.filter((task) => task.verifier_outcome === "passed").length;
+  const effectivePassed = validTasks.filter((task) => task.verifier_outcome === "passed").length;
+  const infraInvalid = observedTasks.filter((task) => task.validity === "infra_failed").length;
+  const unobserved = Math.max(0, expected - accounting.observed);
+  const unclassifiedObserved = Math.max(0, accounting.observed - observedTasks.length);
+  const correctnessBounds = {
+    passed: knownPassed,
+    effective_passed: effectivePassed,
+    total: expected,
+    observed: accounting.observed,
+    infra_invalid: infraInvalid,
+    unobserved,
+    unclassified_observed: unclassifiedObserved,
+    valid_total: validTasks.length,
+    lower_bound: expected > 0 ? knownPassed / expected : null,
+    effective_rate: validTasks.length > 0 ? effectivePassed / validTasks.length : null,
+    upper_bound: expected > 0
+      ? Math.min(
+          expected,
+          knownPassed + infraInvalid + unobserved + unclassifiedObserved
+        ) / expected
+      : null,
+    invalid_rate: expected > 0 ? infraInvalid / expected : null
+  };
+  const verifierGateBatches = batchRecords
+    .filter((record) => record.report?.verifier_gate)
+    .map((record) => ({ batch: record.batch, ...record.report.verifier_gate }));
+  const verifierGateAcquisitions = verifierGateBatches.reduce(
+    (total, metric) => total + Number(metric.acquisitions ?? 0), 0
+  );
+  const verifierGateWaitTotalMs = verifierGateBatches.reduce(
+    (total, metric) => total + Number(metric.wait_ms?.total ?? 0), 0
+  );
+  const verifierGate = {
+    acquisitions: verifierGateAcquisitions,
+    releases: verifierGateBatches.reduce(
+      (total, metric) => total + Number(metric.releases ?? 0), 0
+    ),
+    contended_acquisitions: verifierGateBatches.reduce(
+      (total, metric) => total + Number(metric.contended_acquisitions ?? 0), 0
+    ),
+    wait_ms: {
+      total: verifierGateWaitTotalMs,
+      mean: verifierGateAcquisitions > 0
+        ? verifierGateWaitTotalMs / verifierGateAcquisitions : null,
+      max: verifierGateBatches.length > 0
+        ? Math.max(...verifierGateBatches.map((metric) => Number(metric.wait_ms?.max ?? 0)))
+        : null
+    },
+    batches: verifierGateBatches
+  };
   return {
     schemaVersion: 1,
     kind: "SigmaFormalRunReport",
@@ -448,11 +545,49 @@ export function aggregateFormalReports(manifest, batchRecords) {
       completed: batchRecords.length
     },
     trial_accounting: accounting,
+    correctness_bounds: correctnessBounds,
+    verifier_gate: verifierGate,
     counts: aggregateNumericObjects(reports, "counts"),
     failure_categories: aggregateFailureCategories(reports),
     lane_metrics: laneMetrics(tasks, reports[0]?.evaluation_lane ?? null),
     usage,
-    cost_usd: sumReports(reports, ["cost_usd"]),
+    cost_usd: billedCostUsd,
+    api_equivalent_cost_usd: apiEquivalentCostUsd,
+    cost_accounting: {
+      billed: {
+        amount_usd: billedCostUsd,
+        status: billedKnownRecords === 0 && billedUnknownRecords === 0
+          ? billedCostUsd === null ? "unavailable" : "reported_aggregate"
+          : billedUnknownRecords === 0
+            ? "complete"
+            : billedKnownRecords === 0
+              && billingModes.length === 1 && billingModes[0] === "subscription"
+              ? "subscription_not_attributed"
+              : billedKnownRecords > 0 ? "partial" : "unavailable",
+        known_records: billedKnownRecords,
+        unknown_records: billedUnknownRecords,
+        billing_modes: billingModes
+      },
+      api_equivalent: {
+        amount_usd: apiEquivalentCostUsd,
+        status: apiEquivalentTotalRecords === 0
+          ? apiEquivalentCostUsd === null ? "unavailable" : "reported_aggregate"
+          : apiEquivalentPricedRecords === 0
+            ? "unavailable"
+            : apiEquivalentPricedRecords === apiEquivalentTotalRecords ? "complete" : "partial",
+        priced_records: apiEquivalentPricedRecords,
+        total_records: apiEquivalentTotalRecords,
+        coverage: apiEquivalentTotalRecords > 0
+          ? apiEquivalentPricedRecords / apiEquivalentTotalRecords : null,
+        component_records: apiEquivalentComponentRecords,
+        component_coverage: apiEquivalentPricedRecords > 0
+          ? apiEquivalentComponentRecords / apiEquivalentPricedRecords : null,
+        components_usd: apiEquivalentCostUsd !== null
+          ? apiEquivalentComponentsUsd : null,
+        basis: "bundled_model_catalog_list_price_estimate_not_billed_charge",
+        pricing_catalogs: pricingCatalogs
+      }
+    },
     tasks
   };
 }
@@ -470,10 +605,20 @@ function formalMarkdown(report) {
     `- Completed batches: ${report.batches.completed}/${report.batches.expected}`,
     `- Observed trials: ${report.trial_accounting.observed}/${report.trial_accounting.expected}`,
     `- Verifier passes: ${passCount}`,
+    `- Pass-rate lower/effective/upper bounds: ${report.correctness_bounds?.lower_bound ?? "n/a"} / ${report.correctness_bounds?.effective_rate ?? "n/a"} / ${report.correctness_bounds?.upper_bound ?? "n/a"}`,
+    `- Infra-invalid rate: ${report.correctness_bounds?.invalid_rate ?? "n/a"}`,
+    `- Verifier concurrency schedule: ${JSON.stringify(report.execution.batches.map((batch) => ({ batch: batch.id, concurrency: batch.verifier_concurrency })))}`,
+    `- Verifier gate wait ms (total/mean/max): ${report.verifier_gate?.wait_ms?.total ?? "n/a"} / ${report.verifier_gate?.wait_ms?.mean ?? "n/a"} / ${report.verifier_gate?.wait_ms?.max ?? "n/a"}`,
     `- Verifier reach/pass rate: ${report.lane_metrics.verifier_reached}/${report.lane_metrics.verifier_pass_rate ?? "n/a"}`,
     `- Counts: ${JSON.stringify(report.counts)}`,
     `- Failure categories: ${JSON.stringify(report.failure_categories)}`,
-    `- Cost USD: ${report.cost_usd}`,
+    `- Attributed/billed cost USD: ${report.cost_usd ?? "unavailable"}`,
+    `- Billed cost status: ${report.cost_accounting?.billed?.status ?? "unknown"}`,
+    `- API-equivalent estimated cost USD: ${report.api_equivalent_cost_usd ?? "unavailable"}`,
+    `- API-equivalent estimate coverage: ${report.cost_accounting?.api_equivalent?.coverage ?? "unknown"}`,
+    `- API-equivalent component coverage: ${report.cost_accounting?.api_equivalent?.component_coverage ?? "unknown"}`,
+    `- API-equivalent cost components USD: ${JSON.stringify(report.cost_accounting?.api_equivalent?.components_usd ?? {})}`,
+    `- Pricing catalogs: ${JSON.stringify(report.cost_accounting?.api_equivalent?.pricing_catalogs ?? [])}`,
     ""
   ];
   return lines.join("\n");
@@ -499,8 +644,13 @@ async function writeFormalReport(outputDir, manifest, records, preregistrationSh
 async function runBatch(manifest, batch, options, deps) {
   const files = batchPaths(options.outputDir, batch.id);
   await ensureStableJson(files.tasks, selectedTasks(manifest, batch));
+  let bootstrapPreflightSha256 = null;
+  if (manifest.execution.bootstrap_preflight) {
+    await ensureStableJson(files.bootstrapPreflight, manifest.execution.bootstrap_preflight);
+    bootstrapPreflightSha256 = sha256(await readFile(files.bootstrapPreflight));
+  }
   const runner = deps.runTerminalBenchCli ?? runTerminalBenchCli;
-  return await runner([
+  const args = [
     "--mode", "batch",
     "--tasks-file", files.tasks,
     "--dataset", manifest.task_selection.dataset,
@@ -518,6 +668,8 @@ async function runBatch(manifest, batch, options, deps) {
     "--managed-environment-mode", manifest.execution.managed_environment_mode,
     "--harbor-topology", manifest.execution.harbor_topology,
     "--concurrency", String(manifest.execution.concurrency),
+    "--verifier-concurrency", String(batch.verifier_concurrency),
+    "--verifier-proxy-mode", manifest.execution.verifier_proxy_mode,
     "--attempts", String(manifest.execution.attempts_per_task),
     "--retries", String(manifest.execution.retries),
     "--timeout-leniency-multiplier", "1",
@@ -525,7 +677,17 @@ async function runBatch(manifest, batch, options, deps) {
     "--run-label", `formal-${safePathPart(manifest.formal_run_id)}-${safePathPart(batch.id)}`,
     "--reuse-package",
     "--expected-archive-sha256", manifest.archive_sha256
-  ], {
+  ];
+  if (manifest.execution.verifier_proxy_url) {
+    args.push("--verifier-proxy-url", manifest.execution.verifier_proxy_url);
+  }
+  if (manifest.execution.bootstrap_preflight) {
+    args.push(
+      "--bootstrap-preflight-file", files.bootstrapPreflight,
+      "--expected-bootstrap-preflight-sha256", bootstrapPreflightSha256
+    );
+  }
+  return await runner(args, {
     ...(deps.terminalBenchDeps ?? {}),
     beforeHarborDispatch: deps.beforeHarborDispatch,
     assertFrozenRunControls: (context) => assertFrozenBatchControls(manifest, batch, context)

@@ -41,8 +41,11 @@ export function aggregateReviewerUsage(
     : billingModes.size > 0
       ? "metered"
       : undefined;
+  const apiEquivalentCosts = usages.flatMap((item) =>
+    item.apiEquivalentCostMicroUsd === undefined ? [] : [item.apiEquivalentCostMicroUsd]);
+  const { apiEquivalentCostMicroUsd: _firstApiEquivalentCost, ...firstWithoutEstimate } = first;
   return {
-    ...first,
+    ...firstWithoutEstimate,
     usageId: `${requestId}:usage`,
     requestId,
     providerReported: usages.every((item) => item.providerReported),
@@ -54,6 +57,9 @@ export function aggregateReviewerUsage(
     costMicroUsd: subscriptionOnly || containsUnpriced
       ? null
       : usages.reduce((total, item) => total + (item.costMicroUsd ?? 0), 0),
+    ...(apiEquivalentCosts.length === usages.length
+      ? { apiEquivalentCostMicroUsd: apiEquivalentCosts.reduce((total, item) => total + item, 0) }
+      : {}),
     ...(billingMode ? { billingMode } : {}),
     latencyMs: usages.reduce((total, item) => total + item.latencyMs, 0),
     attempt: usages.reduce((total, item) =>

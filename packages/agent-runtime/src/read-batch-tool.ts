@@ -14,6 +14,10 @@ export const MAX_READ_BATCH_CALLS = 8;
 const ELIGIBLE_MAXIMUM_EFFECTS = new Set<ToolEffect>([
   "filesystem.read",
   "filesystem.read.external",
+  // Mixed navigation/edit tools may be advertised by their maximum effect.
+  // Every nested call is still prepared below and only an exact read-only
+  // plan is admitted, so operations such as LSP rename cannot enter a batch.
+  "filesystem.write",
   "process.spawn.readonly"
 ]);
 const ALLOWED_PLAN_EFFECTS = new Set<ToolEffect>([

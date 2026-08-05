@@ -261,12 +261,16 @@ export async function settleBudgetBoundaryProcesses(
   let settled = 0;
   while (pending.size > 0) {
     signal.throwIfAborted();
-    for (const [id, handle] of [...pending.entries()]) {
-      let result: ProcessPollResult;
+    const polls = await Promise.all([...pending.entries()].map(async ([id, handle]) => {
       try {
-        result = await options.execution.poll(handle, { signal });
+        return { id, handle, result: await options.execution!.poll!(handle, { signal }) };
       } catch (error) {
         if (signal.aborted) throw error;
+        return { id, handle, error };
+      }
+    }));
+    for (const { id, handle, result, error } of polls) {
+      if (!result) {
         await recordLost(session, handle, error, summaries.get(id)!, options);
         pending.delete(id);
         settled += 1;
@@ -328,15 +332,24 @@ export async function terminateUnhandedBudgetBoundaryProcesses(
   if (!options.execution?.terminate) {
     return { attempted: pending.length, settled: 0, unavailable: true };
   }
-  let settled = 0;
-  for (const handle of pending) {
-    signal.throwIfAborted();
-    const summary = emptyProcessSummary();
+  const attempts = await Promise.all(pending.map(async (handle) => {
     try {
-      const result = await options.execution.terminate(handle, {
-        signal,
-        timeoutMs: 10_000
-      });
+      return {
+        handle,
+        result: await options.execution!.terminate!(handle, {
+          signal,
+          timeoutMs: 10_000
+        })
+      };
+    } catch (error) {
+      if (signal.aborted) throw error;
+      return { handle, error };
+    }
+  }));
+  let settled = 0;
+  for (const { handle, result, error } of attempts) {
+    const summary = emptyProcessSummary();
+    if (result) {
       await recordOutput(session, handle.id, result, summary, options);
       session.execution.processHandles.delete(handle.id);
       await options.emit(session, "process.exited", "runtime", {
@@ -352,8 +365,7 @@ export async function terminateUnhandedBudgetBoundaryProcesses(
         "runtime",
         settlementEvidence(session, handle, result, summary)
       );
-    } catch (error) {
-      if (signal.aborted) throw error;
+    } else {
       await recordLost(session, handle, error, summary, options);
     }
     settled += 1;

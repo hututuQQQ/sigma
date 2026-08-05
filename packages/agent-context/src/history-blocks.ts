@@ -1,5 +1,9 @@
 import { createHash } from "node:crypto";
-import { modelImageInputTokenEstimate, type ModelMessage } from "agent-protocol";
+import {
+  modelImageInputTokenEstimate,
+  modelMessagesWithoutImagePayloads,
+  type ModelMessage
+} from "agent-protocol";
 import { approximateTokens } from "./unicode.js";
 
 export interface HistoryBlock {
@@ -8,11 +12,13 @@ export interface HistoryBlock {
 }
 
 export function messageTokens(message: ModelMessage): number {
-  return approximateTokens(message.content)
-    + approximateTokens(message.reasoningContent ?? "")
-    + approximateTokens(JSON.stringify(message.toolCalls ?? []))
-    + modelImageInputTokenEstimate([message])
-    + 6;
+  // Provider-native replay state can contain signed/encrypted reasoning that
+  // replaces the neutral fields on the wire. Count the complete durable
+  // message so history selection and provider request sizing use the same
+  // representation. Inline image bytes remain transport-only.
+  const [modelVisibleMessage] = modelMessagesWithoutImagePayloads([message]);
+  return approximateTokens(JSON.stringify(modelVisibleMessage))
+    + modelImageInputTokenEstimate([message]);
 }
 
 export function withoutUnneededHistoricalReasoning(message: ModelMessage): ModelMessage {
@@ -94,13 +100,50 @@ function fitText(value: string, maximumTokens: number): string {
   return `${value.slice(0, low)}${marker}${suffix}`.trimEnd();
 }
 
+function fitAssistantMessage(
+  content: string,
+  maximumTokens: number
+): ModelMessage | undefined {
+  const empty: ModelMessage = { role: "assistant", content: "" };
+  if (maximumTokens < messageTokens(empty)) return undefined;
+  const message = (value: string): ModelMessage => ({ role: "assistant", content: value });
+  const full = message(content);
+  if (messageTokens(full) <= maximumTokens) return full;
+  const marker = "\n...[context compacted]...\n";
+  if (messageTokens(message(marker)) > maximumTokens) {
+    let prefixLow = 0;
+    let prefixHigh = content.length;
+    while (prefixLow < prefixHigh) {
+      const middle = Math.ceil((prefixLow + prefixHigh) / 2);
+      if (messageTokens(message(content.slice(0, middle))) <= maximumTokens) {
+        prefixLow = middle;
+      } else {
+        prefixHigh = middle - 1;
+      }
+    }
+    return message(content.slice(0, prefixLow).trimEnd());
+  }
+  let low = 0;
+  let high = Math.floor(content.length / 2);
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    const candidate = message(
+      `${content.slice(0, middle)}${marker}${content.slice(-middle)}`.trimEnd()
+    );
+    if (messageTokens(candidate) <= maximumTokens) {
+      low = middle;
+    } else {
+      high = middle - 1;
+    }
+  }
+  const suffix = low > 0 ? content.slice(-low) : "";
+  return message(`${content.slice(0, low)}${marker}${suffix}`.trimEnd());
+}
+
 export function compactHistoryFallback(
   block: HistoryBlock,
   maximumTokens: number
 ): ModelMessage[] | undefined {
-  const empty: ModelMessage = { role: "assistant", content: "" };
-  const contentOverhead = messageTokens(empty) - approximateTokens(empty.content);
-  if (maximumTokens < messageTokens(empty)) return undefined;
   const observations = block.messages
     .filter((message) => message.role === "tool")
     .map((message, index) => `Observation ${index + 1}:\n${message.content}`)
@@ -109,11 +152,8 @@ export function compactHistoryFallback(
   const observationSummary = observations.length > 0
     ? `${explanation}\nThe following is a non-executable observation summary; it is not a tool call and contains no call arguments:\n${observations}`
     : explanation;
-  const compacted: ModelMessage = {
-    role: "assistant",
-    content: fitText(observationSummary, maximumTokens - contentOverhead)
-  };
-  return messageTokens(compacted) <= maximumTokens ? [compacted] : [empty];
+  const compacted = fitAssistantMessage(observationSummary, maximumTokens);
+  return compacted ? [compacted] : undefined;
 }
 
 export function compactHistoryBlock(

@@ -33,6 +33,7 @@ function languageId(filePath: string): string {
   const extension = path.extname(filePath).toLowerCase();
   return ({
     ".ts": "typescript", ".tsx": "typescriptreact", ".js": "javascript", ".jsx": "javascriptreact",
+    ".mts": "typescript", ".cts": "typescript", ".mjs": "javascript", ".cjs": "javascript",
     ".py": "python", ".rs": "rust", ".go": "go"
   } as Record<string, string>)[extension] ?? "plaintext";
 }
@@ -92,7 +93,7 @@ export class LspClient {
         textDocument: {
           documentSymbol: {}, definition: {}, references: {}, hover: {}, rename: {}, publishDiagnostics: {}
         },
-        workspace: { workspaceEdit: { documentChanges: true } }
+        workspace: { workspaceEdit: { documentChanges: true }, symbol: {} }
       },
       workspaceFolders: [{ uri: pathToFileURL(this.rootPath).href, name: path.basename(this.rootPath) }]
     }, signal);
@@ -103,6 +104,11 @@ export class LspClient {
   async symbols(filePath: string, signal?: AbortSignal): Promise<unknown> {
     const uri = await this.open(filePath, signal);
     return await this.request("textDocument/documentSymbol", { textDocument: { uri } }, signal);
+  }
+
+  async workspaceSymbols(filePath: string, query: string, signal?: AbortSignal): Promise<unknown> {
+    await this.open(filePath, signal);
+    return await this.request("workspace/symbol", { query }, signal);
   }
 
   async definition(filePath: string, position: LspPosition, signal?: AbortSignal): Promise<LspLocation | LspLocation[] | null> {

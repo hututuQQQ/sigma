@@ -67,7 +67,9 @@ pnpm bench:tb:formal -- \\
 The Python adapters only depend on the Python standard library and Harbor. The
 Sigma adapter uploads the packaged Sigma CLI, installs it as
 \`/usr/local/bin/agent\`, invokes \`agent run\`, and records its structured
-result after the run. The optional \`codex_harbor_agent:PortableCodex\` adapter
+result after the run. The neutral \`verifier_gate_plugin:VerifierGatePlugin\`
+can bound verifier phases across independent Harbor processes using run-scoped
+OS file locks. The optional \`codex_harbor_agent:PortableCodex\` adapter
 inherits Harbor's stock Codex behavior while installing a caller-provided,
 SHA-256-bound native Codex archive without live runtime downloads. Evaluation
 output is never passed back into either solving session.
@@ -91,6 +93,9 @@ export async function packageHarborRuntime(options = {}) {
   const codexSourcePath = options.codexSourcePath
     ? path.resolve(options.codexSourcePath)
     : path.join(rootDir, "portable", "harbor", "codex_harbor_agent.py");
+  const verifierGateSourcePath = options.verifierGateSourcePath
+    ? path.resolve(options.verifierGateSourcePath)
+    : path.join(rootDir, "portable", "harbor", "verifier_gate_plugin.py");
   const sandboxComposeSourcePath = options.sandboxComposeSourcePath
     ? path.resolve(options.sandboxComposeSourcePath)
     : path.join(rootDir, "portable", "harbor", "docker-compose-sigma-sandbox.yaml");
@@ -105,6 +110,9 @@ export async function packageHarborRuntime(options = {}) {
   if (!existsSync(codexSourcePath)) {
     throw new Error(`Portable Codex Harbor runtime source is missing: ${codexSourcePath}`);
   }
+  if (!existsSync(verifierGateSourcePath)) {
+    throw new Error(`Portable verifier gate source is missing: ${verifierGateSourcePath}`);
+  }
   if (!existsSync(sandboxComposeSourcePath)) {
     throw new Error(`Portable Harbor sandbox Compose overlay is missing: ${sandboxComposeSourcePath}`);
   }
@@ -114,17 +122,21 @@ export async function packageHarborRuntime(options = {}) {
 
   const sourceText = await readFile(sourcePath, "utf8");
   const codexSourceText = await readFile(codexSourcePath, "utf8");
+  const verifierGateSourceText = await readFile(verifierGateSourcePath, "utf8");
   const sandboxComposeText = await readFile(sandboxComposeSourcePath, "utf8");
   assertNoRemovedHarborAdapter(sourceText, "Portable Harbor runtime source");
   assertNoRemovedHarborAdapter(codexSourceText, "Portable Codex Harbor runtime source");
+  assertNoRemovedHarborAdapter(verifierGateSourceText, "Portable verifier gate source");
 
   await rm(harborRuntimeDir, { recursive: true, force: true });
   await mkdir(harborRuntimeDir, { recursive: true });
 
   const runtimePath = path.join(harborRuntimeDir, "sigma_harbor_agent.py");
   const codexRuntimePath = path.join(harborRuntimeDir, "codex_harbor_agent.py");
+  const verifierGateRuntimePath = path.join(harborRuntimeDir, "verifier_gate_plugin.py");
   await writeFile(runtimePath, sourceText, "utf8");
   await writeFile(codexRuntimePath, codexSourceText, "utf8");
+  await writeFile(verifierGateRuntimePath, verifierGateSourceText, "utf8");
   await writeFile(sandboxComposePath, sandboxComposeText, "utf8");
 
   const readmeText = runtimeReadme(agentCliTarball);
@@ -138,6 +150,7 @@ export async function packageHarborRuntime(options = {}) {
     harborRuntimeDir,
     runtimePath,
     codexRuntimePath,
+    verifierGateRuntimePath,
     sandboxComposePath,
     agentCliTarball
   };

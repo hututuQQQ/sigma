@@ -82,6 +82,7 @@ export function validateSpec(spec: ModelSpec): void {
     throw new Error(`Non-metered model spec '${spec.id}' must not declare API pricing.`);
   }
   if (spec.pricing) validatePricing(spec.id, spec.pricing);
+  if (spec.apiEquivalentPricing) validatePricing(spec.id, spec.apiEquivalentPricing);
 }
 
 function validateTokenizer(spec: ModelSpec): void {

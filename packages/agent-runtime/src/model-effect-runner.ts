@@ -6,10 +6,7 @@ import {
   type RunOutcome
 } from "agent-protocol";
 import type { KernelEffect } from "agent-kernel";
-import {
-  RepositoryContextProvider,
-  type ContextPlan
-} from "agent-context";
+import { RepositoryContextProvider, type ContextPlan } from "agent-context";
 import { steeringRestart } from "./effect-helpers.js";
 import type { EffectRunnerOptions } from "./effect-runner.js";
 import type { RuntimeSession } from "./types.js";
@@ -33,9 +30,7 @@ import {
   budgetFailure,
   type PreparedModelTurn
 } from "./model-budget-convergence.js";
-import {
-  ModelSummarizer
-} from "./model-summarizer.js";
+import { ModelSummarizer } from "./model-summarizer.js";
 import { prepareModelAttempt } from "./model-turn-preparation.js";
 import { LongHorizonCoordinator } from "./long-horizon-coordinator.js";
 import type { ReviewCoordinator } from "./review-coordinator.js";
@@ -82,7 +77,10 @@ export class ModelEffectRunner {
     const turnId = ++session.durable.modelTurn;
     let effectRevision = effect.revision;
     try {
-      await this.longHorizon.prepareForMainModel(session, turnSignal);
+      const openingDeadline = deadlineForecast(session);
+      if (openingDeadline.stage !== "converge") {
+        await this.longHorizon.prepareForMainModel(session, turnSignal);
+      }
       const hookResult = await this.options.hooks.dispatch(session, "pre_model", {
         sessionId: session.identity.sessionId,
         runId: session.durable.runId,
@@ -203,23 +201,45 @@ export class ModelEffectRunner {
     signal: AbortSignal,
     hookContext: readonly ContextItem[]
   ): Promise<RunOutcome | null> {
-    const prepared = await prepareModelAttempt(
+    const openingForecast = deadlineForecast(session);
+    let prepared = await prepareModelAttempt(
       this.options,
       this.repositoryContext,
       this.summarizer,
       session,
       turnId,
       signal,
-      hookContext
+      hookContext,
+      openingForecast.stage === "converge" ? "final" : undefined
     );
     if (prepared.failure) return prepared.failure;
-    const { turn, plan } = prepared;
+    let { turn, plan } = prepared;
     if (!turn || !plan) {
       throw new Error("Model turn preparation completed without a turn.");
     }
     const admissionFailure = convergenceAdmissionFailure(session, { kind: "model" });
     if (admissionFailure) return admissionFailure;
-    const forecast = deadlineForecast(session);
+    let forecast = deadlineForecast(session);
+    if (openingForecast.stage !== "converge" && forecast.stage === "converge") {
+      prepared = await prepareModelAttempt(
+        this.options,
+        this.repositoryContext,
+        this.summarizer,
+        session,
+        turnId,
+        signal,
+        hookContext,
+        "final"
+      );
+      if (prepared.failure) return prepared.failure;
+      ({ turn, plan } = prepared);
+      if (!turn || !plan) {
+        throw new Error("Deadline closeout preparation completed without a turn.");
+      }
+      forecast = deadlineForecast(session);
+      const closeoutAdmissionFailure = convergenceAdmissionFailure(session, { kind: "model" });
+      if (closeoutAdmissionFailure) return closeoutAdmissionFailure;
+    }
     await this.options.emit(session, "model.prompt_materialized", "runtime", {
       turnId,
       effectRevision,

@@ -24,6 +24,7 @@ import {
 } from "./execution-tool-values.js";
 import {
   DEFAULT_PROCESS_POLL_YIELD_MS,
+  MAXIMUM_PROCESS_POLL_YIELD_MS,
   pollProcessUntilYield,
   processYieldMs
 } from "./process-wait.js";
@@ -62,6 +63,10 @@ function environmentProcessAvailable(options: ExecutionToolOptions): boolean {
     && options.writeScope === "enclosing-container"
     && options.enclosingContainerRoot === true
     && Boolean(options.enclosingContainerAttestationDigest);
+}
+
+function handoffAvailable(options: ExecutionToolOptions): boolean {
+  return options.handoff === true && availableNetworkModes(options).includes("full");
 }
 
 function environmentProcessArguments(
@@ -147,11 +152,11 @@ function spawnTool(
           network: networkProperty(options),
           env: { type: "object", additionalProperties: { type: "string" } },
           ...(options.pty === false ? {} : { pty: { type: "boolean" } }),
-          ...(options.handoff === true ? {
+          ...(handoffAvailable(options) ? {
             lifecycle: {
               type: "string",
               enum: ["session", "deliverable"],
-              description: "Use deliverable only for a service that must survive successful task completion; verify it through a separate interface probe, then call process_handoff."
+              description: "Use deliverable only for a TCP service that must survive successful task completion. It requires network=full; process_handoff performs the delivery-boundary readiness probe."
             }
           } : {}),
           readRoots: {
@@ -201,15 +206,15 @@ function processPollTool(
   return {
     descriptor: executionToolSchema(
       "process_poll",
-      "Wait briefly for incremental output or completion from an in-session background process. Returns immediately when output or terminal state is available.",
+      "Wait for completion from an in-session background process while aggregating incremental output. Returns terminal status when the process exits, or current status when yieldMs expires.",
       {
         ...handleProperties,
         yieldMs: {
           type: "integer",
           minimum: 0,
-          maximum: 30000,
+          maximum: MAXIMUM_PROCESS_POLL_YIELD_MS,
           description:
-            "Maximum wait for output or completion. Defaults to 5000 ms; set 0 for an immediate poll."
+            "Maximum wait for completion while collecting output. Defaults to 30000 ms, supports up to 300000 ms, and 0 performs an immediate poll."
         }
       },
       ["handleId", "brokerInstanceId"],
@@ -221,9 +226,12 @@ function processPollTool(
       const result = await pollProcessUntilYield(
         options.broker,
         handle(input),
-        processYieldMs(input, DEFAULT_PROCESS_POLL_YIELD_MS),
-        context.signal,
-        true
+        processYieldMs(
+          input,
+          DEFAULT_PROCESS_POLL_YIELD_MS,
+          MAXIMUM_PROCESS_POLL_YIELD_MS
+        ),
+        context.signal
       );
       return await processReceipt(
         request,
@@ -305,7 +313,7 @@ function processControlTools(
     ...(options.stdin === false
       ? [] : [processWriteTool(options, handleProperties)]),
     processTerminateTool(options, handleProperties),
-    ...(options.handoff === true
+    ...(handoffAvailable(options)
     ? [processHandoffTool(options, handleProperties)]
     : [])
   ];

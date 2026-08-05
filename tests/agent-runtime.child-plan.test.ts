@@ -112,30 +112,34 @@ describe("child Plan terminal ownership", () => {
     })).resolves.toMatchObject({ nodes: [{ status: "completed", owner: { kind: "root" } }] });
   });
 
-  it("returns a failed child node blocked, then permits root to reopen and re-delegate it", async () => {
+  it("returns failed child work to root without poisoning replacement evidence", async () => {
     const childId = "22222222-2222-4222-8222-222222222222";
     const replacementId = "33333333-3333-4333-8333-333333333333";
     const fixture = await harness([childNode("validation", childId)]);
     await handleChildEvent(fixture.session, "child.completed", failure(childId, ["validation"]),
       fixture.control, fixture.emit);
 
-    const blocked = fixture.session.durable.state.plan;
-    expect(blocked.nodes[0]).toMatchObject({
-      status: "blocked",
+    const returnedToRoot = fixture.session.durable.state.plan;
+    expect(returnedToRoot.nodes[0]).toMatchObject({
+      status: "pending",
       owner: { kind: "root" },
-      blockedReason: `Child ${childId} failed.`
+      evidence: []
     });
+    expect(returnedToRoot.nodes[0]).not.toHaveProperty("blockedReason");
+    expect(fixture.session.durable.state.evidence).toContainEqual(expect.objectContaining({
+      kind: "child_outcome",
+      status: "failed",
+      producer: { authority: "runtime", id: childId }
+    }));
     await fixture.control.updatePlan(fixture.session, {
-      expectedRevision: blocked.revision,
+      expectedRevision: returnedToRoot.revision,
       plan: {
-        ...blocked,
-        revision: blocked.revision + 1,
+        ...returnedToRoot,
+        revision: returnedToRoot.revision + 1,
         activeNodeId: "validation",
         nodes: [{
-          ...blocked.nodes[0]!,
-          status: "in_progress",
-          blockedReason: undefined,
-          evidence: []
+          ...returnedToRoot.nodes[0]!,
+          status: "in_progress"
         }]
       }
     });

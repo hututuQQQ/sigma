@@ -5,6 +5,7 @@ import type {
 } from "agent-execution";
 import { describe, expect, it, vi } from "vitest";
 import {
+  MAXIMUM_PROCESS_POLL_YIELD_MS,
   pollProcessUntilYield,
   processYieldMs
 } from "../packages/agent-tools/src/process-wait.js";
@@ -58,8 +59,7 @@ describe("bounded process waiting", () => {
       brokerWithPoll(poll),
       handle,
       1_000,
-      new AbortController().signal,
-      false
+      new AbortController().signal
     );
 
     expect(observed).toMatchObject({
@@ -70,20 +70,21 @@ describe("bounded process waiting", () => {
     expect(poll).toHaveBeenCalledTimes(2);
   });
 
-  it("returns as soon as an explicit poll observes output", async () => {
-    const poll = vi.fn(async () => result("running", "ready\n"));
+  it("keeps an explicit poll open through incremental output until completion", async () => {
+    const poll = vi.fn()
+      .mockResolvedValueOnce(result("running", "ready\n"))
+      .mockResolvedValueOnce(result("exited", "done\n"));
 
     const observed = await pollProcessUntilYield(
       brokerWithPoll(poll),
       handle,
       1_000,
-      new AbortController().signal,
-      true
+      new AbortController().signal
     );
 
-    expect(observed.state).toBe("running");
-    expect(observed.stdout).toBe("ready\n");
-    expect(poll).toHaveBeenCalledTimes(1);
+    expect(observed.state).toBe("exited");
+    expect(observed.stdout).toBe("ready\ndone\n");
+    expect(poll).toHaveBeenCalledTimes(2);
   });
 
   it("rejects invalid wait budgets before broker execution", () => {
@@ -91,5 +92,15 @@ describe("bounded process waiting", () => {
       .toThrow("yieldMs must be an integer");
     expect(() => processYieldMs({ yieldMs: 30_001 }, 5_000))
       .toThrow("yieldMs must be an integer");
+    expect(processYieldMs(
+      { yieldMs: MAXIMUM_PROCESS_POLL_YIELD_MS },
+      5_000,
+      MAXIMUM_PROCESS_POLL_YIELD_MS
+    )).toBe(MAXIMUM_PROCESS_POLL_YIELD_MS);
+    expect(() => processYieldMs(
+      { yieldMs: MAXIMUM_PROCESS_POLL_YIELD_MS + 1 },
+      5_000,
+      MAXIMUM_PROCESS_POLL_YIELD_MS
+    )).toThrow("yieldMs must be an integer");
   });
 });

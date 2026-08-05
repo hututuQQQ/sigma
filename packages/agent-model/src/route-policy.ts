@@ -77,21 +77,46 @@ function capabilityFailure(spec: ModelSpec, required: Partial<ModelCapabilities>
 
 export const APPROXIMATE_TOKEN_RESERVATION_MARGIN = 1.5;
 
+type TokenizerAccuracy = ModelCapabilities["tokenizer"] | ModelSpec["tokenizer"]["accuracy"];
+
+function tokenizerReservationMargin(tokenizer: TokenizerAccuracy): number {
+  return tokenizer === "approximate" ? APPROXIMATE_TOKEN_RESERVATION_MARGIN : 1;
+}
+
+function reservedContextTokens(
+  tokenizer: TokenizerAccuracy,
+  inputTokens: number,
+  outputTokens: number
+): number {
+  const margin = tokenizerReservationMargin(tokenizer);
+  // Only the locally counted prompt is approximate. maxOutputTokens is an
+  // exact provider request limit and must not consume tokenizer uncertainty a
+  // second time in the context-window eligibility check.
+  return Math.ceil(inputTokens * margin) + outputTokens;
+}
+
 function tokenizerMargin(spec: ModelSpec): number {
-  return spec.tokenizer.accuracy === "approximate" ? APPROXIMATE_TOKEN_RESERVATION_MARGIN : 1;
+  return tokenizerReservationMargin(spec.tokenizer.accuracy);
 }
 
 function contextRequirement(spec: ModelSpec, constraints: ModelRouteConstraints): number {
-  const margin = tokenizerMargin(spec);
-  const input = Math.ceil((constraints.estimatedInputTokens ?? 0) * margin);
-  const output = Math.ceil((constraints.maxOutputTokens ?? spec.capabilities.maxOutputTokens) * margin);
-  return input + output;
+  return reservedContextTokens(
+    spec.tokenizer.accuracy,
+    constraints.estimatedInputTokens ?? 0,
+    constraints.maxOutputTokens ?? spec.capabilities.maxOutputTokens
+  );
 }
 
 export interface ModelReservationEstimate {
   inputTokens: number;
   outputTokens: number;
   costMicroUsd: number | null;
+  /**
+   * Catalog-price estimate for the request input when an attempt fails before
+   * provider usage is available. This remains distinct from billed cost so a
+   * subscription request is never presented as an attributed charge.
+   */
+  apiEquivalentInputCostMicroUsd?: number;
 }
 
 export function modelReservationEstimate(
@@ -101,12 +126,20 @@ export function modelReservationEstimate(
   const margin = tokenizerMargin(spec);
   const inputTokens = Math.ceil((constraints.estimatedInputTokens ?? 0) * margin);
   const outputTokens = Math.ceil((constraints.maxOutputTokens ?? spec.capabilities.maxOutputTokens) * margin);
-  if (spec.billingMode !== "metered") return { inputTokens, outputTokens, costMicroUsd: null };
-  if (!spec.pricing) return { inputTokens, outputTokens, costMicroUsd: null };
+  const apiEquivalentPricing = spec.apiEquivalentPricing ?? spec.pricing;
+  if (!apiEquivalentPricing) return { inputTokens, outputTokens, costMicroUsd: null };
+  const apiEquivalentRates = modelPricingRates(apiEquivalentPricing, inputTokens);
+  const apiEquivalentInputCostMicroUsd = Math.ceil(
+    inputTokens * apiEquivalentRates.inputMicroUsdPerMillion / 1_000_000
+  );
+  if (spec.billingMode !== "metered" || !spec.pricing) {
+    return { inputTokens, outputTokens, costMicroUsd: null, apiEquivalentInputCostMicroUsd };
+  }
   const rates = modelPricingRates(spec.pricing, inputTokens);
   return {
     inputTokens,
     outputTokens,
+    apiEquivalentInputCostMicroUsd,
     costMicroUsd: Math.ceil((
       inputTokens * rates.inputMicroUsdPerMillion
       + outputTokens * rates.outputMicroUsdPerMillion

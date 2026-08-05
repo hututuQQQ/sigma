@@ -56,6 +56,10 @@ function draft(overrides: Record<string, unknown> = {}) {
       managed_environment_mode: "disabled",
       harbor_topology: "main_only",
       concurrency: 2,
+      verifier_concurrency: 2,
+      verifier_proxy_mode: "direct",
+      verifier_proxy_url: null,
+      bootstrap_preflight: null,
       attempts_per_task: 1,
       retries: 0,
       package_mode: "reuse",
@@ -63,6 +67,7 @@ function draft(overrides: Record<string, unknown> = {}) {
         {
           id: "001",
           task_indexes: [0, 1],
+          verifier_concurrency: 1,
           timeout_cohorts: [
             { id: "short", task_indexes: [0, 1], effective_solver_timeout_sec: 900 }
           ]
@@ -70,6 +75,7 @@ function draft(overrides: Record<string, unknown> = {}) {
         {
           id: "002",
           task_indexes: [2],
+          verifier_concurrency: 2,
           timeout_cohorts: [
             { id: "long", task_indexes: [2], effective_solver_timeout_sec: 1200 }
           ]
@@ -169,7 +175,13 @@ describe("formal benchmark preregistration", () => {
         reasoning_effort: "max"
       },
       solver_controls: { max_turns: 73, command_timeout_sec: 41, cleanup_grace_sec: 17 },
-      execution: { concurrency: 2, attempts_per_task: 1, retries: 0 }
+      execution: {
+        concurrency: 2,
+        verifier_concurrency: 2,
+        verifier_proxy_mode: "direct",
+        attempts_per_task: 1,
+        retries: 0
+      }
     });
     expect(value.task_selection.task_selection_sha256).toMatch(/^[a-f0-9]{64}$/u);
     expect(value.consumption_identity_sha256).toBe(
@@ -186,6 +198,21 @@ describe("formal benchmark preregistration", () => {
     const excessiveCommandTimeout = draft();
     (excessiveCommandTimeout.solver_controls as Record<string, unknown>).command_timeout_sec = 601;
     expect(() => sigmaFormalRunPreregistration(excessiveCommandTimeout)).toThrow(/at most 600/u);
+    const excessiveConcurrency = draft();
+    (excessiveConcurrency.execution as Record<string, unknown>).concurrency = 5;
+    expect(() => sigmaFormalRunPreregistration(excessiveConcurrency)).toThrow(/at most 4/u);
+    const excessiveVerifierConcurrency = draft();
+    (excessiveVerifierConcurrency.execution as Record<string, unknown>).verifier_concurrency = 3;
+    expect(() => sigmaFormalRunPreregistration(excessiveVerifierConcurrency))
+      .toThrow(/must not exceed/iu);
+    const decreasingVerifierConcurrency = draft();
+    const decreasingBatches = (decreasingVerifierConcurrency.execution as {
+      batches: Array<{ verifier_concurrency: number }>;
+    }).batches;
+    decreasingBatches[0].verifier_concurrency = 2;
+    decreasingBatches[1].verifier_concurrency = 1;
+    expect(() => sigmaFormalRunPreregistration(decreasingVerifierConcurrency))
+      .toThrow(/non-decreasing/iu);
   });
 
   it("rejects score thresholds, mutable task sources, and stale digests", () => {
@@ -206,6 +233,24 @@ describe("formal benchmark preregistration", () => {
     (contradictoryTopology.execution as Record<string, unknown>).harbor_topology = "managed_three_role";
     expect(() => sigmaFormalRunPreregistration(contradictoryTopology))
       .toThrow(/requires managed_environment_mode=required/u);
+
+    const credentialedProxy = draft();
+    Object.assign(credentialedProxy.execution, {
+      verifier_proxy_mode: "custom",
+      verifier_proxy_url: "http://user:secret@proxy.example.test:8080"
+    });
+    expect(() => sigmaFormalRunPreregistration(credentialedProxy))
+      .toThrow(/must not contain credentials/iu);
+
+    const withPreflight = draft();
+    (withPreflight.execution as Record<string, unknown>).bootstrap_preflight = {
+      schemaVersion: 1,
+      command: "docker",
+      args: ["version"],
+      timeout_sec: 30
+    };
+    expect(sigmaFormalRunPreregistration(withPreflight).execution.bootstrap_preflight)
+      .toEqual({ schemaVersion: 1, command: "docker", args: ["version"], timeout_sec: 30 });
   });
 
   it("requires the active SHA-bound file instead of a passive digest", async () => {
@@ -265,6 +310,10 @@ describe("formal benchmark preregistration", () => {
       managedEnvironmentMode: "disabled",
       harborTopology: "main_only",
       nConcurrentTrials: 2,
+      verifierConcurrency: 1,
+      verifierProxyMode: "direct",
+      verifierProxyUrl: null,
+      bootstrapPreflight: null,
       attemptsPerTask: 1,
       retries: 0
     };
@@ -274,6 +323,18 @@ describe("formal benchmark preregistration", () => {
       taskProbe: { tasks: [{ network_mode: "public" }] },
       timeoutPlan: { agent_wall_time_sec: 900 },
       jobConfig: {
+        verifier: {
+          env: {
+            HTTP_PROXY: "",
+            HTTPS_PROXY: "",
+            ALL_PROXY: "",
+            http_proxy: "",
+            https_proxy: "",
+            all_proxy: "",
+            NO_PROXY: "*",
+            no_proxy: "*"
+          }
+        },
         agents: [{
           kwargs: {
             max_turns: 73,
@@ -338,11 +399,64 @@ describe("formal benchmark controller", () => {
       status: "complete",
       trial_accounting: { expected: 3, observed: 3, scored: 2 },
       counts: { passed: 2, structured_blocker: 1 },
+      correctness_bounds: {
+        lower_bound: 2 / 3,
+        effective_rate: 2 / 3,
+        upper_bound: 2 / 3,
+        invalid_rate: 0
+      },
       failure_categories: { structured_blocker: 1 },
-      lane_metrics: { verifier_reached: 2, verifier_passed: 2 }
+      lane_metrics: { verifier_reached: 2, verifier_passed: 2 },
+      cost_usd: 0.03,
+      cost_accounting: { billed: { status: "reported_aggregate" } }
     });
     expect(aggregate).not.toHaveProperty("acceptance");
     expect(aggregate).not.toHaveProperty("minimum_passes");
+  });
+
+  it("keeps subscription charges unknown while aggregating catalog-price estimates", () => {
+    const value = manifest();
+    const pricedReport = (taskCount: number, amountUsd: number) => ({
+      ...report(taskCount, taskCount),
+      cost_usd: null,
+      api_equivalent_cost_usd: amountUsd,
+      cost_accounting: {
+        billed: {
+          amount_usd: null,
+          status: "subscription_not_attributed",
+          known_records: 0,
+          unknown_records: taskCount,
+          billing_modes: ["subscription"]
+        },
+        api_equivalent: {
+          amount_usd: amountUsd,
+          status: "complete",
+          priced_records: taskCount,
+          total_records: taskCount,
+          coverage: 1,
+          component_records: 0,
+          components_usd: null,
+          pricing_catalogs: [{ id: "catalog@1", effective_at: "2026-08-01" }]
+        }
+      }
+    });
+    const aggregate = aggregateFormalReports(value, [
+      { batch: "001", report: pricedReport(2, 0.2), docker_cleanup: { clean: true } },
+      { batch: "002", report: pricedReport(1, 0.1), docker_cleanup: { clean: true } }
+    ]);
+
+    expect(aggregate).toMatchObject({
+      cost_usd: null,
+      api_equivalent_cost_usd: 0.3,
+      cost_accounting: {
+        billed: { status: "subscription_not_attributed", unknown_records: 3 },
+        api_equivalent: {
+          status: "complete",
+          coverage: 1,
+          pricing_catalogs: [{ id: "catalog@1", effective_at: "2026-08-01" }]
+        }
+      }
+    });
   });
 
   it("treats fully observed valid agent timeouts as completed outcomes", () => {
@@ -371,7 +485,17 @@ describe("formal benchmark controller", () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "sigma-formal-controller-"));
     const output = path.join(directory, "output");
     try {
-      const frozen = await frozenManifest(directory);
+      const preregistrationDraft = draft();
+      (preregistrationDraft.execution as Record<string, unknown>).bootstrap_preflight = {
+        schemaVersion: 1,
+        command: "docker",
+        args: ["version"],
+        timeout_sec: 30
+      };
+      const frozen = await frozenManifest(
+        directory,
+        sigmaFormalRunPreregistration(preregistrationDraft)
+      );
       const invocations: string[][] = [];
       const runner = async (argv: string[], runnerDeps: { beforeHarborDispatch: () => Promise<void> }) => {
         invocations.push(argv);
@@ -417,6 +541,10 @@ describe("formal benchmark controller", () => {
         "--command-timeout-sec", "41",
         "--agent-timeout-grace-sec", "17",
         "--concurrency", "2",
+        "--verifier-concurrency", "1",
+        "--verifier-proxy-mode", "direct",
+        "--bootstrap-preflight-file",
+        "--expected-bootstrap-preflight-sha256",
         "--attempts", "1",
         "--retries", "0",
         "--network", "full",
@@ -424,6 +552,20 @@ describe("formal benchmark controller", () => {
         "--managed-environment-mode", "disabled",
         "--harbor-topology", "main_only"
       ]));
+      expect(invocations[1]).toEqual(expect.arrayContaining([
+        "--verifier-concurrency", "2"
+      ]));
+      const preflightPath = invocations[0][invocations[0].indexOf("--bootstrap-preflight-file") + 1];
+      const preflightDigest = invocations[0][
+        invocations[0].indexOf("--expected-bootstrap-preflight-sha256") + 1
+      ];
+      expect(JSON.parse(await readFile(preflightPath, "utf8"))).toEqual({
+        schemaVersion: 1,
+        command: "docker",
+        args: ["version"],
+        timeout_sec: 30
+      });
+      expect(sha256(await readFile(preflightPath))).toBe(preflightDigest);
       expect(invocations.flat()).not.toContain("minimum-passes");
       expect(JSON.parse(await readFile(path.join(output, "state.json"), "utf8")))
         .toMatchObject({
@@ -508,6 +650,34 @@ describe("formal benchmark controller", () => {
       { batch: "002", report: report(1, 1), docker_cleanup: { clean: true } }
     ]);
     expect(aggregate.status).toBe("incomplete");
+  });
+
+  it("keeps missing formal trials in the pass-rate uncertainty interval", () => {
+    const value = manifest();
+    const incomplete = report(2, 1);
+    incomplete.trial_accounting.observed = 1;
+    incomplete.trial_accounting.scored = 1;
+    incomplete.trial_accounting.missing = 1;
+    incomplete.tasks = incomplete.tasks.slice(0, 1);
+    incomplete.incomplete_reason = "missing Harbor result" as unknown as null;
+    const aggregate = aggregateFormalReports(value, [
+      { batch: "001", report: incomplete, docker_cleanup: { clean: true } },
+      { batch: "002", report: report(1, 1), docker_cleanup: { clean: true } }
+    ]);
+    expect(aggregate).toMatchObject({
+      status: "incomplete",
+      correctness_bounds: {
+        passed: 2,
+        effective_passed: 2,
+        total: 3,
+        observed: 2,
+        unobserved: 1,
+        lower_bound: 2 / 3,
+        effective_rate: 1,
+        upper_bound: 1,
+        invalid_rate: 0
+      }
+    });
   });
 
   it("does not accept an infrastructure-invalid task even when accounting has no errors", () => {
@@ -673,7 +843,13 @@ describe("formal benchmark controller", () => {
         status: "incomplete",
         batches: { expected: 2, completed: 2 },
         trial_accounting: { expected: 3, observed: 3, missing: 0 },
-        counts: { passed: 2, infra_failed: 1 }
+        counts: { passed: 2, infra_failed: 1 },
+        correctness_bounds: {
+          lower_bound: 2 / 3,
+          effective_rate: 1,
+          upper_bound: 1,
+          invalid_rate: 1 / 3
+        }
       });
       await expect(readFile(
         path.join(output, `infrastructure-recovery-${recoverySha256}.json`),

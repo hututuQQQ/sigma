@@ -1,4 +1,5 @@
 import type { ContextAuthority } from "./events.js";
+import { MAX_STRATEGIST_CALLS } from "./context-limits.js";
 
 export interface ContextItem {
   id: string;
@@ -128,7 +129,7 @@ export const DEFAULT_ASSURANCE_RESOURCE_POLICY: Readonly<AssuranceResourcePolicy
   repairMaxToolCalls: 8,
   strategistMode: "adaptive",
   duplicateThreshold: 3,
-  strategyRemainingPercent: 25
+  strategyRemainingPercent: 75
 };
 
 export function emptyRuntimePromptState(): RuntimePromptState {
@@ -142,7 +143,7 @@ export function emptyRuntimePromptState(): RuntimePromptState {
 export function emptyLongHorizonState(
   policy: AssuranceResourcePolicy = DEFAULT_ASSURANCE_RESOURCE_POLICY
 ): LongHorizonState {
-  const strategistCapacity = policy.strategistMode === "off" ? 0 : 1;
+  const strategistCapacity = policy.strategistMode === "off" ? 0 : MAX_STRATEGIST_CALLS;
   return {
     schemaVersion: 1,
     goalEpoch: 0,

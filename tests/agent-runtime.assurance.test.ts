@@ -159,7 +159,7 @@ describe("assurance resource reserve", () => {
       inputTokens: 20_000,
       outputTokens: 6_000,
       costMicroUsd: 2_000,
-      modelTurns: 9,
+      modelTurns: 10,
       toolCalls: 0,
       children: 0
     });
@@ -167,7 +167,7 @@ describe("assurance resource reserve", () => {
       inputTokens: 80_000,
       outputTokens: 24_000,
       costMicroUsd: 8_000,
-      modelTurns: 8,
+      modelTurns: 7,
       toolCalls: 2
     });
     consumeModelTurns(session, 10);
@@ -180,7 +180,7 @@ describe("assurance resource reserve", () => {
     (reviewMode) => {
       const session = mutatedSession(reviewMode);
 
-      expect(availableAuxiliaryBudget(session).modelTurns).toBe(9);
+      expect(availableAuxiliaryBudget(session).modelTurns).toBe(10);
       expect(availableOrchestratorBudget(session)).toEqual(rawAvailableBudget(session));
       expect(mainBudgetWindow(session)).toEqual({
         available: rawAvailableBudget(session),
@@ -219,7 +219,7 @@ describe("assurance resource reserve", () => {
       inputTokens: 17_000,
       outputTokens: 4_900,
       costMicroUsd: 1_700,
-      modelTurns: 6
+      modelTurns: 7
     });
 
     // Re-reading the ledger is idempotent and cannot double-charge restored
@@ -264,10 +264,10 @@ describe("assurance resource reserve", () => {
 
     session.durable.state.evidence.push(failedReview(session));
     expect(availableOrchestratorBudget(session)).toMatchObject({
-      inputTokens: 87_500,
-      outputTokens: 26_250,
-      costMicroUsd: 8_750,
-      modelTurns: 5
+      inputTokens: 86_666,
+      outputTokens: 26_000,
+      costMicroUsd: 8_666,
+      modelTurns: 4
     });
 
     session.durable.state.longHorizon.assurance.protectedRepairTurnsRemaining = 1;
@@ -287,7 +287,7 @@ describe("assurance resource reserve", () => {
     };
 
     expect(reviewRepairActive(session)).toBe(true);
-    expect(availableOrchestratorBudget(session).modelTurns).toBe(5);
+    expect(availableOrchestratorBudget(session).modelTurns).toBe(4);
   });
 
   it("treats repair tool protection as a floor and closes only at the hard resource boundary", () => {
@@ -300,14 +300,14 @@ describe("assurance resource reserve", () => {
       inputTokens: 80_000,
       outputTokens: 24_000,
       costMicroUsd: 8_000,
-      modelTurns: 15,
+      modelTurns: 14,
       toolCalls: 10
     });
     expect(availableAuxiliaryBudget(session)).toMatchObject({
       inputTokens: 20_000,
       outputTokens: 6_000,
       costMicroUsd: 2_000,
-      modelTurns: 5
+      modelTurns: 6
     });
     expect(repairEpisodeWindow(session)).toEqual({
       active: true,

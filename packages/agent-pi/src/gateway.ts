@@ -36,6 +36,7 @@ import {
   piBillingMode,
   type PiReasoningEffort
 } from "./models.js";
+import { hasKnownPricing } from "./model-pricing.js";
 import { FileModelsStore } from "./models-store.js";
 import { piReasoningStreamOptions } from "./reasoning.js";
 import { monitoredPiStream } from "./stream-timeout.js";
@@ -80,6 +81,15 @@ function newPiStreamLifecycle(): PiStreamLifecycle {
     hasReasoning: false,
     hasToolCall: false
   };
+}
+
+function piSamplingOptions(
+  capabilities: ModelCapabilities,
+  request: ModelRequest
+): Partial<Pick<ModelRequest, "temperature">> {
+  return capabilities.temperatureControl === false || request.temperature === undefined
+    ? {}
+    : { temperature: request.temperature };
 }
 
 function observePiStreamEvent(
@@ -149,6 +159,7 @@ export class PiModelGateway implements ModelGateway {
   private readonly idleTimeoutMs: number;
   private readonly activeStreamTimeoutMs?: number;
   private readonly reasoningEffort?: PiReasoningEffort;
+  private readonly hasKnownCatalogPrice: boolean;
   private readonly codexInstructionNonce = randomUUID();
 
   constructor(options: PiModelGatewayOptions) {
@@ -170,7 +181,8 @@ export class PiModelGateway implements ModelGateway {
       ? undefined
       : Math.max(1, Math.trunc(options.activeStreamTimeoutMs));
     this.reasoningEffort = options.reasoningEffort;
-    this.capabilities = options.capabilities ?? {
+    this.hasKnownCatalogPrice = hasKnownPricing(this.piModel);
+    const capabilities = options.capabilities ?? {
       contextWindowTokens: piModel.contextWindow,
       maxOutputTokens: piModel.maxTokens,
       tools: true,
@@ -181,6 +193,11 @@ export class PiModelGateway implements ModelGateway {
       promptCache: true,
       tokenizer: "approximate",
       imageInput: piModel.input.includes("image")
+    };
+    this.capabilities = {
+      ...capabilities,
+      temperatureControl: options.capabilities?.temperatureControl
+        ?? piModel.api !== "openai-codex-responses"
     };
   }
 
@@ -205,7 +222,7 @@ export class PiModelGateway implements ModelGateway {
         const options = {
           signal,
           maxTokens: request.maxOutputTokens,
-          temperature: request.temperature,
+          ...piSamplingOptions(this.capabilities, request),
           toolChoice: request.toolChoice,
           maxRetries: 0,
           ...(request.sessionId ? { sessionId: request.sessionId } : {}),
@@ -241,7 +258,9 @@ export class PiModelGateway implements ModelGateway {
           : { activeTimeoutMs: this.activeStreamTimeoutMs })
       });
       for await (const event of stream) {
-        const mapped = mapPiStreamEvent(event, toolIndex, startedAt, billingMode, responseStatus);
+        const mapped = mapPiStreamEvent(
+          event, toolIndex, startedAt, billingMode, responseStatus, this.hasKnownCatalogPrice
+        );
         toolIndex = mapped.nextToolIndex;
         if (mapped.error) {
           lifecycle.lastEventType = "error";

@@ -171,6 +171,9 @@ export function toUsageRecord(usage: NormalizedModelUsage, identity: UsageRecord
     cacheReadTokens: usage.cacheReadTokens,
     cacheWriteTokens: usage.cacheWriteTokens,
     costMicroUsd: usage.costMicroUsd,
+    ...(usage.apiEquivalentCostMicroUsd === undefined
+      ? {}
+      : { apiEquivalentCostMicroUsd: usage.apiEquivalentCostMicroUsd }),
     ...(usage.billingMode ? { billingMode: usage.billingMode } : {}),
     latencyMs: usage.latencyMs,
     attempt: usage.retryAttempt + 1,

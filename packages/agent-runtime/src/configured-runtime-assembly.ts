@@ -7,7 +7,11 @@ import type { AgentSupervisor } from "agent-supervisor";
 import { connectMcpServers } from "./composition-mcp.js";
 import type { RuntimeMcpHttpServerConfig } from "./composition-mcp.js";
 import { createRuntime } from "./create-runtime.js";
-import { auditDurableChildren } from "./durable-children.js";
+import {
+  auditDurableChildRecords,
+  durableChildCompletionFailure,
+  readDurableChildren
+} from "./durable-children.js";
 import { brokerRuntimeEnvironment } from "./execution-capabilities.js";
 import type { RuntimeCustomization } from "./customization.js";
 import type { createRoleGateways } from "./model-composition.js";
@@ -55,24 +59,32 @@ async function joinChildren(
   signal: AbortSignal
 ): Promise<ChildJoinSummary> {
   const jobs = await supervisor.joinParent(parentId, parentRunId, signal);
+  const durableChildren = await readDurableChildren(store, parentId);
   const evidence: JsonValue[] = jobs.map((job) => JSON.parse(JSON.stringify({
     childId: job.id,
     status: job.status,
     outcome: job.result?.outcome.kind ?? null,
     report: job.result?.report ?? null,
+    metadata: durableChildren.get(job.id)?.metadata ?? null,
     isolation: job.isolation ?? null,
     error: job.error ?? null
   })) as JsonValue);
   const failures = jobs.flatMap((job) => {
+    const durable = durableChildren.get(job.id);
+    if (durable?.runId === parentRunId) {
+      const failure = durableChildCompletionFailure(durable);
+      return failure ? [failure] : [];
+    }
+    // A missing durable spawn/completion cannot be treated as reconciled even
+    // if the in-memory child happens to have a terminal result.
     if (job.status !== "completed" || job.result?.outcome.kind !== "completed") {
       return [`Child ${job.id} ended as ${job.result?.outcome.kind ?? job.status}: ${job.error ?? "no report"}`];
     }
     return job.isolation?.kind === "git_worktree" && job.isolation.cleanup === "retained"
       ? [`Child ${job.id} has an unintegrated worktree at ${job.isolation.worktreePath}`] : [];
   });
-  const durable = await auditDurableChildren(
-    store,
-    parentId,
+  const durable = auditDurableChildRecords(
+    durableChildren,
     parentRunId,
     new Set(jobs.map((job) => job.id))
   );

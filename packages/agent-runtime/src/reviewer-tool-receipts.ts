@@ -105,6 +105,7 @@ export function toolMessage(call: ModelToolCall, receipt: ToolReceipt): ModelMes
   return {
     role: "tool",
     toolCallId: call.id,
+    isError: !receipt.ok,
     content: `${receipt.output.length <= 12_000
       ? receipt.output
       : `${receipt.output.slice(0, 9_000)}\n...[review tool output truncated]...\n${receipt.output.slice(-3_000)}`}${evidenceNote}`

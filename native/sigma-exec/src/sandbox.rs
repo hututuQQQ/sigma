@@ -1307,6 +1307,7 @@ fn build_sandboxed_command(
         &execution_roots,
         &protected_roots,
         params.policy.enclosing_container_root,
+        &helper_source,
     )?;
     let executable =
         authorize_linux_executable(params, &system_roots, &execution_roots, &runtime_cwd_source)?;
@@ -1770,21 +1771,54 @@ fn verify_pinned_root_hierarchy(
 }
 
 #[cfg(target_os = "linux")]
+fn pinned_source_at_destination_under_root(
+    source: &PinnedMountSource,
+    destination: &Path,
+    root: &PinnedMountSource,
+) -> Result<bool, RpcError> {
+    Ok(source.destination() == destination && source.is_descendant_of(root)?)
+}
+
+#[cfg(target_os = "linux")]
 fn reject_internal_mount_conflicts(
     read_roots: &[PinnedMountSource],
     write_roots: &[PinnedMountSource],
     execution_roots: &[PinnedMountSource],
     protected_roots: &[PinnedMountSource],
     enclosing_container_root: bool,
+    helper_source: &PinnedMountSource,
 ) -> Result<(), RpcError> {
     let reserved = [
         Path::new(INTERNAL_HELPER_MOUNT),
         Path::new(crate::linux_hardening::INTERNAL_CWD_PIN_MOUNT),
     ];
     for destination in reserved {
-        for root in read_roots
+        for root in read_roots {
+            if enclosing_container_root && root.destination() == Path::new("/") {
+                continue;
+            }
+            // Packaged container runners may execute the helper from the
+            // reserved destination itself. An ancestor read-only root that
+            // contains this exact pinned inode is safe because the final
+            // descriptor bind is applied after policy mounts. A replacement
+            // tree, writable root, or any other occupancy still fails closed.
+            if destination == Path::new(INTERNAL_HELPER_MOUNT)
+                && pinned_source_at_destination_under_root(helper_source, destination, root)?
+            {
+                continue;
+            }
+            if root.occupies_destination(destination)? {
+                return Err(RpcError::new(
+                    "policy_denied",
+                    format!(
+                        "sandbox policy collides with reserved internal mount '{}'",
+                        destination.display()
+                    ),
+                ));
+            }
+        }
+        for root in write_roots
             .iter()
-            .chain(write_roots)
             .chain(execution_roots)
             .chain(protected_roots)
         {
@@ -2568,6 +2602,45 @@ mod tests {
         verify_pinned_root_hierarchy(&read_roots, &[], &independent_execution, &[])
             .expect("independent execution root should remain allowed");
         std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn identifies_only_the_same_pinned_helper_inside_a_read_root() {
+        let base = std::env::temp_dir().join(format!(
+            "sigma-pinned-helper-{}-{}",
+            std::process::id(),
+            PROTECTED_GUARD_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let root = base.join("declared");
+        let helper_path = root.join("helper");
+        let moved = base.join("original");
+        std::fs::create_dir_all(&root).expect("create helper root");
+        std::fs::write(&helper_path, "original").expect("create helper");
+        let read_root = PinnedMountSource::pin(&root).expect("pin read root");
+        let helper = PinnedMountSource::pin(&helper_path).expect("pin helper");
+        assert!(
+            pinned_source_at_destination_under_root(&helper, &helper_path, &read_root)
+                .expect("verify helper tree")
+        );
+        assert!(
+            !pinned_source_at_destination_under_root(
+                &helper,
+                &root.join("other-helper"),
+                &read_root
+            )
+            .expect("reject a different destination")
+        );
+
+        std::fs::rename(&root, &moved).expect("move original helper tree");
+        std::fs::create_dir_all(&root).expect("create replacement helper root");
+        std::fs::write(root.join("helper"), "replacement").expect("replace helper");
+        let replacement = PinnedMountSource::pin(&root).expect("pin replacement root");
+        assert!(
+            !pinned_source_at_destination_under_root(&helper, &helper_path, &replacement)
+                .expect("reject replacement helper tree")
+        );
+        std::fs::remove_dir_all(base).expect("remove helper test root");
     }
 
     #[cfg(target_os = "linux")]

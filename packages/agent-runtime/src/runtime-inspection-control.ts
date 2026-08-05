@@ -11,6 +11,16 @@ import {
 import type { RuntimeControlServiceOptions } from "./runtime-control-contracts.js";
 import type { RuntimeSession } from "./types.js";
 
+function legacyArtifactReference(value: {
+  artifactId: string;
+  name: string;
+  sizeBytes?: number;
+}): string {
+  return [value.artifactId, value.name, value.sizeBytes]
+    .filter((item) => item !== undefined)
+    .join(":");
+}
+
 export class RuntimeInspectionControl {
   constructor(private readonly options: RuntimeControlServiceOptions) {}
 
@@ -108,11 +118,16 @@ export class RuntimeInspectionControl {
       ...session.durable.state.receipts,
       ...session.durable.state.reviewReceipts.map((item) => item.receipt)
     ];
+    const receiptArtifactRefs = receipts.flatMap((receipt) => receipt.artifactRefs ?? []);
     const allowed = new Set(receipts.flatMap((receipt) => [
         ...receipt.artifacts,
         ...(receipt.artifactRefs ?? []).map((item) => item.artifactId)
       ]).concat(lifecycleArtifacts));
-    if (!allowed.has(input.artifactId)) {
+    const artifactId = allowed.has(input.artifactId)
+      ? input.artifactId
+      : receiptArtifactRefs.find((item) =>
+        legacyArtifactReference(item) === input.artifactId)?.artifactId;
+    if (!artifactId) {
       throw Object.assign(
         new Error(
           "Artifact is not referenced by a receipt or runtime lifecycle evidence in the current session."
@@ -121,13 +136,13 @@ export class RuntimeInspectionControl {
       );
     }
     const raw = this.options.readArtifactBytes
-      ? await this.options.readArtifactBytes(session.identity.sessionId, input.artifactId)
-      : Buffer.from(await this.options.readArtifact(session.identity.sessionId, input.artifactId), "utf8");
+      ? await this.options.readArtifactBytes(session.identity.sessionId, artifactId)
+      : Buffer.from(await this.options.readArtifact(session.identity.sessionId, artifactId), "utf8");
     const external = receipts.some((receipt) =>
       receipt.contentTrust === "external_untrusted"
-      && (receipt.artifacts.includes(input.artifactId)
-        || (receipt.artifactRefs ?? []).some((item) => item.artifactId === input.artifactId)));
-    return this.artifactPage(input, Buffer.from(raw), external);
+      && (receipt.artifacts.includes(artifactId)
+        || (receipt.artifactRefs ?? []).some((item) => item.artifactId === artifactId)));
+    return this.artifactPage({ ...input, artifactId }, Buffer.from(raw), external);
   }
 
   private artifactPage(

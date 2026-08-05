@@ -19,6 +19,7 @@ import type { RuntimeControlService } from "./runtime-control.js";
 import type { RuntimeOptions, RuntimeSession } from "./types.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 import { toolRuntimeContext } from "./repository-recovery-context.js";
+import { deadlineForecast } from "./convergence-policy.js";
 
 export interface ToolExecutionMonitorOptions {
   runtime: RuntimeOptions;
@@ -45,6 +46,32 @@ export function resolveToolIdleWatchdogMs(runtime: RuntimeOptions, descriptor: T
 
 function processTimeout(message: string, code: "process_deadline" | "process_idle_timeout"): Error {
   return Object.assign(new Error(message), { name: "TimeoutError", code });
+}
+
+function terminalOnlyDescriptor(descriptor: ToolDescriptor): boolean {
+  const effects = [
+    ...descriptor.possibleEffects,
+    ...(descriptor.maximumEffects ?? descriptor.possibleEffects)
+  ];
+  return effects.length > 0 && effects.every((effect) =>
+    effect === "outcome.propose"
+      || effect === "outcome.report_blocked"
+      || effect === "outcome.request_input");
+}
+
+function deadlineBoundedToolTimeoutMs(
+  session: RuntimeSession,
+  descriptor: ToolDescriptor
+): number {
+  const forecast = deadlineForecast(session);
+  if (forecast.stage === "unbounded") return descriptor.timeoutMs;
+  const settlementReserveMs = terminalOnlyDescriptor(descriptor)
+    ? 0
+    : forecast.finalizationReserveMs ?? 0;
+  return Math.max(1, Math.min(
+    descriptor.timeoutMs,
+    Math.max(1, (forecast.remainingMs ?? 0) - settlementReserveMs)
+  ));
 }
 
 function requiresToolSettlement(plan: ToolCallPlan): boolean {
@@ -98,9 +125,12 @@ export class ToolExecutionMonitor {
     const controller = new AbortController();
     const onAbort = (): void => controller.abort(signal.reason ?? new Error("Run cancelled."));
     if (signal.aborted) onAbort(); else signal.addEventListener("abort", onAbort, { once: true });
-    const timeoutMs = descriptor.timeoutMs;
+    const timeoutMs = deadlineBoundedToolTimeoutMs(session, descriptor);
+    const timeoutLabel = timeoutMs < descriptor.timeoutMs
+      ? "deadline-bounded execution timeout"
+      : "execution timeout";
     const timer = setTimeout(() => controller.abort(processTimeout(
-      `Tool '${call.name}' exceeded its ${timeoutMs}ms execution timeout.`, "process_deadline"
+      `Tool '${call.name}' exceeded its ${timeoutMs}ms ${timeoutLabel}.`, "process_deadline"
     )), timeoutMs);
     const idleTimeoutMs = resolveToolIdleWatchdogMs(this.options.runtime, descriptor);
     let idleTimer: ReturnType<typeof setTimeout> | undefined;

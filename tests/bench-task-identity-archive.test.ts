@@ -52,12 +52,17 @@ function preregistration(tasks: Array<ReturnType<typeof task>>) {
       managed_environment_mode: "disabled",
       harbor_topology: "main_only",
       concurrency: 1,
+      verifier_concurrency: 1,
+      verifier_proxy_mode: "inherit",
+      verifier_proxy_url: null,
+      bootstrap_preflight: null,
       attempts_per_task: 1,
       retries: 0,
       package_mode: "reuse",
       batches: [{
         id: "only",
         task_indexes: tasks.map((_task, index) => index),
+        verifier_concurrency: 1,
         timeout_cohorts: [{
           id: "timeout",
           task_indexes: tasks.map((_task, index) => index),

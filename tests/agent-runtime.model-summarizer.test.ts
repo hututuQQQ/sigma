@@ -13,6 +13,7 @@ import type {
 } from "../packages/agent-protocol/src/index.js";
 import type { BudgetController } from "../packages/agent-runtime/src/budget-controller.js";
 import {
+  continuationInputReserve,
   deterministicArchiveFallback,
   ModelSummarizer,
   type ModelSummaryInput
@@ -150,6 +151,22 @@ function harness(gateway: SummaryGateway) {
 }
 
 describe("ModelSummarizer", () => {
+  it("reserves input capacity for the orchestrator after an archive call", () => {
+    const gateway = new SummaryGateway(summaryContent());
+    expect(continuationInputReserve(gateway, {
+      inputTokens: 100_000,
+      modelTurns: 2
+    })).toBeGreaterThanOrEqual(8_192);
+    expect(continuationInputReserve(gateway, {
+      inputTokens: 10_000,
+      modelTurns: 2
+    })).toBe(5_000);
+    expect(continuationInputReserve(gateway, {
+      inputTokens: 100_000,
+      modelTurns: 1
+    })).toBe(0);
+  });
+
   it("uses the summarizer role with no tools and records measured usage", async () => {
     const gateway = new SummaryGateway(summaryContent());
     const test = harness(gateway);
@@ -169,6 +186,19 @@ describe("ModelSummarizer", () => {
     expect(test.calls).toEqual(["route:summarizer", "reserve", "commit"]);
     expect(test.usage).toHaveLength(1);
     expect(test.usage[0]).toMatchObject({ role: "summarizer" });
+  });
+
+  it("omits temperature when the provider wire profile rejects that control", async () => {
+    const gateway = new SummaryGateway(summaryContent());
+    gateway.capabilities.temperatureControl = false;
+    const test = harness(gateway);
+    await expect(test.summarizer.summarize(
+      test.session,
+      summaryInput(),
+      new AbortController().signal
+    )).resolves.toBeDefined();
+    expect(gateway.requests).toHaveLength(1);
+    expect(Object.hasOwn(gateway.requests[0]!, "temperature")).toBe(false);
   });
 
   it("rejects malformed output after one attempt so the caller can fall back", async () => {

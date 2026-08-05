@@ -752,11 +752,13 @@ describe("configured runtime execution capabilities", () => {
             properties: { background: { type: "boolean" } }
           });
         }
-        // Lifecycle controls are offered only after a durable process handle
-        // exists, independently of whether stdin is supported.
-        expect(request.tools?.find((tool) => tool.name === "process_write")).toBeUndefined();
-        expect(request.tools?.find((tool) => tool.name === "process_poll")).toBeUndefined();
-        expect(request.tools?.find((tool) => tool.name === "process_terminate")).toBeUndefined();
+        // Lifecycle controls remain in the stable model schema whenever this
+        // session can create a background process. Individual calls still
+        // validate the handle and broker capabilities at execution time.
+        expect(request.tools?.find((tool) => tool.name === "process_write") !== undefined)
+          .toBe(processCapabilities.stdin);
+        expect(request.tools?.find((tool) => tool.name === "process_poll")).toBeDefined();
+        expect(request.tools?.find((tool) => tool.name === "process_terminate")).toBeDefined();
       }
       const codeIntelAvailable = backgroundAvailable
         && processCapabilities.stdin

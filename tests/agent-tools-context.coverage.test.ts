@@ -102,6 +102,49 @@ describe("context, platform, and repository tool capabilities", () => {
     });
   });
 
+  it("returns a compact plan acknowledgement because durable plan state is projected separately", async () => {
+    const tools = registerBuiltinTools(new EffectToolRegistry(), { execution });
+    const runtimeControl = {
+      updateWorkPlan: async () => ({
+        status: "updated" as const,
+        warnings: [],
+        plan: {
+          revision: 7,
+          goal: "Implement and verify a multi-step change",
+          acceptanceCriteria: ["The implementation works", "The checks pass"],
+          activeStepId: "verify",
+          plan: [{
+            id: "implement",
+            step: "A deliberately detailed implementation milestone that belongs in durable state",
+            status: "completed" as const
+          }, {
+            id: "verify",
+            step: "A deliberately detailed verification milestone that belongs in durable state",
+            status: "in_progress" as const
+          }]
+        }
+      })
+    } as RuntimeControlPort;
+    const result = await tools.execute(
+      request("plan", "update_plan", {
+        plan: [{ step: "Implement", status: "completed" }, {
+          step: "Verify", status: "in_progress"
+        }]
+      }),
+      { ...context("."), runtimeControl }
+    );
+
+    expect(result.result).toEqual({
+      status: "updated",
+      revision: 7,
+      stepCount: 2,
+      activeStepId: "verify",
+      warnings: []
+    });
+    expect(result.output).not.toContain("deliberately detailed");
+    expect(result.output.length).toBeLessThan(160);
+  });
+
   it("keeps explicit blocked-report and user-input capabilities orthogonal", async () => {
     const tools = registerCompletionTool(new EffectToolRegistry());
     const input = tools.descriptor("request_user_input")!;

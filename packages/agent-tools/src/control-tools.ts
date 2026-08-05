@@ -1,6 +1,7 @@
 import type {
   JsonValue,
   ModelPlanUpdate,
+  ModelPlanUpdateResult,
   ToolCallPlan,
   ToolDescriptor,
   ToolReceipt,
@@ -119,8 +120,27 @@ function updatePlanTool(): RegisteredEffectTool {
           : {}),
         plan: input.plan
       } as unknown as ModelPlanUpdate);
-      return receipt(request, startedAt, updated, ["runtime.control"]);
+      return receipt(
+        request,
+        startedAt,
+        compactPlanUpdateResult(updated),
+        ["runtime.control"]
+      );
     }
+  };
+}
+
+function compactPlanUpdateResult(updated: ModelPlanUpdateResult): JsonValue {
+  return {
+    status: updated.status,
+    revision: updated.plan.revision,
+    stepCount: updated.plan.plan.length,
+    ...(updated.plan.activeStepId ? { activeStepId: updated.plan.activeStepId } : {}),
+    warnings: updated.warnings.map((warning) => ({
+      code: warning.code,
+      message: warning.message,
+      ...(warning.stepId ? { stepId: warning.stepId } : {})
+    }))
   };
 }
 
@@ -149,7 +169,7 @@ function readArtifactTool(): RegisteredEffectTool {
   return {
     descriptor: descriptor(
       "read_artifact",
-      "Read a byte range from a large artifact referenced by a receipt in this session. Continue with nextOffset until eof.",
+      "Read a byte range from a large artifact referenced by a receipt in this session. Pass exactly the artifactId field from artifactRefs, without appending its name or size. Continue with nextOffset until eof.",
       {
         artifactId: { type: "string" },
         offsetBytes: { type: "number", minimum: 0 },
@@ -216,7 +236,7 @@ function requestStrategyTool(): RegisteredEffectTool {
   return {
     descriptor: descriptor(
       "request_strategy",
-      "Request the one optional fresh-context strategy reset when the current approach needs an independent hypothesis and next discriminating action. This is advisory and does not terminate work or restrict tools.",
+      "Request one optional fresh-context strategy reset when the current approach needs an independent hypothesis and next discriminating action. A later objective resource checkpoint may still occur; both are advisory and resource-capped.",
       {}
     ),
     async execute(request) {

@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "command": "node",
+  "args": [
+    "scripts/bench-verifier-egress-preflight.mjs",
+    "--expected-self-sha256",
+    "a672515a831715c908dbd4f081a10e76b3d917ec1edbd8c7ebde4483eaf22f95",
+    "--max-attempts",
+    "2",
+    "--attempt-backoff-ms",
+    "2000"
+  ],
+  "timeout_sec": 600
+}

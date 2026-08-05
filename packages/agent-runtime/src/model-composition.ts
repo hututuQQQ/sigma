@@ -14,7 +14,7 @@ import {
 import type { ModelExecutionRole, ModelGateway } from "agent-protocol";
 import type { RuntimeCustomization } from "./customization.js";
 
-const DEFAULT_MODEL_RETRIES = 10;
+const DEFAULT_MODEL_RETRIES = 4;
 const DEFAULT_MODEL_RETRY_BASE_DELAY_MS = 500;
 const DEFAULT_MODEL_RETRY_MAX_DELAY_MS = 32_000;
 const DEFAULT_MODEL_RETRY_JITTER_RATIO = 0.1;

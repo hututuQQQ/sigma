@@ -10,6 +10,8 @@ import type {
 import { isEnclosingContainerMutationEvidence } from "agent-kernel";
 import type { RuntimeSession } from "./types.js";
 import { CHECKPOINT_INTEGRITY_VALIDATOR } from "./validation-policy.js";
+import { assuranceRequirement } from "./assurance-engine.js";
+import { validationReadinessTelemetry } from "./validation-readiness.js";
 
 const MUTATION_KINDS = new Set([
   "workspace_delta", "repository_delta", "repository_acceptance",
@@ -109,13 +111,6 @@ export interface FrontierValidationReadiness {
   ready: boolean;
 }
 
-function isExecutedValidation(item: ValidationEvidence): boolean {
-  if (item.status === "passed") return true;
-  return item.status === "failed"
-    && item.data.termination?.processStarted === true
-    && item.data.termination.state === "exited";
-}
-
 export function currentRepositoryAcceptance(
   session: RuntimeSession
 ): RepositoryAcceptanceEvidence | undefined {
@@ -131,36 +126,26 @@ export function currentRepositoryAcceptance(
 export function frontierValidationReadiness(session: RuntimeSession): FrontierValidationReadiness {
   const changed = session.durable.state.mutationFrontier.changedPaths;
   const validations = sessionMutationEvidence(session).filter((item) => isCurrentValidation(session, item));
-  const passed = validations.filter((item) => item.status === "passed");
-  const executed = validations.filter(isExecutedValidation);
   const acceptance = currentRepositoryAcceptance(session);
   const acceptedPaths = new Set(acceptance ? sessionMutationEvidence(session).flatMap((item) =>
     item.kind === "repository_delta"
       && item.data.transactionHandle === acceptance.data.transactionHandle
       ? [".git", ...(item.data.reviewDiffPaths ?? [])] : []) : []);
-  const declaredPassedPaths = new Set(passed.flatMap((item) => item.data.coveredPaths));
-  const declaredExecutedPaths = new Set(executed.flatMap((item) => item.data.coveredPaths));
-  const coveredPaths = changed.filter((changedPath) => acceptedPaths.has(changedPath)
-    || declaredPassedPaths.has(changedPath));
-  const missingPaths = changed.filter((path) => !coveredPaths.includes(path));
-  const executedPaths = changed.filter((changedPath) => acceptedPaths.has(changedPath)
-    || declaredExecutedPaths.has(changedPath));
-  const missingExecutionPaths = changed.filter((path) => !executedPaths.includes(path));
   const latestFailed = [...validations].reverse().find((item) => item.status === "failed");
+  const readiness = validationReadinessTelemetry({
+    changedPaths: changed,
+    validations,
+    acceptedPaths,
+    requiredClaims: assuranceRequirement(session).requiredClaims,
+    repositoryAccepted: Boolean(acceptance)
+  });
   return {
     validations,
-    coveredPaths,
-    missingPaths,
-    // Runtime records declared subjects but deliberately does not infer which
-    // semantic claim the task requires. The independent reviewer owns that
-    // judgment.
-    missingClaims: [],
-    executedPaths,
-    missingExecutionPaths,
-    missingExecutionClaims: [],
-    executionReady: executed.length > 0,
+    // These classifications are advisory telemetry. Structural frontier
+    // binding remains completion authority, and the independent reviewer owns
+    // any binding semantic judgment.
+    ...readiness,
     ...(latestFailed ? { latestFailed } : {}),
-    ready: passed.length > 0
   };
 }
 

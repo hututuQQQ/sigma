@@ -71,7 +71,10 @@ function coverageTelemetryLines(
 ): string[] {
   return [
     ...(coverage.missingClaims.length > 0
-      ? [`- telemetry-only inferred validation claim gaps: ${coverage.missingClaims.slice(0, 16).join(", ")}`]
+      ? [
+          `- telemetry-only inferred validation claim gaps: ${coverage.missingClaims.slice(0, 16).join(", ")}`,
+          "- a narrow probe or syntax check does not establish broader behavior; prefer the project's existing unit, integration, typecheck, or acceptance command when available"
+        ]
       : []),
     ...(coverage.missingPaths.length > 0
       ? [`- non-authoritative declared-subject gaps (${coverage.missingPaths.length}): ${coverage.missingPaths.slice(0, 16).join(", ")}`]

@@ -1,4 +1,4 @@
-import type { RunOutcome } from "agent-protocol";
+import type { RunOutcome, ToolDescriptor } from "agent-protocol";
 import { decide, mutationFrontierHasChanges, type KernelEffect } from "agent-kernel";
 import {
   attemptFromEffect,
@@ -31,6 +31,7 @@ import {
   completionReviewBlocker,
   explicitReviewGateDecision
 } from "./completion-evidence-gate.js";
+import { settleSessionProcessesForCompletion } from "./process-cleanup.js";
 
 export interface EffectRunnerOptions {
   runtime: RuntimeOptions;
@@ -51,6 +52,18 @@ export interface EffectRunnerOptions {
   reviewer: ReviewerPort;
   reviewerForSession?: (session: RuntimeSession) => ReviewerPort;
   hooks: RuntimeHookCoordinator;
+}
+
+function terminalOnlyDescriptor(descriptor: ToolDescriptor | undefined): boolean {
+  if (!descriptor) return false;
+  const effects = [
+    ...descriptor.possibleEffects,
+    ...(descriptor.maximumEffects ?? descriptor.possibleEffects)
+  ];
+  return effects.length > 0 && effects.every((effect) =>
+    effect === "outcome.propose"
+      || effect === "outcome.report_blocked"
+      || effect === "outcome.request_input");
 }
 
 export class EffectRunner {
@@ -108,8 +121,12 @@ export class EffectRunner {
     signal: AbortSignal,
     effects: ExecuteToolEffect[]
   ): Promise<boolean> {
+    const descriptors = this.options.runtime.tools.descriptors();
+    const terminalOnly = effects.every((effect) => terminalOnlyDescriptor(
+      descriptors.find((item) => item.name === effect.request.name)
+    ));
     const failure = convergenceAdmissionFailure(session, {
-      kind: "tool", count: effects.length
+      kind: "tool", count: effects.length, terminalOnly
     });
     const deadline = deadlineForecast(session);
     // At a live deadline, cancellation remains an outer hard boundary. A
@@ -118,6 +135,14 @@ export class EffectRunner {
     // completion assurance can still run from a clean kernel phase.
     if (failure && deadline.stage === "stop") {
       return await this.options.finish(session, failure);
+    }
+    if (failure && deadline.stage === "converge") {
+      await this.toolBatches.rejectForResourceBoundary(
+        session,
+        effects.map(attemptFromEffect),
+        failure.message
+      );
+      return false;
     }
     await this.toolBatches.execute(session, effects.map(attemptFromEffect), signal);
     if (effects.some((effect) => effect.request.name === "request_review")) {
@@ -199,6 +224,18 @@ export class EffectRunner {
       }
       outcome = { ...outcome, evidence: [...session.durable.state.evidence] };
       outcomeRevision = session.durable.state.revision;
+    }
+    if (outcome.kind === "completed") {
+      const processEvents = await settleSessionProcessesForCompletion(
+        session,
+        this.options.runtime.execution,
+        this.options.emit,
+        signal
+      );
+      if (processEvents > 0) {
+        outcome = { ...outcome, evidence: [...session.durable.state.evidence] };
+        outcomeRevision = session.durable.state.revision;
+      }
     }
     if (outcome.kind === "completed"
       && automaticCompletionReviewRequired(session)

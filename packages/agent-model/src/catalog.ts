@@ -110,6 +110,8 @@ export interface ModelSpec {
   capabilities: ModelCapabilities;
   tokenizer: TokenizerMetadata;
   pricing?: ModelPricing;
+  /** Public catalog rates used only for API-equivalent reporting. */
+  apiEquivalentPricing?: ModelPricing;
   supportedReasoningEfforts?: readonly PiReasoningEffort[];
   defaultReasoningEffort?: PiReasoningEffort;
 }
@@ -163,7 +165,8 @@ export function modelSpecsForPiCatalog(
         : {}),
       ...(billingMode === "metered" && model.pricing
         ? { pricing: model.pricing }
-        : {})
+        : {}),
+      ...(model.pricing ? { apiEquivalentPricing: model.pricing } : {})
     };
   });
 }

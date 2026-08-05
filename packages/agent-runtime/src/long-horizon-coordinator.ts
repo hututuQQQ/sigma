@@ -36,6 +36,7 @@ import {
   type PreparedModelBudget
 } from "./model-accounting.js";
 import { fitPreparedBudget } from "./model-budget-convergence.js";
+import { deterministicSamplingOptions } from "./model-request-policy.js";
 import { currentFrontierReview } from "./mutation-evidence.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 import type { RuntimeOptions, RuntimeSession } from "./types.js";
@@ -68,6 +69,18 @@ interface StrategistExecution {
 }
 
 const MAX_STRATEGY_OUTPUT_TOKENS = 4_096;
+
+function strategistAttemptAmounts(prepared: PreparedModelBudget) {
+  const first = prepared.attemptReservations?.[0];
+  return first
+    ? fullAmounts({
+        inputTokens: first.inputTokens,
+        outputTokens: first.outputTokens,
+        costMicroUsd: first.costMicroUsd ?? 0,
+        modelTurns: 1
+      })
+    : fullAmounts(prepared.reserved);
+}
 
 function hasActivePlanWork(session: RuntimeSession): boolean {
   return session.durable.state.plan.nodes.some((node) =>
@@ -260,11 +273,15 @@ export class LongHorizonCoordinator {
       ));
       return undefined;
     }
-    const capacity = auxiliaryCapacity(session, fullAmounts(prepared.reserved));
+    // Routed gateways reserve the complete retry chain in `reserved`. The
+    // strategist is deliberately capped to one attempt below, so protect the
+    // reviewer pool against that same one-attempt amount rather than treating
+    // every possible route retry as one oversized auxiliary call.
+    const capacity = auxiliaryCapacity(session, strategistAttemptAmounts(prepared));
     const fitted = capacity ? fitPreparedBudget(prepared, capacity, 1) : null;
     if (!fitted) {
       // Strategist is lowest priority. Skipping it is observable but does not
-      // consume the one permitted strategist invocation.
+      // consume the permitted strategist invocation for this checkpoint.
       return undefined;
     }
     return { gateway, messages, maximumOutput, budget: fitted };
@@ -286,7 +303,7 @@ export class LongHorizonCoordinator {
         signal,
         tools: [],
         toolChoice: "none",
-        temperature: 0,
+        ...deterministicSamplingOptions(prepared.gateway),
         maxOutputTokens: prepared.maximumOutput,
         messages: prepared.messages
       };

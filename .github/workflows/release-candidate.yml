@@ -239,25 +239,22 @@ jobs:
         with:
           name: release-${{ matrix.label }}-${{ github.run_id }}
           if-no-files-found: error
+          retention-days: 7
           path: |
             .artifacts/agent-cli-${{ matrix.label }}.${{ matrix.release == 'windows' && 'zip' || 'tgz' }}
             .artifacts/agent-cli-${{ matrix.label }}.${{ matrix.release == 'windows' && 'zip' || 'tgz' }}.sha256
             .artifacts/agent-cli-${{ matrix.label }}.sbom.cdx.json
             .artifacts/agent-cli-${{ matrix.label }}.provenance.json
-      - name: Upload public provenance key
+      - name: Upload release-wide verification metadata
         if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
-          name: release-public-key-${{ github.run_id }}
+          name: release-metadata-${{ github.run_id }}
           if-no-files-found: error
-          path: .artifacts/release-provenance-public.pem
-      - name: Upload live-evaluation override record
-        if: needs.metadata.outputs.live_eval_override == 'true' && runner.os == 'Linux'
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-live-eval-override-${{ github.run_id }}
-          if-no-files-found: error
-          path: .artifacts/release-live-evaluation-override.json
+          retention-days: 7
+          path: |
+            .artifacts/release-provenance-public.pem
+            .artifacts/release-live-evaluation-override.json
       - name: Upload candidate evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -265,7 +262,24 @@ jobs:
           name: rc-${{ matrix.label }}-${{ github.run_id }}
           if-no-files-found: warn
           include-hidden-files: true
-          path: .artifacts/**
+          retention-days: 14
+          path: |
+            .artifacts/agent-cli-package-verify-${{ matrix.label }}.json
+            .artifacts/sandbox-smoke-${{ matrix.label }}.json
+            .artifacts/lsp-sandbox-smoke-${{ matrix.label }}.json
+            .artifacts/sigma-exec-branch-coverage.json
+            .artifacts/replay-100k.json
+            .artifacts/product-readiness-${{ matrix.label }}.json
+            .artifacts/product-readiness-${{ matrix.label }}.md
+            .artifacts/smoke-product/product-smoke.json
+            .artifacts/smoke-tui-product/tui-smoke.json
+            .artifacts/smoke-provider/provider-smoke.json
+            .artifacts/eval-rc/latest.json
+            .artifacts/eval-rc/*/run*.json
+            .artifacts/eval-rc/*/report*.md
+            .artifacts/eval-rc/*/human-audit*.json
+            .artifacts/eval-rc/*/human-audit*.md
+            .artifacts/eval-rc/*/infrastructure-error.log
 
   desktop:
     name: Build Sigma Code Windows x64 installer
@@ -360,6 +374,7 @@ jobs:
         with:
           name: release-desktop-win32-x64-${{ github.run_id }}
           if-no-files-found: error
+          retention-days: 7
           path: |
             desktop-assets/Sigma-Code-${{ needs.metadata.outputs.version }}-x64.exe
             desktop-assets/Sigma-Code-${{ needs.metadata.outputs.version }}-x64.exe.sha256
@@ -374,18 +389,22 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Download verified release assets
         uses: actions/download-artifact@v4
         with:
           pattern: release-*-${{ github.run_id }}
           path: release-assets
           merge-multiple: true
-      - name: Require the complete release asset set
+      - name: Prepare compact public asset set
         shell: bash
         env:
           RELEASE_LIVE_EVAL_OVERRIDE: ${{ needs.metadata.outputs.live_eval_override }}
           RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
+          set -euo pipefail
           node --input-type=module <<'NODE'
           import { readdirSync } from "node:fs";
 
@@ -404,13 +423,71 @@ jobs:
             `Sigma-Code-${process.env.RELEASE_VERSION}-x64.exe.blockmap`,
             "latest.yml"
           ];
-          if (process.env.RELEASE_LIVE_EVAL_OVERRIDE === "true") {
+          const expectsOverride = process.env.RELEASE_LIVE_EVAL_OVERRIDE === "true";
+          if (expectsOverride) {
             expected.push("release-live-evaluation-override.json");
           }
           const actual = new Set(readdirSync("release-assets"));
           const missing = expected.filter((name) => !actual.has(name));
           if (missing.length > 0) throw new Error(`Missing release assets: ${missing.join(", ")}`);
+          if (!expectsOverride && actual.has("release-live-evaluation-override.json")) {
+            throw new Error("Unexpected live-evaluation override record for a release without an override.");
+          }
           NODE
+          (
+            cd release-assets
+            sha256sum --check agent-cli-linux-x64.tgz.sha256
+            sha256sum --check agent-cli-win32-x64.zip.sha256
+            sha256sum --check "Sigma-Code-${RELEASE_VERSION}-x64.exe.sha256"
+          )
+
+          mkdir publication-assets release-evidence
+          cp -- \
+            release-assets/agent-cli-linux-x64.tgz \
+            release-assets/agent-cli-win32-x64.zip \
+            "release-assets/Sigma-Code-${RELEASE_VERSION}-x64.exe" \
+            "release-assets/Sigma-Code-${RELEASE_VERSION}-x64.exe.blockmap" \
+            release-assets/latest.yml \
+            publication-assets/
+          cp -- \
+            release-assets/agent-cli-linux-x64.sbom.cdx.json \
+            release-assets/agent-cli-linux-x64.provenance.json \
+            release-assets/agent-cli-win32-x64.sbom.cdx.json \
+            release-assets/agent-cli-win32-x64.provenance.json \
+            release-assets/release-provenance-public.pem \
+            release-evidence/
+          if [[ "${RELEASE_LIVE_EVAL_OVERRIDE}" == "true" ]]; then
+            cp -- release-assets/release-live-evaluation-override.json release-evidence/
+          fi
+
+          python3 <<'PY'
+          from pathlib import Path
+          from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
+
+          source_dir = Path("release-evidence")
+          output = Path("publication-assets/release-evidence.zip")
+          with ZipFile(output, "x") as archive:
+              for source in sorted(source_dir.iterdir(), key=lambda item: item.name):
+                  if not source.is_file():
+                      raise RuntimeError(f"Unexpected release evidence entry: {source}")
+                  info = ZipInfo(source.name, date_time=(1980, 1, 1, 0, 0, 0))
+                  info.compress_type = ZIP_DEFLATED
+                  info.create_system = 3
+                  info.external_attr = 0o100644 << 16
+                  archive.writestr(info, source.read_bytes(), compresslevel=9)
+          PY
+
+          (
+            cd publication-assets
+            sha256sum \
+              agent-cli-linux-x64.tgz \
+              agent-cli-win32-x64.zip \
+              "Sigma-Code-${RELEASE_VERSION}-x64.exe" \
+              "Sigma-Code-${RELEASE_VERSION}-x64.exe.blockmap" \
+              latest.yml \
+              release-evidence.zip \
+              > SHA256SUMS
+          )
       - name: Create immutable GitHub Release
         shell: bash
         env:
@@ -433,7 +510,7 @@ jobs:
           - **Windows x64:** **unsigned preview**. The archive passed package, sandbox, live-product, checksum, SBOM, and signed-provenance verification, but its executables do not have a trusted Authenticode signature. Windows SmartScreen or Smart App Control may warn or block execution.
           - **Sigma Code Windows x64 installer:** **unsigned preview** containing both the desktop UI and the verified Sigma Runtime from this release. Install it to use Sigma Code without separately installing Node.js or the agent CLI. The matching blockmap and update manifest enable Sigma-owned desktop updates.
 
-          Verify the matching SHA-256 sidecar before running the installer. Verify the archive sidecars and signed provenance before extracting either Runtime archive. Windows assets are not trusted signed Windows binaries.
+          Most users only need one installer or Runtime archive. Verify published files with `SHA256SUMS`. The SBOMs, signed provenance, public verification key, and any release exception record are collected in `release-evidence.zip`. Windows assets are not trusted signed Windows binaries.
           EOF
           )"
           if [[ "${RELEASE_LIVE_EVAL_OVERRIDE}" == "true" ]]; then
@@ -443,25 +520,16 @@ jobs:
 
           The quick-five live evaluation gate was explicitly skipped for this tag: ${RELEASE_LIVE_EVAL_OVERRIDE_REASON}
 
-          All deterministic platform, security, live-provider, package, checksum, SBOM, and signed-provenance gates still passed. See \`release-live-evaluation-override.json\` for the audit record."
+          All deterministic platform, security, live-provider, package, checksum, SBOM, and signed-provenance gates still passed. See \`release-live-evaluation-override.json\` inside \`release-evidence.zip\` for the audit record."
           fi
           assets=(
-            "release-assets/agent-cli-linux-x64.tgz#Linux x64 — stable"
-            "release-assets/agent-cli-linux-x64.tgz.sha256"
-            "release-assets/agent-cli-linux-x64.sbom.cdx.json"
-            "release-assets/agent-cli-linux-x64.provenance.json"
-            "release-assets/agent-cli-win32-x64.zip#Windows x64 Runtime — UNSIGNED PREVIEW"
-            "release-assets/agent-cli-win32-x64.zip.sha256"
-            "release-assets/agent-cli-win32-x64.sbom.cdx.json"
-            "release-assets/agent-cli-win32-x64.provenance.json"
-            "release-assets/release-provenance-public.pem"
-            "release-assets/Sigma-Code-${RELEASE_VERSION}-x64.exe#Sigma Code Windows x64 installer — UI + Runtime (UNSIGNED PREVIEW)"
-            "release-assets/Sigma-Code-${RELEASE_VERSION}-x64.exe.sha256"
-            "release-assets/Sigma-Code-${RELEASE_VERSION}-x64.exe.blockmap"
-            "release-assets/latest.yml"
+            "publication-assets/agent-cli-linux-x64.tgz#Linux x64 — stable"
+            "publication-assets/agent-cli-win32-x64.zip#Windows x64 Runtime — UNSIGNED PREVIEW"
+            "publication-assets/Sigma-Code-${RELEASE_VERSION}-x64.exe#Sigma Code Windows x64 installer — UI + Runtime (UNSIGNED PREVIEW)"
+            "publication-assets/SHA256SUMS#SHA-256 checksums for release binaries and metadata"
+            "publication-assets/release-evidence.zip#SBOM, signed provenance, public key, and release audit evidence"
+            "publication-assets/Sigma-Code-${RELEASE_VERSION}-x64.exe.blockmap"
+            "publication-assets/latest.yml"
           )
-          if [[ "${RELEASE_LIVE_EVAL_OVERRIDE}" == "true" ]]; then
-            assets+=("release-assets/release-live-evaluation-override.json")
-          fi
           gh release create "${GITHUB_REF_NAME}" "${assets[@]}" \
             --repo "${GITHUB_REPOSITORY}" --notes "${release_notes}" "${options[@]}"

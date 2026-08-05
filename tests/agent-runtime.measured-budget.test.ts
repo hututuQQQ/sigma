@@ -452,7 +452,7 @@ describe("provider-measured model budget settlement", () => {
     });
   });
 
-  it("continues useful work while an explicit deadline is still live", async () => {
+  it("rejects new tool work and uses a text-only closeout inside the explicit deadline reserve", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-deadline-settlement-workspace-"));
     const state = await mkdtemp(path.join(os.tmpdir(), "sigma-deadline-settlement-state-"));
     await writeFile(path.join(workspace, "seed.txt"), "seed\n", "utf8");
@@ -472,8 +472,8 @@ describe("provider-measured model budget settlement", () => {
         },
         finishReason: "tool_calls",
         usage: measuredUsage(100, 10)
-      }, stopResponse("Inspection completed.")], {}, () => {
-        currentTime = startedAt + 15_000;
+      }, stopResponse("The partial inspection is summarized before the deadline.")], {}, () => {
+        currentTime = startedAt + 55_000;
       });
       const store = new SegmentedJsonlStore({ rootDir: state });
       const runtime = createRuntime({
@@ -483,7 +483,7 @@ describe("provider-measured model budget settlement", () => {
         tools: registerBuiltinTools(new EffectToolRegistry()),
         permissionMode: "auto",
         outputReserveTokens: 100,
-        runDeadlineMs: 20_000
+        runDeadlineMs: 60_000
       });
       const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" }, {
         inputTokens: 10_000, outputTokens: 1_000, costMicroUsd: 10_000_000, modelTurns: 10,
@@ -499,12 +499,25 @@ describe("provider-measured model budget settlement", () => {
         kind: "completed"
       });
       expect(gateway.requests).toHaveLength(2);
+      expect(gateway.requests[0]?.tools.length).toBeGreaterThan(0);
+      expect(gateway.requests[1]).toMatchObject({
+        tools: [],
+        toolChoice: "none"
+      });
       const events = await storedEvents(store, session.sessionId);
       expect(events).toContainEqual(expect.objectContaining({
-        type: "tool.completed",
+        type: "tool.failed",
         payload: expect.objectContaining({
-          callId: "read-before-explicit-deadline"
+          callId: "read-before-explicit-deadline",
+          diagnostics: expect.arrayContaining(["budget_exhausted"])
         })
+      }));
+      expect(events.some((event) => event.type === "tool.completed"
+        && (event.payload as { callId?: string }).callId === "read-before-explicit-deadline"
+      )).toBe(false);
+      expect(events).toContainEqual(expect.objectContaining({
+        type: "diagnostic",
+        payload: expect.objectContaining({ kind: "deadline.stage", stage: "converge" })
       }));
       expect(events.at(-1)?.type).toBe("run.completed");
     } finally {

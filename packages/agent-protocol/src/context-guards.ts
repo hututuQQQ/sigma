@@ -7,6 +7,7 @@ import type {
   StrategyReset,
   ToolResultPruneState
 } from "./context.js";
+import { MAX_STRATEGIST_CALLS } from "./context-limits.js";
 
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -104,7 +105,7 @@ export function isAssuranceResourcePolicy(
 export function isAssuranceReserveState(value: unknown): value is AssuranceReserveState {
   const reserve = record(value);
   if (!reserve || reserve.schemaVersion !== 1) return false;
-  const strategistCapacity = reserve.strategistMode === "off" ? 0 : 1;
+  const strategistCapacity = reserve.strategistMode === "off" ? 0 : MAX_STRATEGIST_CALLS;
   return isAssuranceResourcePolicy(reserve)
     && isNonNegativeInteger(reserve.maxAuxiliaryCalls)
     && Number(reserve.maxAuxiliaryCalls)

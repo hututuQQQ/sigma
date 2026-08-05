@@ -40,6 +40,7 @@ export interface PreparedModelTurn {
   messages: ContextPlan["messages"];
   tools: ModelToolDefinition[];
   toolChoice?: ModelRequest["toolChoice"];
+  boundaryStage?: ModelTurnBoundaryStage;
   budget: PreparedModelBudget;
   outputReserveTokens: number;
   toolSchemaDigest: string;
@@ -185,6 +186,13 @@ function requestOutputTokens(input: TurnPreparationInput): number {
   return Math.min(providerCapped, withFinalReplyHeldBack);
 }
 
+function remainingInputLimit(input: TurnPreparationInput): number {
+  const margin = input.session.services.gateway.capabilities.tokenizer === "approximate"
+    ? APPROXIMATE_TOKEN_RESERVATION_MARGIN
+    : 1;
+  return Math.max(0, Math.floor(input.available.inputTokens / margin));
+}
+
 function recoveryNotice(input: TurnPreparationInput): ContextItem | undefined {
   const mode = input.session.durable.state.lengthRecovery.mode;
   if (mode === "none") return undefined;
@@ -326,6 +334,7 @@ export async function prepareBudgetedModelTurn(
     dynamic: frame.items,
     tools,
     outputReserveTokens,
+    maxInputTokens: remainingInputLimit(input),
     ...(input.archive ? { archive: input.archive } : {})
   });
   const budget = await prepareModelBudget(
@@ -351,6 +360,7 @@ export async function prepareBudgetedModelTurn(
       outputReserveTokens,
       toolSchemaDigest,
       requestDigest,
+      ...(boundaryStage ? { boundaryStage } : {}),
       ...(toolChoice ? { toolChoice } : {}),
       promptState: committedPromptState(input, frame, plan),
       frameMode: frame.frameMode

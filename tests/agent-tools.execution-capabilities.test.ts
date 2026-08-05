@@ -1,7 +1,11 @@
 import { mkdtemp, rm } from "node:fs/promises";
+import { createServer, type Server } from "node:net";
 import os from "node:os";
 import path from "node:path";
-import type { ExecutionBroker, ExecutionResult } from "../packages/agent-execution/src/index.js";
+import type {
+  ExecutionBroker,
+  ExecutionResult
+} from "../packages/agent-execution/src/index.js";
 import type {
   JsonValue,
   ToolExecutionContext,
@@ -39,6 +43,30 @@ function execution(workspacePath: string): ToolExecutionContext {
     progress: async () => undefined,
     createArtifact: async () => "artifact"
   };
+}
+
+async function listenTcp(): Promise<{ server: Server; port: number }> {
+  const server = createServer((socket) => socket.end());
+  await new Promise<void>((resolve, reject) => {
+    const failed = (error: Error): void => reject(error);
+    server.once("error", failed);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", failed);
+      resolve();
+    });
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    server.close();
+    throw new Error("TCP test server did not expose an IP port.");
+  }
+  return { server, port: address.port };
+}
+
+async function closeServer(server: Server): Promise<void> {
+  if (!server.listening) return;
+  await new Promise<void>((resolve, reject) => server.close((error) =>
+    error ? reject(error) : resolve()));
 }
 
 function brokerFixture(): {
@@ -210,7 +238,7 @@ describe("execution tool capability closure", () => {
       handoff: true,
       processHandoff: "allow",
       networkMode: "none",
-      networkModes: ["none"],
+      networkModes: ["none", "full"],
       runtimeCommands: ["runtime"],
       shells: []
     });
@@ -218,24 +246,39 @@ describe("execution tool capability closure", () => {
       properties: { lifecycle: { enum: ["session", "deliverable"] } }
     });
     expect(tools.descriptor("process_handoff")?.possibleEffects).toEqual(["process.handoff"]);
+    await expect(tools.prepare(request("process_handoff", {
+      handleId: "process", brokerInstanceId: "broker"
+    }), preparation(root))).rejects.toMatchObject({ code: "tool_arguments_invalid" });
 
-    const spawnCall = request("process_spawn", { executable: "runtime", lifecycle: "deliverable" });
+    const spawnCall = request("process_spawn", {
+      executable: "runtime", lifecycle: "deliverable", network: "full"
+    });
     const spawnPlan = await tools.prepare(spawnCall, preparation(root));
-    await expect(tools.execute(spawnCall, { ...execution(root), callPlan: spawnPlan }))
+    await expect(tools.execute(spawnCall, {
+      ...execution(root), callPlan: spawnPlan, approval: { networkApproved: true }
+    }))
       .resolves.toMatchObject({ ok: true });
     expect(fixture.spawn).toHaveBeenCalledWith(
       expect.objectContaining({ lifecycle: "deliverable" }),
       expect.anything()
     );
 
-    const handoffCall = request("process_handoff", {
-      handleId: "process", brokerInstanceId: "broker"
-    });
-    const handoffPlan = await tools.prepare(handoffCall, preparation(root));
-    await expect(tools.execute(handoffCall, {
-      ...execution(root), callPlan: handoffPlan, approval: { processHandoffApproved: true }
-    })).resolves.toMatchObject({ ok: true });
-    expect(fixture.handoff).toHaveBeenCalledOnce();
+    const listening = await listenTcp();
+    try {
+      const handoffCall = request("process_handoff", {
+        handleId: "process",
+        brokerInstanceId: "broker",
+        readiness: { kind: "tcp", host: "127.0.0.1", port: listening.port }
+      });
+      const handoffPlan = await tools.prepare(handoffCall, preparation(root));
+      await expect(tools.execute(handoffCall, {
+        ...execution(root), callPlan: handoffPlan, approval: { processHandoffApproved: true }
+      })).resolves.toMatchObject({ ok: true });
+      expect(fixture.poll).not.toHaveBeenCalled();
+      expect(fixture.handoff).toHaveBeenCalledOnce();
+    } finally {
+      await closeServer(listening.server);
+    }
 
     const denied = registerBuiltinTools(new EffectToolRegistry(), {
       handoff: true,
@@ -246,6 +289,94 @@ describe("execution tool capability closure", () => {
     expect(denied.descriptor("process_spawn")?.inputSchema).not.toMatchObject({
       properties: { lifecycle: expect.anything() }
     });
+
+    const isolated = registerBuiltinTools(new EffectToolRegistry(), {
+      broker: fixture.broker,
+      handoff: true,
+      processHandoff: "allow",
+      networkMode: "none",
+      networkModes: ["none"],
+      runtimeCommands: ["runtime"],
+      shells: []
+    });
+    expect(isolated.descriptor("process_handoff")).toBeUndefined();
+    expect(isolated.descriptor("process_spawn")?.inputSchema).not.toMatchObject({
+      properties: { lifecycle: expect.anything() }
+    });
+  });
+
+  it("refuses handoff when the delivery endpoint is unreachable", async () => {
+    const root = await workspace();
+    const fixture = brokerFixture();
+    const tools = registerBuiltinTools(new EffectToolRegistry(), {
+      broker: fixture.broker,
+      handoff: true,
+      processHandoff: "allow",
+      networkMode: "full",
+      networkModes: ["full"],
+      runtimeCommands: ["runtime"],
+      shells: []
+    });
+    const released = await listenTcp();
+    const port = released.port;
+    await closeServer(released.server);
+    const handoffCall = request("process_handoff", {
+      handleId: "process",
+      brokerInstanceId: "broker",
+      readiness: { kind: "tcp", port, timeoutMs: 100 }
+    });
+    const handoffPlan = await tools.prepare(handoffCall, preparation(root));
+
+    await expect(tools.execute(handoffCall, {
+      ...execution(root), callPlan: handoffPlan, approval: { processHandoffApproved: true }
+    })).rejects.toMatchObject({ code: "process_readiness_failed" });
+    expect(fixture.poll).not.toHaveBeenCalled();
+    expect(fixture.handoff).not.toHaveBeenCalled();
+  });
+
+  it("waits within one handoff call for a service that is still starting", async () => {
+    const root = await workspace();
+    const fixture = brokerFixture();
+    const tools = registerBuiltinTools(new EffectToolRegistry(), {
+      broker: fixture.broker,
+      handoff: true,
+      processHandoff: "allow",
+      networkMode: "full",
+      networkModes: ["full"],
+      runtimeCommands: ["runtime"],
+      shells: []
+    });
+    const reserved = await listenTcp();
+    const port = reserved.port;
+    await closeServer(reserved.server);
+    const delayed = createServer((socket) => socket.end());
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const listening = new Promise<void>((resolve, reject) => {
+      const failed = (error: Error): void => reject(error);
+      delayed.once("error", failed);
+      timer = setTimeout(() => delayed.listen(port, "127.0.0.1", () => {
+        delayed.off("error", failed);
+        resolve();
+      }), 50);
+    });
+    const handoffCall = request("process_handoff", {
+      handleId: "process",
+      brokerInstanceId: "broker",
+      readiness: { kind: "tcp", port, timeoutMs: 500 }
+    });
+    const handoffPlan = await tools.prepare(handoffCall, preparation(root));
+
+    try {
+      const handedOff = expect(tools.execute(handoffCall, {
+        ...execution(root), callPlan: handoffPlan, approval: { processHandoffApproved: true }
+      })).resolves.toMatchObject({ ok: true });
+      await listening;
+      await handedOff;
+      expect(fixture.handoff).toHaveBeenCalledOnce();
+    } finally {
+      if (timer) clearTimeout(timer);
+      await closeServer(delayed);
+    }
   });
 
   it("routes disposable-environment processes through the current shell contract", async () => {
@@ -262,7 +393,7 @@ describe("execution tool capability closure", () => {
       handoff: true,
       processHandoff: "allow",
       networkMode: "none",
-      networkModes: ["none"],
+      networkModes: ["none", "full"],
       runtimeCommands: ["runtime"],
       shells: ["bash"],
       directExecutableResolution: true,
@@ -301,7 +432,8 @@ describe("execution tool capability closure", () => {
       target: "environment",
       background: true,
       yieldMs: 0,
-      lifecycle: "deliverable"
+      lifecycle: "deliverable",
+      network: "full"
     });
     const plan = await tools.prepare(call, preparation(root));
     expect(plan).toMatchObject({
@@ -315,7 +447,7 @@ describe("execution tool capability closure", () => {
       approval: {
         callId: call.callId,
         authority: "runtime",
-        networkApproved: false,
+        networkApproved: true,
         externalReadApproved: true,
         processHandoffApproved: false,
         openWorldApproved: true
@@ -483,6 +615,13 @@ describe("execution tool capability closure", () => {
     }), preparation(root))).resolves.toMatchObject({
       processMode: "background",
       exactEffects: expect.not.arrayContaining(["validation"])
+    });
+    await expect(tools.prepare(request("shell", {
+      executable: "runtime",
+      background: true,
+      timeoutMs: 120_000
+    }), preparation(root))).resolves.toMatchObject({
+      processMode: "background"
     });
 
     const backgroundCall = request("shell", {

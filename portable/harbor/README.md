@@ -23,3 +23,31 @@ Adapter-owned structured summaries and traces use schema 1 and current,
 unversioned artifact names. The formal task boundary accepts
 `provenance_source` only; removed field aliases are not reconstructed for the
 solver.
+
+`verifier_gate_plugin:VerifierGatePlugin` is a neutral host-side Harbor plugin
+that applies a run-scoped, cross-process file-lock semaphore at verification
+start. The benchmark launcher can also set verifier-only proxy variables in
+Harbor's `verifier.env`; neither control inspects task names, agent output,
+verifier output, rewards, or scores.
+
+Formal runs freeze a non-decreasing verifier-concurrency schedule and may bind
+a generic, non-shell bootstrap preflight by SHA-256. A failed preflight stops
+before Harbor dispatch, so it cannot consume a benchmark attempt.
+
+For ad-hoc Docker runs, verifier proxy mode `auto` reads Docker's advertised
+HTTP proxy and records the resolved credential-free origin. It does not expose
+a host-loopback proxy directly to containers. Formal runs must freeze that
+resolved origin with proxy mode `custom` so host configuration cannot drift
+between preregistration and execution.
+
+`scripts/bench-verifier-egress-preflight.json` is the repository-managed
+bootstrap descriptor. It SHA-binds its implementation and launches one cached,
+ephemeral Ubuntu container per configured verifier slot. Every worker performs
+a neutral APT package-index refresh, installs the common CA/curl bootstrap
+tools, and completes a bounded HTTPS request. This exercises package-manager,
+TLS, proxy, and concurrent Docker egress before any selected task is dispatched;
+it does not inspect task identity, agent output, verifier output, or scores. A
+failed concurrent cohort is retried once after a bounded delay, and the run is
+released only when every verifier slot succeeds in the same cohort. Retry
+counts and per-cohort outcomes are emitted in the preflight result. Benchmark
+trials and post-verifier failures remain non-retriable.

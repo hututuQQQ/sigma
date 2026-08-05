@@ -12,11 +12,14 @@ import {
   type JsonValue,
   type ModelCapabilities,
   type ModelGateway,
+  type ModelMessage,
   type ModelRequest,
   type ModelResponse,
   type ModelStreamEvent,
+  type ModelToolDefinition,
   type ToolReceipt
 } from "../packages/agent-protocol/src/index.js";
+import type { ModelRouteConstraints } from "../packages/agent-model/src/index.js";
 import { evolve } from "../packages/agent-kernel/src/index.js";
 import { BudgetController } from "../packages/agent-runtime/src/budget-controller.js";
 import {
@@ -30,6 +33,11 @@ import {
 } from "../packages/agent-runtime/src/long-horizon-strategy.js";
 import { longHorizonLedger } from "../packages/agent-runtime/src/long-horizon-ledger.js";
 import { progressCheckpoints } from "../packages/agent-runtime/src/progress-checkpoint.js";
+import {
+  emptyMarginalProgressHistory,
+  marginalProgressSignals,
+  recordMarginalProgress
+} from "../packages/agent-runtime/src/long-horizon-progress.js";
 import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
 import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
 
@@ -43,6 +51,9 @@ function addBatch(
     ok?: boolean;
     reasoningContent?: string;
     actualEffects?: ToolReceipt["actualEffects"];
+    workspaceDelta?: ToolReceipt["workspaceDelta"];
+    artifacts?: string[];
+    evidence?: ToolReceipt["evidence"];
   } = {}
 ): void {
   const callId = `call-${index}`;
@@ -73,9 +84,10 @@ function addBatch(
     },
     observedEffects: ["filesystem.read"],
     actualEffects: options.actualEffects ?? ["filesystem.read"],
-    artifacts: [],
+    artifacts: options.artifacts ?? [],
     diagnostics: [],
-    evidence: [],
+    evidence: options.evidence ?? [],
+    ...(options.workspaceDelta ? { workspaceDelta: options.workspaceDelta } : {}),
     startedAt: "2026-01-01T00:00:00.000Z",
     completedAt: "2026-01-01T00:00:01.000Z"
   };
@@ -212,6 +224,38 @@ class StrategistGateway implements ModelGateway {
   async countTokens(): Promise<number> { return 100; }
 }
 
+class RetryChainStrategistGateway extends StrategistGateway {
+  async budgetPlan(
+    _messages: ModelMessage[],
+    _tools: ModelToolDefinition[],
+    _maxOutputTokens: number,
+    remainingBudgetMicroUsd: number
+  ) {
+    const attemptReservations = Array.from({ length: 11 }, () => ({
+      inputTokens: 100,
+      outputTokens: 4_096,
+      costMicroUsd: 0
+    }));
+    return {
+      estimatedInputTokens: 100,
+      reservedInputTokens: 1_100,
+      reservedOutputTokens: 45_056,
+      reservedCostMicroUsd: 0,
+      reservedModelTurns: 11,
+      attemptReservations,
+      constraints: {
+        estimatedInputTokens: 100,
+        maxOutputTokens: 4_096,
+        remainingBudgetMicroUsd
+      } satisfies ModelRouteConstraints
+    };
+  }
+
+  routingIdentity(): { role: "planner"; routeId: string } {
+    return { role: "planner", routeId: "retry-chain" };
+  }
+}
+
 function coordinatorHarness(
   session: RuntimeSession,
   gateway: StrategistGateway,
@@ -246,6 +290,147 @@ function coordinatorHarness(
 }
 
 describe("objective long-horizon triggers", () => {
+  it("forms marginal progress only from durable vector components", () => {
+    const calls = [{ id: "progress-call", name: "update_plan", arguments: {} }];
+    const assistant: ModelMessage = { role: "assistant", content: "", toolCalls: calls };
+    const receipt: ToolReceipt = {
+      callId: "progress-call",
+      ok: true,
+      output: "same result",
+      outcome: { status: "succeeded", output: "same result", diagnosticCodes: [] },
+      observedEffects: ["filesystem.read"],
+      actualEffects: ["filesystem.read"],
+      workspaceDelta: { added: [], modified: ["src/current.ts"], deleted: [] },
+      artifacts: ["artifact-1"],
+      diagnostics: [],
+      evidence: [{
+        evidenceId: "validation-1",
+        sessionId: "session",
+        runId: "run",
+        kind: "validation",
+        status: "failed",
+        createdAt: "2026-01-01T00:00:01.000Z",
+        producer: { authority: "runtime" },
+        summary: "Validation failed.",
+        data: {
+          schemaVersion: 1,
+          validator: "test",
+          exitCode: 1,
+          frontierRevision: 1,
+          stateDigest: "a".repeat(64),
+          coveredPaths: ["src/current.ts"]
+        }
+      }],
+      startedAt: "2026-01-01T00:00:00.000Z",
+      completedAt: "2026-01-01T00:00:01.000Z"
+    };
+    const seen = emptyMarginalProgressHistory();
+    seen.resultDigests.add("seen");
+    expect(marginalProgressSignals(
+      { assistant, calls, receipts: [receipt] },
+      { batch: 1, toolNames: ["update_plan"], callDigest: "call", resultDigest: "seen", summary: "" },
+      seen
+    )).toEqual([
+      "workspace_revision", "plan_revision", "validation_evidence", "artifact"
+    ]);
+    seen.validationEvidenceIds.add("validation-1");
+    seen.artifactIds.add("artifact-1");
+    expect(marginalProgressSignals(
+      { assistant, calls, receipts: [receipt] },
+      { batch: 2, toolNames: ["update_plan"], callDigest: "call", resultDigest: "seen", summary: "" },
+      seen
+    )).toEqual(["workspace_revision", "plan_revision"]);
+    expect(marginalProgressSignals(
+      {
+        assistant,
+        calls: [{ id: "progress-call", name: "read", arguments: {} }],
+        receipts: [{
+          ...receipt,
+          workspaceDelta: { added: [], modified: [], deleted: [] },
+          artifacts: [],
+          evidence: []
+        }]
+      },
+      { batch: 3, toolNames: ["read"], callDigest: "next", resultDigest: "new", summary: "" },
+      seen
+    )).toEqual(["discriminating_result"]);
+  });
+
+  it("does not let repeated validation IDs reset convergence on the same frontier", () => {
+    const validation = (evidenceId: string, status: "failed" | "passed"): NonNullable<
+      ToolReceipt["evidence"]
+    >[number] => ({
+      evidenceId,
+      sessionId: "session",
+      runId: "run",
+      kind: "validation",
+      status,
+      createdAt: "2026-01-01T00:00:01.000Z",
+      producer: { authority: "runtime" },
+      summary: `Validation ${status}.`,
+      data: {
+        schemaVersion: 1,
+        validator: "test",
+        exitCode: status === "passed" ? 0 : 1,
+        frontierRevision: 1,
+        stateDigest: "a".repeat(64),
+        coveredPaths: ["src/current.ts"]
+      }
+    });
+    const batch = (evidence: NonNullable<ToolReceipt["evidence"]>[number]) => {
+      const call = { id: "validate", name: "shell", arguments: { command: "pnpm test" } };
+      return {
+        assistant: { role: "assistant" as const, content: "", toolCalls: [call] },
+        calls: [call],
+        receipts: [{
+          callId: "validate",
+          ok: evidence.status === "passed",
+          output: evidence.summary,
+          outcome: {
+            status: evidence.status === "passed" ? "succeeded" as const : "failed" as const,
+            output: evidence.summary,
+            diagnosticCodes: []
+          },
+          observedEffects: ["validation" as const],
+          actualEffects: ["validation" as const],
+          artifacts: [],
+          diagnostics: [],
+          evidence: [evidence],
+          startedAt: "2026-01-01T00:00:00.000Z",
+          completedAt: "2026-01-01T00:00:01.000Z"
+        }]
+      };
+    };
+    const first = batch(validation("validation-1", "failed"));
+    const history = emptyMarginalProgressHistory();
+    const firstOutcome = {
+      batch: 1,
+      toolNames: ["shell"],
+      callDigest: "first",
+      resultDigest: "failed-result",
+      summary: "failed"
+    };
+    recordMarginalProgress(history, first, firstOutcome);
+
+    const repeated = batch(validation("validation-2", "failed"));
+    history.resultDigests.add("repeated-result");
+    expect(marginalProgressSignals(repeated, {
+      ...firstOutcome,
+      batch: 2,
+      callDigest: "second",
+      resultDigest: "repeated-result"
+    }, history)).toEqual([]);
+
+    const changed = batch(validation("validation-3", "passed"));
+    history.resultDigests.add("passed-result");
+    expect(marginalProgressSignals(changed, {
+      ...firstOutcome,
+      batch: 3,
+      callDigest: "third",
+      resultDigest: "passed-result"
+    }, history)).toEqual(["validation_evidence"]);
+  });
+
   it("keeps pure settled-batch telemetry out of the model-visible prompt identity", () => {
     const session = runtimeSessionFixture();
     const before = longHorizonLedger(session);
@@ -260,18 +445,18 @@ describe("objective long-horizon triggers", () => {
     expect(after.content).not.toContain("settled tool batches");
   });
 
-  it("does not turn a finite diverse sequence below the attention boundary into a semantic checkpoint", () => {
+  it("allows a bounded pair of diverse diagnostic results before requesting a pivot", () => {
     const session = runtimeSessionFixture();
     session.durable.state.messages.push({ role: "user", content: "Investigate." });
     refresh(session);
-    for (let index = 0; index < 12; index += 1) {
+    for (let index = 0; index < 2; index += 1) {
       addBatch(session, index);
       refresh(session);
     }
     expect(session.durable.state.longHorizon).toMatchObject({
       schemaVersion: 1,
-      settledBatchCount: 12,
-      duplicateStreak: 1,
+      settledBatchCount: 2,
+      duplicateStreak: 0,
       strategyRequested: false
     });
     expect(strategistTrigger(session)).toBeUndefined();
@@ -279,27 +464,26 @@ describe("objective long-horizon triggers", () => {
     expect(session.durable.state.outcome).toBeUndefined();
   });
 
-  it("asks a fresh model for semantic judgement after distinct exploration fills an evidence-attention window", () => {
+  it("does not let an unbounded stream of distinct diagnostics manufacture progress", () => {
     const session = runtimeSessionFixture();
     session.durable.state.messages.push({ role: "user", content: "Investigate." });
     refresh(session);
-    for (let index = 0; index < 3; index += 1) {
+    for (let index = 0; index < 4; index += 1) {
       addBatch(session, index, {
         arguments: { command: `inspect --candidate ${index}` },
-        output: `distinct-result-${index}`,
-        reasoningContent: `${String(index)}:${"reason about evidence ".repeat(700)}`
+        output: `distinct-result-${index}`
       });
       refresh(session);
     }
 
     const attention = evidenceAttentionWindow(session);
     expect(attention).toMatchObject({
-      saturated: true,
-      batchCount: 3
+      saturated: false,
+      batchCount: 2
     });
-    expect(attention.tokenCount).toBeGreaterThanOrEqual(attention.tokenLimit);
-    expect(session.durable.state.longHorizon.duplicateStreak).toBe(1);
-    expect(strategistTrigger(session)).toBe("evidence_window");
+    expect(attention.tokenCount).toBeGreaterThan(0);
+    expect(session.durable.state.longHorizon.duplicateStreak).toBe(2);
+    expect(strategistTrigger(session)).toBe("duplicate_result");
     expect(progressCheckpoints(session)).toEqual([]);
     expect(session.durable.state.outcome).toBeUndefined();
   });
@@ -316,6 +500,7 @@ describe("objective long-horizon triggers", () => {
       output: "{\"status\":\"accepted\"}"
     });
     addBatch(plan, 2, {
+      output: "observed-0",
       reasoningContent: "reason about different evidence ".repeat(600)
     });
     refresh(plan);
@@ -328,14 +513,21 @@ describe("objective long-horizon triggers", () => {
     mutation.durable.state.messages.push({ role: "user", content: "Investigate." });
     refresh(mutation);
     addBatch(mutation, 0, {
+      name: "shell",
+      actualEffects: ["filesystem.write"],
+      output: "same mutation result",
       reasoningContent: "reason about evidence ".repeat(600)
     });
     addBatch(mutation, 1, {
       name: "shell",
-      actualEffects: ["process.spawn", "filesystem.write"],
-      output: "changed"
+      actualEffects: ["filesystem.write"],
+      output: "same mutation result",
+      workspaceDelta: { added: [], modified: ["src/current.ts"], deleted: [] }
     });
     addBatch(mutation, 2, {
+      name: "shell",
+      actualEffects: ["filesystem.write"],
+      output: "same mutation result",
       reasoningContent: "reason about different evidence ".repeat(600)
     });
     refresh(mutation);
@@ -353,9 +545,28 @@ describe("objective long-horizon triggers", () => {
     addBatch(validation, 1, {
       name: "validate",
       output: "failed validation",
-      ok: false
+      ok: false,
+      evidence: [{
+        evidenceId: "validation-commitment",
+        sessionId: "session",
+        runId: "run",
+        kind: "validation",
+        status: "failed",
+        createdAt: "2026-01-01T00:00:01.000Z",
+        producer: { authority: "runtime" },
+        summary: "Validation failed.",
+        data: {
+          schemaVersion: 1,
+          validator: "test",
+          exitCode: 1,
+          frontierRevision: 1,
+          stateDigest: "a".repeat(64),
+          coveredPaths: ["src/current.ts"]
+        }
+      }]
     });
     addBatch(validation, 2, {
+      output: "observed-0",
       reasoningContent: "reason about different evidence ".repeat(600)
     });
     refresh(validation);
@@ -365,7 +576,7 @@ describe("objective long-horizon triggers", () => {
     });
   });
 
-  it("does not let arbitrary mutations hide a stale active plan from the token attention boundary", () => {
+  it("does not let a declared write effect without a workspace revision manufacture progress", () => {
     const session = runtimeSessionFixture();
     session.durable.state.messages.push({ role: "user", content: "Implement the plan." });
     session.durable.state.plan = {
@@ -396,20 +607,21 @@ describe("objective long-horizon triggers", () => {
         name: "shell",
         arguments: { command: `generate-probe ${index}` },
         actualEffects: ["process.spawn", "filesystem.write"],
-        output: `created distinct probe ${index}`,
+        output: "no observable workspace revision",
         reasoningContent: `${String(index)}:${"reason about evidence ".repeat(700)}`
       });
       refresh(session);
     }
 
     expect(evidenceAttentionWindow(session)).toMatchObject({
-      saturated: true,
-      batchCount: 3
+      saturated: false,
+      batchCount: 2
     });
-    expect(strategistTrigger(session)).toBe("evidence_window");
+    expect(session.durable.state.longHorizon.duplicateStreak).toBe(2);
+    expect(strategistTrigger(session)).toBe("duplicate_result");
   });
 
-  it("triggers only after the configured number of exactly repeated calls and results", () => {
+  it("triggers after two post-baseline batches make no marginal progress", () => {
     const repeated = runtimeSessionFixture();
     repeated.durable.state.messages.push({ role: "user", content: "Investigate." });
     refresh(repeated);
@@ -420,21 +632,43 @@ describe("objective long-horizon triggers", () => {
       });
       refresh(repeated);
     }
-    expect(repeated.durable.state.longHorizon.duplicateStreak).toBe(3);
+    expect(repeated.durable.state.longHorizon.duplicateStreak).toBe(2);
     expect(strategistTrigger(repeated)).toBe("duplicate_result");
 
     const merelySimilar = runtimeSessionFixture();
     merelySimilar.durable.state.messages.push({ role: "user", content: "Investigate." });
     refresh(merelySimilar);
-    for (let index = 0; index < 3; index += 1) {
+    for (let index = 0; index < 2; index += 1) {
       addBatch(merelySimilar, index, {
         arguments: { path: "same.ts", offset: 0 },
         output: `same-looking result with objective revision ${index}`
       });
       refresh(merelySimilar);
     }
-    expect(merelySimilar.durable.state.longHorizon.duplicateStreak).toBe(1);
+    expect(merelySimilar.durable.state.longHorizon.duplicateStreak).toBe(0);
     expect(strategistTrigger(merelySimilar)).toBeUndefined();
+  });
+
+  it("keeps semantic result memory across more than eight settled batches", () => {
+    const session = runtimeSessionFixture();
+    session.durable.state.messages.push({ role: "user", content: "Investigate." });
+    refresh(session);
+    for (let index = 0; index < 9; index += 1) {
+      addBatch(session, index, {
+        arguments: { path: `file-${index}.ts` },
+        output: `observed-${index}`,
+        workspaceDelta: { added: [], modified: [`file-${index}.ts`], deleted: [] }
+      });
+      refresh(session);
+    }
+
+    addBatch(session, 9, {
+      arguments: { path: "file-0.ts" },
+      output: "observed-0"
+    });
+    refresh(session);
+
+    expect(session.durable.state.longHorizon.duplicateStreak).toBe(1);
   });
 
   it("accepts an explicit low-friction strategy request without forcing an action", () => {
@@ -550,7 +784,7 @@ describe("objective long-horizon triggers", () => {
     expect(progressCheckpoints(session)).toEqual([]);
   });
 
-  it("stops projecting strategy facts after newer objective receipts change their basis", async () => {
+  it("uses a strategy for one action and retains its failed routes as anti-loop memory", async () => {
     const session = runtimeSessionFixture();
     session.durable.state.messages.push({ role: "user", content: "Investigate." });
     refresh(session);
@@ -571,9 +805,12 @@ describe("objective long-horizon triggers", () => {
     });
     refresh(session);
 
-    const projected = longHorizonLedger(session).content;
-    expect(projected).toContain("prior fresh-context strategy reset is historical");
-    expect(projected).not.toContain("Inspect the nearest independent boundary.");
+    const afterReceipt = longHorizonLedger(session).content;
+    expect(afterReceipt).toContain("prior fresh-context strategy reset is historical");
+    expect(afterReceipt).not.toContain("Inspect the nearest independent boundary.");
+    expect(afterReceipt).toContain("Repeating that exact action.");
+    expect(afterReceipt).toContain("do not repeat a prior falsified route");
+    expect(strategistTrigger(session)).toBeUndefined();
     expect(session.durable.state.longHorizon.strategy).toBeDefined();
   });
 
@@ -581,15 +818,15 @@ describe("objective long-horizon triggers", () => {
     const session = runtimeSessionFixture();
     session.durable.state.messages.push({ role: "user", content: "Investigate." });
     refresh(session);
-    for (let index = 0; index < 3; index += 1) {
+    for (let index = 0; index < 2; index += 1) {
       addBatch(session, index, {
         name: "shell",
         arguments: {
           command: `inspect --candidate ${index}`,
           env: { API_TOKEN: "do-not-project-secret-values" }
         },
-        output: `signal-${index}`,
-        reasoningContent: `${String(index)}:${"reason about evidence ".repeat(700)}`
+        output: "same signal",
+        reasoningContent: `${String(index)}:${"reason about evidence ".repeat(index === 0 ? 10 : 3_000)}`
       });
       refresh(session);
     }
@@ -633,6 +870,49 @@ describe("objective long-horizon triggers", () => {
     expect(strategistInput).not.toMatch(/deadline|remainingMs|verifier|benchmark/iu);
   });
 
+  it("bounds validation evidence before sending it to the strategist", async () => {
+    const session = runtimeSessionFixture();
+    session.durable.state.messages.push({ role: "user", content: "Investigate." });
+    session.durable.state.evidence.push({
+      evidenceId: "validation-large-output",
+      sessionId: session.identity.sessionId,
+      runId: session.durable.runId,
+      kind: "validation",
+      status: "failed",
+      createdAt: "2026-01-01T00:00:01.000Z",
+      producer: { authority: "runtime" },
+      summary: "Validation produced a large diagnostic stream.",
+      data: {
+        schemaVersion: 1,
+        validator: "test",
+        command: "pnpm test",
+        exitCode: 1,
+        output: `${"bounded-head ".repeat(2_000)}far-tail-marker`,
+        frontierRevision: session.durable.state.mutationFrontier.revision,
+        stateDigest: session.durable.state.mutationFrontier.currentStateDigest,
+        coveredPaths: []
+      }
+    });
+    refresh(session);
+    for (let index = 0; index < 3; index += 1) {
+      addBatch(session, index, {
+        arguments: { path: "same.ts" },
+        output: "same result"
+      });
+      refresh(session);
+    }
+    const gateway = new StrategistGateway();
+
+    await coordinatorHarness(session, gateway)
+      .prepareForMainModel(session, new AbortController().signal);
+
+    const strategistInput = gateway.requests[0]!.messages.at(-1)?.content ?? "";
+    expect(strategistInput).toContain("bounded-head");
+    expect(strategistInput).toContain("outputDigest");
+    expect(strategistInput).not.toContain("far-tail-marker");
+    expect(strategistInput.length).toBeLessThan(10_000);
+  });
+
   it("derives the same attention boundary after snapshot-style recovery and ignores deadline changes", () => {
     const session = runtimeSessionFixture();
     session.durable.state.messages.push({ role: "user", content: "Investigate." });
@@ -655,11 +935,11 @@ describe("objective long-horizon triggers", () => {
     expect(strategistTrigger(recovered)).toBe(strategistTrigger(session));
   });
 
-  it("uses the 25% resource band only when work remains active", async () => {
+  it("checkpoints after the first 25% of resources are consumed only while work is active", async () => {
     const inactive = runtimeSessionFixture();
     consumeModelTurns(
       inactive,
-      Math.floor(inactive.durable.state.budget.limits.modelTurns * 0.8)
+      Math.floor(inactive.durable.state.budget.limits.modelTurns * 0.26)
     );
     const inactiveGateway = new StrategistGateway();
     await coordinatorHarness(inactive, inactiveGateway)
@@ -683,7 +963,7 @@ describe("objective long-horizon triggers", () => {
     };
     consumeModelTurns(
       active,
-      Math.floor(active.durable.state.budget.limits.modelTurns * 0.8)
+      Math.floor(active.durable.state.budget.limits.modelTurns * 0.26)
     );
     const activeGateway = new StrategistGateway();
     await coordinatorHarness(active, activeGateway)
@@ -709,10 +989,10 @@ describe("objective long-horizon triggers", () => {
       }]
     };
     const limit = session.durable.state.budget.limits.inputTokens;
-    // With a 20% assurance pool, consuming 60% of the raw input budget leaves
-    // 25% of the main loop's 80% allocation. The old raw-ledger calculation
-    // incorrectly saw 40% remaining and delayed strategy until repair time.
-    consumeInputTokens(session, Math.floor(limit * 0.6));
+    // With a 20% assurance pool, consuming just over 20% of the raw input
+    // budget crosses 25% of the main loop's 80% allocation. Measuring the raw
+    // ledger instead would delay the objective checkpoint.
+    consumeInputTokens(session, Math.floor(limit * 0.21));
     const gateway = new StrategistGateway();
 
     await coordinatorHarness(session, gateway)
@@ -722,7 +1002,7 @@ describe("objective long-horizon triggers", () => {
     expect(session.durable.state.longHorizon.strategy?.trigger).toBe("resource_band");
   });
 
-  it("does not advance the Standard resource band for an optional assurance pool", async () => {
+  it("does not checkpoint before the first 25% of Standard resources are consumed", async () => {
     const session = runtimeSessionFixture();
     session.durable.state.plan = {
       revision: 1,
@@ -739,7 +1019,7 @@ describe("objective long-horizon triggers", () => {
       }]
     };
     const limit = session.durable.state.budget.limits.inputTokens;
-    consumeInputTokens(session, Math.floor(limit * 0.6));
+    consumeInputTokens(session, Math.floor(limit * 0.19));
     const gateway = new StrategistGateway();
 
     await coordinatorHarness(session, gateway)
@@ -747,6 +1027,107 @@ describe("objective long-horizon triggers", () => {
 
     expect(gateway.calls).toBe(0);
     expect(session.durable.state.longHorizon.strategy).toBeUndefined();
+  });
+
+  it("allows one distinct resource checkpoint after an early no-progress pivot", async () => {
+    const session = runtimeSessionFixture();
+    session.durable.state.messages.push({ role: "user", content: "Investigate." });
+    session.durable.state.plan = {
+      revision: 1,
+      goal: "Finish the active work.",
+      activeNodeId: "active",
+      nodes: [{
+        id: "active",
+        title: "Finish",
+        dependencies: [],
+        status: "in_progress",
+        owner: { kind: "root" },
+        acceptanceCriteria: [],
+        evidence: []
+      }]
+    };
+    refresh(session);
+    for (let index = 0; index < 3; index += 1) {
+      addBatch(session, index, {
+        arguments: { path: "same.ts" },
+        output: "same result"
+      });
+      refresh(session);
+    }
+    const gateway = new StrategistGateway();
+    const coordinator = coordinatorHarness(session, gateway);
+
+    await coordinator.prepareForMainModel(session, new AbortController().signal);
+    expect(gateway.calls).toBe(1);
+    expect(session.durable.state.longHorizon.strategy?.trigger).toBe("duplicate_result");
+
+    addBatch(session, 4, {
+      arguments: { path: "independent.ts" },
+      output: "new discriminating evidence"
+    });
+    refresh(session);
+    session.durable.state.plan = {
+      ...session.durable.state.plan,
+      revision: session.durable.state.plan.revision + 1,
+      nodes: session.durable.state.plan.nodes.map((node) => ({
+        ...node,
+        title: "Act on the discriminating evidence"
+      }))
+    };
+    const limit = session.durable.state.budget.limits.inputTokens;
+    consumeInputTokens(session, Math.floor(limit * 0.3));
+
+    await coordinator.prepareForMainModel(session, new AbortController().signal);
+    await coordinator.prepareForMainModel(session, new AbortController().signal);
+
+    expect(gateway.calls).toBe(2);
+    expect(session.durable.state.longHorizon.assurance.strategistCalls).toBe(2);
+    expect(session.durable.state.longHorizon.strategy?.trigger).toBe("resource_band");
+  });
+
+  it("uses a distinct no-progress reset after an earlier resource checkpoint", async () => {
+    const session = runtimeSessionFixture();
+    session.durable.state.messages.push({ role: "user", content: "Investigate." });
+    session.durable.state.plan = {
+      revision: 1,
+      goal: "Finish the active work.",
+      activeNodeId: "active",
+      nodes: [{
+        id: "active",
+        title: "Finish",
+        dependencies: [],
+        status: "in_progress",
+        owner: { kind: "root" },
+        acceptanceCriteria: [],
+        evidence: []
+      }]
+    };
+    consumeInputTokens(
+      session,
+      Math.floor(session.durable.state.budget.limits.inputTokens * 0.3)
+    );
+    const gateway = new StrategistGateway();
+    const coordinator = coordinatorHarness(session, gateway);
+
+    await coordinator.prepareForMainModel(session, new AbortController().signal);
+    expect(gateway.calls).toBe(1);
+    expect(session.durable.state.longHorizon.strategy?.trigger).toBe("resource_band");
+
+    for (let index = 0; index < 3; index += 1) {
+      addBatch(session, index, {
+        arguments: { path: "same.ts" },
+        output: "same result"
+      });
+      refresh(session);
+    }
+    await coordinator.prepareForMainModel(session, new AbortController().signal);
+
+    expect(gateway.calls).toBe(2);
+    expect(session.durable.state.longHorizon.assurance.strategistCalls).toBe(2);
+    expect(session.durable.state.longHorizon.strategy?.trigger).toBe("duplicate_result");
+    const secondInput = gateway.requests[1]!.messages.at(-1)?.content ?? "";
+    expect(secondInput).toContain('"priorStrategy"');
+    expect(secondInput).toContain('"trigger":"resource_band"');
   });
 
   it("honors strategist_mode=off for every objective trigger", async () => {
@@ -794,5 +1175,29 @@ describe("objective long-horizon triggers", () => {
     expect(gateway.calls).toBe(0);
     expect(session.durable.state.longHorizon.strategy).toBeUndefined();
     expect(session.durable.state.longHorizon.assurance.strategistCalls).toBe(0);
+  });
+
+  it("fits one strategist attempt instead of charging the full route retry chain", async () => {
+    const session = runtimeSessionFixture();
+    session.durable.state.messages.push({ role: "user", content: "Investigate." });
+    refresh(session);
+    for (let index = 0; index < 3; index += 1) {
+      addBatch(session, index, {
+        arguments: { path: "same.ts" },
+        output: "same result"
+      });
+      refresh(session);
+    }
+    const gateway = new RetryChainStrategistGateway();
+
+    await coordinatorHarness(session, gateway)
+      .prepareForMainModel(session, new AbortController().signal);
+
+    expect(gateway.calls).toBe(1);
+    expect(session.durable.state.longHorizon.assurance.strategistCalls).toBe(1);
+    expect(session.durable.state.longHorizon.strategy).toMatchObject({
+      trigger: "duplicate_result",
+      decision: "revise_plan"
+    });
   });
 });

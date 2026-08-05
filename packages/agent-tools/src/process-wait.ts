@@ -6,21 +6,23 @@ import type {
 import type { JsonValue } from "agent-protocol";
 
 export const DEFAULT_EXECUTION_YIELD_MS = 10_000;
-export const DEFAULT_PROCESS_POLL_YIELD_MS = 5_000;
+export const DEFAULT_PROCESS_POLL_YIELD_MS = 30_000;
 export const MAXIMUM_PROCESS_YIELD_MS = 30_000;
+export const MAXIMUM_PROCESS_POLL_YIELD_MS = 300_000;
 const PROCESS_POLL_INTERVAL_MS = 250;
 
 export function processYieldMs(
   input: Record<string, JsonValue>,
-  fallback: number
+  fallback: number,
+  maximum = MAXIMUM_PROCESS_YIELD_MS
 ): number {
   const value = input.yieldMs;
   if (value === undefined) return fallback;
   if (!Number.isSafeInteger(value)
     || Number(value) < 0
-    || Number(value) > MAXIMUM_PROCESS_YIELD_MS) {
+    || Number(value) > maximum) {
     throw Object.assign(new Error(
-      `yieldMs must be an integer from 0 to ${String(MAXIMUM_PROCESS_YIELD_MS)}.`
+      `yieldMs must be an integer from 0 to ${String(maximum)}.`
     ), { code: "tool_arguments_invalid" });
   }
   return Number(value);
@@ -80,17 +82,14 @@ export async function pollProcessUntilYield(
   broker: ExecutionBroker,
   handle: ProcessHandle,
   yieldMs: number,
-  signal: AbortSignal,
-  returnOnOutput: boolean
+  signal: AbortSignal
 ): Promise<ProcessPollResult> {
   const deadline = Date.now() + yieldMs;
   let accumulated: ProcessPollResult | undefined;
   while (true) {
     const current = await broker.poll(handle, { signal });
     accumulated = mergeProcessResults(accumulated, current);
-    if (current.state !== "running"
-      || (returnOnOutput && (current.stdout.length > 0 || current.stderr.length > 0))
-      || Date.now() >= deadline) {
+    if (current.state !== "running" || Date.now() >= deadline) {
       return accumulated;
     }
     await delay(

@@ -5,7 +5,13 @@ import {
   type JsonValue, type ModelGateway, type ModelToolCall, type ModelToolDefinition,
   type ToolCallPlan, type ToolDescriptor, type ToolReceipt, type WorkspaceDelta
 } from "agent-protocol";
-import { planContext, type ContextPlan, type PlanContextOptions } from "agent-context";
+import {
+  historyBlocks,
+  planContext,
+  type ContextPlan,
+  type PlanContextOptions
+} from "agent-context";
+import { APPROXIMATE_TOKEN_RESERVATION_MARGIN } from "agent-model";
 import { canonicalWorkspacePath, isInside, resolveWorkspacePath } from "agent-platform";
 import type { RuntimeSession } from "./types.js";
 import { failed } from "./tool-receipt.js";
@@ -18,6 +24,7 @@ export {
   projectModelToolDescriptors,
   sessionModelToolProjectionCapabilities,
   sessionSkillProjectionCapabilities,
+  stableSessionModelToolProjectionCapabilities,
   type ModelToolProjectionCapabilities
 } from "./model-tool-projection.js";
 
@@ -42,10 +49,47 @@ export function modelTools(descriptors: readonly ToolDescriptor[]): ModelToolDef
 }
 
 const PROACTIVE_CONTEXT_WINDOW_PERCENT = 90;
+const STRUCTURAL_HISTORY_REPLAN_RATIO = 0.8;
 
 function contextOverflowError(error: unknown): boolean {
   return Boolean(error && typeof error === "object"
     && (error as { code?: unknown }).code === "context_overflow");
+}
+
+function mandatoryHistoryBlockCount(
+  history: PlanContextOptions["history"]
+): { blocks: number; mandatory: number } {
+  const blocks = historyBlocks(history);
+  if (blocks.length === 0) return { blocks: 0, mandatory: 0 };
+  let newestUser = -1;
+  for (let index = blocks.length - 1; index >= 0; index -= 1) {
+    if (blocks[index]!.messages.some((message) => message.role === "user")) {
+      newestUser = index;
+      break;
+    }
+  }
+  const latest = blocks.length - 1;
+  return {
+    blocks: blocks.length,
+    mandatory: newestUser >= 0 && newestUser !== latest ? 2 : 1
+  };
+}
+
+function smallerRawHistoryBlockCap(
+  counts: { blocks: number; mandatory: number },
+  current: number,
+  omitted: number,
+  ratio: number
+): number {
+  const retained = Math.max(counts.mandatory, counts.blocks - omitted);
+  if (retained <= counts.mandatory || ratio >= STRUCTURAL_HISTORY_REPLAN_RATIO) {
+    return current;
+  }
+  const proportional = Math.max(
+    counts.mandatory,
+    Math.floor(retained * ratio * 0.98)
+  );
+  return Math.min(current, retained - 1, proportional);
 }
 
 export async function providerSizedPlan(
@@ -54,29 +98,50 @@ export async function providerSizedPlan(
 ): Promise<ContextPlan> {
   const providerLimit = gateway.capabilities.contextWindowTokens;
   const { maxInputTokens, ...contextInput } = input;
-  const inputLimit = Math.min(providerLimit - input.outputReserveTokens, maxInputTokens ?? providerLimit);
-  // Keep replayable history below the provider's final context headroom so
-  // the existing archive path activates before a very large request reaches
-  // transport. Exact mandatory context still gets one full-window attempt.
+  const reservationMargin = gateway.capabilities.tokenizer === "approximate"
+    ? APPROXIMATE_TOKEN_RESERVATION_MARGIN
+    : 1;
+  // Route selection margins locally counted input while reserving the exact
+  // provider output limit. Planning against the raw provider window used to create
+  // requests which fit the planner but were rejected by that later route
+  // check, before the archive path had a chance to compact history.
+  const safeInputTokens = Math.floor(
+    (providerLimit - input.outputReserveTokens)
+      / reservationMargin
+  );
+  const safeProviderLimit = safeInputTokens + input.outputReserveTokens;
+  const inputLimit = Math.min(
+    safeInputTokens,
+    maxInputTokens ?? safeInputTokens
+  );
+  // Keep replayable history below the final safe context headroom so the
+  // archive path activates before route selection. Provider-tokenized
+  // mandatory context still gets one full-window attempt.
   const proactiveLimit = Math.floor(
-    providerLimit * PROACTIVE_CONTEXT_WINDOW_PERCENT / 100
+    safeProviderLimit * PROACTIVE_CONTEXT_WINDOW_PERCENT / 100
+  );
+  const historyBlockCounts = mandatoryHistoryBlockCount(contextInput.history);
+  let maximumRawHistoryBlocks = Math.min(
+    historyBlockCounts.blocks,
+    contextInput.maximumRawHistoryBlocks ?? historyBlockCounts.blocks
   );
   let planningLimit = Math.min(
-    providerLimit,
+    safeProviderLimit,
     Math.max(input.outputReserveTokens + 1, proactiveLimit)
   );
-  let usedMandatoryFallback = planningLimit === providerLimit;
+  let usedMandatoryFallback = planningLimit === safeProviderLimit;
   while (planningLimit > input.outputReserveTokens) {
     let plan: ContextPlan;
     try {
       plan = planContext({
         ...contextInput,
         contextWindowTokens: planningLimit,
-        promptCache: gateway.capabilities.promptCache
+        promptCache: gateway.capabilities.promptCache,
+        maximumRawHistoryBlocks
       });
     } catch (error) {
       if (!usedMandatoryFallback && contextOverflowError(error)) {
-        planningLimit = providerLimit;
+        planningLimit = safeProviderLimit;
         usedMandatoryFallback = true;
         continue;
       }
@@ -88,11 +153,25 @@ export async function providerSizedPlan(
       planningLimit - input.outputReserveTokens
     );
     if (tokens <= planningInputLimit
-      && tokens + input.outputReserveTokens <= planningLimit) return plan;
+      && tokens + input.outputReserveTokens <= planningLimit
+      && Math.ceil(tokens * reservationMargin)
+        + input.outputReserveTokens <= providerLimit) return plan;
     const ratio = Math.min(
       planningInputLimit / Math.max(1, tokens),
       planningLimit / (tokens + input.outputReserveTokens)
     );
+    // Make a provider-mismatch retry structurally smaller before allowing one
+    // aggressive ratio step to jump past the usable context window.
+    const nextBlockCap = smallerRawHistoryBlockCap(
+      historyBlockCounts,
+      maximumRawHistoryBlocks,
+      plan.omittedHistoryTurns,
+      ratio
+    );
+    if (nextBlockCap < maximumRawHistoryBlocks) {
+      maximumRawHistoryBlocks = nextBlockCap;
+      continue;
+    }
     const next = Math.min(planningLimit - 1, Math.floor(planningLimit * ratio * 0.98));
     if (next <= input.outputReserveTokens) break;
     planningLimit = next;
