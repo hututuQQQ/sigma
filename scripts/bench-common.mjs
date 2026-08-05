@@ -36,6 +36,7 @@ export const harborSandboxComposePath = path.join(
 );
 export const terminalBenchDataset = "terminal-bench/terminal-bench-2";
 export const portableAgentImportPath = "sigma_harbor_agent:SigmaCliHarborAgent";
+export const verifierGateImportPath = "verifier_gate_plugin:VerifierGatePlugin";
 export const agentImportPath = portableAgentImportPath;
 export const removedHarborPackageName = ["integrations", "harbor"].join(".");
 export const removedHarborDirectoryName = ["integrations", "harbor"].join("/");
@@ -48,7 +49,8 @@ export const defaultAgentTimeoutLeniencyMultiplier = 1.5;
 export const defaultAgentTimeoutLeniencyMinExtraSec = 600;
 export const defaultBenchmarkTurnCadenceSec = 5;
 export const defaultBenchmarkMaxTurnsCap = 1000;
-export const defaultConcurrentTrials = 5;
+export const maxConcurrentTrials = 4;
+export const defaultConcurrentTrials = maxConcurrentTrials;
 
 let benchmarkPricingCatalogPromise;
 
@@ -92,11 +94,13 @@ export const terminalBenchCliFlags = Object.freeze([
   "agent-timeout-grace-sec",
   "attempts",
   "benchmark-class",
+  "bootstrap-preflight-file",
   "command-timeout-sec",
   "concurrency",
   "dataset",
   "execution-mode",
   "expected-archive-sha256",
+  "expected-bootstrap-preflight-sha256",
   "harbor-topology",
   "help",
   "k",
@@ -115,6 +119,9 @@ export const terminalBenchCliFlags = Object.freeze([
   "tasks-file",
   "timeout-leniency-min-extra-sec",
   "timeout-leniency-multiplier",
+  "verifier-concurrency",
+  "verifier-proxy-mode",
+  "verifier-proxy-url",
   "write-scope"
 ]);
 
@@ -313,6 +320,18 @@ function asPositiveInt(value, fallback, name) {
   return parsed;
 }
 
+function asPositiveIntAtMost(value, fallback, maximum, name) {
+  if (value === undefined || value === null || value === true || value === "") return fallback;
+  const parsed = typeof value === "number" ? value : Number(String(value));
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive integer.`);
+  }
+  if (parsed > maximum) {
+    throw new Error(`${name} must be at most ${maximum}.`);
+  }
+  return parsed;
+}
+
 function asPositiveNumber(value, fallback, name) {
   if (value === undefined || value === null || value === true || value === "") return fallback;
   const parsed = Number(value);
@@ -401,6 +420,205 @@ function normalizedSha256(value, name) {
   return text;
 }
 
+function verifierProxyMode(value, fallback = "inherit") {
+  const mode = asString(value, fallback);
+  if (!["inherit", "direct", "auto", "custom"].includes(mode)) {
+    throw new Error("verifier proxy mode must be inherit, direct, auto, or custom.");
+  }
+  return mode;
+}
+
+export function normalizeVerifierProxyUrl(value, label = "verifier proxy URL") {
+  const text = asString(value);
+  if (!text) return null;
+  let parsed;
+  try {
+    parsed = new URL(text);
+  } catch (error) {
+    throw new Error(`${label} must be a valid HTTP(S) URL.`, { cause: error });
+  }
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw new Error(`${label} must use http or https.`);
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error(`${label} must not contain credentials.`);
+  }
+  if ((parsed.pathname && parsed.pathname !== "/") || parsed.search || parsed.hash) {
+    throw new Error(`${label} must be an origin without a path, query, or fragment.`);
+  }
+  return parsed.origin;
+}
+
+const automaticVerifierProxyKeys = Object.freeze([
+  "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"
+]);
+
+function isLoopbackProxyHostname(hostname) {
+  return ["localhost", "127.0.0.1", "::1", "[::1]"].includes(hostname.toLowerCase());
+}
+
+export function resolveDockerVerifierProxy(env = process.env) {
+  const dockerProxyUrl = env.SIGMA_DOCKER_PROXY_URL;
+  if (typeof dockerProxyUrl === "string" && dockerProxyUrl.trim() !== "") {
+    return {
+      origin: normalizeVerifierProxyUrl(dockerProxyUrl, "SIGMA_DOCKER_PROXY_URL"),
+      source: env.SIGMA_DOCKER_PROXY_SOURCE || "SIGMA_DOCKER_PROXY_URL",
+      loopbackRewritten: false
+    };
+  }
+  const rejected = [];
+  const loopback = [];
+  for (const key of automaticVerifierProxyKeys) {
+    const value = env[key];
+    if (typeof value !== "string" || value.trim() === "") continue;
+    let origin;
+    try {
+      origin = normalizeVerifierProxyUrl(value, key);
+    } catch {
+      rejected.push(key);
+      continue;
+    }
+    const parsed = new URL(origin);
+    if (isLoopbackProxyHostname(parsed.hostname)) {
+      loopback.push(key);
+      continue;
+    }
+    return {
+      origin: parsed.origin,
+      source: key,
+      loopbackRewritten: false
+    };
+  }
+  const loopbackSuffix = loopback.length > 0
+    ? ` Loopback variables are not Docker-reachable: ${loopback.join(", ")}.`
+    : "";
+  const suffix = rejected.length > 0
+    ? ` Rejected invalid or credentialed variables: ${rejected.join(", ")}.`
+    : "";
+  throw new Error(
+    "verifier proxy mode auto requires a Docker-reachable, credential-free HTTP(S) proxy."
+      + loopbackSuffix + suffix
+  );
+}
+
+export function discoverDockerProxyOrigin(env = process.env, spawnSync = spawn.sync) {
+  const command = env.SIGMA_DOCKER_COMMAND || "docker";
+  const result = spawnSync(command, ["info", "--format", "{{json .HTTPProxy}}"], {
+    encoding: "utf8",
+    env,
+    windowsHide: true
+  });
+  if (result.error || result.status !== 0) {
+    throw new Error([
+      "Could not inspect Docker's advertised proxy for verifier proxy mode auto.",
+      result.stderr || result.error?.message || ""
+    ].filter(Boolean).join(" "));
+  }
+  let value = String(result.stdout || "").trim();
+  if (!value || value === "null" || value === '""') return null;
+  try {
+    value = JSON.parse(value);
+  } catch {
+    // Older Docker clients may ignore the JSON formatter and return plain text.
+  }
+  if (typeof value !== "string" || !value.trim()) return null;
+  const withProtocol = /^[a-z][a-z0-9+.-]*:\/\//iu.test(value)
+    ? value : `http://${value}`;
+  return normalizeVerifierProxyUrl(withProtocol, "Docker advertised proxy");
+}
+
+export function verifierProxyEnvironment(options = {}) {
+  const mode = options.verifierProxyMode ?? "inherit";
+  if (mode === "inherit") return {};
+  if (mode === "direct") {
+    return {
+      HTTP_PROXY: "",
+      HTTPS_PROXY: "",
+      ALL_PROXY: "",
+      http_proxy: "",
+      https_proxy: "",
+      all_proxy: "",
+      NO_PROXY: "*",
+      no_proxy: "*"
+    };
+  }
+  if (mode !== "auto" && mode !== "custom") {
+    throw new Error("verifier proxy mode must be inherit, direct, auto, or custom.");
+  }
+  const origin = normalizeVerifierProxyUrl(options.verifierProxyUrl);
+  if (!origin) throw new Error(`verifier proxy mode ${mode} requires a resolved verifier proxy URL.`);
+  const noProxy = "localhost,127.0.0.1,::1";
+  return {
+    HTTP_PROXY: origin,
+    HTTPS_PROXY: origin,
+    ALL_PROXY: origin,
+    http_proxy: origin,
+    https_proxy: origin,
+    all_proxy: origin,
+    NO_PROXY: noProxy,
+    no_proxy: noProxy
+  };
+}
+
+export function normalizeBootstrapPreflightDescriptor(value, label = "bootstrap preflight") {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} must be an object.`);
+  }
+  const keys = ["schemaVersion", "command", "args", "timeout_sec"];
+  const unknown = Object.keys(value).filter((key) => !keys.includes(key));
+  const missing = keys.filter((key) => !Object.hasOwn(value, key));
+  if (unknown.length > 0 || missing.length > 0) {
+    throw new Error(
+      `${label} has an invalid field set (missing: ${missing.join(", ") || "none"}; unknown: ${unknown.join(", ") || "none"}).`
+    );
+  }
+  if (value.schemaVersion !== 1) throw new Error(`${label}.schemaVersion must be 1.`);
+  const command = typeof value.command === "string" ? value.command.trim() : "";
+  if (!command || command.includes("\0") || /[\r\n]/u.test(command)) {
+    throw new Error(`${label}.command must be a non-empty single-line executable name or path.`);
+  }
+  if (!Array.isArray(value.args) || value.args.length > 256
+    || value.args.some((arg) => typeof arg !== "string" || arg.includes("\0"))) {
+    throw new Error(`${label}.args must be an array of at most 256 NUL-free strings.`);
+  }
+  if (value.timeout_sec === undefined || value.timeout_sec === null
+    || value.timeout_sec === true || value.timeout_sec === "") {
+    throw new Error(`${label}.timeout_sec must be a positive integer.`);
+  }
+  const timeoutSec = asPositiveIntAtMost(
+    value.timeout_sec, undefined, 600, `${label}.timeout_sec`
+  );
+  return {
+    schemaVersion: 1,
+    command,
+    args: [...value.args],
+    timeout_sec: timeoutSec
+  };
+}
+
+function readBootstrapPreflightFile(filePath, expectedSha256 = null) {
+  if (!filePath) return { filePath: null, sha256: null, descriptor: null };
+  const resolved = path.resolve(filePath);
+  const bytes = readFileSync(resolved);
+  const observedSha256 = createHash("sha256").update(bytes).digest("hex");
+  if (expectedSha256 && observedSha256 !== expectedSha256) {
+    throw new Error(
+      `Bootstrap preflight file SHA-256 ${observedSha256} does not match ${expectedSha256}.`
+    );
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(bytes.toString("utf8"));
+  } catch (error) {
+    throw new Error("--bootstrap-preflight-file must contain valid JSON.", { cause: error });
+  }
+  return {
+    filePath: resolved,
+    sha256: observedSha256,
+    descriptor: normalizeBootstrapPreflightDescriptor(parsed, "bootstrap preflight file")
+  };
+}
+
 export function readTaskSelectionFile(filePath) {
   if (!filePath) return [];
   const resolved = path.resolve(filePath);
@@ -462,6 +680,64 @@ export function resolveRunOptions(argv, env = process.env) {
     throw new Error("Harbor topology managed_three_role requires managed environment mode required.");
   }
   const configuredMaxTurns = flags["max-turns"] ?? env.AGENT_MAX_TURNS;
+  const nConcurrentTrials = asPositiveIntAtMost(
+    flags.concurrency ?? env.AGENT_BENCH_CONCURRENCY,
+    defaultConcurrentTrials,
+    maxConcurrentTrials,
+    "--concurrency"
+  );
+  const configuredVerifierConcurrency = flags["verifier-concurrency"]
+    ?? env.SIGMA_VERIFIER_CONCURRENCY;
+  const resolvedVerifierConcurrency = asPositiveIntAtMost(
+    configuredVerifierConcurrency,
+    nConcurrentTrials,
+    maxConcurrentTrials,
+    "--verifier-concurrency"
+  );
+  if (resolvedVerifierConcurrency > nConcurrentTrials) {
+    throw new Error("--verifier-concurrency must not exceed --concurrency.");
+  }
+  const resolvedVerifierProxyMode = verifierProxyMode(
+    flags["verifier-proxy-mode"] ?? env.SIGMA_VERIFIER_PROXY_MODE
+  );
+  const configuredVerifierProxyUrl = flags["verifier-proxy-url"]
+    ?? env.SIGMA_VERIFIER_PROXY_URL;
+  let resolvedVerifierProxyUrl = normalizeVerifierProxyUrl(
+    configuredVerifierProxyUrl, "--verifier-proxy-url"
+  );
+  let verifierProxySource = null;
+  let verifierProxyLoopbackRewritten = false;
+  if (resolvedVerifierProxyMode === "auto") {
+    if (resolvedVerifierProxyUrl) {
+      throw new Error("--verifier-proxy-url cannot be combined with --verifier-proxy-mode auto.");
+    }
+    const automaticProxy = resolveDockerVerifierProxy(env);
+    resolvedVerifierProxyUrl = automaticProxy.origin;
+    verifierProxySource = automaticProxy.source;
+    verifierProxyLoopbackRewritten = automaticProxy.loopbackRewritten;
+  } else if (resolvedVerifierProxyMode === "custom" && !resolvedVerifierProxyUrl) {
+    throw new Error("--verifier-proxy-mode custom requires --verifier-proxy-url.");
+  }
+  if (!["auto", "custom"].includes(resolvedVerifierProxyMode) && resolvedVerifierProxyUrl) {
+    throw new Error("--verifier-proxy-url requires --verifier-proxy-mode custom.");
+  }
+  const expectedBootstrapPreflightSha256 = normalizedSha256(
+    flags["expected-bootstrap-preflight-sha256"]
+      ?? env.SIGMA_BENCH_EXPECTED_BOOTSTRAP_PREFLIGHT_SHA256,
+    "--expected-bootstrap-preflight-sha256"
+  );
+  const configuredBootstrapPreflightFile = asString(
+    flags["bootstrap-preflight-file"] ?? env.SIGMA_BENCH_BOOTSTRAP_PREFLIGHT_FILE
+  );
+  if (expectedBootstrapPreflightSha256 && !configuredBootstrapPreflightFile) {
+    throw new Error(
+      "--expected-bootstrap-preflight-sha256 requires --bootstrap-preflight-file."
+    );
+  }
+  const bootstrapPreflight = readBootstrapPreflightFile(
+    configuredBootstrapPreflightFile,
+    expectedBootstrapPreflightSha256
+  );
   return {
     mode,
     benchmarkClass: runClass,
@@ -479,11 +755,17 @@ export function resolveRunOptions(argv, env = process.env) {
     harborTopology: resolvedHarborTopology,
     runLabel: asString(flags["run-label"]),
     k: asPositiveInt(flags.k, 1, "--k"),
-    nConcurrentTrials: asPositiveInt(
-      flags.concurrency ?? env.AGENT_BENCH_CONCURRENCY,
-      defaultConcurrentTrials,
-      "--concurrency"
-    ),
+    nConcurrentTrials,
+    verifierConcurrency: resolvedVerifierConcurrency,
+    verifierConcurrencyExplicit: configuredVerifierConcurrency !== undefined
+      && configuredVerifierConcurrency !== null && configuredVerifierConcurrency !== "",
+    verifierProxyMode: resolvedVerifierProxyMode,
+    verifierProxyUrl: resolvedVerifierProxyUrl,
+    verifierProxySource,
+    verifierProxyLoopbackRewritten,
+    bootstrapPreflightFile: bootstrapPreflight.filePath,
+    bootstrapPreflightSha256: bootstrapPreflight.sha256,
+    bootstrapPreflight: bootstrapPreflight.descriptor,
     attemptsPerTask: asPositiveInt(flags.attempts, 1, "--attempts"),
     retries: asNonNegativeInt(flags.retries, 0, "--retries"),
     taskId: asString(flags["task-id"]),
@@ -572,6 +854,7 @@ export function detectHarborRunCapabilities(helpText = "") {
   const hasPlainAgentKwargs = /key=value/.test(helpText) || /format\s+'key=value'/.test(helpText);
   const hasNTasks = /--n-tasks\b/.test(helpText);
   const hasYes = /--yes\b/.test(helpText);
+  const hasPlugin = /--plugin\b/.test(helpText);
   const hasAgentTimeoutMultiplier =
     /--agent-timeout-multi/i.test(helpText) ||
     /multiplier for agent\s+execution timeout/i.test(helpText);
@@ -581,6 +864,7 @@ export function detectHarborRunCapabilities(helpText = "") {
     agentKwargStyle: hasPlainAgentKwargs ? "plain" : "typed",
     taskLimitFlag: hasNTasks ? "-l" : "-k",
     yesFlag: hasYes ? "--yes" : null,
+    pluginFlag: hasPlugin ? "--plugin" : null,
     agentTimeoutMultiplierFlag: hasAgentTimeoutMultiplier ? "--agent-timeout-multiplier" : null,
     taskSelectionFlag: detectTaskSelectionFlag(helpText)
   };
@@ -778,6 +1062,10 @@ export function buildHarborJobConfig(options, jobsDir, timeoutPlan = null, timeo
       }
     ]
   };
+  const verifierEnv = verifierProxyEnvironment(options);
+  if (Object.keys(verifierEnv).length > 0) {
+    config.verifier = { env: verifierEnv };
+  }
 
   if (options.mode !== "smoke") {
     config.environment = {
@@ -923,8 +1211,19 @@ export function groupHarborTimeoutProbe(timeoutProbe, configuredTasks = []) {
 
 export function buildHarborArgs(options) {
   const capabilities = options.capabilities ?? {};
+  const appendVerifierGate = (args) => {
+    if (!options.enableVerifierGate) return args;
+    if (!capabilities.pluginFlag) {
+      throw new Error(
+        "The selected Harbor CLI does not support --plugin, which is required for verifier concurrency control."
+      );
+    }
+    args.push(capabilities.pluginFlag, verifierGateImportPath);
+    return args;
+  };
   if (options.configPath) {
     const args = ["run", "--config", options.configPath];
+    appendVerifierGate(args);
     if (capabilities.yesFlag) args.push(capabilities.yesFlag);
     return args;
   }
@@ -935,6 +1234,7 @@ export function buildHarborArgs(options) {
       "-a", "oracle", capabilities.taskLimitFlag ?? "-l", "5"
     ];
     if (options.jobsDir) args.push("--jobs-dir", options.jobsDir);
+    appendVerifierGate(args);
     if (capabilities.yesFlag) args.push(capabilities.yesFlag);
     return args;
   }
@@ -950,6 +1250,7 @@ export function buildHarborArgs(options) {
     selectedAgentImportPath
   ];
   if (options.jobsDir) args.push("--jobs-dir", options.jobsDir);
+  appendVerifierGate(args);
   if (capabilities.yesFlag) args.push(capabilities.yesFlag);
 
   if (options.mode === "task") {
@@ -1537,6 +1838,91 @@ async function listNamedFiles(dir, fileName) {
     }
   }
   return files;
+}
+
+async function listFilesWithSuffix(dir, suffix) {
+  if (!existsSync(dir)) return [];
+  const entries = await readdir(dir);
+  const files = [];
+  for (const entry of entries.sort()) {
+    const entryPath = path.join(dir, entry);
+    const entryStat = await stat(entryPath);
+    if (entryStat.isDirectory()) {
+      files.push(...(await listFilesWithSuffix(entryPath, suffix)));
+    } else if (entry.endsWith(suffix)) {
+      files.push(entryPath);
+    }
+  }
+  return files;
+}
+
+function durationDistribution(values) {
+  const sorted = values
+    .map(Number)
+    .filter((value) => Number.isFinite(value) && value >= 0)
+    .sort((left, right) => left - right);
+  if (sorted.length === 0) {
+    return { count: 0, total: 0, mean: null, p50: null, p95: null, max: null };
+  }
+  const total = sorted.reduce((sum, value) => sum + value, 0);
+  const percentile = (fraction) => sorted[Math.max(
+    0,
+    Math.min(sorted.length - 1, Math.ceil(sorted.length * fraction) - 1)
+  )];
+  const rounded = (value) => Math.round(value * 1000) / 1000;
+  return {
+    count: sorted.length,
+    total: rounded(total),
+    mean: rounded(total / sorted.length),
+    p50: rounded(percentile(0.5)),
+    p95: rounded(percentile(0.95)),
+    max: rounded(sorted.at(-1))
+  };
+}
+
+export async function readVerifierGateMetrics(runDir, config = {}) {
+  const eventsDir = path.join(runDir, "runtime-scratch", "verifier-gate", "events");
+  const files = await listFilesWithSuffix(eventsDir, ".jsonl");
+  const acquisitions = [];
+  const releases = [];
+  let contendedAcquisitions = 0;
+  let invalidEventLines = 0;
+  const configuredLimit = config.verifier_concurrency;
+  for (const filePath of files) {
+    const text = await readTextSafe(filePath);
+    for (const line of text.split(/\r?\n/u).filter(Boolean)) {
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        invalidEventLines += 1;
+        continue;
+      }
+      if (event?.schemaVersion !== 1) {
+        invalidEventLines += 1;
+        continue;
+      }
+      if (event.event === "acquired" && Number.isFinite(Number(event.wait_ms))) {
+        acquisitions.push(Number(event.wait_ms));
+        if (event.contended === true) contendedAcquisitions += 1;
+      } else if (event.event === "released" && Number.isFinite(Number(event.held_ms))) {
+        releases.push(Number(event.held_ms));
+      }
+    }
+  }
+  return {
+    enabled: config.verifier_gate_enabled === true,
+    limit: configuredLimit !== null && configuredLimit !== undefined && configuredLimit !== ""
+      && Number.isFinite(Number(configuredLimit))
+      ? Number(configuredLimit) : null,
+    event_files: files.length,
+    acquisitions: acquisitions.length,
+    releases: releases.length,
+    contended_acquisitions: contendedAcquisitions,
+    invalid_event_lines: invalidEventLines,
+    wait_ms: durationDistribution(acquisitions),
+    hold_ms: durationDistribution(releases)
+  };
 }
 
 function optionalFiniteNumber(...values) {
@@ -2850,6 +3236,12 @@ export function formatMarkdownReport(report) {
     `- Mean reward (scored trials only): ${report.trial_accounting?.meanReward ?? "unknown"}`,
     `- Observed pass rate (all observed trials): ${report.observed_correctness?.pass_rate ?? "unknown"} (${report.observed_correctness?.passed ?? 0}/${report.observed_correctness?.total ?? 0})`,
     `- Effective pass rate (excluding infra-invalid trials): ${report.effective_correctness?.pass_rate ?? "unknown"} (${report.effective_correctness?.passed ?? 0}/${report.effective_correctness?.total ?? 0})`,
+    `- Pass-rate lower/effective/upper bounds: ${report.correctness_bounds?.lower_bound ?? "unknown"} / ${report.correctness_bounds?.effective_rate ?? "unknown"} / ${report.correctness_bounds?.upper_bound ?? "unknown"}`,
+    `- Infra-invalid rate: ${report.correctness_bounds?.invalid_rate ?? "unknown"} (${report.correctness_bounds?.infra_invalid ?? 0}/${report.correctness_bounds?.total ?? 0})`,
+    `- Verifier concurrency: ${report.verifier_concurrency ?? "unbounded-by-sigma"}`,
+    `- Verifier proxy mode: ${report.verifier_proxy?.mode ?? "inherit"}`,
+    `- Verifier gate wait ms (p50/p95/max): ${report.verifier_gate?.wait_ms?.p50 ?? "unknown"} / ${report.verifier_gate?.wait_ms?.p95 ?? "unknown"} / ${report.verifier_gate?.wait_ms?.max ?? "unknown"}`,
+    `- Bootstrap preflight: ${report.bootstrap_preflight?.status ?? "not_configured"}`,
     `- Input tokens: ${report.usage?.input_tokens ?? 0}`,
     `- Cache tokens: ${report.usage?.cache_tokens ?? 0}`,
     `- Cache read ratio: ${report.cache_read_ratio ?? "unknown"}`,
@@ -3073,8 +3465,36 @@ export async function generateBenchReport(runDir) {
     valid: tasks.filter((task) => task.validity === "valid").length,
     infra_failed: tasks.filter((task) => task.validity === "infra_failed").length
   };
-  const effectiveTasks = tasks.filter((task) => task.validity === "valid");
+  const observedTrialTasks = harborTrialResults.length > 0 ? tasks : [];
+  const effectiveTasks = observedTrialTasks.filter((task) => task.validity === "valid");
   const effectivePassed = effectiveTasks.filter((task) => task.verifier_outcome === "passed").length;
+  const knownPassed = observedTrialTasks.filter(
+    (task) => task.verifier_outcome === "passed"
+  ).length;
+  const infraInvalid = observedTrialTasks.filter(
+    (task) => task.validity === "infra_failed"
+  ).length;
+  const totalForBounds = expected > 0 ? expected : accounting.observed;
+  const unobserved = Math.max(0, totalForBounds - accounting.observed);
+  const unclassifiedObserved = Math.max(0, accounting.observed - observedTrialTasks.length);
+  const possiblePassed = knownPassed + infraInvalid + unobserved + unclassifiedObserved;
+  const correctnessBounds = {
+    passed: knownPassed,
+    effective_passed: effectivePassed,
+    total: totalForBounds,
+    observed: accounting.observed,
+    unobserved,
+    unclassified_observed: unclassifiedObserved,
+    infra_invalid: infraInvalid,
+    valid_total: effectiveTasks.length,
+    lower_bound: totalForBounds > 0 ? knownPassed / totalForBounds : null,
+    effective_rate: effectiveTasks.length > 0 ? effectivePassed / effectiveTasks.length : null,
+    upper_bound: totalForBounds > 0
+      ? Math.min(totalForBounds, possiblePassed) / totalForBounds
+      : null,
+    invalid_rate: totalForBounds > 0 ? infraInvalid / totalForBounds : null
+  };
+  const verifierGate = await readVerifierGateMetrics(runDir, config);
 
   const commandScript = await readTextSafe(commandPath);
   const notes = Array.isArray(config.notes) ? [...config.notes] : [];
@@ -3256,6 +3676,11 @@ export async function generateBenchReport(runDir) {
     agent_cli_sha256: config.agent_cli_sha256 ?? null,
     package_reused: config.package_reused ?? false,
     n_concurrent_trials: resolvedJobConfig?.n_concurrent_trials ?? config.n_concurrent_trials ?? null,
+    verifier_concurrency: config.verifier_concurrency ?? null,
+    verifier_gate_enabled: config.verifier_gate_enabled === true,
+    verifier_proxy: config.verifier_proxy ?? { mode: "inherit", origin: null },
+    bootstrap_preflight: config.bootstrap_preflight ?? { status: "not_configured" },
+    verifier_gate: verifierGate,
     trial_accounting: accounting,
     validity,
     observed_correctness: {
@@ -3268,6 +3693,7 @@ export async function generateBenchReport(runDir) {
       total: effectiveTasks.length,
       pass_rate: effectiveTasks.length > 0 ? effectivePassed / effectiveTasks.length : null
     },
+    correctness_bounds: correctnessBounds,
     harbor_job_accounting: harborJobAccounting,
     orphan_artifacts: orphanArtifacts,
     usage,

@@ -20,6 +20,7 @@ export interface DurableChild {
   completed?: Record<string, JsonValue>;
   integrated: boolean;
   outcomeRecorded: boolean;
+  planReconciled: boolean;
 }
 
 const BUDGET_KEYS = [
@@ -37,9 +38,42 @@ function childEvent(event: AgentEventEnvelope): { childId: string; detail: Recor
   return { childId: outer.childId, detail: record(outer.payload ?? null) };
 }
 
+function updatedPlanNodes(event: AgentEventEnvelope): JsonValue[] | undefined {
+  if (event.type !== "plan.updated") return undefined;
+  const nodes = record(record(event.payload).plan).nodes;
+  return Array.isArray(nodes) ? nodes : undefined;
+}
+
+function reconciledPlanOwnership(
+  child: DurableChild,
+  latestPlanNodes: readonly JsonValue[] | undefined
+): boolean {
+  const planNodeIds = Array.isArray(child.metadata.planNodeIds)
+    ? child.metadata.planNodeIds.filter((item): item is string => typeof item === "string")
+    : [];
+  if (planNodeIds.length === 0) return true;
+  if (!latestPlanNodes) return false;
+  return planNodeIds.every((id) => !latestPlanNodes.some((value) => {
+    const node = record(value);
+    const owner = record(node.owner);
+    return node.id === id && owner.kind === "child" && owner.childId === child.childId;
+  }));
+}
+
+function reconcileChildrenPlanOwnership(
+  children: ReadonlyMap<string, DurableChild>,
+  latestPlanNodes: readonly JsonValue[] | undefined
+): void {
+  for (const child of children.values()) {
+    child.planReconciled = reconciledPlanOwnership(child, latestPlanNodes);
+  }
+}
+
 export async function readDurableChildren(store: RunStore, parentSessionId: string): Promise<Map<string, DurableChild>> {
   const children = new Map<string, DurableChild>();
+  let latestPlanNodes: JsonValue[] | undefined;
   for await (const event of store.events(parentSessionId)) {
+    latestPlanNodes = updatedPlanNodes(event) ?? latestPlanNodes;
     const recordedChildId = childOutcomeRecorded(event);
     if (recordedChildId) {
       const child = children.get(recordedChildId);
@@ -55,7 +89,8 @@ export async function readDurableChildren(store: RunStore, parentSessionId: stri
         detached: parsed.detail.detached === true,
         metadata: record(parsed.detail.metadata ?? null),
         integrated: false,
-        outcomeRecorded: false
+        outcomeRecorded: false,
+        planReconciled: false
       });
       continue;
     }
@@ -66,6 +101,7 @@ export async function readDurableChildren(store: RunStore, parentSessionId: stri
     if (event.type === "child.message" && parsed.detail.kind === "started"
       && typeof parsed.detail.sessionId === "string") child.childSessionId = parsed.detail.sessionId;
   }
+  reconcileChildrenPlanOwnership(children, latestPlanNodes);
   return children;
 }
 
@@ -77,15 +113,50 @@ function childOutcomeRecorded(event: AgentEventEnvelope): string | null {
   return typeof childId === "string" && childId ? childId : null;
 }
 
-function failure(child: DurableChild): string | null {
+export function durableChildCompletionFailure(child: DurableChild): string | null {
   if (!child.completed) return `Child ${child.childId} was interrupted before a durable terminal outcome; spawn a replacement or resolve it explicitly.`;
-  const status = typeof child.completed.status === "string" ? child.completed.status : "unknown";
-  if (status !== "completed") return `Child ${child.childId} ended as ${status}.`;
   const isolation = record(child.completed.isolation ?? null);
   if (isolation.kind === "git_worktree" && isolation.cleanup === "retained" && !child.integrated) {
     return `Child ${child.childId} has an unintegrated worktree at ${String(isolation.worktreePath ?? "unknown")}.`;
   }
-  return null;
+  const status = typeof child.completed.status === "string" ? child.completed.status : "unknown";
+  if (status === "completed") return null;
+  // Failed delegation is durable evidence, not an irrevocable failure of the
+  // parent goal. The child completion handler has already returned its Plan
+  // nodes to the parent. Stay conservative when that reconciliation evidence
+  // was not recorded, because the parent may still have child-owned work.
+  if (!child.outcomeRecorded) {
+    return `Child ${child.childId} ended as ${status} before its terminal outcome was durably reconciled.`;
+  }
+  return child.planReconciled
+    ? null
+    : `Child ${child.childId} ended as ${status}, but its delegated Plan ownership was not durably returned to the parent.`;
+}
+
+export function auditDurableChildRecords(
+  children: ReadonlyMap<string, DurableChild>,
+  parentRunId: string,
+  excludeIds: ReadonlySet<string> = new Set()
+): ChildJoinSummary {
+  const joined = [...children.values()].filter((child) =>
+    child.runId === parentRunId && !child.detached && !excludeIds.has(child.childId)
+  );
+  return {
+    evidence: joined.map((child) => ({
+      childId: child.childId,
+      status: child.completed?.status ?? "interrupted",
+      outcome: record(child.completed?.outcome ?? null).kind ?? null,
+      metadata: child.metadata,
+      planReconciled: child.planReconciled,
+      isolation: child.completed?.isolation ?? null,
+      integrated: child.integrated,
+      error: child.completed?.error ?? null
+    })),
+    failures: joined.flatMap((child) => {
+      const value = durableChildCompletionFailure(child);
+      return value ? [value] : [];
+    })
+  };
 }
 
 export async function auditDurableChildren(
@@ -94,22 +165,11 @@ export async function auditDurableChildren(
   parentRunId: string,
   excludeIds: ReadonlySet<string> = new Set()
 ): Promise<ChildJoinSummary> {
-  const children = await readDurableChildren(store, parentSessionId);
-  const joined = [...children.values()].filter((child) =>
-    child.runId === parentRunId && !child.detached && !excludeIds.has(child.childId)
+  return auditDurableChildRecords(
+    await readDurableChildren(store, parentSessionId),
+    parentRunId,
+    excludeIds
   );
-  return {
-    evidence: joined.map((child) => ({
-      childId: child.childId,
-      status: child.completed?.status ?? "interrupted",
-      isolation: child.completed?.isolation ?? null,
-      integrated: child.integrated
-    })),
-    failures: joined.flatMap((child) => {
-      const value = failure(child);
-      return value ? [value] : [];
-    })
-  };
 }
 
 interface ChildLedgerSnapshot {

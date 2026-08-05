@@ -18,6 +18,7 @@ import {
   computeHarborTimeoutPlan,
   detectHarborRunCapabilities,
   detectTaskSelectionFlag,
+  discoverDockerProxyOrigin,
   ensurePlaceholderTask,
   generateBenchReport,
   groupHarborTimeoutProbe,
@@ -40,6 +41,7 @@ import {
   taskSelectionIdentity,
   taskSelectionIdentitySha256,
   terminalBenchDataset,
+  verifierProxyEnvironment,
   writeJson
 } from "./bench-common.mjs";
 import {
@@ -76,7 +78,11 @@ Agent:
   --max-turns <count>               Hard model-turn limit
 
 Execution:
-  --concurrency <count>             Concurrent trials
+  --concurrency <count>             Concurrent trials (maximum: 4)
+  --verifier-concurrency <count>    Cross-process verifier phase limit
+  --verifier-proxy-mode <mode>      inherit, direct, auto, or custom
+  --verifier-proxy-url <origin>     Credential-free HTTP(S) origin for custom mode
+  --bootstrap-preflight-file <json> Generic non-shell command descriptor run before trials
   --attempts <count>                Attempts per task (default: 1)
   --retries <count>                 Harness retries (default: 0)
   --network <none|loopback|full>    Network policy
@@ -201,7 +207,22 @@ export async function runTerminalBenchCli(argv, deps = {}) {
 
 async function runTerminalBenchCliImpl(argv, deps, signal) {
   loadDotEnv();
-  const options = resolveRunOptions(argv);
+  const optionFlags = parseTerminalBenchArgs(argv);
+  const requestedVerifierProxyMode = optionFlags["verifier-proxy-mode"]
+    ?? process.env.SIGMA_VERIFIER_PROXY_MODE;
+  let optionEnv = process.env;
+  if (requestedVerifierProxyMode === "auto" && !process.env.SIGMA_DOCKER_PROXY_URL) {
+    const dockerProxyOrigin = deps.discoverDockerProxyOrigin?.(process.env)
+      ?? discoverDockerProxyOrigin(process.env);
+    if (dockerProxyOrigin) {
+      optionEnv = {
+        ...process.env,
+        SIGMA_DOCKER_PROXY_URL: dockerProxyOrigin,
+        SIGMA_DOCKER_PROXY_SOURCE: "docker_info.HTTPProxy"
+      };
+    }
+  }
+  const options = resolveRunOptions(argv, optionEnv);
   if (options.mode === "task" && !options.taskId) {
     throw new Error("Task mode requires --task-id <task-id>.");
   }
@@ -213,7 +234,13 @@ async function runTerminalBenchCliImpl(argv, deps, signal) {
   const runId = boundedBenchmarkRunId(baseRunId, options.runLabel);
   const runDir = path.join(benchRootDir, runId);
   const jobsDir = deps.harborJobsDir ?? portableHarborJobsDir(runDir);
-  const env = harborEnvForRun(runDir);
+  const verifierGateEnabled = options.verifierConcurrencyExplicit
+    || options.verifierConcurrency < options.nConcurrentTrials;
+  const env = {
+    ...harborEnvForRun(runDir),
+    SIGMA_VERIFIER_CONCURRENCY: String(options.verifierConcurrency),
+    SIGMA_VERIFIER_GATE_POLL_MS: "50"
+  };
   const startedAt = new Date().toISOString();
   const baseRunner = deps.runProcess ?? runProcess;
   const runner = (command, args, runnerOptions = {}) => baseRunner(command, args, {
@@ -248,6 +275,22 @@ async function runTerminalBenchCliImpl(argv, deps, signal) {
     dataset: options.dataset ?? terminalBenchDataset,
     k: options.mode === "k" ? options.k : null,
     n_concurrent_trials: options.nConcurrentTrials,
+    verifier_concurrency: options.verifierConcurrency,
+    verifier_gate_enabled: verifierGateEnabled,
+    verifier_proxy: {
+      mode: options.verifierProxyMode,
+      origin: ["auto", "custom"].includes(options.verifierProxyMode)
+        ? options.verifierProxyUrl : null,
+      source: options.verifierProxySource ?? null,
+      loopback_rewritten: options.verifierProxyLoopbackRewritten === true
+    },
+    bootstrap_preflight: options.bootstrapPreflight
+      ? {
+          status: "pending",
+          file_sha256: options.bootstrapPreflightSha256,
+          descriptor: options.bootstrapPreflight
+        }
+      : { status: "not_configured" },
     task_id: options.mode === "task" ? options.taskId : null,
     tasks_file: options.tasksFile,
     tasks_file_sha256: options.tasksFileSha256,
@@ -343,10 +386,12 @@ async function runTerminalBenchCliImpl(argv, deps, signal) {
     );
   }
   const importSmokeScript = [
-    "import pathlib, sys, sigma_harbor_agent",
+    "import pathlib, sys, sigma_harbor_agent, verifier_gate_plugin",
     "expected = pathlib.Path(sys.argv[1]).resolve()",
-    "actual = pathlib.Path(sigma_harbor_agent.__file__).resolve().parent",
-    "assert actual == expected, f'loaded {actual}, expected {expected}'"
+    "actual_agent = pathlib.Path(sigma_harbor_agent.__file__).resolve().parent",
+    "actual_gate = pathlib.Path(verifier_gate_plugin.__file__).resolve().parent",
+    "assert actual_agent == expected, f'loaded agent from {actual_agent}, expected {expected}'",
+    "assert actual_gate == expected, f'loaded gate from {actual_gate}, expected {expected}'"
   ].join("; ");
   const importSmoke = await runner(
     harborPythonCommand(env),
@@ -470,6 +515,7 @@ async function runTerminalBenchCliImpl(argv, deps, signal) {
 
   const attemptOptions = {
     ...options,
+    enableVerifierGate: verifierGateEnabled,
     agentCliTarball: env.AGENT_CLI_TARBALL
   };
   const timeoutGroups = options.mode === "smoke"
@@ -632,6 +678,39 @@ async function runTerminalBenchCliImpl(argv, deps, signal) {
       { ...env, SIGMA_BENCH_RUN_SLOT: slot.runSlot }
     ).trimEnd())
     .join("\n"), "utf8");
+
+  if (options.bootstrapPreflight) {
+    process.stdout.write("Running generic bootstrap preflight...\n");
+    const preflightResult = await runner(
+      options.bootstrapPreflight.command,
+      options.bootstrapPreflight.args,
+      {
+        cwd: rootDir,
+        env: { ...env, ...verifierProxyEnvironment(options) },
+        timeoutMs: options.bootstrapPreflight.timeout_sec * 1000,
+        stdoutPath: path.join(runDir, "bootstrap-preflight.stdout.log"),
+        stderrPath: path.join(runDir, "bootstrap-preflight.stderr.log"),
+        rawPath: path.join(runDir, "bootstrap-preflight.raw.log")
+      }
+    );
+    config = {
+      ...config,
+      bootstrap_preflight: {
+        ...config.bootstrap_preflight,
+        status: preflightResult.exitCode === 0 ? "passed" : "failed",
+        exit_code: preflightResult.exitCode
+      }
+    };
+    await writeJson(path.join(runDir, "config.json"), config);
+    if (preflightResult.exitCode !== 0) {
+      return await failBeforeHarbor(
+        runDir,
+        config,
+        `Bootstrap preflight failed with exit code ${preflightResult.exitCode}; no Harbor trial was started.`,
+        preflightResult.exitCode || 1
+      );
+    }
+  }
 
   const cleanupBefore = await dockerCleanup(env.SIGMA_HARBOR_RUN_ID);
   await writeJson(path.join(runDir, "docker-cleanup-before.json"), cleanupBefore);

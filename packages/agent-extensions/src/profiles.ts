@@ -98,7 +98,7 @@ export const DEFAULT_PROFILE_ASSURANCE: Readonly<ProfileAssurancePolicy> = {
   repairMaxToolCalls: 8,
   strategistMode: "adaptive",
   duplicateThreshold: 3,
-  strategyRemainingPercent: 25
+  strategyRemainingPercent: 75
 };
 
 const MODEL_ROLES: readonly ModelRole[] = [

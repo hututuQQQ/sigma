@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { MAX_STRATEGIST_CALLS } from "./context-limits.js";
 import {
   budgetAmountsSchema,
   budgetLedgerStateSchema,
@@ -238,12 +239,12 @@ export const longHorizonStateSchema = z.object({
   })
   .refine((state) => state.assurance.maxAuxiliaryCalls
     === state.assurance.reviewRounds * state.assurance.reviewerMaxTurns
-      + (state.assurance.strategistMode === "off" ? 0 : 1), {
+      + (state.assurance.strategistMode === "off" ? 0 : MAX_STRATEGIST_CALLS), {
     path: ["assurance", "maxAuxiliaryCalls"],
     message: "Auxiliary model-turn capacity must match review and strategist policy"
   })
   .refine((state) => state.assurance.strategistCalls
-    <= (state.assurance.strategistMode === "off" ? 0 : 1)
+    <= (state.assurance.strategistMode === "off" ? 0 : MAX_STRATEGIST_CALLS)
     && state.assurance.reviewerCalls <= state.assurance.reviewRounds
     && state.assurance.repairEpisodes <= state.assurance.repairRounds, {
     path: ["assurance"],

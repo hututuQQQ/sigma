@@ -35,7 +35,8 @@ import { longHorizonLedger } from "../packages/agent-runtime/src/long-horizon-le
 import { progressCheckpoints } from "../packages/agent-runtime/src/progress-checkpoint.js";
 import {
   emptyMarginalProgressHistory,
-  marginalProgressSignals
+  marginalProgressSignals,
+  recordMarginalProgress
 } from "../packages/agent-runtime/src/long-horizon-progress.js";
 import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
 import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
@@ -355,6 +356,81 @@ describe("objective long-horizon triggers", () => {
     )).toEqual(["discriminating_result"]);
   });
 
+  it("does not let repeated validation IDs reset convergence on the same frontier", () => {
+    const validation = (evidenceId: string, status: "failed" | "passed"): NonNullable<
+      ToolReceipt["evidence"]
+    >[number] => ({
+      evidenceId,
+      sessionId: "session",
+      runId: "run",
+      kind: "validation",
+      status,
+      createdAt: "2026-01-01T00:00:01.000Z",
+      producer: { authority: "runtime" },
+      summary: `Validation ${status}.`,
+      data: {
+        schemaVersion: 1,
+        validator: "test",
+        exitCode: status === "passed" ? 0 : 1,
+        frontierRevision: 1,
+        stateDigest: "a".repeat(64),
+        coveredPaths: ["src/current.ts"]
+      }
+    });
+    const batch = (evidence: NonNullable<ToolReceipt["evidence"]>[number]) => {
+      const call = { id: "validate", name: "shell", arguments: { command: "pnpm test" } };
+      return {
+        assistant: { role: "assistant" as const, content: "", toolCalls: [call] },
+        calls: [call],
+        receipts: [{
+          callId: "validate",
+          ok: evidence.status === "passed",
+          output: evidence.summary,
+          outcome: {
+            status: evidence.status === "passed" ? "succeeded" as const : "failed" as const,
+            output: evidence.summary,
+            diagnosticCodes: []
+          },
+          observedEffects: ["validation" as const],
+          actualEffects: ["validation" as const],
+          artifacts: [],
+          diagnostics: [],
+          evidence: [evidence],
+          startedAt: "2026-01-01T00:00:00.000Z",
+          completedAt: "2026-01-01T00:00:01.000Z"
+        }]
+      };
+    };
+    const first = batch(validation("validation-1", "failed"));
+    const history = emptyMarginalProgressHistory();
+    const firstOutcome = {
+      batch: 1,
+      toolNames: ["shell"],
+      callDigest: "first",
+      resultDigest: "failed-result",
+      summary: "failed"
+    };
+    recordMarginalProgress(history, first, firstOutcome);
+
+    const repeated = batch(validation("validation-2", "failed"));
+    history.resultDigests.add("repeated-result");
+    expect(marginalProgressSignals(repeated, {
+      ...firstOutcome,
+      batch: 2,
+      callDigest: "second",
+      resultDigest: "repeated-result"
+    }, history)).toEqual([]);
+
+    const changed = batch(validation("validation-3", "passed"));
+    history.resultDigests.add("passed-result");
+    expect(marginalProgressSignals(changed, {
+      ...firstOutcome,
+      batch: 3,
+      callDigest: "third",
+      resultDigest: "passed-result"
+    }, history)).toEqual(["validation_evidence"]);
+  });
+
   it("keeps pure settled-batch telemetry out of the model-visible prompt identity", () => {
     const session = runtimeSessionFixture();
     const before = longHorizonLedger(session);
@@ -573,6 +649,28 @@ describe("objective long-horizon triggers", () => {
     expect(strategistTrigger(merelySimilar)).toBeUndefined();
   });
 
+  it("keeps semantic result memory across more than eight settled batches", () => {
+    const session = runtimeSessionFixture();
+    session.durable.state.messages.push({ role: "user", content: "Investigate." });
+    refresh(session);
+    for (let index = 0; index < 9; index += 1) {
+      addBatch(session, index, {
+        arguments: { path: `file-${index}.ts` },
+        output: `observed-${index}`,
+        workspaceDelta: { added: [], modified: [`file-${index}.ts`], deleted: [] }
+      });
+      refresh(session);
+    }
+
+    addBatch(session, 9, {
+      arguments: { path: "file-0.ts" },
+      output: "observed-0"
+    });
+    refresh(session);
+
+    expect(session.durable.state.longHorizon.duplicateStreak).toBe(1);
+  });
+
   it("accepts an explicit low-friction strategy request without forcing an action", () => {
     const session = runtimeSessionFixture();
     session.durable.state.messages.push({ role: "user", content: "Solve this." });
@@ -686,7 +784,7 @@ describe("objective long-horizon triggers", () => {
     expect(progressCheckpoints(session)).toEqual([]);
   });
 
-  it("stops projecting strategy facts after newer objective receipts change their basis", async () => {
+  it("uses a strategy for one action and retains its failed routes as anti-loop memory", async () => {
     const session = runtimeSessionFixture();
     session.durable.state.messages.push({ role: "user", content: "Investigate." });
     refresh(session);
@@ -707,9 +805,12 @@ describe("objective long-horizon triggers", () => {
     });
     refresh(session);
 
-    const projected = longHorizonLedger(session).content;
-    expect(projected).toContain("prior fresh-context strategy reset is historical");
-    expect(projected).not.toContain("Inspect the nearest independent boundary.");
+    const afterReceipt = longHorizonLedger(session).content;
+    expect(afterReceipt).toContain("prior fresh-context strategy reset is historical");
+    expect(afterReceipt).not.toContain("Inspect the nearest independent boundary.");
+    expect(afterReceipt).toContain("Repeating that exact action.");
+    expect(afterReceipt).toContain("do not repeat a prior falsified route");
+    expect(strategistTrigger(session)).toBeUndefined();
     expect(session.durable.state.longHorizon.strategy).toBeDefined();
   });
 
@@ -769,6 +870,49 @@ describe("objective long-horizon triggers", () => {
     expect(strategistInput).not.toMatch(/deadline|remainingMs|verifier|benchmark/iu);
   });
 
+  it("bounds validation evidence before sending it to the strategist", async () => {
+    const session = runtimeSessionFixture();
+    session.durable.state.messages.push({ role: "user", content: "Investigate." });
+    session.durable.state.evidence.push({
+      evidenceId: "validation-large-output",
+      sessionId: session.identity.sessionId,
+      runId: session.durable.runId,
+      kind: "validation",
+      status: "failed",
+      createdAt: "2026-01-01T00:00:01.000Z",
+      producer: { authority: "runtime" },
+      summary: "Validation produced a large diagnostic stream.",
+      data: {
+        schemaVersion: 1,
+        validator: "test",
+        command: "pnpm test",
+        exitCode: 1,
+        output: `${"bounded-head ".repeat(2_000)}far-tail-marker`,
+        frontierRevision: session.durable.state.mutationFrontier.revision,
+        stateDigest: session.durable.state.mutationFrontier.currentStateDigest,
+        coveredPaths: []
+      }
+    });
+    refresh(session);
+    for (let index = 0; index < 3; index += 1) {
+      addBatch(session, index, {
+        arguments: { path: "same.ts" },
+        output: "same result"
+      });
+      refresh(session);
+    }
+    const gateway = new StrategistGateway();
+
+    await coordinatorHarness(session, gateway)
+      .prepareForMainModel(session, new AbortController().signal);
+
+    const strategistInput = gateway.requests[0]!.messages.at(-1)?.content ?? "";
+    expect(strategistInput).toContain("bounded-head");
+    expect(strategistInput).toContain("outputDigest");
+    expect(strategistInput).not.toContain("far-tail-marker");
+    expect(strategistInput.length).toBeLessThan(10_000);
+  });
+
   it("derives the same attention boundary after snapshot-style recovery and ignores deadline changes", () => {
     const session = runtimeSessionFixture();
     session.durable.state.messages.push({ role: "user", content: "Investigate." });
@@ -791,11 +935,11 @@ describe("objective long-horizon triggers", () => {
     expect(strategistTrigger(recovered)).toBe(strategistTrigger(session));
   });
 
-  it("uses the 25% resource band only when work remains active", async () => {
+  it("checkpoints after the first 25% of resources are consumed only while work is active", async () => {
     const inactive = runtimeSessionFixture();
     consumeModelTurns(
       inactive,
-      Math.floor(inactive.durable.state.budget.limits.modelTurns * 0.8)
+      Math.floor(inactive.durable.state.budget.limits.modelTurns * 0.26)
     );
     const inactiveGateway = new StrategistGateway();
     await coordinatorHarness(inactive, inactiveGateway)
@@ -819,7 +963,7 @@ describe("objective long-horizon triggers", () => {
     };
     consumeModelTurns(
       active,
-      Math.floor(active.durable.state.budget.limits.modelTurns * 0.8)
+      Math.floor(active.durable.state.budget.limits.modelTurns * 0.26)
     );
     const activeGateway = new StrategistGateway();
     await coordinatorHarness(active, activeGateway)
@@ -845,10 +989,10 @@ describe("objective long-horizon triggers", () => {
       }]
     };
     const limit = session.durable.state.budget.limits.inputTokens;
-    // With a 20% assurance pool, consuming 60% of the raw input budget leaves
-    // 25% of the main loop's 80% allocation. The old raw-ledger calculation
-    // incorrectly saw 40% remaining and delayed strategy until repair time.
-    consumeInputTokens(session, Math.floor(limit * 0.6));
+    // With a 20% assurance pool, consuming just over 20% of the raw input
+    // budget crosses 25% of the main loop's 80% allocation. Measuring the raw
+    // ledger instead would delay the objective checkpoint.
+    consumeInputTokens(session, Math.floor(limit * 0.21));
     const gateway = new StrategistGateway();
 
     await coordinatorHarness(session, gateway)
@@ -858,7 +1002,7 @@ describe("objective long-horizon triggers", () => {
     expect(session.durable.state.longHorizon.strategy?.trigger).toBe("resource_band");
   });
 
-  it("does not advance the Standard resource band for an optional assurance pool", async () => {
+  it("does not checkpoint before the first 25% of Standard resources are consumed", async () => {
     const session = runtimeSessionFixture();
     session.durable.state.plan = {
       revision: 1,
@@ -875,7 +1019,7 @@ describe("objective long-horizon triggers", () => {
       }]
     };
     const limit = session.durable.state.budget.limits.inputTokens;
-    consumeInputTokens(session, Math.floor(limit * 0.6));
+    consumeInputTokens(session, Math.floor(limit * 0.19));
     const gateway = new StrategistGateway();
 
     await coordinatorHarness(session, gateway)
@@ -883,6 +1027,107 @@ describe("objective long-horizon triggers", () => {
 
     expect(gateway.calls).toBe(0);
     expect(session.durable.state.longHorizon.strategy).toBeUndefined();
+  });
+
+  it("allows one distinct resource checkpoint after an early no-progress pivot", async () => {
+    const session = runtimeSessionFixture();
+    session.durable.state.messages.push({ role: "user", content: "Investigate." });
+    session.durable.state.plan = {
+      revision: 1,
+      goal: "Finish the active work.",
+      activeNodeId: "active",
+      nodes: [{
+        id: "active",
+        title: "Finish",
+        dependencies: [],
+        status: "in_progress",
+        owner: { kind: "root" },
+        acceptanceCriteria: [],
+        evidence: []
+      }]
+    };
+    refresh(session);
+    for (let index = 0; index < 3; index += 1) {
+      addBatch(session, index, {
+        arguments: { path: "same.ts" },
+        output: "same result"
+      });
+      refresh(session);
+    }
+    const gateway = new StrategistGateway();
+    const coordinator = coordinatorHarness(session, gateway);
+
+    await coordinator.prepareForMainModel(session, new AbortController().signal);
+    expect(gateway.calls).toBe(1);
+    expect(session.durable.state.longHorizon.strategy?.trigger).toBe("duplicate_result");
+
+    addBatch(session, 4, {
+      arguments: { path: "independent.ts" },
+      output: "new discriminating evidence"
+    });
+    refresh(session);
+    session.durable.state.plan = {
+      ...session.durable.state.plan,
+      revision: session.durable.state.plan.revision + 1,
+      nodes: session.durable.state.plan.nodes.map((node) => ({
+        ...node,
+        title: "Act on the discriminating evidence"
+      }))
+    };
+    const limit = session.durable.state.budget.limits.inputTokens;
+    consumeInputTokens(session, Math.floor(limit * 0.3));
+
+    await coordinator.prepareForMainModel(session, new AbortController().signal);
+    await coordinator.prepareForMainModel(session, new AbortController().signal);
+
+    expect(gateway.calls).toBe(2);
+    expect(session.durable.state.longHorizon.assurance.strategistCalls).toBe(2);
+    expect(session.durable.state.longHorizon.strategy?.trigger).toBe("resource_band");
+  });
+
+  it("uses a distinct no-progress reset after an earlier resource checkpoint", async () => {
+    const session = runtimeSessionFixture();
+    session.durable.state.messages.push({ role: "user", content: "Investigate." });
+    session.durable.state.plan = {
+      revision: 1,
+      goal: "Finish the active work.",
+      activeNodeId: "active",
+      nodes: [{
+        id: "active",
+        title: "Finish",
+        dependencies: [],
+        status: "in_progress",
+        owner: { kind: "root" },
+        acceptanceCriteria: [],
+        evidence: []
+      }]
+    };
+    consumeInputTokens(
+      session,
+      Math.floor(session.durable.state.budget.limits.inputTokens * 0.3)
+    );
+    const gateway = new StrategistGateway();
+    const coordinator = coordinatorHarness(session, gateway);
+
+    await coordinator.prepareForMainModel(session, new AbortController().signal);
+    expect(gateway.calls).toBe(1);
+    expect(session.durable.state.longHorizon.strategy?.trigger).toBe("resource_band");
+
+    for (let index = 0; index < 3; index += 1) {
+      addBatch(session, index, {
+        arguments: { path: "same.ts" },
+        output: "same result"
+      });
+      refresh(session);
+    }
+    await coordinator.prepareForMainModel(session, new AbortController().signal);
+
+    expect(gateway.calls).toBe(2);
+    expect(session.durable.state.longHorizon.assurance.strategistCalls).toBe(2);
+    expect(session.durable.state.longHorizon.strategy?.trigger).toBe("duplicate_result");
+    const secondInput = gateway.requests[1]!.messages.at(-1)?.content ?? "";
+    expect(secondInput).toContain('"priorStrategy"');
+    expect(secondInput).toContain('"trigger":"resource_band"');
   });
 
   it("honors strategist_mode=off for every objective trigger", async () => {

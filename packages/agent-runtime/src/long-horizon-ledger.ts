@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { ContextItem } from "agent-protocol";
+import { MAX_STRATEGIST_CALLS, type ContextItem } from "agent-protocol";
 import { approximateTokens, fitApproximateTokens } from "agent-context";
 import type { RuntimeSession } from "./types.js";
 import { longHorizonProgressBasisDigest } from "./long-horizon-state.js";
@@ -43,17 +43,21 @@ export function longHorizonLedger(session: RuntimeSession): ContextItem {
             : []),
           `- next discriminating action: ${strategy.nextDiscriminatingAction}`,
           `- expected signal: ${strategy.expectedSignal}`,
+          "- governing rule: use this reset for the next main-model action; the first settled receipt makes it historical anti-loop memory.",
           ...(strategy.validationTarget
             ? [`- validation target: ${strategy.validationTarget}`]
             : [])
         ]
       : strategy
         ? [
-            "The prior fresh-context strategy reset is historical: newer objective receipts changed its basis.",
-            "Use the current plan, frontier, validation state, and newest tool results rather than carrying forward its old facts."
+            "The prior fresh-context strategy reset is historical: a newer objective receipt changed its basis.",
+            "Its recommendation and next action no longer govern; use the current plan, frontier, validation state, and newest tool results.",
+            "- anti-loop rule: do not repeat a prior falsified route unless newer objective evidence changed the premise that made it fail.",
+            `- prior falsified routes: ${strategy.falsifiedApproaches.join(" | ") || "none recorded"}`,
+            `- prior established facts (revalidate when newer evidence conflicts): ${strategy.establishedFacts.join(" | ") || "none recorded"}`
           ]
         : []),
-    `- assurance calls used: strategist=${state.assurance.strategistCalls}/${state.assurance.strategistMode === "off" ? 0 : 1}, reviewer=${state.assurance.reviewerCalls}/${state.assurance.reviewRounds}`,
+    `- assurance calls used: strategist=${state.assurance.strategistCalls}/${state.assurance.strategistMode === "off" ? 0 : MAX_STRATEGIST_CALLS}, reviewer=${state.assurance.reviewerCalls}/${state.assurance.reviewRounds}`,
     `Long-horizon state digest: ${stateDigest}`
   ];
   const content = fitApproximateTokens(lines.join("\n"), MAX_LONG_HORIZON_STATUS_TOKENS);

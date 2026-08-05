@@ -80,7 +80,9 @@ describe("hard-ledger convergence admission", () => {
       role: target.services.modelRole,
       routeId: "route",
       providerId: target.services.gateway.provider,
-      modelId: target.services.gateway.model,
+      // Routed usage records the catalog spec ID while the gateway exposes
+      // the upstream model name. The reserve must still use the sample.
+      modelId: `${target.services.gateway.provider}/${target.services.gateway.model}`,
       tokenizerId: "tokenizer",
       tokenizerAccuracy: "exact" as const,
       providerReported: true,

@@ -20,6 +20,7 @@ export type MarginalProgressSignal =
 export interface MarginalProgressHistory {
   resultDigests: Set<string>;
   validationEvidenceIds: Set<string>;
+  validationSemanticKeys: Set<string>;
   artifactIds: Set<string>;
   /** Novel diagnostic output is useful while exploring, but it cannot reset
    * convergence forever. A durable commitment starts a fresh bounded window. */
@@ -32,6 +33,7 @@ export function emptyMarginalProgressHistory(): MarginalProgressHistory {
   return {
     resultDigests: new Set(),
     validationEvidenceIds: new Set(),
+    validationSemanticKeys: new Set(),
     artifactIds: new Set(),
     discriminatingResultsSinceCommit: 0
   };
@@ -55,13 +57,50 @@ function workspaceRevision(receipt: ToolReceipt): boolean {
         && evidence.data.source === "enclosing_container_mutation"));
 }
 
+type ReceiptEvidence = NonNullable<ToolReceipt["evidence"]>[number];
+type ValidationEvidence = Extract<ReceiptEvidence, { kind: "validation" }>;
+
+function sorted(values: readonly string[] | undefined): string[] {
+  return [...(values ?? [])].sort((left, right) => left.localeCompare(right));
+}
+
+/** Identity of the assurance fact, excluding per-execution IDs, timestamps,
+ * output previews, and artifact IDs. A rerun on the same frontier is progress
+ * only when its target or pass/fail state changes. */
+function validationSemanticKey(evidence: ValidationEvidence): string {
+  const claim = evidence.data.claim ?? evidence.data.adapterInference;
+  return JSON.stringify({
+    validator: evidence.data.validator,
+    frontierRevision: evidence.data.frontierRevision,
+    stateDigest: evidence.data.stateDigest,
+    coveredPaths: sorted(evidence.data.coveredPaths),
+    intent: evidence.data.intent ? {
+      purpose: evidence.data.intent.purpose ?? null,
+      subjects: sorted(evidence.data.intent.subjects),
+      criterionIds: sorted(evidence.data.intent.criterionIds)
+    } : null,
+    claim: claim ? {
+      kind: claim.kind,
+      status: claim.status,
+      subject: {
+        projectId: claim.subject.projectId ?? null,
+        configPaths: sorted(claim.subject.configPaths),
+        selectedTests: sorted(claim.subject.selectedTests),
+        exactFiles: sorted(claim.subject.exactFiles)
+      }
+    } : null,
+    status: evidence.status
+  });
+}
+
 function hasNewValidationEvidence(
   receipt: ToolReceipt,
   history: MarginalProgressHistory
 ): boolean {
   return receiptEvidence(receipt).some((evidence) =>
     evidence.kind === "validation"
-      && !history.validationEvidenceIds.has(evidence.evidenceId));
+      && !history.validationEvidenceIds.has(evidence.evidenceId)
+      && !history.validationSemanticKeys.has(validationSemanticKey(evidence)));
 }
 
 function receiptArtifactIds(receipt: ToolReceipt): string[] {
@@ -133,6 +172,7 @@ export function recordMarginalProgress(
     for (const evidence of receiptEvidence(receipt)) {
       if (evidence.kind === "validation") {
         history.validationEvidenceIds.add(evidence.evidenceId);
+        history.validationSemanticKeys.add(validationSemanticKey(evidence));
       }
     }
     for (const id of receiptArtifactIds(receipt)) history.artifactIds.add(id);

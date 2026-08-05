@@ -1,4 +1,4 @@
-import type { BudgetAmounts } from "agent-protocol";
+import { MAX_STRATEGIST_CALLS, type BudgetAmounts } from "agent-protocol";
 import { mutationFrontierHasChanges } from "agent-kernel";
 import type { RuntimeSession } from "./types.js";
 
@@ -92,8 +92,10 @@ function remainingAuxiliaryTurnCapacity(
     assurance.reviewRounds - substantiveReviewRoundsUsed(session)
   );
   const reviewerCapacity = remainingReviewRounds * assurance.reviewerMaxTurns;
-  const strategistCapacity = assurance.strategistMode !== "off"
-    && usage.strategistCalls < 1 ? 1 : 0;
+  const strategistCapacity = remainingReviewRounds > 0
+    && assurance.strategistMode !== "off"
+    ? Math.max(0, MAX_STRATEGIST_CALLS - usage.strategistCalls)
+    : 0;
   return Math.min(
     remainingGlobal,
     reviewerCapacity + strategistCapacity
@@ -158,8 +160,8 @@ export interface MainBudgetWindow {
 /**
  * Report the main loop's resource window after removing capacity that belongs
  * to strategist/reviewer calls and review repair. Resource-band decisions must
- * use this window, not the raw session ledger: waiting until 25% of the raw
- * ledger remains leaves only 5% for the main loop when assurance owns 20%.
+ * use this window, not the raw session ledger: a fixed percentage of raw
+ * capacity maps to a later, distorted checkpoint when assurance owns 20%.
  */
 export function mainBudgetWindow(session: RuntimeSession): MainBudgetWindow {
   const raw = rawAvailableBudget(session);

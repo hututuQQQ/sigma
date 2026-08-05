@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   emptyLongHorizonState,
+  MAX_STRATEGIST_CALLS,
   type JsonValue,
   type AssuranceResourcePolicy,
   type LongHorizonActionOutcome,
@@ -9,7 +10,7 @@ import {
   type ModelMessage,
   type ToolReceipt
 } from "agent-protocol";
-import { approximateTokens, messageTokens } from "agent-context";
+import { approximateTokens, fitApproximateTokens, messageTokens } from "agent-context";
 import { currentAuxiliaryUsage } from "./assurance-budget.js";
 import {
   batchMadeMarginalProgress,
@@ -39,10 +40,21 @@ export interface EvidenceAttentionWindow {
 const MINIMUM_EVIDENCE_ATTENTION_TOKENS = 8_192;
 const MAXIMUM_EVIDENCE_ATTENTION_TOKENS = 12_288;
 const MAXIMUM_RESULT_ATTENTION_TOKENS = 3_072;
+const MAXIMUM_RELEVANT_EVIDENCE_SUMMARY_TOKENS = 512;
+const MAXIMUM_RELEVANT_EVIDENCE_COMMAND_TOKENS = 256;
+const MAXIMUM_RELEVANT_EVIDENCE_OUTPUT_TOKENS = 768;
 const SUMMARY_ARGUMENT_KEYS = new Set([
   "command", "executable", "args", "path", "paths", "query", "pattern",
   "purpose", "subjects", "cwd", "offset", "limit", "message"
 ]);
+
+function boundedEvidenceValue(value: unknown, maximumTokens: number): string | null {
+  if (value === undefined || value === null) return null;
+  return fitApproximateTokens(
+    typeof value === "string" ? value : JSON.stringify(value),
+    maximumTokens
+  );
+}
 
 function canonical(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonical);
@@ -219,12 +231,26 @@ export function longHorizonRelevantEvidence(session: RuntimeSession): unknown[] 
         evidenceId: evidence.evidenceId,
         kind: evidence.kind,
         status: evidence.status,
-        summary: evidence.summary,
+        summary: fitApproximateTokens(
+          evidence.summary,
+          MAXIMUM_RELEVANT_EVIDENCE_SUMMARY_TOKENS
+        ),
         intent: evidence.data.intent ?? null,
         runtimeRecord: {
-          command: evidence.data.command ?? null,
+          command: evidence.data.command
+            ? fitApproximateTokens(
+                evidence.data.command,
+                MAXIMUM_RELEVANT_EVIDENCE_COMMAND_TOKENS
+              )
+            : null,
           exitCode: evidence.data.exitCode ?? null,
-          output: evidence.data.output ?? null
+          output: boundedEvidenceValue(
+            evidence.data.output,
+            MAXIMUM_RELEVANT_EVIDENCE_OUTPUT_TOKENS
+          ),
+          outputDigest: evidence.data.output !== undefined
+            ? longHorizonDigest(evidence.data.output)
+            : null
         }
       }];
     }
@@ -292,7 +318,7 @@ export function withAccountedAssurance(
     assurance: {
       ...state.assurance,
       strategistCalls: Math.min(
-        state.assurance.strategistMode === "off" ? 0 : 1,
+        state.assurance.strategistMode === "off" ? 0 : MAX_STRATEGIST_CALLS,
         usage.strategistCalls
       ),
       reviewerCalls: Math.min(
@@ -322,8 +348,10 @@ export function nextLongHorizonState(session: RuntimeSession): LongHorizonState 
   if (current.settledBatchCount === batches.length) return current;
   let next = { ...current };
   const progressHistory = emptyMarginalProgressHistory();
-  const historyStart = Math.max(0, current.settledBatchCount - 8);
-  for (let index = historyStart; index < current.settledBatchCount; index += 1) {
+  // Rebuild the semantic comparison history for the complete goal epoch.
+  // Keeping only the last eight batches allowed an older result to age out
+  // and then manufacture fresh progress when a long loop returned to it.
+  for (let index = 0; index < current.settledBatchCount; index += 1) {
     const batch = batches[index]!;
     recordMarginalProgress(progressHistory, batch, actionOutcome(batch, index + 1));
   }

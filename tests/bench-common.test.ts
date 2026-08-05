@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   assertUniqueHarborTaskExecutionIdentities,
@@ -15,6 +16,7 @@ import {
   defaultAgentCliTarballForEnv,
   detectHarborRunCapabilities,
   detectTaskSelectionFlag,
+  discoverDockerProxyOrigin,
   formatMarkdownReport,
   generateBenchReport,
   groupHarborTimeoutProbe,
@@ -25,9 +27,11 @@ import {
   parseHarborTimeoutProbe,
   portableAgentImportPath,
   projectHarborTaskConfig,
+  readVerifierGateMetrics,
   readTaskSelectionFile,
   removedHarborAdapterErrorMessage,
   removedHarborPackageName,
+  resolveDockerVerifierProxy,
   resolveHarborCommand,
   resolveRunOptions,
   suggestedOwnerForFailureCategory,
@@ -250,6 +254,191 @@ describe("Terminal-Bench command construction", () => {
     expect(() => resolveRunOptions([
       "--mode", "task", "--task-id", "generic-task", "--reasoning-effort", "extreme"
     ])).toThrow(/reasoning effort/iu);
+  });
+
+  it("caps total concurrency at four and isolates verifier concurrency from trial concurrency", () => {
+    expect(() => resolveRunOptions([
+      "--mode", "task", "--task-id", "generic-task", "--concurrency", "5"
+    ], {})).toThrow(/at most 4/iu);
+    expect(() => resolveRunOptions([
+      "--mode", "task", "--task-id", "generic-task", "--concurrency", "2.5"
+    ], {})).toThrow(/positive integer/iu);
+    expect(() => resolveRunOptions([
+      "--mode", "task", "--task-id", "generic-task",
+      "--concurrency", "2", "--verifier-concurrency", "3"
+    ], {})).toThrow(/must not exceed/iu);
+
+    const options = resolveRunOptions([
+      "--mode", "task", "--task-id", "generic-task",
+      "--concurrency", "4", "--verifier-concurrency", "1"
+    ], {});
+    expect(options).toMatchObject({
+      nConcurrentTrials: 4,
+      verifierConcurrency: 1,
+      verifierConcurrencyExplicit: true
+    });
+    expect(buildHarborArgs({
+      ...options,
+      enableVerifierGate: true,
+      configPath: "job.json",
+      capabilities: { pluginFlag: "--plugin", yesFlag: "--yes" }
+    })).toEqual([
+      "run", "--config", "job.json",
+      "--plugin", "verifier_gate_plugin:VerifierGatePlugin", "--yes"
+    ]);
+  });
+
+  it("makes verifier proxy routing explicit without embedding credentials", () => {
+    const direct = resolveRunOptions([
+      "--mode", "task", "--task-id", "generic-task",
+      "--verifier-proxy-mode", "direct"
+    ], {});
+    expect(buildHarborJobConfig(direct, "jobs").verifier.env).toMatchObject({
+      HTTP_PROXY: "",
+      HTTPS_PROXY: "",
+      ALL_PROXY: "",
+      NO_PROXY: "*"
+    });
+
+    const custom = resolveRunOptions([
+      "--mode", "task", "--task-id", "generic-task",
+      "--verifier-proxy-mode", "custom",
+      "--verifier-proxy-url", "http://proxy.example.test:8080"
+    ], {});
+    expect(buildHarborJobConfig(custom, "jobs").verifier.env).toMatchObject({
+      HTTP_PROXY: "http://proxy.example.test:8080",
+      HTTPS_PROXY: "http://proxy.example.test:8080",
+      NO_PROXY: "localhost,127.0.0.1,::1"
+    });
+    expect(() => resolveRunOptions([
+      "--mode", "task", "--task-id", "generic-task",
+      "--verifier-proxy-mode", "custom",
+      "--verifier-proxy-url", "http://user:secret@proxy.example.test:8080"
+    ], {})).toThrow(/must not contain credentials/iu);
+    expect(() => resolveRunOptions([
+      "--mode", "task", "--task-id", "generic-task",
+      "--verifier-proxy-url", "http://proxy.example.test:8080"
+    ], {})).toThrow(/requires --verifier-proxy-mode custom/iu);
+
+    expect(() => resolveDockerVerifierProxy({
+      HTTP_PROXY: "htpp://127.0.0.1:7890",
+      HTTPS_PROXY: "http://127.0.0.1:7890"
+    })).toThrow(/not Docker-reachable/iu);
+    const automatic = resolveRunOptions([
+      "--mode", "task", "--task-id", "generic-task",
+      "--verifier-proxy-mode", "auto"
+    ], {
+      HTTP_PROXY: "htpp://127.0.0.1:7890",
+      HTTPS_PROXY: "http://127.0.0.1:7890",
+      SIGMA_DOCKER_PROXY_URL: "http://http.docker.internal:3128",
+      SIGMA_DOCKER_PROXY_SOURCE: "docker_info.HTTPProxy"
+    });
+    expect(automatic).toMatchObject({
+      verifierProxyMode: "auto",
+      verifierProxyUrl: "http://http.docker.internal:3128",
+      verifierProxySource: "docker_info.HTTPProxy",
+      verifierProxyLoopbackRewritten: false
+    });
+    expect(buildHarborJobConfig(automatic, "jobs").verifier.env).toMatchObject({
+      HTTP_PROXY: "http://http.docker.internal:3128",
+      HTTPS_PROXY: "http://http.docker.internal:3128"
+    });
+    expect(() => resolveRunOptions([
+      "--mode", "task", "--task-id", "generic-task",
+      "--verifier-proxy-mode", "auto"
+    ], { HTTP_PROXY: "htpp://127.0.0.1:7890" })).toThrow(/credential-free/iu);
+
+    expect(discoverDockerProxyOrigin({}, () => ({
+      status: 0,
+      stdout: '"http.docker.internal:3128"\n',
+      stderr: ""
+    }))).toBe("http://http.docker.internal:3128");
+  });
+
+  it("loads and SHA-binds a generic non-shell bootstrap preflight descriptor", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "sigma-bootstrap-preflight-"));
+    const filePath = path.join(directory, "preflight.json");
+    const bytes = `${JSON.stringify({
+      schemaVersion: 1,
+      command: "docker",
+      args: ["version"],
+      timeout_sec: 30
+    })}\n`;
+    await writeFile(filePath, bytes, "utf8");
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    try {
+      expect(resolveRunOptions([
+        "--mode", "task", "--task-id", "generic-task",
+        "--bootstrap-preflight-file", filePath,
+        "--expected-bootstrap-preflight-sha256", sha256
+      ], {})).toMatchObject({
+        bootstrapPreflightFile: filePath,
+        bootstrapPreflightSha256: sha256,
+        bootstrapPreflight: {
+          schemaVersion: 1,
+          command: "docker",
+          args: ["version"],
+          timeout_sec: 30
+        }
+      });
+      expect(() => resolveRunOptions([
+        "--mode", "task", "--task-id", "generic-task",
+        "--bootstrap-preflight-file", filePath,
+        "--expected-bootstrap-preflight-sha256", "f".repeat(64)
+      ], {})).toThrow(/does not match/iu);
+      const fractionalBytes = `${JSON.stringify({
+        schemaVersion: 1,
+        command: "docker",
+        args: ["version"],
+        timeout_sec: 1.5
+      })}\n`;
+      await writeFile(filePath, fractionalBytes, "utf8");
+      expect(() => resolveRunOptions([
+        "--mode", "task", "--task-id", "generic-task",
+        "--bootstrap-preflight-file", filePath
+      ], {})).toThrow(/positive integer/iu);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("aggregates verifier gate contention telemetry without task metadata", async () => {
+    const runDir = await mkdtemp(path.join(os.tmpdir(), "sigma-verifier-gate-"));
+    const eventsDir = path.join(runDir, "runtime-scratch", "verifier-gate", "events");
+    await mkdir(eventsDir, { recursive: true });
+    await writeFile(path.join(eventsDir, "slot-1.jsonl"), [
+      JSON.stringify({
+        schemaVersion: 1, event: "acquired", trial_id: "opaque-1",
+        wait_ms: 0.5, contended: false
+      }),
+      JSON.stringify({
+        schemaVersion: 1, event: "released", trial_id: "opaque-1", held_ms: 100
+      }),
+      JSON.stringify({
+        schemaVersion: 1, event: "acquired", trial_id: "opaque-2",
+        wait_ms: 50, contended: true
+      }),
+      JSON.stringify({
+        schemaVersion: 1, event: "released", trial_id: "opaque-2", held_ms: 200
+      })
+    ].join("\n"), "utf8");
+    try {
+      expect(await readVerifierGateMetrics(runDir, {
+        verifier_gate_enabled: true,
+        verifier_concurrency: 1
+      })).toMatchObject({
+        enabled: true,
+        limit: 1,
+        acquisitions: 2,
+        releases: 2,
+        contended_acquisitions: 1,
+        invalid_event_lines: 0,
+        wait_ms: { count: 2, total: 50.5, p50: 0.5, p95: 50, max: 50 },
+        hold_ms: { count: 2, total: 300, p50: 100, p95: 200, max: 200 }
+      });
+    } finally {
+      await rm(runDir, { recursive: true, force: true });
+    }
   });
 
   it("freezes write-scope capability negotiation without assuming outer-container authority", () => {
@@ -1400,6 +1589,15 @@ describe("benchmark report generation", () => {
     expect(report.counts.infra_failed).toBe(1);
     expect(report.validity).toEqual({ valid: 0, infra_failed: 1 });
     expect(report.effective_correctness).toEqual({ passed: 0, total: 0, pass_rate: null });
+    expect(report.correctness_bounds).toMatchObject({
+      passed: 0,
+      total: 1,
+      infra_invalid: 1,
+      lower_bound: 0,
+      effective_rate: null,
+      upper_bound: 1,
+      invalid_rate: 1
+    });
   });
 
   it("excludes verifier setup failures from effective correctness", async () => {
@@ -2197,6 +2395,19 @@ describe("benchmark report generation", () => {
 
     expect(report.status).toBe("incomplete");
     expect(report.trial_accounting.missing).toBe(1);
+    expect(report.correctness_bounds).toMatchObject({
+      passed: 1,
+      effective_passed: 1,
+      total: 2,
+      observed: 1,
+      unobserved: 1,
+      infra_invalid: 0,
+      valid_total: 1,
+      lower_bound: 0.5,
+      effective_rate: 1,
+      upper_bound: 1,
+      invalid_rate: 0
+    });
     expect(report.incomplete_reason?.join("\n")).toContain("trial result count 1 does not match expected 2");
   });
 });

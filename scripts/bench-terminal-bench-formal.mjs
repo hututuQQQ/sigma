@@ -123,7 +123,8 @@ function batchPaths(outputDir, batchId) {
   return {
     started: path.join(outputDir, `batch-${safeId}.started.json`),
     completed: path.join(outputDir, `batch-${safeId}.completed.json`),
-    tasks: path.join(outputDir, `batch-${safeId}.tasks.json`)
+    tasks: path.join(outputDir, `batch-${safeId}.tasks.json`),
+    bootstrapPreflight: path.join(outputDir, `batch-${safeId}.bootstrap-preflight.json`)
   };
 }
 
@@ -471,6 +472,63 @@ export function aggregateFormalReports(manifest, batchRecords) {
     component,
     sumReports(reports, ["cost_accounting", "api_equivalent", "components_usd", component])
   ]));
+  const observedTasks = batchRecords.flatMap((record) => {
+    const reportedTasks = Array.isArray(record.report?.tasks) ? record.report.tasks : [];
+    const observedCount = Math.max(0, Number(record.report?.trial_accounting?.observed ?? 0));
+    return reportedTasks.slice(0, observedCount);
+  });
+  const validTasks = observedTasks.filter((task) => task.validity === "valid");
+  const knownPassed = observedTasks.filter((task) => task.verifier_outcome === "passed").length;
+  const effectivePassed = validTasks.filter((task) => task.verifier_outcome === "passed").length;
+  const infraInvalid = observedTasks.filter((task) => task.validity === "infra_failed").length;
+  const unobserved = Math.max(0, expected - accounting.observed);
+  const unclassifiedObserved = Math.max(0, accounting.observed - observedTasks.length);
+  const correctnessBounds = {
+    passed: knownPassed,
+    effective_passed: effectivePassed,
+    total: expected,
+    observed: accounting.observed,
+    infra_invalid: infraInvalid,
+    unobserved,
+    unclassified_observed: unclassifiedObserved,
+    valid_total: validTasks.length,
+    lower_bound: expected > 0 ? knownPassed / expected : null,
+    effective_rate: validTasks.length > 0 ? effectivePassed / validTasks.length : null,
+    upper_bound: expected > 0
+      ? Math.min(
+          expected,
+          knownPassed + infraInvalid + unobserved + unclassifiedObserved
+        ) / expected
+      : null,
+    invalid_rate: expected > 0 ? infraInvalid / expected : null
+  };
+  const verifierGateBatches = batchRecords
+    .filter((record) => record.report?.verifier_gate)
+    .map((record) => ({ batch: record.batch, ...record.report.verifier_gate }));
+  const verifierGateAcquisitions = verifierGateBatches.reduce(
+    (total, metric) => total + Number(metric.acquisitions ?? 0), 0
+  );
+  const verifierGateWaitTotalMs = verifierGateBatches.reduce(
+    (total, metric) => total + Number(metric.wait_ms?.total ?? 0), 0
+  );
+  const verifierGate = {
+    acquisitions: verifierGateAcquisitions,
+    releases: verifierGateBatches.reduce(
+      (total, metric) => total + Number(metric.releases ?? 0), 0
+    ),
+    contended_acquisitions: verifierGateBatches.reduce(
+      (total, metric) => total + Number(metric.contended_acquisitions ?? 0), 0
+    ),
+    wait_ms: {
+      total: verifierGateWaitTotalMs,
+      mean: verifierGateAcquisitions > 0
+        ? verifierGateWaitTotalMs / verifierGateAcquisitions : null,
+      max: verifierGateBatches.length > 0
+        ? Math.max(...verifierGateBatches.map((metric) => Number(metric.wait_ms?.max ?? 0)))
+        : null
+    },
+    batches: verifierGateBatches
+  };
   return {
     schemaVersion: 1,
     kind: "SigmaFormalRunReport",
@@ -487,6 +545,8 @@ export function aggregateFormalReports(manifest, batchRecords) {
       completed: batchRecords.length
     },
     trial_accounting: accounting,
+    correctness_bounds: correctnessBounds,
+    verifier_gate: verifierGate,
     counts: aggregateNumericObjects(reports, "counts"),
     failure_categories: aggregateFailureCategories(reports),
     lane_metrics: laneMetrics(tasks, reports[0]?.evaluation_lane ?? null),
@@ -545,6 +605,10 @@ function formalMarkdown(report) {
     `- Completed batches: ${report.batches.completed}/${report.batches.expected}`,
     `- Observed trials: ${report.trial_accounting.observed}/${report.trial_accounting.expected}`,
     `- Verifier passes: ${passCount}`,
+    `- Pass-rate lower/effective/upper bounds: ${report.correctness_bounds?.lower_bound ?? "n/a"} / ${report.correctness_bounds?.effective_rate ?? "n/a"} / ${report.correctness_bounds?.upper_bound ?? "n/a"}`,
+    `- Infra-invalid rate: ${report.correctness_bounds?.invalid_rate ?? "n/a"}`,
+    `- Verifier concurrency schedule: ${JSON.stringify(report.execution.batches.map((batch) => ({ batch: batch.id, concurrency: batch.verifier_concurrency })))}`,
+    `- Verifier gate wait ms (total/mean/max): ${report.verifier_gate?.wait_ms?.total ?? "n/a"} / ${report.verifier_gate?.wait_ms?.mean ?? "n/a"} / ${report.verifier_gate?.wait_ms?.max ?? "n/a"}`,
     `- Verifier reach/pass rate: ${report.lane_metrics.verifier_reached}/${report.lane_metrics.verifier_pass_rate ?? "n/a"}`,
     `- Counts: ${JSON.stringify(report.counts)}`,
     `- Failure categories: ${JSON.stringify(report.failure_categories)}`,
@@ -580,8 +644,13 @@ async function writeFormalReport(outputDir, manifest, records, preregistrationSh
 async function runBatch(manifest, batch, options, deps) {
   const files = batchPaths(options.outputDir, batch.id);
   await ensureStableJson(files.tasks, selectedTasks(manifest, batch));
+  let bootstrapPreflightSha256 = null;
+  if (manifest.execution.bootstrap_preflight) {
+    await ensureStableJson(files.bootstrapPreflight, manifest.execution.bootstrap_preflight);
+    bootstrapPreflightSha256 = sha256(await readFile(files.bootstrapPreflight));
+  }
   const runner = deps.runTerminalBenchCli ?? runTerminalBenchCli;
-  return await runner([
+  const args = [
     "--mode", "batch",
     "--tasks-file", files.tasks,
     "--dataset", manifest.task_selection.dataset,
@@ -599,6 +668,8 @@ async function runBatch(manifest, batch, options, deps) {
     "--managed-environment-mode", manifest.execution.managed_environment_mode,
     "--harbor-topology", manifest.execution.harbor_topology,
     "--concurrency", String(manifest.execution.concurrency),
+    "--verifier-concurrency", String(batch.verifier_concurrency),
+    "--verifier-proxy-mode", manifest.execution.verifier_proxy_mode,
     "--attempts", String(manifest.execution.attempts_per_task),
     "--retries", String(manifest.execution.retries),
     "--timeout-leniency-multiplier", "1",
@@ -606,7 +677,17 @@ async function runBatch(manifest, batch, options, deps) {
     "--run-label", `formal-${safePathPart(manifest.formal_run_id)}-${safePathPart(batch.id)}`,
     "--reuse-package",
     "--expected-archive-sha256", manifest.archive_sha256
-  ], {
+  ];
+  if (manifest.execution.verifier_proxy_url) {
+    args.push("--verifier-proxy-url", manifest.execution.verifier_proxy_url);
+  }
+  if (manifest.execution.bootstrap_preflight) {
+    args.push(
+      "--bootstrap-preflight-file", files.bootstrapPreflight,
+      "--expected-bootstrap-preflight-sha256", bootstrapPreflightSha256
+    );
+  }
+  return await runner(args, {
     ...(deps.terminalBenchDeps ?? {}),
     beforeHarborDispatch: deps.beforeHarborDispatch,
     assertFrozenRunControls: (context) => assertFrozenBatchControls(manifest, batch, context)

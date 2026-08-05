@@ -236,7 +236,7 @@ function requestStrategyTool(): RegisteredEffectTool {
   return {
     descriptor: descriptor(
       "request_strategy",
-      "Request the one optional fresh-context strategy reset when the current approach needs an independent hypothesis and next discriminating action. This is advisory and does not terminate work or restrict tools.",
+      "Request one optional fresh-context strategy reset when the current approach needs an independent hypothesis and next discriminating action. A later objective resource checkpoint may still occur; both are advisory and resource-capped.",
       {}
     ),
     async execute(request) {

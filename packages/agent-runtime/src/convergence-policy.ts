@@ -21,9 +21,9 @@ const MODEL_LATENCY_SAMPLE_LIMIT = 20;
 
 function observedModelLatencyMs(session: RuntimeSession): number | undefined {
   const samples = session.durable.state.usage
-    .filter((item) => item.role === session.services.modelRole
-      && item.providerId === session.services.gateway.provider
-      && item.modelId === session.services.gateway.model
+    .filter((item) => item.sessionId === session.identity.sessionId
+      && item.runId === session.durable.runId
+      && item.role === session.services.modelRole
       && Number.isFinite(item.latencyMs)
       && item.latencyMs > 0)
     .slice(-MODEL_LATENCY_SAMPLE_LIMIT)

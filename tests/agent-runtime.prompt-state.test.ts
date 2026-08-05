@@ -232,6 +232,7 @@ describe("incremental runtime prompt state", () => {
     });
 
     const toolClosure = await prepare(2);
+    expect(toolClosure.turn.boundaryStage).toBe("tool_closure");
     expect(toolClosure.turn.tools).toEqual([
       expect.objectContaining({ name: "read" })
     ]);
@@ -241,6 +242,7 @@ describe("incremental runtime prompt state", () => {
 
     const final = await prepare(1);
     expect(final.turn).toMatchObject({
+      boundaryStage: "final",
       toolChoice: "none",
       tools: []
     });

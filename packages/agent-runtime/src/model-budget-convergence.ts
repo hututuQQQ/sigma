@@ -40,6 +40,7 @@ export interface PreparedModelTurn {
   messages: ContextPlan["messages"];
   tools: ModelToolDefinition[];
   toolChoice?: ModelRequest["toolChoice"];
+  boundaryStage?: ModelTurnBoundaryStage;
   budget: PreparedModelBudget;
   outputReserveTokens: number;
   toolSchemaDigest: string;
@@ -359,6 +360,7 @@ export async function prepareBudgetedModelTurn(
       outputReserveTokens,
       toolSchemaDigest,
       requestDigest,
+      ...(boundaryStage ? { boundaryStage } : {}),
       ...(toolChoice ? { toolChoice } : {}),
       promptState: committedPromptState(input, frame, plan),
       frameMode: frame.frameMode

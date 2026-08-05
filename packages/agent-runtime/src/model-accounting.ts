@@ -152,8 +152,13 @@ function normalizedUsage(
   const existing = (response as ModelResponse & { usage?: NormalizedModelUsage }).usage;
   if (existing) {
     const billingMode = existing.billingMode ?? prepared.spec?.billingMode;
+    // Routed/provider usage can report only the successful provider attempt.
+    // Deadline convergence needs the complete wall-clock request, including
+    // retry and backoff time spent before that attempt succeeded.
+    const endToEndLatencyMs = Math.max(0, Math.round(latencyMs));
     return {
       ...existing,
+      latencyMs: Math.max(existing.latencyMs, endToEndLatencyMs),
       ...(billingMode ? { billingMode } : {}),
       ...(billingMode === "subscription" || billingMode === "unpriced"
         ? { costMicroUsd: null }

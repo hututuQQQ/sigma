@@ -4,6 +4,12 @@ import { open, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  maxConcurrentTrials,
+  normalizeBootstrapPreflightDescriptor,
+  normalizeVerifierProxyUrl,
+  verifierProxyEnvironment
+} from "./bench-common.mjs";
+import {
   assertUniqueHarborTaskExecutionIdentities,
   harborTaskExecutionIdentitySha256,
   taskSelectionIdentity,
@@ -237,14 +243,14 @@ function normalizedTimeoutCohorts(value, batchIndexes, tasks, label) {
   return cohorts;
 }
 
-function normalizedBatches(value, tasks) {
+function normalizedBatches(value, tasks, maxVerifierConcurrency) {
   if (!Array.isArray(value) || value.length === 0) throw new Error("execution.batches must be non-empty.");
   const ids = new Set();
   const seen = new Set();
   const batches = value.map((item, index) => {
     const batch = record(item, `execution.batches[${index}]`);
     exactKeys(batch, [
-      "id", "task_indexes", "task_selection_sha256", "timeout_cohorts"
+      "id", "task_indexes", "task_selection_sha256", "verifier_concurrency", "timeout_cohorts"
     ], `execution.batches[${index}]`);
     const id = identifier(batch.id, `execution.batches[${index}].id`);
     if (ids.has(id)) throw new Error(`execution.batches contains duplicate id '${id}'.`);
@@ -265,6 +271,11 @@ function normalizedBatches(value, tasks) {
       id,
       task_indexes: taskIndexes,
       task_selection_sha256: selectionDigest,
+      verifier_concurrency: positiveIntegerAtMost(
+        batch.verifier_concurrency,
+        maxVerifierConcurrency,
+        `execution.batches[${index}].verifier_concurrency`
+      ),
       timeout_cohorts: normalizedTimeoutCohorts(
         batch.timeout_cohorts, taskIndexes, tasks, `execution.batches[${index}].timeout_cohorts`
       )
@@ -273,6 +284,13 @@ function normalizedBatches(value, tasks) {
   if (seen.size !== tasks.length || tasks.some((_task, index) => !seen.has(index))) {
     throw new Error("execution.batches must partition the complete frozen task selection exactly once.");
   }
+  for (let index = 1; index < batches.length; index += 1) {
+    if (batches[index].verifier_concurrency < batches[index - 1].verifier_concurrency) {
+      throw new Error(
+        "execution.batches verifier_concurrency must be non-decreasing for phased rollout."
+      );
+    }
+  }
   return batches;
 }
 
@@ -280,8 +298,39 @@ function normalizedExecution(value, tasks) {
   const execution = record(value, "execution");
   exactKeys(execution, [
     "network_mode", "execution_mode", "write_scope", "managed_environment_mode", "harbor_topology",
-    "concurrency", "attempts_per_task", "retries", "package_mode", "batches"
+    "concurrency", "verifier_concurrency", "verifier_proxy_mode", "verifier_proxy_url",
+    "bootstrap_preflight", "attempts_per_task", "retries", "package_mode", "batches"
   ], "execution");
+  const proxyMode = enumValue(
+    execution.verifier_proxy_mode, ["inherit", "direct", "custom"],
+    "execution.verifier_proxy_mode"
+  );
+  const proxyUrl = execution.verifier_proxy_url === null
+    ? null
+    : normalizeVerifierProxyUrl(
+        execution.verifier_proxy_url, "execution.verifier_proxy_url"
+      );
+  if (proxyMode === "custom" && !proxyUrl) {
+    throw new Error("execution.verifier_proxy_mode custom requires verifier_proxy_url.");
+  }
+  if (proxyMode !== "custom" && proxyUrl) {
+    throw new Error("execution.verifier_proxy_url requires verifier_proxy_mode custom.");
+  }
+  const concurrency = positiveIntegerAtMost(
+    execution.concurrency, maxConcurrentTrials, "execution.concurrency"
+  );
+  const verifierConcurrency = positiveIntegerAtMost(
+    execution.verifier_concurrency, maxConcurrentTrials, "execution.verifier_concurrency"
+  );
+  if (verifierConcurrency > concurrency) {
+    throw new Error("execution.verifier_concurrency must not exceed execution.concurrency.");
+  }
+  const batches = normalizedBatches(execution.batches, tasks, verifierConcurrency);
+  if (Math.max(...batches.map((batch) => batch.verifier_concurrency)) !== verifierConcurrency) {
+    throw new Error(
+      "execution.verifier_concurrency must equal the maximum batch verifier_concurrency."
+    );
+  }
   const normalized = {
     network_mode: enumValue(execution.network_mode, ["none", "loopback", "full"], "execution.network_mode"),
     execution_mode: enumValue(
@@ -298,11 +347,19 @@ function normalizedExecution(value, tasks) {
     harbor_topology: enumValue(
       execution.harbor_topology, ["main_only", "managed_three_role"], "execution.harbor_topology"
     ),
-    concurrency: positiveInteger(execution.concurrency, "execution.concurrency"),
+    concurrency,
+    verifier_concurrency: verifierConcurrency,
+    verifier_proxy_mode: proxyMode,
+    verifier_proxy_url: proxyUrl,
+    bootstrap_preflight: execution.bootstrap_preflight === null
+      ? null
+      : normalizeBootstrapPreflightDescriptor(
+          execution.bootstrap_preflight, "execution.bootstrap_preflight"
+        ),
     attempts_per_task: execution.attempts_per_task,
     retries: execution.retries,
     package_mode: enumValue(execution.package_mode, ["reuse"], "execution.package_mode"),
-    batches: normalizedBatches(execution.batches, tasks)
+    batches
   };
   if (normalized.attempts_per_task !== 1 || normalized.retries !== 0) {
     throw new Error("Formal evaluation requires attempts_per_task=1 and retries=0.");
@@ -350,12 +407,17 @@ export function sigmaFormalRunPreregistration(draft, options = {}) {
   const executionDraft = record(input.execution, "execution");
   exactKeys(executionDraft, [
     "network_mode", "execution_mode", "write_scope", "managed_environment_mode", "harbor_topology",
-    "concurrency", "attempts_per_task", "retries", "package_mode", "batches"
+    "concurrency", "verifier_concurrency", "verifier_proxy_mode", "verifier_proxy_url",
+    "bootstrap_preflight", "attempts_per_task", "retries", "package_mode", "batches"
   ], "execution");
   if (!Array.isArray(executionDraft.batches)) throw new Error("execution.batches must be an array.");
   const batches = executionDraft.batches.map((batchValue, batchIndex) => {
     const batch = record(batchValue, `execution.batches[${batchIndex}]`);
-    exactKeys(batch, ["id", "task_indexes", "timeout_cohorts"], `execution.batches[${batchIndex}]`);
+    exactKeys(
+      batch,
+      ["id", "task_indexes", "verifier_concurrency", "timeout_cohorts"],
+      `execution.batches[${batchIndex}]`
+    );
     const taskIndexes = normalizedIndexes(
       batch.task_indexes, tasks.length, `execution.batches[${batchIndex}].task_indexes`
     );
@@ -366,6 +428,7 @@ export function sigmaFormalRunPreregistration(draft, options = {}) {
       id: batch.id,
       task_indexes: taskIndexes,
       task_selection_sha256: formalTaskSelectionSha256(selectionForIndexes(tasks, taskIndexes)),
+      verifier_concurrency: batch.verifier_concurrency,
       timeout_cohorts: batch.timeout_cohorts.map((cohortValue, cohortIndex) => {
         const cohort = record(
           cohortValue, `execution.batches[${batchIndex}].timeout_cohorts[${cohortIndex}]`
@@ -389,7 +452,7 @@ export function sigmaFormalRunPreregistration(draft, options = {}) {
     };
   });
   const payload = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     kind: "SigmaFormalRunPreregistration",
     formal_run_id: identifier(input.formal_run_id, "formal_run_id"),
     source,
@@ -419,7 +482,7 @@ export function validateFormalPreregistration(input, options = {}) {
     "archive_sha256", "model", "task_selection", "solver_controls", "execution",
     "consumption_identity_sha256"
   ], "formal preregistration");
-  if (manifest.schemaVersion !== 1 || manifest.kind !== "SigmaFormalRunPreregistration") {
+  if (manifest.schemaVersion !== 2 || manifest.kind !== "SigmaFormalRunPreregistration") {
     throw new Error("Formal evaluation requires SigmaFormalRunPreregistration.");
   }
   const source = normalizedSource(manifest.source);
@@ -431,7 +494,7 @@ export function validateFormalPreregistration(input, options = {}) {
     manifest.task_selection, path.resolve(options.baseDir ?? process.cwd())
   );
   const normalized = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     kind: "SigmaFormalRunPreregistration",
     formal_run_id: identifier(manifest.formal_run_id, "formal_run_id"),
     source,
@@ -507,12 +570,20 @@ export function assertFrozenBatchControls(manifest, batch, context) {
     || options.managedEnvironmentMode !== execution.managed_environment_mode
     || options.harborTopology !== execution.harbor_topology
     || options.nConcurrentTrials !== execution.concurrency
+    || options.verifierConcurrency !== batch.verifier_concurrency
+    || options.verifierProxyMode !== execution.verifier_proxy_mode
+    || options.verifierProxyUrl !== execution.verifier_proxy_url
+    || canonicalJson(options.bootstrapPreflight) !== canonicalJson(execution.bootstrap_preflight)
     || options.attemptsPerTask !== execution.attempts_per_task
     || options.retries !== execution.retries) {
     throw new Error("Resolved runner controls drifted from the formal preregistration.");
   }
   const expectedTasks = selectionForIndexes(manifest.task_selection.tasks, batch.task_indexes);
   const expectedBySelection = expectedTimeouts(manifest, batch);
+  const expectedVerifierEnv = verifierProxyEnvironment({
+    verifierProxyMode: execution.verifier_proxy_mode,
+    verifierProxyUrl: execution.verifier_proxy_url
+  });
   if (!Array.isArray(context.slots) || context.slots.length !== expectedTasks.length) {
     throw new Error("Harbor timeout probe did not resolve every frozen formal task.");
   }
@@ -528,6 +599,9 @@ export function assertFrozenBatchControls(manifest, batch, context) {
       throw new Error(
         "Resolved Harbor agent controls drifted from the formal preregistration."
       );
+    }
+    if (canonicalJson(slot.jobConfig?.verifier?.env ?? {}) !== canonicalJson(expectedVerifierEnv)) {
+      throw new Error("Resolved Harbor verifier proxy controls drifted from the formal preregistration.");
     }
     const selectionDigest = taskSelectionIdentitySha256(slot.task);
     if (observed.has(selectionDigest) || !expectedBySelection.has(selectionDigest)) {

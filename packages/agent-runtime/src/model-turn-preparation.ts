@@ -236,19 +236,20 @@ export async function prepareModelAttempt(
   let prepared: BudgetedModelTurn;
   try {
     prepared = await prepareBudgetedModelTurn(preparation);
-    ({ prepared, available } = await refreshContextArchive({
-      session,
-      preparation,
-      initial: prepared,
-      initialProjection: projected.archiveProjection,
-      available,
-      signal,
-      summarizer,
-      emit: options.emit
-    }));
-    prepared = await applyProjectedResourceBoundary(
-      options, session, preparation, available, prepared
-    );
+    // Boundary turns preserve the remaining request; their initial plan already has a bounded summary.
+    if (!prepared.turn.boundaryStage) {
+      ({ prepared, available } = await refreshContextArchive({
+        session,
+        preparation,
+        initial: prepared,
+        initialProjection: projected.archiveProjection,
+        available,
+        signal,
+        summarizer,
+        emit: options.emit
+      }));
+    }
+    prepared = await applyProjectedResourceBoundary(options, session, preparation, available, prepared);
   } catch (error) {
     if (!contextBudgetExhausted(error)) throw error;
     return contextBudgetFailure();
@@ -256,7 +257,8 @@ export async function prepareModelAttempt(
   const fittedBudget = fitPreparedBudget(
     prepared.turn.budget,
     available,
-    Number.MAX_SAFE_INTEGER
+    // A boundary request is one logical step; retries must not erase its protected final response.
+    prepared.turn.boundaryStage ? 1 : Number.MAX_SAFE_INTEGER
   );
   if (!fittedBudget) {
     return {

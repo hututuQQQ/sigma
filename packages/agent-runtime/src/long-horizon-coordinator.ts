@@ -281,7 +281,7 @@ export class LongHorizonCoordinator {
     const fitted = capacity ? fitPreparedBudget(prepared, capacity, 1) : null;
     if (!fitted) {
       // Strategist is lowest priority. Skipping it is observable but does not
-      // consume the one permitted strategist invocation.
+      // consume the permitted strategist invocation for this checkpoint.
       return undefined;
     }
     return { gateway, messages, maximumOutput, budget: fitted };

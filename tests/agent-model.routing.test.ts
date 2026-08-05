@@ -453,7 +453,7 @@ describe("capability-aware model routing", () => {
         await vi.runAllTimersAsync();
         await failed;
         expect(new Set(calls)).toEqual(new Set(["openai-codex"]));
-        expect(calls).toHaveLength(category === "auth" || category === "capacity" ? 1 : 11);
+        expect(calls).toHaveLength(category === "auth" || category === "capacity" ? 1 : 5);
       }
     } finally {
       vi.useRealTimers();
@@ -500,7 +500,7 @@ describe("capability-aware model routing", () => {
       const failed = expect(gateways.orchestrator.complete(request())).rejects.toThrow("server");
       await vi.advanceTimersByTimeAsync(0);
       expect(calls).toBe(1);
-      const delays = [500, 1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 32_000, 32_000, 32_000];
+      const delays = [500, 1_000, 2_000, 4_000];
       for (const [index, delay] of delays.entries()) {
         await vi.advanceTimersByTimeAsync(delay - 1);
         expect(calls).toBe(index + 1);
@@ -1410,6 +1410,7 @@ describe("normalized model usage", () => {
       apiEquivalentCostMicroUsd: 14 + priorInputCost,
       billingMode: "subscription",
       providerReported: false,
+      latencyMs: 5,
       attempt: 2
     });
     expect(failedModelUsage(

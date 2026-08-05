@@ -7,6 +7,7 @@ import type {
   ModelResponse,
   StrategyReset
 } from "agent-protocol";
+import { MAX_STRATEGIST_CALLS } from "agent-protocol";
 import type { ModelRouteConstraints } from "agent-model";
 import {
   availableAuxiliaryBudget,
@@ -22,14 +23,26 @@ import type { RuntimeSession } from "./types.js";
 
 export type StrategyTrigger = StrategyReset["trigger"];
 
+const MAXIMUM_STRATEGY_USER_INSTRUCTION_CHARS = 24_000;
+const MAXIMUM_STRATEGY_EVIDENCE_ITEMS = 12;
+
 function boundedUserInstructions(session: RuntimeSession): string[] {
-  return session.durable.state.messages
+  const messages = session.durable.state.messages
     .filter((message) => message.role === "user")
     .map((message) => message.content)
-    .slice(-8)
-    .map((content) => content.length <= 12_000
+    .slice(-8);
+  let remaining = MAXIMUM_STRATEGY_USER_INSTRUCTION_CHARS;
+  const selected: string[] = [];
+  for (const content of [...messages].reverse()) {
+    if (remaining <= 0) break;
+    const limit = Math.min(12_000, remaining);
+    const bounded = content.length <= limit
       ? content
-      : `${content.slice(0, 12_000)}\n[truncated]`);
+      : `${content.slice(0, Math.max(0, limit - 12))}\n[truncated]`;
+    selected.push(bounded);
+    remaining -= bounded.length;
+  }
+  return selected.reverse();
 }
 
 export function strategyMessages(
@@ -39,6 +52,13 @@ export function strategyMessages(
   const state = session.durable.state;
   const frontier = state.mutationFrontier;
   const attention = evidenceAttentionWindow(session);
+  const recentOutcomes = state.longHorizon.recentOutcomes.slice(-8);
+  const recentOutcomeKeys = new Set(recentOutcomes.map((outcome) =>
+    `${outcome.callDigest}:${outcome.resultDigest}`));
+  const olderRepresentativeOutcomes = attention.representativeOutcomes
+    .filter((outcome) => !recentOutcomeKeys.has(
+      `${outcome.callDigest}:${outcome.resultDigest}`
+    ));
   return [{
     role: "system",
     content: [
@@ -46,6 +66,7 @@ export function strategyMessages(
       "A strategy reset was requested by the main model, a proposed user-input suspension, consecutive settled batches without durable marginal progress, a bounded evidence-attention window, or an objective resource band.",
       "Use only the supplied user instructions, checklist, mutation frontier, evidence, and bounded receipt summaries.",
       "Receipt summaries are ordered oldest to newest. Treat recentOutcomes as the authoritative current window; when an older evidence-attention summary conflicts with a newer receipt, use the newer receipt.",
+      "When priorStrategy is present, it is historical anti-loop memory rather than a standing instruction. Account for its established facts, do not repeat a falsified route without newer contradictory evidence, and revise its recommendation when later receipts did not produce progress.",
       "The runtime cannot judge task semantics. Decide whether the evidence supports more exploration, implementing the best current candidate, revising the plan, validating the current result, or requesting user input.",
       "For an input_request trigger, recommend request_user_input only when the missing item is genuinely a user-owned choice or fact that cannot be derived from the durable instructions, workspace, available evidence, or a reasonable best-effort default. Otherwise provide the smallest discriminating action or plan pivot.",
       "Do not solve the task, call tools, mention elapsed time, infer hidden evaluation context, or invent facts.",
@@ -56,6 +77,15 @@ export function strategyMessages(
     content: JSON.stringify({
       trigger,
       userInstructions: boundedUserInstructions(session),
+      priorStrategy: state.longHorizon.strategy ? {
+        trigger: state.longHorizon.strategy.trigger,
+        decision: state.longHorizon.strategy.decision ?? null,
+        establishedFacts: state.longHorizon.strategy.establishedFacts,
+        falsifiedApproaches: state.longHorizon.strategy.falsifiedApproaches,
+        hypothesis: state.longHorizon.strategy.hypothesis,
+        nextDiscriminatingAction: state.longHorizon.strategy.nextDiscriminatingAction,
+        expectedSignal: state.longHorizon.strategy.expectedSignal
+      } : null,
       plan: {
         goal: state.plan.goal,
         activeNodeId: state.plan.activeNodeId ?? null,
@@ -79,14 +109,14 @@ export function strategyMessages(
         environmentChangedPathsDigest:
           longHorizonDigest([...(frontier.environmentChangedPaths ?? [])].sort())
       },
-      evidence: longHorizonRelevantEvidence(session),
-      recentOutcomes: state.longHorizon.recentOutcomes.slice(-8),
+      evidence: longHorizonRelevantEvidence(session).slice(-MAXIMUM_STRATEGY_EVIDENCE_ITEMS),
+      recentOutcomes,
       evidenceAttention: {
         tokenCount: attention.tokenCount,
         tokenLimit: attention.tokenLimit,
         batchCount: attention.batchCount,
         outcomeDigest: attention.outcomeDigest,
-        representativeOutcomes: attention.representativeOutcomes
+        representativeOutcomes: olderRepresentativeOutcomes
       }
     })
   }];
@@ -209,28 +239,46 @@ export function fallbackStrategy(
   };
 }
 
-export function strategistTrigger(session: RuntimeSession): StrategyTrigger | undefined {
-  const state = session.durable.state.longHorizon;
-  if (state.strategy || state.assurance.strategistCalls >= 1
-    || state.assurance.strategistMode === "off") return undefined;
+function strategyTriggerCandidates(
+  session: RuntimeSession,
+  state: LongHorizonState
+): StrategyTrigger[] {
+  const candidates: StrategyTrigger[] = [];
   if (state.strategyRequested) {
-    return state.recentOutcomes.at(-1)?.toolNames.includes("request_user_input")
+    candidates.push(state.recentOutcomes.at(-1)?.toolNames.includes("request_user_input")
       ? "input_request"
-      : "model_request";
+      : "model_request");
   }
-  if (state.assurance.strategistMode !== "adaptive") return undefined;
+  if (state.assurance.strategistMode !== "adaptive") return candidates;
   // The first observation establishes a result baseline. Match OpenCode's
   // three-call doom-loop boundary by resetting after the following two
   // no-progress batches under the default duplicateThreshold=3 policy.
   const noProgressThreshold = Math.max(2, state.assurance.duplicateThreshold - 1);
-  if (state.duplicateStreak >= noProgressThreshold) {
-    return "duplicate_result";
-  }
-  if (evidenceAttentionWindow(session).saturated) return "evidence_window";
-  return state.resourceBandTriggered ? "resource_band" : undefined;
+  if (state.duplicateStreak >= noProgressThreshold) candidates.push("duplicate_result");
+  if (evidenceAttentionWindow(session).saturated) candidates.push("evidence_window");
+  if (state.resourceBandTriggered) candidates.push("resource_band");
+  return [...new Set(candidates)];
+}
+
+export function strategistTrigger(session: RuntimeSession): StrategyTrigger | undefined {
+  const state = session.durable.state.longHorizon;
+  if (state.assurance.strategistCalls >= MAX_STRATEGIST_CALLS
+    || state.assurance.strategistMode === "off") return undefined;
+  const strategyCurrent = state.strategy?.basisDigest
+    === longHorizonProgressBasisDigest(session);
+  if (strategyCurrent) return undefined;
+  const candidates = strategyTriggerCandidates(session, state);
+  if (state.assurance.strategistCalls === 0) return candidates[0];
+  // The second bounded call must address a distinct objective signal. This
+  // catches a later doom loop after an earlier resource checkpoint (and vice
+  // versa) without repeatedly asking for the same semantic judgement.
+  return candidates.find((candidate) => candidate !== state.strategy?.trigger);
 }
 
 export function strategyBasisDigest(session: RuntimeSession): string {
+  // A fresh strategy guides exactly the next main-model action. Once that
+  // action settles, its receipt changes the progress basis and the strategy
+  // becomes historical anti-loop memory instead of a standing instruction.
   return longHorizonProgressBasisDigest(session);
 }
 
