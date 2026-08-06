@@ -70,6 +70,24 @@ describe("workspace transaction roots", () => {
     })).rejects.toMatchObject({ code: "workspace_transaction_root_unavailable" });
   });
 
+  it("accepts a state root beneath a system-style symlinked ancestor", async () => {
+    const container = await temporaryRoot();
+    const realAncestor = path.join(container, "private-ancestor");
+    const aliasAncestor = path.join(container, "var");
+    const workspace = path.join(container, "workspace");
+    const state = path.join(aliasAncestor, "state");
+    await mkdir(workspace);
+    await mkdir(realAncestor);
+    const linked = await symlink(realAncestor, aliasAncestor, process.platform === "win32" ? "junction" : "dir")
+      .then(() => true, () => false);
+    if (!linked) return;
+    const root = await workspaceTransactionRoot({
+      workspacePath: workspace, stateRootDir: state, namespace: "unit-transaction"
+    });
+    expect(path.relative(workspace, root).startsWith("..")).toBe(true);
+    await cleanupWorkspaceTransactionRoot(root);
+  });
+
   it("detects a directory identity swap while a lease is active", async () => {
     const container = await temporaryRoot();
     const root = path.join(container, "transaction");

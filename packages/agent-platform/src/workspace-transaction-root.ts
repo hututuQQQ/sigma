@@ -97,6 +97,38 @@ function assertRealDirectory(
   }
 }
 
+/**
+ * Canonicalize symlinked ancestors of the target while leaving the target
+ * itself untouched. macOS ships `/var` and `/tmp` as system-managed symlinks
+ * to `/private/var` and `/private/tmp`; rejecting them breaks any state path
+ * rooted under `$TMPDIR`. The target itself is never resolved here so a
+ * preexisting symlink at the state root is still rejected by
+ * `assertRealDirectory` (the state root must not be replaceable). The whole
+ * ancestor chain is walked top-down from root so a symlink above an existing
+ * real directory (e.g. `/var` above `/var/folders`) is still canonicalized:
+ * once an ancestor symlink is resolved, every descendant segment is re-joined
+ * to the canonical base, so `lstat` never sees the alias again.
+ */
+async function resolveAncestorSymlinks(target: string): Promise<string> {
+  const targetInfo = await lstatAllowMissing(target);
+  if (targetInfo?.isSymbolicLink()) return target;
+  const chain = directoryChain(path.resolve(target));
+  let base = chain[0];
+  for (let index = 1; index < chain.length; index += 1) {
+    const candidate = path.join(base, path.basename(chain[index]));
+    const info = await lstatAllowMissing(candidate);
+    if (!info) {
+      return path.join(base, ...chain.slice(index).map((segment) => path.basename(segment)));
+    }
+    if (info.isSymbolicLink()) {
+      base = await realpath(candidate);
+    } else {
+      base = candidate;
+    }
+  }
+  return base;
+}
+
 async function verifyPrivatePosixDirectory(directory: string, created: boolean): Promise<void> {
   if (process.platform === "win32") return;
   if (typeof process.getuid !== "function") {
@@ -132,7 +164,7 @@ async function lockExistingWindowsDirectories(
  * reparse-point validation while directory handles prevent replacement.
  */
 export async function ensurePrivateStateDirectory(directory: string): Promise<string> {
-  const target = path.resolve(directory);
+  const target = await resolveAncestorSymlinks(path.resolve(directory));
   const chain = directoryChain(target);
   const locks: WindowsDirectoryLock[] = [];
   try {
