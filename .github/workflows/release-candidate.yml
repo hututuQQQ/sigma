@@ -585,12 +585,21 @@ jobs:
           }
           NODE
           "${runtime}/bin/agent" doctor --json > "${RUNNER_TEMP}/embedded-runtime-doctor.json"
+          cat "${RUNNER_TEMP}/embedded-runtime-doctor.json"
           node --input-type=module <<'NODE'
           import { readFileSync } from "node:fs";
           const report = JSON.parse(readFileSync(process.env.RUNNER_TEMP + "/embedded-runtime-doctor.json", "utf8"));
-          const raw = JSON.stringify(report);
-          for (const capability of ["seatbelt+sandbox-exec+forkpty", "full", "none"]) {
-            if (!raw.includes(capability)) throw new Error(`Embedded Runtime doctor omitted ${capability}.`);
+          if (report.sandbox?.available !== true || report.sandbox?.selfTestPassed !== true) {
+            throw new Error(`Embedded Runtime sandbox self-test failed: ${JSON.stringify(report.sandbox)}`);
+          }
+          if (report.sandbox.backend !== "seatbelt+sandbox-exec+forkpty") {
+            throw new Error(`Unexpected embedded Runtime sandbox backend: ${report.sandbox.backend}`);
+          }
+          if (report.capabilities?.pty !== true
+            || report.capabilities?.processHandoff !== false
+            || JSON.stringify(report.capabilities?.networkModes) !== JSON.stringify(["none", "full"])
+            || report.capabilities?.enclosingContainerRoot?.available !== false) {
+            throw new Error(`Unexpected embedded Runtime capabilities: ${JSON.stringify(report.capabilities)}`);
           }
           NODE
           if [[ "${SIGNING_MODE}" == signed ]]; then
