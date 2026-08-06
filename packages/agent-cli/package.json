@@ -34,7 +34,7 @@
     "agent-protocol": "workspace:*",
     "agent-runtime": "workspace:*",
     "agent-tui": "workspace:*",
-    "smol-toml": "^1.7.0"
+    "smol-toml": "^1.7.1"
   },
   "engines": { "node": ">=26.4.0" }
 }
