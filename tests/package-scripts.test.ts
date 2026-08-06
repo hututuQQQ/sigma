@@ -60,6 +60,11 @@ describe("package script semantics", () => {
     expect(linux.find((stage) => stage.id === "package")?.args).toContain("verify:package:agent-cli:linux");
     expect(windows.find((stage) => stage.id === "package")?.args).toContain("verify:package:agent-cli:windows");
     expect(macos.find((stage) => stage.id === "package")?.args).toContain("verify:package:agent-cli:macos");
+    expect(linux.find((stage) => stage.id === "coverage")?.args).toEqual(["test:coverage"]);
+    expect(windows.find((stage) => stage.id === "coverage")?.args).toEqual([
+      "test:coverage", "--", "--maxWorkers=2", "--testTimeout=20000"
+    ]);
+    expect(macos.find((stage) => stage.id === "coverage")?.args).toEqual(["test:coverage"]);
     expect(linux.find((stage) => stage.id === "readiness")?.args).toContain("--require-release-ready");
     expect(linux.find((stage) => stage.id === "readiness")?.args).not.toContain("--require-preview-ready");
     expect(windows.find((stage) => stage.id === "readiness")?.args).toContain("--require-preview-ready");

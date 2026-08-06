@@ -39,18 +39,20 @@ const neutral = [
   stage("tui-smoke", "pnpm", "smoke:tui-product")
 ] as const;
 
-const releaseQuality = [
-  stage("build", "pnpm", "build"),
-  stage("lint", "pnpm", "lint"),
-  stage("coverage", "pnpm", "test:coverage"),
-  stage("native-coverage", "pnpm", "test:coverage:native-protocol"),
-  stage("replay", "pnpm", "perf:replay-100k"),
-  stage("product-smoke", "pnpm", "smoke:product"),
-  stage("tui-smoke", "pnpm", "smoke:tui-product")
-] as const;
+function releaseQuality(coverageArgs: readonly string[] = []): readonly ReleaseStage[] {
+  return [
+    stage("build", "pnpm", "build"),
+    stage("lint", "pnpm", "lint"),
+    stage("coverage", "pnpm", "test:coverage", ...coverageArgs),
+    stage("native-coverage", "pnpm", "test:coverage:native-protocol"),
+    stage("replay", "pnpm", "perf:replay-100k"),
+    stage("product-smoke", "pnpm", "smoke:product"),
+    stage("tui-smoke", "pnpm", "smoke:tui-product")
+  ];
+}
 
 const linuxRelease = [
-  ...releaseQuality,
+  ...releaseQuality(),
   stage("package", "pnpm", "verify:package:agent-cli:linux"),
   stage("sandbox", "python3", "scripts/ci/linux-sandbox-smoke.py", "--broker",
     ".artifacts/agent-cli-linux-x64/bin/sigma-exec", "--output", ".artifacts/sandbox-smoke-linux-x64.json"),
@@ -66,7 +68,7 @@ const linuxRelease = [
 ] as const;
 
 const windowsRelease = [
-  ...releaseQuality,
+  ...releaseQuality(["--", "--maxWorkers=2", "--testTimeout=20000"]),
   stage("package", "pnpm", "verify:package:agent-cli:windows"),
   stage("sandbox", "python", "scripts/ci/windows-sandbox-smoke.py", "--broker",
     ".artifacts/agent-cli-win32-x64/bin/sigma-exec.exe", "--node",
@@ -83,7 +85,7 @@ const windowsRelease = [
 ] as const;
 
 const macosRelease = [
-  ...releaseQuality,
+  ...releaseQuality(),
   stage("package", "pnpm", "verify:package:agent-cli:macos"),
   stage("sandbox", "python3", "scripts/ci/macos-sandbox-smoke.py", "--broker",
     ".artifacts/agent-cli-darwin-arm64/bin/sigma-exec", "--output",
