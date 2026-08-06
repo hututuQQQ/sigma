@@ -143,6 +143,36 @@ function writeRequest(): ModelResponse {
   };
 }
 
+function filesystemBundleRequest(): ModelResponse {
+  return {
+    message: {
+      role: "assistant",
+      content: "",
+      toolCalls: [{
+        id: "load-filesystem-tools",
+        name: "load_tool_bundle",
+        arguments: { bundleId: "filesystem" }
+      }]
+    },
+    finishReason: "tool_calls"
+  };
+}
+
+function processEnvironmentBundleRequest(): ModelResponse {
+  return {
+    message: {
+      role: "assistant",
+      content: "",
+      toolCalls: [{
+        id: "load-process-environment-tools",
+        name: "load_tool_bundle",
+        arguments: { bundleId: "process_environment" }
+      }]
+    },
+    finishReason: "tool_calls"
+  };
+}
+
 function validationRequest(): ModelResponse {
   return {
     message: {
@@ -306,7 +336,8 @@ describe("run command branch coverage", () => {
       "--permission-mode", "auto",
       "--output-format", "stream-json"
     ], { stdin, stdout, stderr, mode: "analyze", ...runDeps([
-      networkExecutionRequest(), evidenceRequest("network-evidence"), complete("network complete")
+      processEnvironmentBundleRequest(), networkExecutionRequest(),
+      evidenceRequest("network-evidence"), complete("network complete")
     ]) });
 
     expect(code).toBe(0);
@@ -335,7 +366,7 @@ describe("run command branch coverage", () => {
       "--permission-mode", "workspace-auto",
       "--output-format", "stream-json"
     ], { stdin, stdout, stderr, mode: "analyze", ...runDeps([
-      networkExecutionRequest()
+      processEnvironmentBundleRequest(), networkExecutionRequest()
     ]) });
 
     expect(code).toBe(2);
@@ -425,8 +456,11 @@ describe("run command branch coverage", () => {
     const stderr = new Capture();
     const completion = allowed ? complete("approved complete") : complete("denied complete");
     const script = allowed
-      ? [writeRequest(), validationRequest(), completion]
-      : [writeRequest(), evidenceRequest("denial-evidence"), completion];
+      ? [
+          filesystemBundleRequest(), writeRequest(), processEnvironmentBundleRequest(),
+          validationRequest(), completion
+        ]
+      : [filesystemBundleRequest(), writeRequest(), evidenceRequest("denial-evidence"), completion];
     // Explicit ask mode prompts for both the mutation and its process validation.
     const responses = allowed ? [answer, "a"] : [answer];
     let sent = 0;

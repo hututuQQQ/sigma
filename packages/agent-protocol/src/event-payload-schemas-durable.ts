@@ -8,6 +8,7 @@ import {
 } from "./budget-mutation-schemas.js";
 import {
   durableToolReceiptShape,
+  compiledHarnessPayloadSchema,
   longHorizonStateSchema,
   modelToolCallSchema,
   sourceSchema,
@@ -165,6 +166,15 @@ export const durableEventPayloadSchemas = {
     skillCount: z.number().int().nonnegative(),
     hookCount: z.number().int().nonnegative(),
     profileCount: z.number().int().nonnegative().optional()
+  }).strict(),
+  "harness.compiled": compiledHarnessPayloadSchema,
+  "tool_bundle.loaded": z.object({
+    bundleId: z.enum([
+      "filesystem", "planning", "code_intelligence", "web_media",
+      "process_environment", "delegation", "assurance_recovery"
+    ]),
+    harnessDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+    toolCount: z.number().int().nonnegative()
   }).strict(),
   "skill.loaded": z.object({
     qualifiedName: nonEmptyStringSchema,

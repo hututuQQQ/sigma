@@ -267,10 +267,10 @@ describe("capability-aware model routing", () => {
     expect(classifyModelFailure(Object.assign(new Error("bad config"), { category: "configuration" }))).toBe("configuration");
   });
   it("ships deterministic metered and ChatGPT subscription catalog entries", () => {
-    expect(BUILTIN_MODEL_SPECS).toHaveLength(1_110);
+    expect(BUILTIN_MODEL_SPECS).toHaveLength(1_154);
     // Radius has no static models until its cache is hydrated, while the
     // provider registry still exposes it as a connection.
-    expect(new Set(BUILTIN_MODEL_SPECS.map((item) => item.providerId)).size).toBe(38);
+    expect(new Set(BUILTIN_MODEL_SPECS.map((item) => item.providerId)).size).toBe(39);
     expect(BUILTIN_MODEL_SPECS.map((item) => item.id)).toContain("openai-codex/gpt-5.6-terra");
     expect(BUILTIN_MODEL_SPECS.map((item) => item.id)).toContain("glm/glm-5.2");
     expect(BUILTIN_MODEL_SPECS.filter((item) => item.billingMode === "metered")

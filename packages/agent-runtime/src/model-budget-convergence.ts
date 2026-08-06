@@ -326,7 +326,16 @@ export async function prepareBudgetedModelTurn(
     dynamic: frame.items,
     tools,
     outputReserveTokens,
-    ...(input.archive ? { archive: input.archive } : {})
+    ...(input.archive ? { archive: input.archive } : {}),
+    ...(session.durable.frozenHarness ? {
+      historyTokenLimit: session.durable.frozenHarness.contextPolicy.historyTokenLimit,
+      rawHistoryBlockTokenLimit:
+        session.durable.frozenHarness.contextPolicy.rawHistoryBlockTokenLimit,
+      historySummaryTokenLimit:
+        session.durable.frozenHarness.contextPolicy.historySummaryTokenLimit,
+      maximumRawHistoryBlocks:
+        session.durable.frozenHarness.contextPolicy.maximumRawHistoryBlocks
+    } : {})
   });
   const budget = await prepareModelBudget(
     session.services.gateway,

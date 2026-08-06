@@ -18,3 +18,4 @@ export * from "./repository-git-execution.js";
 export * from "./repository-git-inspection.js";
 export * from "./web-run-tool.js";
 export * from "./repository-recovery-selection.js";
+export * from "./tool-argument-validation.js";

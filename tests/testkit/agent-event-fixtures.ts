@@ -7,10 +7,13 @@ import {
   type AgentEventType,
   type CheckpointRef,
   type EvidenceRecord,
+  type ModelGateway,
+  type RunMode,
   type UsageRecord
 } from "../../packages/agent-protocol/src/index.js";
 import { freezeSessionCustomization } from "../../packages/agent-extensions/src/index.js";
 import { ContentAddressedArtifactStore } from "../../packages/agent-store/src/index.js";
+import { compileHarnessBuild } from "../../packages/agent-runtime/src/harness-compiler.js";
 
 export const fixtureOccurredAt = "2026-07-10T00:00:00.000Z";
 const turn = { turnId: 1, effectRevision: 0 } as const;
@@ -78,6 +81,41 @@ export async function persistEmptyCustomization(
     skillCount: 0,
     hookCount: 0,
     profileCount: 0
+  };
+}
+
+export async function persistCompiledHarnessFixture(
+  storeRootDir: string,
+  sessionId: string,
+  gateway: ModelGateway,
+  toolNames: readonly string[],
+  mode: RunMode = "change"
+): Promise<AgentEventPayloadMap["harness.compiled"]> {
+  const build = compileHarnessBuild({
+    provider: gateway.provider,
+    model: gateway.model,
+    modelRole: "orchestrator",
+    runMode: mode,
+    modelCapabilities: gateway.capabilities,
+    runtimeCapabilities: {
+      tools: toolNames.map((name) => ({ name, source: "mcp" as const })),
+      executionMode: "sandboxed",
+      writeScope: "workspace",
+      managedEnvironment: false,
+      network: "full",
+      interactiveApprovals: false
+    }
+  });
+  const artifactId = await new ContentAddressedArtifactStore(storeRootDir)
+    .put(sessionId, build.canonicalJson);
+  return {
+    schemaVersion: build.schemaVersion,
+    compilerVersion: build.compilerVersion,
+    digest: build.digest,
+    artifactId,
+    policyPackIds: [...build.policyPackIds],
+    initialToolCount: build.toolPolicy.initialTools.length,
+    potentialToolCount: build.toolPolicy.potentialTools.length
   };
 }
 
@@ -194,6 +232,20 @@ export const agentEventPayloadFixtures = {
   },
   "profile.resolved": { profileId: "profile", digest: "digest", artifactId: "artifact", source: "builtin" },
   "customization.frozen": { digest: "digest", artifactId: "artifact", skillCount: 0, hookCount: 0 },
+  "harness.compiled": {
+    schemaVersion: 1,
+    compilerVersion: "1.0.0",
+    digest: "a".repeat(64),
+    artifactId: "a".repeat(64),
+    policyPackIds: ["sigma.flagship.v1"],
+    initialToolCount: 9,
+    potentialToolCount: 30
+  },
+  "tool_bundle.loaded": {
+    bundleId: "filesystem",
+    harnessDigest: "a".repeat(64),
+    toolCount: 6
+  },
   "skill.loaded": { qualifiedName: "home:skill", digest: "digest", artifactId: "artifact", source: "home" },
   "hook.started": { hookId: "hook", event: "pre_tool", required: true, kind: "command" },
   "hook.completed": { hookId: "hook", event: "pre_tool", required: true, durationMs: 1, outcome: hookOutcome },

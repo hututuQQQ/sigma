@@ -4,6 +4,7 @@ import {
   listPiAuthStatuses,
   listPiModels,
   listPiProviders,
+  PI_AI_VERSION,
   refreshPiProviderModels,
   sanitizePiModelError
 } from "agent-pi";
@@ -78,7 +79,7 @@ async function modelCatalog() {
   });
   return {
     schemaVersion: 1,
-    piVersion: "0.82.1",
+    piVersion: PI_AI_VERSION,
     providers,
     models: entries
   };

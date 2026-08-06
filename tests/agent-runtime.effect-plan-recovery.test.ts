@@ -57,6 +57,12 @@ async function events(store: SegmentedJsonlStore, sessionId: string): Promise<Ag
   return result;
 }
 
+function processEnvironmentTurn() {
+  return fakeToolTurn([fakeToolCall("load-process-environment", "load_tool_bundle", {
+    bundleId: "process_environment"
+  })]);
+}
+
 describe("effect-plan recovery", () => {
   it("denies a dynamically mutating plan in analyze mode before execution", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-analyze-plan-denial-"));
@@ -150,7 +156,7 @@ describe("effect-plan recovery", () => {
     const runtime = createRuntime({
       gateway: new SmokeFakeGateway([
         fakeToolTurn([fakeToolCall("write", "shell", {
-          executable: "fixture",
+          command: "fixture",
           expectedChanges: ["src/expected.txt"]
         })]),
         fakeToolTurn([fakeToolCall("done", "request_user_input", { message: "Violation handled." })])
@@ -206,6 +212,7 @@ describe("effect-plan recovery", () => {
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
     const runtime = createRuntime({
       gateway: new SmokeFakeGateway([
+        processEnvironmentTurn(),
         fakeToolTurn([fakeToolCall("hybrid-write", "shell", {
           executable: "fixture",
           target: "environment",
@@ -291,7 +298,7 @@ describe("effect-plan recovery", () => {
     const runtime = createRuntime({
       gateway: new SmokeFakeGateway([
         fakeToolTurn([fakeToolCall("write", "shell", {
-          executable: "fixture",
+          command: "fixture",
           expectedChanges: ["src/generated/nested/file.ts"]
         })]),
         fakeToolTurn([fakeToolCall("done", "request_user_input", { message: "Nested write handled." })])
@@ -339,7 +346,7 @@ describe("effect-plan recovery", () => {
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
     const gateway = new SmokeFakeGateway([
       fakeToolTurn([fakeToolCall("write", "shell", {
-        executable: "fixture",
+        command: "fixture",
         expectedChanges: ["src/expected.txt"]
       })]),
       fakeToolTurn([fakeToolCall("must-not-run", "request_user_input", {

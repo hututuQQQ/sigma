@@ -9,12 +9,14 @@ import { baseContext } from "./runtime-context.js";
 import { configuredRunDeadlineAt } from "./run-deadline.js";
 import type { RuntimeSession, RuntimeSessionServices } from "./types.js";
 import { createRuntimeSessionAggregate } from "./runtime-session-state.js";
+import type { FrozenHarnessBuild } from "./harness-compiler.js";
 
 export async function newRuntimeSession(
   input: StartSession,
   runDeadlineMs: number | undefined,
   budgetLimits: BudgetLimits | undefined,
   identity: RuntimeSessionServices & {
+    harness: FrozenHarnessBuild;
     parentSessionId?: string;
     workspaceLeaseInherited?: boolean;
   },
@@ -30,11 +32,12 @@ export async function newRuntimeSession(
     startedAt: now,
     deadlineAt: configuredRunDeadlineAt(runDeadlineMs),
     assurancePolicy: normalizedAssurancePolicy(
-      identity.profile?.profile.assurancePolicy
-    )
+      identity.harness.assurancePolicy.resourcePolicy
+    ),
+    harnessRequired: true
   });
   if (budgetLimits) state.budget = createBudgetLedger(budgetLimits);
-  const base = baseContext(environment);
+  const base = baseContext(environment, identity.harness);
   const project = await loadNestedInstructions({ workspacePath: input.workspacePath });
   return createRuntimeSessionAggregate({
     sessionId,
@@ -52,6 +55,7 @@ export async function newRuntimeSession(
     ...(identity.profileSource ? { profileSource: identity.profileSource } : {}),
     state,
     seq: 0,
+    frozenHarness: identity.harness,
     controller: null,
     turnController: null,
     deadlineTimer: null,

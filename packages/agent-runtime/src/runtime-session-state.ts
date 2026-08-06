@@ -37,7 +37,9 @@ export function createRuntimeSessionAggregate(seed: RuntimeSessionSeed): Runtime
     mode: seed.mode,
     state: seed.state,
     seq: seed.seq,
-    ...(seed.frozenCustomization ? { frozenCustomization: seed.frozenCustomization } : {})
+    ...(seed.frozenCustomization ? { frozenCustomization: seed.frozenCustomization } : {}),
+    ...(seed.frozenHarness ? { frozenHarness: seed.frozenHarness } : {}),
+    ...(seed.legacyHarnessReadOnly ? { legacyHarnessReadOnly: true } : {})
   };
   const execution = {
     controller: seed.controller,

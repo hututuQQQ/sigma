@@ -41,18 +41,29 @@ function userMessage(payload: Record<string, JsonValue>): ModelMessage {
   };
 }
 
-const runStarted: EventReducer = (state, _event, payload) => ({
-  ...state,
-  mode: payload.mode === "analyze" || payload.mode === "change" ? payload.mode : state.mode,
-  phase: state.messages.length > 0 ? "ready_model" : "idle",
-  deadlineAt: typeof payload.deadlineAt === "string" ? payload.deadlineAt : undefined,
-  deadlineRemainingMs: undefined,
-  activeModelTurn: undefined,
-  activeModelSemanticDelta: undefined,
-  ...resetModelCompletion,
-  outcome: undefined,
-  proposedOutcome: undefined
-});
+const runStarted: EventReducer = (state, _event, payload) => {
+  const harness = payload.harness && typeof payload.harness === "object"
+    && !Array.isArray(payload.harness)
+    ? payload.harness as Record<string, JsonValue> : undefined;
+  const frozenHarness = harness
+    && typeof harness.digest === "string" && /^[a-f0-9]{64}$/u.test(harness.digest)
+    && harness.artifactId === harness.digest
+    ? { artifactId: harness.digest, digest: harness.digest }
+    : state.frozenHarness;
+  return {
+    ...state,
+    mode: payload.mode === "analyze" || payload.mode === "change" ? payload.mode : state.mode,
+    phase: state.messages.length > 0 ? "ready_model" : "idle",
+    deadlineAt: typeof payload.deadlineAt === "string" ? payload.deadlineAt : undefined,
+    deadlineRemainingMs: undefined,
+    activeModelTurn: undefined,
+    activeModelSemanticDelta: undefined,
+    frozenHarness,
+    ...resetModelCompletion,
+    outcome: undefined,
+    proposedOutcome: undefined
+  };
+};
 
 const userInput: EventReducer = (state, _event, payload) => ({
   ...state,
@@ -117,6 +128,13 @@ const historyRolledBack: EventReducer = (state, _event, payload) => {
 
 const toolRequested: EventReducer = (state) => state;
 
+const sessionCreated: EventReducer = (state, _event, payload) => ({
+  ...state,
+  ...(typeof payload.harnessCompilerVersion === "string"
+    ? { harnessRequired: true }
+    : {})
+});
+
 const approvalRequested: EventReducer = (state, _event, payload) => {
   const pending = pendingForEvent(state, payload);
   if (!pending) return state;
@@ -151,12 +169,14 @@ const toolStarted: EventReducer = (state, _event, payload) => {
 
 const toolFinished: EventReducer = (state, event) => {
   const receipt = toolReceipt(event.payload);
-  const pending = pendingForEvent(state, objectPayload(event.payload));
+  const payload = objectPayload(event.payload);
+  const pending = pendingForEvent(state, payload);
   if (!receipt || !pending || pending.request.callId !== receipt.callId) return state;
   const pendingTools = state.pendingTools.filter((item) => item !== pending);
   const messages = [...state.messages, {
     role: "tool" as const,
-    content: receiptContent(receipt),
+    content: typeof payload.modelOutput === "string"
+      ? payload.modelOutput : receiptContent(receipt),
     toolCallId: receipt.callId,
     isError: !receipt.ok
   }];
@@ -314,6 +334,7 @@ const diagnostic: EventReducer = (state, _event, payload) => {
 };
 
 const reducers: Partial<Record<AgentEventType, EventReducer>> = {
+  "session.created": sessionCreated,
   "run.started": runStarted,
   "user.message": userInput,
   "user.steer": steeringInput,

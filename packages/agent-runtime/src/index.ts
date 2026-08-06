@@ -7,6 +7,14 @@ export {
 export type { RuntimeMcpHttpServerConfig } from "./composition-mcp.js";
 export { configuredExecutionBroker } from "./container-runtime-execution.js";
 export {
+  compileHarnessBuild,
+  restoreHarnessBuild,
+  HARNESS_BUILD_SCHEMA_VERSION,
+  HARNESS_COMPILER_VERSION,
+  type FrozenHarnessBuild,
+  type HarnessCompilerInput
+} from "./harness-compiler.js";
+export {
   SUBJECT_ATTESTATION_SOURCE,
   SUBJECT_ATTESTOR_ID,
   assertSubjectAttestationContext,

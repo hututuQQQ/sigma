@@ -297,8 +297,7 @@ describe("restore_run_changes transaction control", () => {
       gateway: new SmokeFakeGateway([
         fakeToolTurn([fakeToolCall("write", "write", { path: "retained.txt", content: "retained" })]),
         fakeToolTurn([fakeToolCall("spawn", "shell", {
-          executable: "fixture-process",
-          args: [],
+          command: "fixture-process",
           background: true,
           yieldMs: 0
         })]),
@@ -335,7 +334,7 @@ describe("restore_run_changes transaction control", () => {
     const runtime = createRuntime({
       gateway: new SmokeFakeGateway([
         fakeToolTurn([fakeToolCall("invalid-write-plan", "shell", {
-          executable: "fixture",
+          command: "fixture",
           expectedChanges: ["../outside.txt"]
         })]),
         fakeToolTurn([fakeToolCall("done", "request_user_input", { message: "Prepare failure observed." })])

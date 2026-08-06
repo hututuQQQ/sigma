@@ -48,7 +48,7 @@ export const OPENAI_CODEX_DEFAULT_MODEL = "gpt-5.6-terra" as const;
 export const OPENAI_CODEX_BASE_URL = "https://chatgpt.com/backend-api" as const;
 export const GLM_PROVIDER_ID = "glm" as const;
 export const GLM_DEFAULT_MODEL = "glm-5.2" as const;
-export const PI_AI_VERSION = "0.82.1" as const;
+export const PI_AI_VERSION = "0.84.0" as const;
 
 const generatedAt = getBuiltinModelDataGeneratedAt();
 const catalogEffectiveAt = generatedAt === undefined
@@ -144,27 +144,17 @@ export async function createHydratedPiModels(
   modelsStore: ModelsStore = new FileModelsStore()
 ): Promise<Models> {
   const models = createPiModels(credentials, modelsStore);
-  await hydratePiModelCache(models, credentials, modelsStore);
+  await hydratePiModelCache(models);
   return models;
 }
 
 export async function hydratePiModelCache(
-  models: Models,
-  credentials: CredentialStore = defaultCredentialStore(),
-  modelsStore: ModelsStore = new FileModelsStore()
+  models: Models
 ): Promise<void> {
+  const result = await models.refresh({ allowNetwork: false });
   for (const provider of models.getProviders()) {
-    if (!provider.refreshModels) continue;
-    const scopedStore = {
-      read: () => modelsStore.read(provider.id),
-      write: (entry: Parameters<ModelsStore["write"]>[1]) => modelsStore.write(provider.id, entry),
-      delete: () => modelsStore.delete(provider.id)
-    };
-    await provider.refreshModels({
-      credential: await credentials.read(provider.id),
-      store: scopedStore,
-      allowNetwork: false
-    });
+    const failure = result.errors.get(provider.id);
+    if (failure) throw failure;
   }
 }
 

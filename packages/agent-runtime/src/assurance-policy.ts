@@ -35,6 +35,8 @@ export function assurancePolicyFromState(
 export function sessionAssurancePolicy(
   session: RuntimeSession
 ): AssuranceResourcePolicy {
+  const harnessPolicy = session.durable.frozenHarness?.assurancePolicy.resourcePolicy;
+  if (isAssuranceResourcePolicy(harnessPolicy)) return { ...harnessPolicy };
   const profilePolicy = session.services.profile?.profile.assurancePolicy;
   return isAssuranceResourcePolicy(profilePolicy)
     ? { ...profilePolicy }

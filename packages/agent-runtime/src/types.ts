@@ -27,6 +27,10 @@ import type { ReviewerPort } from "./reviewer.js";
 import type { AsyncQueue } from "./async-queue.js";
 import type { ApprovalBinding } from "./approval-binding.js";
 import type { SubjectAttestationContext } from "./subject-attestation.js";
+import type {
+  FrozenHarnessBuild,
+  HarnessReasoningEffort
+} from "./harness-compiler.js";
 
 export interface RuntimeAgentProfile {
   profile: FrozenAgentProfile;
@@ -67,6 +71,11 @@ export interface RuntimeOptions {
   managedEnvironmentMode?: "disabled" | "required";
   managedNetworkMode?: "none" | "loopback" | "full";
   runtimeEnvironment?: RuntimeEnvironment;
+  /** Resolved request policy recorded in the frozen Harness subject. It is
+   * metadata only; Sigma ships one flagship policy rather than model branches. */
+  reasoningEffort?: HarnessReasoningEffort;
+  /** Tool names registered before explicitly configured MCP servers connect. */
+  builtinToolNames?: readonly string[];
   /** Runtime-authority provenance supplied by a trusted launcher. Never derive
    * this from the workspace being operated on. */
   subjectAttestation?: SubjectAttestationContext;
@@ -154,6 +163,9 @@ export interface RuntimeSessionDurableState {
   state: KernelState;
   seq: number;
   frozenCustomization?: FrozenSessionCustomization;
+  frozenHarness?: FrozenHarnessBuild;
+  /** Set only while a pre-compiler session is restored in read-only mode. */
+  legacyHarnessReadOnly?: boolean;
 }
 
 export interface RuntimeSessionExecutionState {

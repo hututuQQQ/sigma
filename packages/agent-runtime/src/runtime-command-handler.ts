@@ -3,7 +3,7 @@ import type {
   RunCommand,
   RunOutcome
 } from "agent-protocol";
-import { beginNextRun, recoveryDenialPayload } from "./run-transitions.js";
+import { recoveryDenialPayload } from "./run-transitions.js";
 import type { SessionCommandBus } from "./session-command-bus.js";
 import type { ApprovalWaiter, RuntimeOptions, RuntimeSession } from "./types.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
@@ -15,6 +15,10 @@ export interface RuntimeCommandHandlerOptions {
   commandBus: SessionCommandBus;
   cancelChildren: RuntimeOptions["cancelChildren"];
   emit: RuntimeEventEmitter;
+  beginRun(
+    session: RuntimeSession,
+    mode: RuntimeSession["durable"]["mode"]
+  ): Promise<void>;
   finish(session: RuntimeSession, outcome: RunOutcome): Promise<boolean>;
   start(session: RuntimeSession): void;
 }
@@ -251,19 +255,23 @@ export class RuntimeCommandHandler {
       session.interaction.followUps.push(followUp);
       return;
     }
+    let beganRun = false;
     if (session.durable.state.phase === "terminal") {
       await this.options.commandBus.claim(session.identity.sessionId);
-      beginNextRun(session, session.durable.mode, this.options.runDeadlineMs);
+      await this.options.beginRun(session, session.durable.mode);
+      beganRun = true;
     } else if (session.durable.state.phase === "needs_input") {
       await this.options.commandBus.claim(session.identity.sessionId);
       session.recovery.lastOutcome = undefined;
     }
-    await this.options.emit(session, "run.started", "runtime", {
-      mode: session.durable.mode,
-      ...(session.durable.state.deadlineAt
-        ? { deadlineAt: session.durable.state.deadlineAt }
-        : {})
-    });
+    if (!beganRun) {
+      await this.options.emit(session, "run.started", "runtime", {
+        mode: session.durable.mode,
+        ...(session.durable.state.deadlineAt
+          ? { deadlineAt: session.durable.state.deadlineAt }
+          : {})
+      });
+    }
     await this.options.emit(session, "user.follow_up", "user", {
       text,
       ...(images?.length ? { images } : {}),
@@ -282,19 +290,23 @@ export class RuntimeCommandHandler {
       await this.steer(session, command.text);
       return;
     }
+    let beganRun = false;
     if (session.durable.state.phase === "terminal") {
       await this.options.commandBus.claim(session.identity.sessionId);
-      beginNextRun(session, command.mode ?? session.durable.mode, this.options.runDeadlineMs);
+      await this.options.beginRun(session, command.mode ?? session.durable.mode);
+      beganRun = true;
     } else if (session.durable.state.phase === "needs_input") {
       await this.options.commandBus.claim(session.identity.sessionId);
       session.recovery.lastOutcome = undefined;
     }
-    await this.options.emit(session, "run.started", "runtime", {
-      mode: session.durable.mode,
-      ...(session.durable.state.deadlineAt
-        ? { deadlineAt: session.durable.state.deadlineAt }
-        : {})
-    });
+    if (!beganRun) {
+      await this.options.emit(session, "run.started", "runtime", {
+        mode: session.durable.mode,
+        ...(session.durable.state.deadlineAt
+          ? { deadlineAt: session.durable.state.deadlineAt }
+          : {})
+      });
+    }
     await this.options.emit(session, "user.message", "user", {
       text: command.text,
       ...(command.images?.length ? { images: command.images } : {})
