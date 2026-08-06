@@ -110,12 +110,19 @@ describe("package script semantics", () => {
     }, source)).toThrow("cannot override secret 'DEEPSEEK_API_KEY'");
   });
 
-  it("verifies annotated release tags without peeling before the type check", async () => {
+  it("verifies the remote annotated tag independently of checkout's local tag ref", async () => {
     const workflow = await readFile(
       path.join(process.cwd(), ".github", "workflows", "release-candidate.yml"), "utf8",
     );
-    expect(workflow).toContain('git cat-file -t "${tag_ref}"');
-    expect(workflow).toContain('git rev-parse "${tag_ref}^{}"');
+    expect(workflow).toContain(
+      'tag_verification_ref="refs/sigma-release-tags/${GITHUB_REF_NAME}"',
+    );
+    expect(workflow).toContain(
+      '"+refs/tags/${GITHUB_REF_NAME}:${tag_verification_ref}"',
+    );
+    expect(workflow).toContain('git cat-file -t "${tag_verification_ref}"');
+    expect(workflow).toContain('git rev-parse "${tag_verification_ref}^{}"');
+    expect(workflow).not.toContain('tag_ref="refs/tags/${GITHUB_REF_NAME}"');
     expect(workflow).not.toContain('git cat-file -t "${GITHUB_REF_NAME}^{tag}"');
   });
 });

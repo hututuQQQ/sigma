@@ -70,17 +70,22 @@ jobs:
           );
           NODE
           if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
-            git fetch origin main --no-tags
+            git fetch --no-tags origin main
             git merge-base --is-ancestor "${GITHUB_SHA}" origin/main || {
               echo "Release tags must point to a commit reachable from main." >&2
               exit 1
             }
-            tag_ref="refs/tags/${GITHUB_REF_NAME}"
-            test "$(git cat-file -t "${tag_ref}")" = tag || {
+            # actions/checkout materializes a tag event's peeled commit at the local
+            # refs/tags/<name> ref. Fetch the remote tag object into an independent
+            # namespace so the annotated-tag check cannot be changed by checkout.
+            tag_verification_ref="refs/sigma-release-tags/${GITHUB_REF_NAME}"
+            git fetch --no-tags origin \
+              "+refs/tags/${GITHUB_REF_NAME}:${tag_verification_ref}"
+            test "$(git cat-file -t "${tag_verification_ref}")" = tag || {
               echo "Release tags must be annotated tags." >&2
               exit 1
             }
-            test "$(git rev-parse "${tag_ref}^{}")" = "${GITHUB_SHA}" || {
+            test "$(git rev-parse "${tag_verification_ref}^{}")" = "${GITHUB_SHA}" || {
               echo "Release tag target must equal the workflow commit." >&2
               exit 1
             }

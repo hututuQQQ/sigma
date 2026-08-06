@@ -23,7 +23,7 @@ function versionReport(bundle: unknown): VersionReport {
     command: "agent",
     package: {
       name: "agent-cli",
-      version: "0.1.7"
+      version: "0.1.8"
     },
     runtime: {
       node: process.version,
@@ -43,7 +43,7 @@ describe("agent-cli version", () => {
       command: "agent",
       package: {
         name: "agent-cli",
-        version: "0.1.7"
+        version: "0.1.8"
       },
       runtime: {
         node: process.version,
@@ -56,14 +56,14 @@ describe("agent-cli version", () => {
   it("prints human and JSON version output", async () => {
     const textStdout = new MemoryWritable();
     await expect(runVersionCommand([], { stdout: textStdout })).resolves.toBe(0);
-    expect(textStdout.text()).toContain("Sigma Code 0.1.7 (agent-cli)");
+    expect(textStdout.text()).toContain("Sigma Code 0.1.8 (agent-cli)");
     expect(textStdout.text()).toContain(`node=${process.version}`);
 
     const jsonStdout = new MemoryWritable();
     await expect(runVersionCommand(["--json"], { stdout: jsonStdout })).resolves.toBe(0);
     expect(JSON.parse(jsonStdout.text())).toMatchObject({
       product: "Sigma Code",
-      package: { name: "agent-cli", version: "0.1.7" }
+      package: { name: "agent-cli", version: "0.1.8" }
     });
   });
 
@@ -110,7 +110,7 @@ describe("agent-cli version", () => {
       process.stdout.write = previousWrite;
     }
 
-    expect(stdout.text()).toContain("Sigma Code 0.1.7 (agent-cli)");
+    expect(stdout.text()).toContain("Sigma Code 0.1.8 (agent-cli)");
   });
 
   it("loads only the lightweight version command for version probes", async () => {
