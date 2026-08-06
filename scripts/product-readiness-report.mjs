@@ -138,7 +138,9 @@ function lspSandboxSmokeReleaseChecks(lspSmoke, lspSmokePath, targetPlatform, ta
   const brokerPlatforms = targetPlatform === "win32"
     ? ["win32", "windows"]
     : targetPlatform === "darwin" ? ["darwin", "macos"] : ["linux"];
-  const brokerArchitectures = targetArch === "x64" ? ["x64", "x86_64", "amd64"] : [targetArch];
+  const brokerArchitectures = targetArch === "x64"
+    ? ["x64", "x86_64", "amd64"]
+    : targetArch === "arm64" ? ["arm64", "aarch64"] : [targetArch];
   const targetMatches = lspSmoke?.targetPlatform === targetPlatform && lspSmoke?.targetArch === targetArch
     && brokerPlatforms.includes(String(lspSmoke?.brokerPlatform ?? "").toLowerCase())
     && brokerArchitectures.includes(String(lspSmoke?.brokerArchitecture ?? "").toLowerCase());

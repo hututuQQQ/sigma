@@ -6,6 +6,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import {
+  assertBrokerTarget,
   assertMetadata,
   parseArguments,
   portableLayout,
@@ -19,6 +20,15 @@ async function fileDigest(filePath: string): Promise<string> {
 }
 
 describe("bundled LSP sandbox smoke", () => {
+  it("accepts canonical broker aliases for Apple Silicon", () => {
+    expect(() => assertBrokerTarget(
+      { platform: "macos", architecture: "aarch64" }, "darwin", "arm64"
+    )).not.toThrow();
+    expect(() => assertBrokerTarget(
+      { platform: "darwin", architecture: "x86_64" }, "darwin", "arm64"
+    )).toThrow("does not match arm64");
+  });
+
   it("resolves portable inputs without host PATH assumptions", () => {
     expect(parseArguments([
       "--bundle", "release",

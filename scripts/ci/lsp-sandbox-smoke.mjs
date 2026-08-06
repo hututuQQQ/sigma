@@ -181,11 +181,13 @@ export function portableNodeToolchain(api, layout, metadata, integrityManifest, 
   };
 }
 
-function assertBrokerTarget(doctor, targetPlatform, targetArch) {
+export function assertBrokerTarget(doctor, targetPlatform, targetArch) {
   const platforms = targetPlatform === "win32"
     ? ["win32", "windows"]
     : targetPlatform === "darwin" ? ["darwin", "macos"] : ["linux"];
-  const architectures = targetArch === "x64" ? ["x64", "x86_64", "amd64"] : [targetArch];
+  const architectures = targetArch === "x64"
+    ? ["x64", "x86_64", "amd64"]
+    : targetArch === "arm64" ? ["arm64", "aarch64"] : [targetArch];
   if (!platforms.includes(String(doctor.platform).toLowerCase())) {
     throw new Error(`Broker platform '${String(doctor.platform)}' does not match ${targetPlatform}.`);
   }
