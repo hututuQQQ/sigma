@@ -97,36 +97,47 @@ function assertRealDirectory(
   }
 }
 
+const TRUSTED_DARWIN_DIRECTORY_ALIASES = [
+  { alias: "/tmp", canonical: "/private/tmp" },
+  { alias: "/var", canonical: "/private/var" }
+] as const;
+
 /**
- * Canonicalize symlinked ancestors of the target while leaving the target
- * itself untouched. macOS ships `/var` and `/tmp` as system-managed symlinks
- * to `/private/var` and `/private/tmp`; rejecting them breaks any state path
- * rooted under `$TMPDIR`. The target itself is never resolved here so a
- * preexisting symlink at the state root is still rejected by
- * `assertRealDirectory` (the state root must not be replaceable). The whole
- * ancestor chain is walked top-down from root so a symlink above an existing
- * real directory (e.g. `/var` above `/var/folders`) is still canonicalized:
- * once an ancestor symlink is resolved, every descendant segment is re-joined
- * to the canonical base, so `lstat` never sees the alias again.
+ * Resolve only fixed, root-owned macOS directory aliases. The remaining path
+ * is kept lexical so user-controlled ancestor links and the final state-root
+ * entry still reach the strict lstat validation below.
  */
-async function resolveAncestorSymlinks(target: string): Promise<string> {
-  const targetInfo = await lstatAllowMissing(target);
-  if (targetInfo?.isSymbolicLink()) return target;
-  const chain = directoryChain(path.resolve(target));
-  let base = chain[0];
-  for (let index = 1; index < chain.length; index += 1) {
-    const candidate = path.join(base, path.basename(chain[index]));
-    const info = await lstatAllowMissing(candidate);
-    if (!info) {
-      return path.join(base, ...chain.slice(index).map((segment) => path.basename(segment)));
-    }
-    if (info.isSymbolicLink()) {
-      base = await realpath(candidate);
-    } else {
-      base = candidate;
+async function resolveTrustedDarwinDirectoryAlias(target: string): Promise<string> {
+  const resolvedTarget = path.resolve(target);
+  if (process.platform !== "darwin") return resolvedTarget;
+  for (const entry of TRUSTED_DARWIN_DIRECTORY_ALIASES) {
+    const relative = path.relative(entry.alias, resolvedTarget);
+    if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`)
+      || path.isAbsolute(relative)) continue;
+    const info = await lstat(entry.alias);
+    if (!info.isSymbolicLink() || info.uid !== 0) continue;
+    const canonicalAlias = await realpath(entry.alias);
+    if (canonicalAlias !== entry.canonical) continue;
+    return path.resolve(canonicalAlias, relative);
+  }
+  return resolvedTarget;
+}
+
+/** Resolve through the nearest existing ancestor without creating anything. */
+async function canonicalPathAllowMissing(target: string): Promise<string> {
+  const resolvedTarget = path.resolve(target);
+  let ancestor = resolvedTarget;
+  while (true) {
+    try {
+      const canonical = await realpath(ancestor);
+      return path.resolve(canonical, path.relative(ancestor, resolvedTarget));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) throw error;
+      ancestor = parent;
     }
   }
-  return base;
 }
 
 async function verifyPrivatePosixDirectory(directory: string, created: boolean): Promise<void> {
@@ -164,7 +175,7 @@ async function lockExistingWindowsDirectories(
  * reparse-point validation while directory handles prevent replacement.
  */
 export async function ensurePrivateStateDirectory(directory: string): Promise<string> {
-  const target = await resolveAncestorSymlinks(path.resolve(directory));
+  const target = await resolveTrustedDarwinDirectoryAlias(directory);
   const chain = directoryChain(target);
   const locks: WindowsDirectoryLock[] = [];
   try {
@@ -220,10 +231,12 @@ export async function workspaceTransactionRoot(
     const platform = options.platform ?? process.platform;
     const workspace = await realpath(path.resolve(options.workspacePath));
     const requestedState = path.resolve(options.stateRootDir ?? defaultStateHome(options));
+    const canonicalRequestedState = await canonicalPathAllowMissing(requestedState);
     const workspaceInfo = await stat(workspace);
 
     let stateRoot: string | undefined;
-    if (!isInside(workspace, requestedState)) {
+    if (!isInside(workspace, requestedState)
+      && !isInside(workspace, canonicalRequestedState)) {
       stateRoot = await ensurePrivateStateDirectory(requestedState);
       if (isInside(workspace, stateRoot) || (await stat(stateRoot)).dev !== workspaceInfo.dev) {
         stateRoot = undefined;
