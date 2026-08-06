@@ -271,7 +271,7 @@ jobs:
             }
           }
       - name: Upload verified Runtime and evidence inputs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-input-runtime-${{ matrix.label }}-${{ github.run_id }}
           if-no-files-found: error
@@ -289,21 +289,21 @@ jobs:
             .artifacts/live-eval-quick-${{ matrix.label }}.json
       - name: Upload public provenance key
         if: runner.os == 'Linux'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-input-public-key-${{ github.run_id }}
           if-no-files-found: error
           path: .artifacts/release-provenance-public.pem
       - name: Upload live-evaluation override record
         if: needs.metadata.outputs.live_eval_override == 'true' && runner.os == 'Linux'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-input-live-eval-override-${{ github.run_id }}
           if-no-files-found: error
           path: .artifacts/release-live-evaluation-override.json
       - name: Upload complete candidate diagnostics
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rc-${{ matrix.label }}-${{ github.run_id }}
           if-no-files-found: warn
@@ -393,7 +393,7 @@ jobs:
             --signing-mode unsigned --codesign not-signed `
             --gatekeeper not-applicable --stapler not-applicable
       - name: Upload public Windows desktop input
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-input-desktop-win32-x64-${{ github.run_id }}
           if-no-files-found: error
@@ -403,7 +403,7 @@ jobs:
             desktop-assets/Sigma-Code-${{ needs.metadata.outputs.version }}-x64.exe.desktop-provenance.json
             desktop-assets/Sigma-Code-${{ needs.metadata.outputs.version }}-x64.exe.signing.json
       - name: Retain Windows updater inputs for 90 days
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: desktop-updater-win32-x64-${{ github.run_id }}
           if-no-files-found: error
@@ -645,7 +645,7 @@ jobs:
         run: |
           if [[ -n "${APPLE_API_KEY:-}" ]]; then rm -f -- "${APPLE_API_KEY}"; fi
       - name: Upload public macOS desktop input
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-input-desktop-darwin-arm64-${{ github.run_id }}
           if-no-files-found: error
@@ -655,7 +655,7 @@ jobs:
             desktop-assets/Sigma-Code-${{ needs.metadata.outputs.version }}-arm64.dmg.desktop-provenance.json
             desktop-assets/Sigma-Code-${{ needs.metadata.outputs.version }}-arm64.dmg.signing.json
       - name: Retain macOS updater inputs for 90 days
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: desktop-updater-darwin-arm64-${{ github.run_id }}
           if-no-files-found: error
