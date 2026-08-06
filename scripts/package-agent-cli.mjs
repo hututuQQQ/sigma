@@ -1536,6 +1536,13 @@ if [ ! -x "$NODE" ]; then
   echo "Sigma Code cannot start: the bundled Node runtime is missing or not executable." >&2
   exit 126
 fi
+BROKER="$SCRIPT_DIR/sigma-exec"
+if [ ! -x "$BROKER" ]; then
+  echo "Sigma Code cannot start: the bundled execution broker is missing or not executable." >&2
+  exit 126
+fi
+export SIGMA_EXEC_PATH="$BROKER"
+export SIGMA_RUNTIME_NODE_PATH="$NODE"
 
 if [ "\${1:-}" = "tui" ]; then
   exec "$NODE" --experimental-ffi --disable-warning=ExperimentalWarning "$SCRIPT_DIR/../packages/agent-cli/dist/bin.js" "$@"
@@ -1552,10 +1559,17 @@ set "PATH=%SCRIPT_DIR%;%PATH%"
 set "NODE_OPTIONS=--preserve-symlinks-main"
 set "NODE_PATH="
 set "NODE_EXE=%SCRIPT_DIR%node.exe"
+set "BROKER_EXE=%SCRIPT_DIR%sigma-exec.exe"
 if not exist "%NODE_EXE%" (
   echo Sigma Code cannot start: the bundled Node runtime is missing. 1>&2
   exit /b 126
 )
+if not exist "%BROKER_EXE%" (
+  echo Sigma Code cannot start: the bundled execution broker is missing. 1>&2
+  exit /b 126
+)
+set "SIGMA_EXEC_PATH=%BROKER_EXE%"
+set "SIGMA_RUNTIME_NODE_PATH=%NODE_EXE%"
 :run
 if /I "%~1"=="tui" goto run_tui
 "%NODE_EXE%" "%SCRIPT_DIR%..\\packages\\agent-cli\\dist\\bin.js" %*

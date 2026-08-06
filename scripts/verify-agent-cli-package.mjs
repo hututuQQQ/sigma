@@ -1317,11 +1317,19 @@ export async function verifyAgentCliPackage(options = {}) {
       assertContains("bin/agent.cmd", wrapper, 'set "PATH=%SCRIPT_DIR%;%PATH%"');
       assertContains("bin/agent.cmd", wrapper, 'set "NODE_OPTIONS=--preserve-symlinks-main"');
       assertContains("bin/agent.cmd", wrapper, 'set "NODE_PATH="');
+      assertContains("bin/agent.cmd", wrapper, 'set "BROKER_EXE=%SCRIPT_DIR%sigma-exec.exe"');
+      assertContains("bin/agent.cmd", wrapper, 'if not exist "%BROKER_EXE%" (');
+      assertContains("bin/agent.cmd", wrapper, 'set "SIGMA_EXEC_PATH=%BROKER_EXE%"');
+      assertContains("bin/agent.cmd", wrapper, 'set "SIGMA_RUNTIME_NODE_PATH=%NODE_EXE%"');
       if (wrapper.toLowerCase().includes("where node")) throw new Error("bin/agent.cmd must not fall back to a system Node runtime.");
     } else {
       assertContains("bin/agent", wrapper, 'exec "$NODE" "$SCRIPT_DIR/../packages/agent-cli/dist/bin.js" "$@"');
       assertContains("bin/agent", wrapper, 'export PATH="$SCRIPT_DIR${PATH:+:$PATH}"');
       assertContains("bin/agent", wrapper, "unset NODE_OPTIONS NODE_PATH");
+      assertContains("bin/agent", wrapper, 'BROKER="$SCRIPT_DIR/sigma-exec"');
+      assertContains("bin/agent", wrapper, 'if [ ! -x "$BROKER" ]; then');
+      assertContains("bin/agent", wrapper, 'export SIGMA_EXEC_PATH="$BROKER"');
+      assertContains("bin/agent", wrapper, 'export SIGMA_RUNTIME_NODE_PATH="$NODE"');
       if (wrapper.includes("command -v node")) throw new Error("bin/agent must not fall back to a system Node runtime.");
     }
     assertContains("README.md", readme, "Sigma Code CLI Bundle");

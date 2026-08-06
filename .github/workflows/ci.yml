@@ -364,6 +364,41 @@ jobs:
         env:
           AGENT_REQUIRE_TARGET_WRAPPER: "1"
         run: pnpm verify:package:agent-cli:macos
+      - name: Verify portable Runtime doctor from a read-only disk image
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_root="${RUNNER_TEMP}/sigma-runtime-image"
+          source_root="${image_root}/Sigma Runtime"
+          dmg="${RUNNER_TEMP}/sigma-runtime-readonly.dmg"
+          mount_point="${RUNNER_TEMP}/sigma runtime mounted"
+          rm -rf "${image_root}" "${mount_point}"
+          rm -f "${dmg}"
+          mkdir -p "${source_root}" "${mount_point}"
+          cp -R .artifacts/agent-cli-darwin-arm64/. "${source_root}/"
+          hdiutil create -quiet -volname "Sigma Runtime Test" -fs HFS+ -srcfolder "${image_root}" "${dmg}"
+          hdiutil attach -nobrowse -readonly -mountpoint "${mount_point}" "${dmg}"
+          cleanup() { hdiutil detach "${mount_point}" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          runtime="${mount_point}/Sigma Runtime"
+          "${runtime}/bin/agent" doctor --json > "${RUNNER_TEMP}/readonly-runtime-doctor.json"
+          cat "${RUNNER_TEMP}/readonly-runtime-doctor.json"
+          node --input-type=module <<'NODE'
+          import { readFileSync } from "node:fs";
+          const report = JSON.parse(readFileSync(process.env.RUNNER_TEMP + "/readonly-runtime-doctor.json", "utf8"));
+          if (report.sandbox?.available !== true || report.sandbox?.selfTestPassed !== true) {
+            throw new Error(`Read-only Runtime sandbox self-test failed: ${JSON.stringify(report.sandbox)}`);
+          }
+          if (report.sandbox.backend !== "seatbelt+sandbox-exec+forkpty") {
+            throw new Error(`Unexpected read-only Runtime sandbox backend: ${report.sandbox.backend}`);
+          }
+          if (report.capabilities?.pty !== true
+            || report.capabilities?.processHandoff !== false
+            || JSON.stringify(report.capabilities?.networkModes) !== JSON.stringify(["none", "full"])
+            || report.capabilities?.enclosingContainerRoot?.available !== false) {
+            throw new Error(`Unexpected read-only Runtime capabilities: ${JSON.stringify(report.capabilities)}`);
+          }
+          NODE
       - name: Required Seatbelt, network, forkpty, timeout, and process-tree test
         run: >-
           python3 scripts/ci/macos-sandbox-smoke.py
