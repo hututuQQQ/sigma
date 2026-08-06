@@ -99,8 +99,12 @@ export function resolveEvaluatorHost(platform = process.platform, arch = process
     packageTarget: "windows", targetPlatform: "win32", targetArch: "x64",
     bundleName: "agent-cli-win32-x64", brokerName: "sigma-exec.exe", nativeTarget: "win32-x64"
   };
+  if (platform === "darwin" && arch === "arm64") return {
+    packageTarget: "macos", targetPlatform: "darwin", targetArch: "arm64",
+    bundleName: "agent-cli-darwin-arm64", brokerName: "sigma-exec", nativeTarget: "darwin-arm64"
+  };
   throw Object.assign(new Error(
-    `Unsupported evaluator host '${platform}-${arch}'. Supported hosts are linux-x64 and win32-x64.`
+    `Unsupported evaluator host '${platform}-${arch}'. Supported hosts are linux-x64, win32-x64, and darwin-arm64.`
   ), { code: "unsupported_evaluator_host", platform, arch });
 }
 

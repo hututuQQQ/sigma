@@ -21,6 +21,15 @@ const sensitiveExtensions = new Set([
   ".tfstate"
 ]);
 
+export function lexicalPathOrder(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+export function resolvedPathIdentity(value: string): string {
+  const resolved = path.resolve(value);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
 function hiddenName(name: string): boolean {
   return name.startsWith(".");
 }

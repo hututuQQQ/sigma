@@ -136,7 +136,8 @@
       "riskClass": "read_only",
       "platforms": [
         "win32-x64",
-        "linux-x64"
+        "linux-x64",
+        "darwin-arm64"
       ],
       "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f"
     },
@@ -200,7 +201,8 @@
       "riskClass": "workspace_write",
       "platforms": [
         "win32-x64",
-        "linux-x64"
+        "linux-x64",
+        "darwin-arm64"
       ],
       "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f"
     },
@@ -268,7 +270,8 @@
       "riskClass": "workspace_write",
       "platforms": [
         "win32-x64",
-        "linux-x64"
+        "linux-x64",
+        "darwin-arm64"
       ],
       "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f"
     },
@@ -336,7 +339,8 @@
       "riskClass": "interactive",
       "platforms": [
         "win32-x64",
-        "linux-x64"
+        "linux-x64",
+        "darwin-arm64"
       ],
       "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f"
     },
@@ -410,7 +414,8 @@
       "riskClass": "interactive",
       "platforms": [
         "win32-x64",
-        "linux-x64"
+        "linux-x64",
+        "darwin-arm64"
       ],
       "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f"
     },

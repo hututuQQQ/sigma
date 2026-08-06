@@ -11,7 +11,7 @@ export interface SubjectProductAttestation {
   productDigest: string;
   buildArtifactDigest: string;
   environmentDigest: string;
-  platform: "win32" | "linux";
+  platform: "win32" | "linux" | "darwin";
 }
 
 export interface SubjectAttestationContext extends SubjectProductAttestation {
@@ -64,9 +64,9 @@ function model(value: unknown): string {
   return value;
 }
 
-function platform(value: unknown): "win32" | "linux" {
-  if (value !== "win32" && value !== "linux") {
-    throw new Error("Subject attestation platform must be win32 or linux.");
+function platform(value: unknown): "win32" | "linux" | "darwin" {
+  if (value !== "win32" && value !== "linux" && value !== "darwin") {
+    throw new Error("Subject attestation platform must be win32, linux, or darwin.");
   }
   return value;
 }

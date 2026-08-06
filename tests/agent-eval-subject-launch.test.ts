@@ -28,13 +28,13 @@ async function portableFile(root: string, relative: string, contents: string): P
   return { path: relative, size: bytes.length, sha256: sha256(bytes) };
 }
 
-async function packagedSubject(targetPlatform: "linux" | "win32"): Promise<{
+async function packagedSubject(targetPlatform: "linux" | "win32" | "darwin"): Promise<{
   root: string;
   paths: { node: string; cli: string; broker: string; wrapper: string };
 }> {
   const root = await mkdtemp(path.join(os.tmpdir(), "sigma-package-launch-"));
   temporary.push(root);
-  const targetArch = "x64";
+  const targetArch = targetPlatform === "darwin" ? "arm64" : "x64";
   const paths = {
     node: `bin/${targetPlatform === "win32" ? "node.exe" : "node"}`,
     cli: "packages/agent-cli/dist/index.js",
@@ -43,7 +43,7 @@ async function packagedSubject(targetPlatform: "linux" | "win32"): Promise<{
   };
   const packageValue = {
     name: `sigma-agent-cli-${targetPlatform}-${targetArch}`,
-    version: "0.1.5",
+    version: "0.1.6",
     bin: { agent: `./${paths.wrapper}` }
   };
   await writeFile(path.join(root, "package.json"), `${JSON.stringify(packageValue)}\n`, "utf8");
@@ -90,9 +90,10 @@ async function packagedSubject(targetPlatform: "linux" | "win32"): Promise<{
 }
 
 describe("packaged subject launch contract", () => {
-  it.each(["linux", "win32"] as const)("binds the %s launch to manifest-covered bundle files", async (targetPlatform) => {
+  it.each(["linux", "win32", "darwin"] as const)("binds the %s launch to manifest-covered bundle files", async (targetPlatform) => {
     const fixture = await packagedSubject(targetPlatform);
-    const subject = await loadPackagedSubjectLaunch(fixture.root, { targetPlatform, targetArch: "x64" });
+    const targetArch = targetPlatform === "darwin" ? "arm64" : "x64";
+    const subject = await loadPackagedSubjectLaunch(fixture.root, { targetPlatform, targetArch });
     expect(subject).toMatchObject({
       nodePath: path.join(fixture.root, ...fixture.paths.node.split("/")),
       cliEntry: path.join(fixture.root, ...fixture.paths.cli.split("/")),

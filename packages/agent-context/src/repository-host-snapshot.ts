@@ -1,8 +1,8 @@
-import type { Dirent } from "node:fs";
 import path from "node:path";
 import {
   pinWorkspaceTransactionDirectories,
   resolveWorkspacePath,
+  type WorkspaceDirectoryEntry,
   type WorkspaceTransactionDirectoryLease
 } from "agent-platform";
 import createIgnore from "ignore";
@@ -12,6 +12,8 @@ import {
   type RepositorySnapshot
 } from "./repository-path-metadata.js";
 import {
+  lexicalPathOrder,
+  resolvedPathIdentity,
   safeAutomaticDirectoryName,
   safeAutomaticFileName
 } from "./repository-path-safety.js";
@@ -54,9 +56,13 @@ interface HostQueueEntry {
   ignoreScope?: IgnoreScope;
 }
 
-interface LockedHostQueueEntry extends HostQueueEntry {
+interface ResolvedHostQueueEntry extends HostQueueEntry {
   directory: string;
   pinnedDirectory: string;
+}
+
+interface LockedHostQueueEntry extends ResolvedHostQueueEntry {
+  lease: WorkspaceTransactionDirectoryLease;
 }
 
 interface HostScanState {
@@ -76,10 +82,6 @@ interface HostScanState {
 
 function repositoryPath(relative: string, name: string): string {
   return (relative ? `${relative}/${name}` : name).replaceAll("\\", "/");
-}
-
-function lexicalOrder(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function scanLimitReached(state: HostScanState, signal: AbortSignal): boolean {
@@ -147,7 +149,7 @@ function indexEntry(
   state: HostScanState,
   queueEntry: LockedHostQueueEntry,
   scope: IgnoreScope | undefined,
-  entry: Dirent,
+  entry: WorkspaceDirectoryEntry,
   signal: AbortSignal
 ): boolean {
   if (scanLimitReached(state, signal)) return false;
@@ -183,7 +185,7 @@ async function scanDirectory(
     const queueStart = state.nextQueue.length;
     try {
       const collected = await boundedDirectoryEntries(
-        queueEntry.pinnedDirectory,
+        queueEntry.lease.directoryEntries(queueEntry.directory),
         MAX_SCANNED_ENTRIES - state.scannedEntries,
         state.deadline,
         signal
@@ -208,14 +210,9 @@ async function scanDirectory(
   }
 }
 
-function pathIdentity(value: string): string {
-  const resolved = path.resolve(value);
-  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
-}
-
 async function pinResolvedBatch(
   workspace: string,
-  entries: LockedHostQueueEntry[],
+  entries: ResolvedHostQueueEntry[],
   state: HostScanState,
   signal: AbortSignal
 ): Promise<LockedHostQueueEntry[]> {
@@ -236,14 +233,15 @@ async function pinResolvedBatch(
     for (const entry of entries) {
       signal.throwIfAborted();
       const verified = await resolveWorkspacePath(workspace, entry.relative || ".");
-      if (pathIdentity(verified) !== pathIdentity(entry.directory)) {
+      if (resolvedPathIdentity(verified) !== resolvedPathIdentity(entry.directory)) {
         throw new Error(`Locked repository directory changed: ${entry.relative}`);
       }
     }
     await activeLease.verify();
     const pinnedEntries = entries.map((entry) => ({
       ...entry,
-      pinnedDirectory: activeLease.pinnedPath(entry.directory)
+      pinnedDirectory: activeLease.pinnedPath(entry.directory),
+      lease: activeLease
     }));
     for (const entry of pinnedEntries) {
       state.access.bindDirectory(entry.relative, entry.pinnedDirectory);
@@ -285,10 +283,10 @@ async function pinDirectoryEntries(
   state: HostScanState,
   signal: AbortSignal
 ): Promise<LockedHostQueueEntry[]> {
-  entries.sort((left, right) => lexicalOrder(left.relative, right.relative));
+  entries.sort((left, right) => lexicalPathOrder(left.relative, right.relative));
   const remaining = Math.max(0, MAX_LOCKED_DIRECTORIES - state.lockedDirectories);
   if (entries.length > remaining) state.truncated = true;
-  const resolved: LockedHostQueueEntry[] = [];
+  const resolved: ResolvedHostQueueEntry[] = [];
   for (const entry of entries.slice(0, remaining)) {
     if (scanLimitReached(state, signal)) break;
     try {
@@ -365,7 +363,7 @@ export async function withHostRepositorySnapshot<T>(
     }
     scanLimitReached(state, signal);
     await verifySnapshotLeases(state, signal);
-    state.files.sort(lexicalOrder);
+    state.files.sort(lexicalPathOrder);
     state.access.restrictFiles(state.files);
     result = await consume({
       files: state.files,

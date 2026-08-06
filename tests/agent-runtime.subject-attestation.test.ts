@@ -28,12 +28,16 @@ function productAttestation() {
     productDigest: sha("a"),
     buildArtifactDigest: sha("b"),
     environmentDigest: sha("c"),
-    platform: process.platform as "win32" | "linux"
+    platform: process.platform as "win32" | "linux" | "darwin"
   };
 }
 
 describe("runtime subject attestation", () => {
   it("rejects unavailable or evaluator-shaped launcher input", () => {
+    expect(assertSubjectProductAttestation({
+      ...productAttestation(),
+      platform: "darwin"
+    })).toMatchObject({ platform: "darwin" });
     expect(() => assertSubjectProductAttestation({
       ...productAttestation(),
       taskId: "forbidden"

@@ -113,7 +113,9 @@ function parseSubjectAttestationEvent(event) {
   ], "Subject attestation");
   if (diagnostic.schemaVersion !== 1) throw new Error("Subject attestation schemaVersion must equal 1.");
   const platform = diagnostic.platform;
-  if (platform !== "win32" && platform !== "linux") throw new Error("Subject attestation platform is unsupported.");
+  if (!new Set(["win32", "linux", "darwin"]).has(platform)) {
+    throw new Error("Subject attestation platform is unsupported.");
+  }
   const value = {
     productDigest: digestField(diagnostic.productDigest, "Subject attestation productDigest"),
     buildArtifactDigest: digestField(diagnostic.buildArtifactDigest, "Subject attestation buildArtifactDigest"),
