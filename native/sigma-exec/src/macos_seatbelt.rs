@@ -10,6 +10,7 @@ use std::fs::File;
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -64,15 +65,19 @@ fn run_internal_probe(arguments: Vec<OsString>) -> i32 {
         }
     };
 
-    if !matches!(
-        std::fs::read_to_string(readable.join("allowed.txt")).as_deref(),
-        Ok("allowed")
-    ) {
-        eprintln!("Seatbelt probe could not read the declared readable root");
-        return 3;
+    match std::fs::read_to_string(readable.join("allowed.txt")) {
+        Ok(contents) if contents == "allowed" => {}
+        Ok(contents) => {
+            eprintln!("Seatbelt probe read unexpected declared-root contents: {contents:?}");
+            return 3;
+        }
+        Err(error) => {
+            eprintln!("Seatbelt probe could not read the declared readable root: {error}");
+            return 3;
+        }
     }
-    if std::fs::write(writable.join("allowed-write.txt"), b"allowed").is_err() {
-        eprintln!("Seatbelt probe could not write the declared writable root");
+    if let Err(error) = std::fs::write(writable.join("allowed-write.txt"), b"allowed") {
+        eprintln!("Seatbelt probe could not write the declared writable root: {error}");
         return 4;
     }
     if std::fs::read_to_string(forbidden.join("forbidden.txt")).is_ok() {
@@ -88,15 +93,15 @@ fn run_internal_probe(arguments: Vec<OsString>) -> i32 {
         return 7;
     }
 
-    let connected = TcpStream::connect(("127.0.0.1", port)).is_ok();
-    match (mode.as_ref(), connected) {
-        ("none", false) | ("loopback", true) => 0,
-        ("none", true) => {
+    let connection = TcpStream::connect(("127.0.0.1", port));
+    match (mode.as_ref(), &connection) {
+        ("none", Err(_)) | ("loopback", Ok(_)) => 0,
+        ("none", Ok(_)) => {
             eprintln!("Seatbelt no-network probe unexpectedly connected to loopback");
             8
         }
-        ("loopback", false) => {
-            eprintln!("Seatbelt loopback probe could not connect to loopback");
+        ("loopback", Err(error)) => {
+            eprintln!("Seatbelt loopback probe could not connect to loopback: {error}");
             9
         }
         _ => 2,
@@ -208,8 +213,8 @@ fn run_policy_probe(
         Err(RpcError::new(
             "sandbox_unavailable",
             format!(
-                "macOS Seatbelt {mode} self-test failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                "macOS Seatbelt {mode} self-test failed ({})",
+                output_failure(&output)
             ),
         ))
     }
@@ -249,11 +254,28 @@ fn run_pty_probe(readable: &Path) -> Result<(), RpcError> {
         Err(RpcError::new(
             "sandbox_unavailable",
             format!(
-                "macOS Seatbelt forkpty self-test failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                "macOS Seatbelt forkpty self-test failed ({})",
+                output_failure(&output)
             ),
         ))
     }
+}
+
+fn output_failure(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    format!(
+        "exitCode={}, signal={}, stderr={}",
+        output
+            .status
+            .code()
+            .map_or_else(|| "none".to_owned(), |code| code.to_string()),
+        output
+            .status
+            .signal()
+            .map_or_else(|| "none".to_owned(), |signal| signal.to_string()),
+        if stderr.is_empty() { "<empty>" } else { stderr }
+    )
 }
 
 pub(crate) fn prepare_command(
@@ -563,5 +585,12 @@ mod tests {
         assert!(policy.contains("subpath (param \"WRITE_ROOT_0\")"));
         assert!(policy.contains("require-not (literal (param \"PROTECTED_0\"))"));
         assert!(policy.contains("require-not (subpath (param \"PROTECTED_0\"))"));
+    }
+
+    #[test]
+    fn platform_policy_keeps_firmlink_traversal_read_only() {
+        assert!(PLATFORM_POLICY.contains("/System/Volumes/Data/Users"));
+        assert!(!PLATFORM_POLICY.contains("file-write* (subpath \"/tmp\")"));
+        assert!(!PLATFORM_POLICY.contains("com.apple.app-sandbox.read-write"));
     }
 }

@@ -4,10 +4,13 @@
   (subpath "/Library/Filesystems/NetFSPlugins")
   (subpath "/Library/Preferences")
   (subpath "/System/Library")
+  (subpath "/System/iOSSupport/System/Library")
   (subpath "/usr/lib")
   (subpath "/usr/share")
   (subpath "/private/var/db/timezone")
-  (subpath "/private/var/db/DarwinDirectory/local/recordStore.data"))
+  (subpath "/private/var/db/DarwinDirectory/local/recordStore.data")
+  (subpath "/var/db")
+  (subpath "/private/var/db"))
 
 (allow file-map-executable
   (subpath "/Library/Apple/System/Library/Frameworks")
@@ -16,6 +19,10 @@
   (subpath "/System/Library/Frameworks")
   (subpath "/System/Library/PrivateFrameworks")
   (subpath "/System/Library/SubFrameworks")
+  (subpath "/System/Library/Extensions")
+  (subpath "/System/iOSSupport/System/Library/Frameworks")
+  (subpath "/System/iOSSupport/System/Library/PrivateFrameworks")
+  (subpath "/System/iOSSupport/System/Library/SubFrameworks")
   (subpath "/usr/lib"))
 
 (allow system-mac-syscall (mac-policy-name "vnguard"))
@@ -32,8 +39,18 @@
   (path-ancestors "/System/Volumes/Data/private"))
 
 (allow file-read* file-test-existence
+  (literal "/System/Library/CoreServices")
+  (literal "/System/Library/CoreServices/.SystemVersionPlatform.plist")
+  (literal "/System/Library/CoreServices/SystemVersion.plist"))
+
+(allow file-read-metadata
+  (subpath "/var")
+  (subpath "/private/var"))
+
+(allow file-read* file-test-existence
   (literal "/dev/random")
   (literal "/dev/urandom")
+  (literal "/dev/autofs_nowait")
   (literal "/dev/null")
   (literal "/dev/zero")
   (literal "/private/etc/master.passwd")
@@ -62,15 +79,35 @@
 (allow file-read* file-write* (literal "/dev/tty"))
 (allow file-read-metadata (literal "/dev") (regex #"^/dev/.*$"))
 
+(allow file-read-metadata
+  (literal "/dev/stdin")
+  (literal "/dev/stdout")
+  (literal "/dev/stderr")
+  (regex #"^/dev/tty[^/]*$")
+  (regex #"^/dev/pty[^/]*$"))
+
+; /Users is a firmlink into /System/Volumes/Data on modern macOS. These rules
+; only expose directory metadata needed to reach explicitly parameterized roots.
+(allow file-read-metadata (literal "/System/Volumes") (vnode-type DIRECTORY))
+(allow file-read-metadata (literal "/System/Volumes/Data") (vnode-type DIRECTORY))
+(allow file-read-metadata (literal "/System/Volumes/Data/Users") (vnode-type DIRECTORY))
+
 (allow mach-lookup
   (global-name "com.apple.analyticsd")
+  (global-name "com.apple.analyticsd.messagetracer")
   (global-name "com.apple.appsleep")
   (global-name "com.apple.bsd.dirhelper")
   (global-name "com.apple.diagnosticd")
+  (global-name "com.apple.dt.automationmode.reader")
+  (global-name "com.apple.espd")
   (global-name "com.apple.logd")
+  (global-name "com.apple.logd.events")
   (global-name "com.apple.runningboard")
   (global-name "com.apple.secinitd")
   (global-name "com.apple.system.opendirectoryd.membership")
+  (global-name "com.apple.system.DirectoryService.libinfo_v1")
+  (global-name "com.apple.system.logger")
+  (global-name "com.apple.system.notification_center")
   (global-name "com.apple.trustd")
   (global-name "com.apple.trustd.agent")
   (global-name "com.apple.SecurityServer")
@@ -78,6 +115,9 @@
   (global-name "com.apple.ocspd")
   (global-name "com.apple.SystemConfiguration.DNSConfiguration")
   (global-name "com.apple.SystemConfiguration.configd"))
+
+(allow ipc-posix-shm-read*
+  (ipc-posix-name "apple.shm.notification_center"))
 
 (allow system-socket
   (require-all (socket-domain AF_SYSTEM) (socket-protocol 2)))
