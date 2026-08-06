@@ -114,10 +114,11 @@ pub(crate) fn detect() -> Result<(), RpcError> {
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_nanos())
         .unwrap_or(0);
-    let base = std::env::temp_dir().join(format!(
+    let requested_base = std::env::temp_dir().join(format!(
         "sigma-seatbelt-self-test-{}-{nonce}",
         std::process::id()
     ));
+    let base = create_canonical_self_test_root(&requested_base)?;
     let readable = base.join("readable");
     let writable = readable.join("writable");
     let protected = writable.join("protected");
@@ -149,6 +150,19 @@ pub(crate) fn detect() -> Result<(), RpcError> {
     })();
     let _ = std::fs::remove_dir_all(&base);
     result
+}
+
+fn create_canonical_self_test_root(requested: &Path) -> Result<PathBuf, RpcError> {
+    std::fs::create_dir_all(requested).map_err(RpcError::from)?;
+    requested.canonicalize().map_err(|error| {
+        RpcError::new(
+            "sandbox_unavailable",
+            format!(
+                "cannot resolve macOS Seatbelt self-test root '{}': {error}",
+                requested.display()
+            ),
+        )
+    })
 }
 
 fn validate_sandbox_executable() -> Result<(), RpcError> {
@@ -574,6 +588,7 @@ fn sandbox_command(profile: &SeatbeltProfile) -> Result<Command, RpcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
 
     #[test]
     fn write_policy_excludes_protected_paths() {
@@ -593,5 +608,33 @@ mod tests {
         assert!(PLATFORM_POLICY.contains("/System/Volumes/Data/Users"));
         assert!(!PLATFORM_POLICY.contains("file-write* (subpath \"/tmp\")"));
         assert!(!PLATFORM_POLICY.contains("com.apple.app-sandbox.read-write"));
+    }
+
+    #[test]
+    fn self_test_root_resolves_symlink_aliases_before_building_the_profile() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0);
+        let fixture = std::env::temp_dir().join(format!(
+            "sigma-seatbelt-canonical-root-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let actual_parent = fixture.join("actual");
+        let alias = fixture.join("alias");
+        std::fs::create_dir_all(&actual_parent).expect("create actual self-test parent");
+        symlink(&actual_parent, &alias).expect("create self-test path alias");
+
+        let resolved = create_canonical_self_test_root(&alias.join("probe"))
+            .expect("canonicalize self-test root through alias");
+        assert_eq!(
+            resolved,
+            actual_parent
+                .canonicalize()
+                .expect("canonical actual self-test parent")
+                .join("probe")
+        );
+
+        std::fs::remove_dir_all(&fixture).expect("remove canonical-root fixture");
     }
 }

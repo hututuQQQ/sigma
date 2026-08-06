@@ -369,19 +369,20 @@ jobs:
         run: |
           set -euo pipefail
           image_root="${RUNNER_TEMP}/sigma-runtime-image"
-          source_root="${image_root}/Sigma Runtime"
+          source_root="${image_root}/Sigma Code.app/Contents/Resources/sigma-runtime"
           dmg="${RUNNER_TEMP}/sigma-runtime-readonly.dmg"
-          mount_point="${RUNNER_TEMP}/sigma runtime mounted"
+          mount_point="${RUNNER_TEMP}/sigma app mounted"
           rm -rf "${image_root}" "${mount_point}"
           rm -f "${dmg}"
           mkdir -p "${source_root}" "${mount_point}"
           cp -R .artifacts/agent-cli-darwin-arm64/. "${source_root}/"
-          hdiutil create -quiet -volname "Sigma Runtime Test" -fs HFS+ -srcfolder "${image_root}" "${dmg}"
+          hdiutil create -quiet -volname "Sigma App Runtime Test" -fs HFS+ -srcfolder "${image_root}" "${dmg}"
           hdiutil attach -nobrowse -readonly -mountpoint "${mount_point}" "${dmg}"
           cleanup() { hdiutil detach "${mount_point}" >/dev/null 2>&1 || true; }
           trap cleanup EXIT
-          runtime="${mount_point}/Sigma Runtime"
-          "${runtime}/bin/agent" doctor --json > "${RUNNER_TEMP}/readonly-runtime-doctor.json"
+          runtime="${mount_point}/Sigma Code.app/Contents/Resources/sigma-runtime"
+          test "$(cd /var/tmp && pwd -P)" = "/private/var/tmp"
+          TMPDIR=/var/tmp "${runtime}/bin/agent" doctor --json > "${RUNNER_TEMP}/readonly-runtime-doctor.json"
           cat "${RUNNER_TEMP}/readonly-runtime-doctor.json"
           node --input-type=module <<'NODE'
           import { readFileSync } from "node:fs";
