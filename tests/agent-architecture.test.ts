@@ -26,11 +26,15 @@ import { createApprovingReviewer } from "./helpers/approving-reviewer.js";
 import { registerContentValidator, validationTurn } from "./helpers/content-validator.js";
 import {
   completeAgentEventPayload,
+  persistCompiledHarnessFixture,
   persistEmptyCustomization
 } from "./testkit/agent-event-fixtures.js";
 
 const createRuntime = (options: Parameters<typeof createBaseRuntime>[0]) => createBaseRuntime({
   ...options,
+  // This suite injects its registry as an external test surface. Production
+  // composition supplies the exact built-in list before MCP tools connect.
+  builtinToolNames: options.builtinToolNames ?? [],
   reviewer: createApprovingReviewer()
 });
 
@@ -270,7 +274,7 @@ describe("Sigma architecture", () => {
           content: "",
           toolCalls: [{
             id: "inspect-files",
-            name: "batch_read",
+            name: "read_batch",
             arguments: {
               calls: [
                 { name: "read", arguments: { path: "first.txt" } },
@@ -304,7 +308,7 @@ describe("Sigma architecture", () => {
       message: "Inspected both files."
     });
 
-    expect(gateway.requests[0]?.tools.map((tool) => tool.name)).toContain("batch_read");
+    expect(gateway.requests[0]?.tools.map((tool) => tool.name)).toContain("read_batch");
     const modelReceipts = gateway.requests[1]?.messages.filter((message) => message.role === "tool") ?? [];
     expect(modelReceipts).toHaveLength(1);
     expect(modelReceipts[0]).toMatchObject({ toolCallId: "inspect-files" });
@@ -624,6 +628,18 @@ describe("Sigma architecture", () => {
       idempotence: "replay_safe"
     };
     const customization = await persistEmptyCustomization(storeRootDir, "session");
+    const gateway = new FakeGateway([
+      validationTurn("validate-restored-write", [{ path: "restored.txt", expected: "ok" }]),
+      { message: { role: "assistant", content: "restored" }, finishReason: "stop" },
+      { message: { role: "assistant", content: "restored" }, finishReason: "stop" }
+    ]);
+    const tools = registerContentValidator(registerBuiltinTools(new EffectToolRegistry()));
+    const harness = await persistCompiledHarnessFixture(
+      storeRootDir,
+      "session",
+      gateway,
+      tools.descriptors().map((tool) => tool.name)
+    );
     const persisted = [
       event(1, "session.created", { workspacePath: workspace, mode: "change" }),
       event(2, "customization.frozen", customization),
@@ -662,18 +678,15 @@ describe("Sigma architecture", () => {
         toolName: "write", arguments: { path: "restored.txt", content: "ok" },
         effects: ["filesystem.read", "filesystem.write"], plan: restoredPlan
       }),
-      event(11, "run.suspended", { turnId: 1, effectRevision: 5, requestId: "restored-write", callId: "restored-write", message: "approval required" })
+      event(11, "run.suspended", { turnId: 1, effectRevision: 5, requestId: "restored-write", callId: "restored-write", message: "approval required" }),
+      event(12, "harness.compiled", harness)
     ];
     for (const stored of persisted) await store.append(stored, stored.seq - 1);
     const runtime = createRuntime({
-      gateway: new FakeGateway([
-        validationTurn("validate-restored-write", [{ path: "restored.txt", expected: "ok" }]),
-        { message: { role: "assistant", content: "restored" }, finishReason: "stop" },
-        { message: { role: "assistant", content: "restored" }, finishReason: "stop" }
-      ]),
+      gateway,
       store: new SegmentedJsonlStore({ rootDir: storeRootDir }),
       storeRootDir,
-      tools: registerContentValidator(registerBuiltinTools(new EffectToolRegistry())),
+      tools,
       permissionMode: "ask",
       runDeadlineMs: 60_000
     });

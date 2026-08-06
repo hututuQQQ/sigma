@@ -1,12 +1,13 @@
 import type { McpServerConfigValue } from "agent-config";
+import { planContext } from "agent-context";
 import type { ExecutionBroker } from "agent-execution";
 import type { HookRunnerPort } from "agent-extensions";
-import type { JsonValue, RunStore } from "agent-protocol";
+import type { JsonValue, ModelGateway, RunMode, RunStore } from "agent-protocol";
 import type { SegmentedJsonlStore } from "agent-store";
 import type { AgentSupervisor } from "agent-supervisor";
 import { connectMcpServers } from "./composition-mcp.js";
 import type { RuntimeMcpHttpServerConfig } from "./composition-mcp.js";
-import { createRuntime } from "./create-runtime.js";
+import { createRuntime, type CreateRuntimeOptions } from "./create-runtime.js";
 import { auditDurableChildren } from "./durable-children.js";
 import { brokerRuntimeEnvironment } from "./execution-capabilities.js";
 import type { RuntimeCustomization } from "./customization.js";
@@ -14,6 +15,13 @@ import type { createRoleGateways } from "./model-composition.js";
 import type { SubjectAttestationContext } from "./subject-attestation.js";
 import type { ChildJoinSummary } from "./types.js";
 import type { createConfiguredTools } from "./configured-runtime-tools.js";
+import type { FrozenHarnessBuild, HarnessReasoningEffort } from "./harness-compiler.js";
+import { compileRuntimeHarness } from "./runtime-harness.js";
+import { baseContext } from "./runtime-context.js";
+import { modelTools } from "./effect-helpers.js";
+import { projectModelToolDescriptors } from "./model-tool-projection.js";
+import { withReadBatchDescriptor } from "./read-batch-tool.js";
+import { projectInitialHarnessToolDescriptors } from "./harness-tool-projection.js";
 
 export interface RuntimeAssemblyConfig {
   runDeadlineSec: number;
@@ -25,6 +33,7 @@ export interface RuntimeAssemblyConfig {
   executionMode?: "sandboxed" | "container";
   writeScope?: "workspace" | "enclosing-container";
   checkpoint?: { maxFiles: number; maxBytes: number };
+  reasoningEffort?: HarnessReasoningEffort;
 }
 
 export interface RuntimeAssemblyPrepared {
@@ -82,6 +91,74 @@ async function joinChildren(
   };
 }
 
+async function measureInitialHarnessTokens(input: {
+  build: FrozenHarnessBuild;
+  mode: RunMode;
+  runtimeOptions: CreateRuntimeOptions;
+  gateway: ModelGateway;
+  tools: ReturnType<typeof createConfiguredTools>;
+  skillsAvailable: boolean;
+}) {
+  const { build, mode, runtimeOptions, gateway, tools, skillsAvailable } = input;
+  const descriptors = projectInitialHarnessToolDescriptors(
+    build,
+    withReadBatchDescriptor(projectModelToolDescriptors(
+      tools.modelDescriptors?.() ?? tools.descriptors(),
+      {
+        skillsAvailable,
+        environmentMutationAvailable: mode === "change",
+        processControlsAvailable: false,
+        childControlsAvailable: false,
+        planReadRequired: false
+      }
+    ))
+  );
+  const definitions = modelTools(descriptors);
+  const prompt = planContext({
+    system: baseContext(runtimeOptions.runtimeEnvironment, build),
+    history: [],
+    dynamic: [],
+    tools: definitions,
+    contextWindowTokens: gateway.capabilities.contextWindowTokens,
+    outputReserveTokens: 0,
+    promptCache: false
+  }).messages;
+  const [mandatoryPromptTokens, initialToolSchemaTokens, combinedTokens] =
+    await Promise.all([
+      gateway.countTokens(prompt, []),
+      gateway.countTokens([], definitions),
+      gateway.countTokens(prompt, definitions)
+    ]);
+  return {
+    tokenizer: gateway.capabilities.tokenizer,
+    countMethod: "gateway.countTokens" as const,
+    mandatoryPromptTokens,
+    initialToolSchemaTokens,
+    combinedTokens,
+    mandatoryPromptBytes: Buffer.byteLength(JSON.stringify(prompt), "utf8"),
+    initialToolSchemaBytes: Buffer.byteLength(JSON.stringify(definitions), "utf8")
+  };
+}
+
+function createHarnessInspectors(input: {
+  runtimeOptions: CreateRuntimeOptions;
+  gateway: ModelGateway;
+  tools: ReturnType<typeof createConfiguredTools>;
+  customization: RuntimeCustomization;
+}) {
+  const { runtimeOptions, gateway, tools, customization } = input;
+  const inspectHarness = (mode: RunMode) => compileRuntimeHarness(
+    runtimeOptions, gateway, "orchestrator", mode, customization.profile
+  );
+  return {
+    inspectHarness,
+    inspectHarnessTokens: async (mode: RunMode) => await measureInitialHarnessTokens({
+      build: inspectHarness(mode), mode, runtimeOptions, gateway, tools,
+      skillsAvailable: customization.skills.descriptors.length > 0
+    })
+  };
+}
+
 export function createComposedRuntime(input: {
   config: RuntimeAssemblyConfig;
   interactiveApprovals: boolean;
@@ -90,6 +167,7 @@ export function createComposedRuntime(input: {
   tools: ReturnType<typeof createConfiguredTools>;
   store: SegmentedJsonlStore;
   supervisor: AgentSupervisor;
+  builtinToolNames: readonly string[];
   subjectAttestation: SubjectAttestationContext | undefined;
   agentProfileHookRunner?: HookRunnerPort;
 }) {
@@ -101,11 +179,12 @@ export function createComposedRuntime(input: {
     tools,
     store,
     supervisor,
+    builtinToolNames,
     subjectAttestation,
     agentProfileHookRunner
   } = input;
   const { storeRootDir, customization, execution, executionReport, hookRunner } = prepared;
-  return createRuntime({
+  const runtimeOptions: CreateRuntimeOptions = {
     gateway: gateways.orchestrator,
     store,
     storeRootDir,
@@ -133,6 +212,8 @@ export function createComposedRuntime(input: {
       enclosingContainerAttestationDigest:
         executionReport.capabilities.enclosingContainerRoot?.attestationDigest
     },
+    ...(config.reasoningEffort ? { reasoningEffort: config.reasoningEffort } : {}),
+    builtinToolNames,
     subjectAttestation,
     skills: customization.skills,
     hooks: customization.hookDefinitions,
@@ -145,5 +226,12 @@ export function createComposedRuntime(input: {
       await supervisor.cancelParent(parentId, parentRunId, reason),
     hasActiveChildren: (parentId) => supervisor.list(parentId)
       .some((child) => child.status === "queued" || child.status === "running")
+  };
+  const inspectors = createHarnessInspectors({
+    runtimeOptions, gateway: gateways.orchestrator, tools, customization
   });
+  return {
+    runtime: createRuntime(runtimeOptions),
+    ...inspectors
+  };
 }

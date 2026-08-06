@@ -1,6 +1,7 @@
 import type { ContentAddressedArtifactStore } from "agent-store";
 import { restoreRuntimeCustomization } from "./runtime-customization-restore.js";
 import { hydrateRuntimeSession } from "./runtime-session-restore.js";
+import { restoreRuntimeHarness } from "./runtime-harness.js";
 import type { OpenCheckpointRecoveryResult } from "./runtime-control-contracts.js";
 import type { RuntimeOptions, RuntimeSession } from "./types.js";
 
@@ -31,6 +32,7 @@ export async function resumeRuntimeSession(
     options.runtime.runtimeEnvironment
   );
   await restoreRuntimeCustomization(session, options.artifacts, options.runtime);
+  await restoreRuntimeHarness(session, options.artifacts, options.runtime);
   await options.bind(session);
   options.accept(session);
   const recovery = await options.recoverOpen(session);

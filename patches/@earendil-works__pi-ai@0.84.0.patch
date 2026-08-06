@@ -1,0 +1,59 @@
+diff --git a/dist/api/openai-codex-responses.js b/dist/api/openai-codex-responses.js
+index 603ab2e3b082669045b7ecb849bd33f45918bce5..5e9359200911559f994689adfef3bf29acc62d7c 100644
+--- a/dist/api/openai-codex-responses.js
++++ b/dist/api/openai-codex-responses.js
+@@ -349,6 +349,16 @@ export const stream = (model, context, options) => {
+                 delete block.customInput;
+             }
+             output.stopReason = options?.signal?.aborted ? "aborted" : "error";
++            if (error instanceof CodexApiError && error.eventType) {
++                appendAssistantMessageDiagnostic(output, {
++                    type: "codex_provider_failure",
++                    timestamp: Date.now(),
++                    details: {
++                        providerEventType: error.eventType,
++                        ...(error.code ? { providerErrorCode: error.code } : {}),
++                    },
++                });
++            }
+             output.errorMessage = formatProviderError(normalizeProviderError(error));
+             stream.push({ type: "error", reason: output.stopReason, error: output });
+             stream.end();
+@@ -481,11 +491,13 @@ async function processStream(response, output, stream, model, grammarToolInputPr
+ class CodexApiError extends Error {
+     code;
+     payload;
++    eventType;
+     constructor(message, options) {
+         super(message);
+         this.name = "CodexApiError";
+         this.code = options?.code;
+         this.payload = options?.payload;
++        this.eventType = options?.eventType;
+         this.cause = options?.cause;
+     }
+ }
+@@ -525,16 +537,21 @@ async function* mapCodexEvents(events) {
+             continue;
+         if (type === "error") {
+             const { code, message } = extractCodexEventError(event);
+-            throw new CodexApiError(`Codex error: ${message || code || JSON.stringify(event)}`, {
++            throw new CodexApiError(message || code || "Codex stream error", {
+                 code,
+                 payload: event,
++                eventType: "error",
+             });
+         }
+         if (type === "response.failed") {
+             const response = event.response;
+             const code = response?.error?.code;
+             const message = response?.error?.message;
+-            throw new CodexApiError(message || "Codex response failed", { code, payload: event });
++            throw new CodexApiError(message || "Codex response failed", {
++                code,
++                payload: event,
++                eventType: "response_failed",
++            });
+         }
+         if (type === "response.done" || type === "response.completed" || type === "response.incomplete") {
+             const response = event.response;

@@ -94,7 +94,10 @@ async function archiveItem(
 ): Promise<ContextItem> {
   let tokenCount: number;
   try {
-    tokenCount = await gateway.countTokens([{ role: "assistant", content }], []);
+    const measured = await gateway.countTokens([{ role: "assistant", content }], []);
+    tokenCount = Number.isFinite(measured)
+      ? Math.max(1, Math.ceil(measured))
+      : Math.max(1, Math.ceil(content.length / 4));
   } catch {
     tokenCount = Math.max(1, Math.ceil(content.length / 4));
   }

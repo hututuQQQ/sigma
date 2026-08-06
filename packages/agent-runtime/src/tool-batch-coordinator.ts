@@ -1,7 +1,7 @@
 import type { ModelToolCall, ToolDescriptor, ToolReceipt } from "agent-protocol";
 import type { ActiveModelTurn } from "agent-kernel";
 import { loadNestedInstructions } from "agent-context";
-import { isToolAllowed } from "agent-tools";
+import { assertDescriptorArguments, isToolAllowed } from "agent-tools";
 import {
   failed,
   projectModelToolDescriptors,
@@ -24,6 +24,11 @@ import {
 } from "./read-batch-tool.js";
 import { ReadBatchExecutor } from "./read-batch-executor.js";
 import { ToolReceiptRecorder } from "./tool-receipt-recorder.js";
+import {
+  LOAD_TOOL_BUNDLE_NAME,
+  projectHarnessToolDescriptors
+} from "./harness-tool-projection.js";
+import { ToolBundleLoader } from "./tool-bundle-loader.js";
 
 function settledReviewRequestReceipt(session: RuntimeSession, receipt: ToolReceipt): ToolReceipt {
   const candidateDigest = completionCandidate(session)?.digest;
@@ -80,27 +85,56 @@ function projectedDirectTools(
   session: RuntimeSession,
   descriptors: readonly ToolDescriptor[]
 ): ToolDescriptor[] {
-  return projectModelToolDescriptors(
-    descriptors.filter((descriptor) =>
-      isToolAllowed(descriptor, session.durable.mode)
-      && profileAllowsTool(session, descriptor)),
-    sessionModelToolProjectionCapabilities(session)
-  );
+  return projectHarnessToolDescriptors(session, withReadBatchDescriptor(
+    projectModelToolDescriptors(
+      descriptors.filter((descriptor) =>
+        isToolAllowed(descriptor, session.durable.mode)
+        && profileAllowsTool(session, descriptor)),
+      sessionModelToolProjectionCapabilities(session)
+    )
+  ));
 }
 
 const TERMINAL_TOOL_NAMES = new Set(["report_blocked", "request_user_input"]);
-const BARRIER_TOOL_NAMES = new Set(["request_review", READ_BATCH_TOOL_NAME]);
+const BARRIER_TOOL_NAMES = new Set([
+  "request_review", READ_BATCH_TOOL_NAME, LOAD_TOOL_BUNDLE_NAME
+]);
 
 function violatesToolProjection(
   attempts: readonly ToolAttempt[],
-  offeredNames: ReadonlySet<string>
+  offered: ReadonlyMap<string, ToolDescriptor>,
+  backing: ReadonlyMap<string, ToolDescriptor>
 ): boolean {
   const terminalCount = attempts.filter(({ call }) => TERMINAL_TOOL_NAMES.has(call.name)).length;
   const conflictingTerminalBatch = attempts.length > 1 && terminalCount > 0;
   const conflictingBarrierBatch = attempts.length > 1
     && attempts.some(({ call }) => BARRIER_TOOL_NAMES.has(call.name));
-  return terminalCount > 1 || conflictingTerminalBatch || conflictingBarrierBatch
-    || attempts.some((attempt) => !offeredNames.has(attempt.call.name));
+  if (terminalCount > 1 || conflictingTerminalBatch || conflictingBarrierBatch) return true;
+  return attempts.some((attempt) => {
+    const descriptor = offered.get(attempt.call.name);
+    if (!descriptor) return true;
+    try {
+      // Admission validates the exact schema shown to the model. The backing
+      // registry may retain a wider schema for a later tool bundle, but guessed
+      // hidden parameters must not cross the frozen Harness boundary.
+      assertDescriptorArguments(descriptor, attempt.call.arguments);
+      return false;
+    } catch {
+      const backingDescriptor = backing.get(attempt.call.name);
+      const argumentsValue = attempt.call.arguments;
+      const projectedProperties = descriptor.inputSchema.properties;
+      const backingProperties = backingDescriptor?.inputSchema.properties;
+      if (!argumentsValue || typeof argumentsValue !== "object" || Array.isArray(argumentsValue)
+        || !projectedProperties || typeof projectedProperties !== "object" || Array.isArray(projectedProperties)
+        || !backingProperties || typeof backingProperties !== "object" || Array.isArray(backingProperties)) {
+        // Preserve the ordinary tool_arguments_invalid path for malformed
+        // values. Admission owns authority reduction, not generic diagnostics.
+        return false;
+      }
+      return Object.keys(argumentsValue).some((name) =>
+        !Object.hasOwn(projectedProperties, name) && Object.hasOwn(backingProperties, name));
+    }
+  });
 }
 
 function terminalAttempt(attempt: ToolAttempt): boolean {
@@ -115,6 +149,7 @@ interface InstructionPreparation {
 export class ToolBatchCoordinator {
   private readonly receipts: ToolReceiptRecorder;
   private readonly readBatches: ReadBatchExecutor;
+  private readonly bundleLoader: ToolBundleLoader;
 
   constructor(
     private readonly options: EffectRunnerOptions,
@@ -128,6 +163,7 @@ export class ToolBatchCoordinator {
       this.receipts,
       async (session, call, descriptor) => await this.loadInstructions(session, call, descriptor)
     );
+    this.bundleLoader = new ToolBundleLoader(options, this.receipts);
   }
 
   async execute(session: RuntimeSession, attempts: ToolAttempt[], signal: AbortSignal): Promise<void> {
@@ -141,7 +177,8 @@ export class ToolBatchCoordinator {
       const projectedDescriptors = projectedDirectTools(session, modelDescriptors);
       if (violatesToolProjection(
         attempts,
-        new Set(withReadBatchDescriptor(projectedDescriptors).map((item) => item.name))
+        new Map(projectedDescriptors.map((item) => [item.name, item])),
+        descriptors
       )) {
         await this.rejectProjection(session, attempts);
         return;
@@ -152,6 +189,14 @@ export class ToolBatchCoordinator {
           attempts[0]!,
           projectedDescriptors,
           turnSignal
+        );
+        return;
+      }
+      if (attempts.length === 1 && attempts[0]!.call.name === LOAD_TOOL_BUNDLE_NAME) {
+        await this.bundleLoader.execute(
+          session,
+          attempts[0]!.call,
+          attempts[0]!.modelTurn
         );
         return;
       }

@@ -124,10 +124,16 @@ export interface ToolResultPruneProposal {
   prunedTokens: number;
 }
 
+export interface ToolResultPruneOptions {
+  protectedRecentToolResultTokens?: number;
+  minimumToolResultPruneTokens?: number;
+}
+
 export function proposeToolResultPrune(
   history: readonly ModelMessage[],
   previous: ToolResultPruneState | undefined,
-  archiveSourceDigest?: string
+  archiveSourceDigest?: string,
+  options: ToolResultPruneOptions = {}
 ): ToolResultPruneProposal {
   const blocks = historyBlocks(history);
   const current = validPruneState(blocks, previous, archiveSourceDigest)
@@ -139,7 +145,8 @@ export function proposeToolResultPrune(
     if (tokens <= 0) continue;
     protectedTokens += tokens;
     firstProtected = index;
-    if (protectedTokens >= PROTECTED_RECENT_TOOL_RESULT_TOKENS) break;
+    if (protectedTokens >= (options.protectedRecentToolResultTokens
+      ?? PROTECTED_RECENT_TOOL_RESULT_TOKENS)) break;
   }
   const eligibleEnd = firstProtected - 1;
   const start = current?.coveredBlocks ?? 0;
@@ -153,7 +160,8 @@ export function proposeToolResultPrune(
   }
   const prunedTokens = blocks.slice(start, eligibleEnd + 1)
     .reduce((total, block) => total + toolResultTokens(block), 0);
-  if (prunedTokens < MINIMUM_TOOL_RESULT_PRUNE_TOKENS) {
+  if (prunedTokens < (options.minimumToolResultPruneTokens
+    ?? MINIMUM_TOOL_RESULT_PRUNE_TOKENS)) {
     return {
       ...(current ? { state: current } : {}),
       changed: false,

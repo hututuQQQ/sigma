@@ -39,6 +39,8 @@ import { runtimeReviewerFactory } from "./runtime-reviewer-factory.js";
 import { ModelReviewer } from "./reviewer.js";
 import { rollbackRuntimeTurns } from "./runtime-conversation-rollback.js";
 import { handleRuntimeResume } from "./runtime-resume-handler.js";
+import { beginRuntimeHarnessRun } from "./runtime-harness-transition.js";
+import { compileRuntimeHarness } from "./runtime-harness.js";
 
 export class InProcessRuntimeClient implements RuntimeClient {
   private readonly sessions = new Map<string, RuntimeSession>();
@@ -57,9 +59,7 @@ export class InProcessRuntimeClient implements RuntimeClient {
   private readonly childCheckpointRecovery: ChildCheckpointRecoveryCoordinator;
   private readonly managedSessions: ManagedSessionLifecycle;
   private readonly profileHookRecovery?: ModelAgentProfileHookRunner;
-  constructor(private readonly options: RuntimeOptions & { storeRootDir: string }, testing: {
-    checkpointManager?: CheckpointManager
-  } = {}) {
+  constructor(private readonly options: RuntimeOptions & { storeRootDir: string }, testing: { checkpointManager?: CheckpointManager } = {}) {
     assertProfileResources(options, options.profile);
     this.artifacts = new ContentAddressedArtifactStore(options.storeRootDir);
     this.managedSessions = new ManagedSessionLifecycle({
@@ -76,6 +76,7 @@ export class InProcessRuntimeClient implements RuntimeClient {
       commandBus: this.commandBus,
       cancelChildren: options.cancelChildren,
       emit: async (session, type, authority, value) => await this.emit(session, type, authority, value),
+      beginRun: async (session, mode) => await beginRuntimeHarnessRun(session, mode, { runtime: this.options, artifacts: this.artifacts, events: this.events, runDeadlineMs: this.runDeadlineMs }),
       finish: async (session, outcome) => await this.finish(session, outcome),
       start: (session) => this.startRun(session)
     });
@@ -175,9 +176,9 @@ export class InProcessRuntimeClient implements RuntimeClient {
     await ensurePrivateStateDirectory(this.options.storeRootDir);
     assertProfileResources(this.options, selection.profile);
     const gateway = this.options.gatewayForRole?.(modelRole, selection.profile) ?? this.options.gateway;
+    const harness = compileRuntimeHarness(this.options, gateway, modelRole, input.mode, selection.profile);
     const session = await newRuntimeSession(input, this.runDeadlineMs, allocatedBudget, {
-      gateway,
-      modelRole,
+      gateway, modelRole, harness,
       profile: selection.profile,
       profileSource: selection.profileSource,
       workspaceLeaseInherited,

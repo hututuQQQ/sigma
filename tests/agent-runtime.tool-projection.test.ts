@@ -38,7 +38,7 @@ describe("session model-tool capability projection", () => {
     ]));
     const batch = readBatchDescriptor(descriptors);
     expect(batch).toMatchObject({
-      name: "batch_read",
+      name: "read_batch",
       approval: "auto",
       possibleEffects: ["filesystem.read", "process.spawn.readonly"]
     });
@@ -59,7 +59,7 @@ describe("session model-tool capability projection", () => {
     });
     const offered = withReadBatchDescriptor(projected);
     const schema = JSON.stringify(
-      offered.find((item) => item.name === "batch_read")?.inputSchema
+      offered.find((item) => item.name === "read_batch")?.inputSchema
     );
     expect(schema).toContain('"read"');
     expect(schema).not.toContain('"read_plan"');

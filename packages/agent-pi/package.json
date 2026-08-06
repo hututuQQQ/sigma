@@ -17,7 +17,7 @@
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\""
   },
   "dependencies": {
-    "@earendil-works/pi-ai": "0.82.1",
+    "@earendil-works/pi-ai": "0.84.0",
     "agent-platform": "workspace:*",
     "agent-protocol": "workspace:*"
   },

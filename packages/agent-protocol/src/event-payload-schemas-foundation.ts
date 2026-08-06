@@ -24,6 +24,16 @@ export const turnSchema = {
   effectRevision: z.number().int().nonnegative()
 };
 
+export const compiledHarnessPayloadSchema = z.object({
+  schemaVersion: z.literal(1),
+  compilerVersion: nonEmptyStringSchema,
+  digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  artifactId: z.string().regex(/^[a-f0-9]{64}$/u),
+  policyPackIds: z.array(nonEmptyStringSchema).min(1),
+  initialToolCount: z.number().int().nonnegative(),
+  potentialToolCount: z.number().int().nonnegative()
+}).strict();
+
 export const modelToolCallSchema = z.object({
   id: nonEmptyStringSchema,
   name: nonEmptyStringSchema,
@@ -119,6 +129,8 @@ export const durableToolReceiptShape = {
   name: nonEmptyStringSchema,
   ok: z.boolean(),
   output: z.string(),
+  /** Bounded model-visible receipt projection; full output remains durable. */
+  modelOutput: z.string().optional(),
   result: jsonValueSchema.optional(),
   outcome: toolOutcomeSchema,
   observedEffects: z.array(toolEffectSchema),

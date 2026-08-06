@@ -8,7 +8,7 @@ import type {
 } from "agent-protocol";
 import { maximumToolEffects } from "agent-tools";
 
-export const READ_BATCH_TOOL_NAME = "batch_read";
+export const READ_BATCH_TOOL_NAME = "read_batch";
 export const MAX_READ_BATCH_CALLS = 8;
 
 const ELIGIBLE_MAXIMUM_EFFECTS = new Set<ToolEffect>([
@@ -102,7 +102,7 @@ export function parseReadBatchMembers(
   const calls = input?.calls;
   if (!Array.isArray(calls) || calls.length < 2 || calls.length > MAX_READ_BATCH_CALLS) {
     throw Object.assign(new Error(
-      `batch_read requires between 2 and ${MAX_READ_BATCH_CALLS} calls.`
+      `read_batch requires between 2 and ${MAX_READ_BATCH_CALLS} calls.`
     ), { code: "tool_arguments_invalid" });
   }
   const eligible = new Map(eligibleReadBatchDescriptors(descriptors)
@@ -114,7 +114,7 @@ export function parseReadBatchMembers(
     if (typeof name !== "string" || !eligible.has(name)
       || !object(argumentsValue as JsonValue)) {
       throw Object.assign(new Error(
-        `batch_read member ${index + 1} must name an offered read-only tool and provide object arguments.`
+        `read_batch member ${index + 1} must name an offered read-only tool and provide object arguments.`
       ), { code: "tool_arguments_invalid" });
     }
     return {

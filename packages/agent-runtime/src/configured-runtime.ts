@@ -39,6 +39,7 @@ import {
   createComposedRuntime,
   type RuntimeAssemblyPrepared
 } from "./configured-runtime-assembly.js";
+import type { FrozenHarnessBuild, HarnessTokenInspection } from "./harness-compiler.js";
 export interface RuntimeCompositionConfig {
   workspace: string;
   provider: string;
@@ -102,6 +103,8 @@ export interface ConfiguredRuntime {
   workspace: string;
   storeRootDir: string;
   execution: ExecutionBroker;
+  inspectHarness(mode: "analyze" | "change"): FrozenHarnessBuild;
+  inspectHarnessTokens(mode: "analyze" | "change"): Promise<HarnessTokenInspection>;
   close(): Promise<void>;
 }
 export interface RuntimeFactoryOptions {
@@ -163,6 +166,7 @@ export async function createConfiguredRuntime(
     const runtimeReference: { current?: InProcessRuntimeClient } = {};
     const supervisor = createConfiguredSupervisor(config, execution, runtimeReference);
     const tools = createConfiguredTools(config, execution, supervisor, executionReport, storeRootDir);
+    const builtinToolNames = tools.descriptors().map((tool) => tool.name);
     mcpClients = await configuredMcpClients(
       options.connectMcp !== false,
       config.mcpServers,
@@ -172,7 +176,7 @@ export async function createConfiguredRuntime(
       options.additionalMcpServers
     );
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
-    const runtime = createComposedRuntime({
+    const composed = createComposedRuntime({
       config,
       interactiveApprovals: options.interactiveApprovals ?? options.surface !== "cli",
       prepared,
@@ -180,15 +184,18 @@ export async function createConfiguredRuntime(
       tools,
       store,
       supervisor,
+      builtinToolNames,
       subjectAttestation,
       agentProfileHookRunner: deps.agentProfileHookRunner
     });
-    runtimeReference.current = runtime;
+    runtimeReference.current = composed.runtime;
     return {
       workspace,
       storeRootDir,
-      runtime,
+      runtime: composed.runtime,
       execution,
+      inspectHarness: composed.inspectHarness,
+      inspectHarnessTokens: composed.inspectHarnessTokens,
       close: async () => await closeComposition(mcpClients, execution)
     };
   } catch (error) {

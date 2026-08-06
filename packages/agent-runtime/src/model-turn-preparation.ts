@@ -36,6 +36,7 @@ import { profileAllowsTool } from "./profile-policy.js";
 import { progressCheckpoints } from "./progress-checkpoint.js";
 import type { RuntimeSession } from "./types.js";
 import { withReadBatchDescriptor } from "./read-batch-tool.js";
+import { projectHarnessToolDescriptors } from "./harness-tool-projection.js";
 
 export interface PreparedModelAttempt {
   turn?: PreparedModelTurn;
@@ -70,7 +71,13 @@ async function projectedToolHistory(
   const pruneProposal = proposeToolResultPrune(
     history,
     session.durable.state.toolResultPrune,
-    archiveSourceDigest
+    archiveSourceDigest,
+    session.durable.frozenHarness ? {
+      protectedRecentToolResultTokens:
+        session.durable.frozenHarness.contextPolicy.protectedRecentToolResultTokens,
+      minimumToolResultPruneTokens:
+        session.durable.frozenHarness.contextPolicy.minimumToolResultPruneTokens
+    } : {}
   );
   if (pruneProposal.changed && pruneProposal.state) {
     await options.emit(session, "context.tool_results_pruned", "runtime", {
@@ -266,11 +273,14 @@ export async function prepareModelAttempt(
   const modelDescriptors = options.runtime.tools.modelDescriptors?.()
     ?? options.runtime.tools.descriptors();
   const capabilities = sessionModelToolProjectionCapabilities(session);
-  const descriptors = withReadBatchDescriptor(projectModelToolDescriptors(
-    modelDescriptors.filter((item) =>
-      isToolAllowed(item, session.durable.mode) && profileAllowsTool(session, item)),
-    capabilities
-  ));
+  const descriptors = projectHarnessToolDescriptors(
+    session,
+    withReadBatchDescriptor(projectModelToolDescriptors(
+      modelDescriptors.filter((item) =>
+        isToolAllowed(item, session.durable.mode) && profileAllowsTool(session, item)),
+      capabilities
+    ))
+  );
   const query = [...session.durable.state.messages].reverse()
     .find((message) => message.role === "user")?.content ?? "";
   const dynamic = await repositoryContext.collect(

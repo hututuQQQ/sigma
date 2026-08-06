@@ -108,6 +108,10 @@ export interface KernelState {
   checkpointHead?: CheckpointRef;
   frozenProfile?: FrozenArtifactRef;
   frozenCustomization?: FrozenCustomizationRef;
+  /** New-schema sessions fail closed when their frozen Harness artifact is absent. */
+  harnessRequired?: boolean;
+  frozenHarness?: FrozenCustomizationRef;
+  loadedToolBundles?: string[];
   frozenSkills: FrozenArtifactRef[];
   activeProcessIds: string[];
   childIds: string[];
@@ -132,6 +136,7 @@ export interface CreateKernelStateOptions {
   startedAt: string;
   deadlineAt?: string;
   assurancePolicy?: AssuranceResourcePolicy;
+  harnessRequired?: boolean;
 }
 
 export function createKernelState(options: CreateKernelStateOptions): KernelState {
@@ -160,6 +165,8 @@ export function createKernelState(options: CreateKernelStateOptions): KernelStat
     usage: [],
     plan: createEmptyPlan(),
     budget: createBudgetLedger(),
+    ...(options.harnessRequired ? { harnessRequired: true } : {}),
+    loadedToolBundles: [],
     frozenSkills: [],
     activeProcessIds: [],
     childIds: [],
@@ -275,6 +282,11 @@ function validFrozenState(state: Record<string, unknown>): boolean {
   return [
     state.frozenProfile === undefined || isFrozenArtifactRef(state.frozenProfile),
     state.frozenCustomization === undefined || isFrozenCustomizationRef(state.frozenCustomization),
+    state.harnessRequired === undefined || typeof state.harnessRequired === "boolean",
+    state.frozenHarness === undefined || isFrozenCustomizationRef(state.frozenHarness),
+    state.loadedToolBundles === undefined || (Array.isArray(state.loadedToolBundles)
+      && state.loadedToolBundles.every((item) => typeof item === "string" && item.length > 0)
+      && new Set(state.loadedToolBundles).size === state.loadedToolBundles.length),
     Array.isArray(state.frozenSkills) && state.frozenSkills.every(isFrozenArtifactRef)
   ].every(Boolean);
 }

@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import type { ArtifactRef, ToolReceipt } from "agent-protocol";
 
-export const MODEL_TOOL_PROJECTION_ARTIFACT_THRESHOLD_CHARS = 12_000;
+export const SUCCESS_TOOL_ARTIFACT_THRESHOLD_BYTES = 8 * 1_024;
+export const FAILED_TOOL_ARTIFACT_THRESHOLD_BYTES = 12 * 1_024;
 
 interface MaterializedContent {
   name: string;
@@ -15,7 +16,9 @@ function sha256(content: string): string {
 
 function largeContents(toolName: string, callId: string, receipt: ToolReceipt): MaterializedContent[] {
   const values: MaterializedContent[] = [];
-  if (receipt.output.length > MODEL_TOOL_PROJECTION_ARTIFACT_THRESHOLD_CHARS) {
+  const threshold = receipt.ok
+    ? SUCCESS_TOOL_ARTIFACT_THRESHOLD_BYTES : FAILED_TOOL_ARTIFACT_THRESHOLD_BYTES;
+  if (Buffer.byteLength(receipt.output, "utf8") > threshold) {
     values.push({
       name: `${toolName}-${callId}-output.txt`,
       mediaType: "text/plain; charset=utf-8",
@@ -24,7 +27,7 @@ function largeContents(toolName: string, callId: string, receipt: ToolReceipt): 
   }
   if (receipt.result !== undefined) {
     const content = JSON.stringify(receipt.result);
-    if (content.length > MODEL_TOOL_PROJECTION_ARTIFACT_THRESHOLD_CHARS) {
+    if (Buffer.byteLength(content, "utf8") > threshold) {
       values.push({
         name: `${toolName}-${callId}-result.json`,
         mediaType: "application/json",

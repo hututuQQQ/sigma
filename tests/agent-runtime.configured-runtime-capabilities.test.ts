@@ -422,7 +422,18 @@ describe("configured runtime execution capabilities", () => {
     const runtimeConfig = configured(root);
     runtimeConfig.writeScope = "enclosing-container";
     runtimeConfig.readScope = "host";
-    const gateway = new CapturingGateway();
+    const gateway = new CapturingGateway([{
+      message: {
+        role: "assistant",
+        content: "",
+        toolCalls: [{
+          id: "load-process-environment",
+          name: "load_tool_bundle",
+          arguments: { bundleId: "process_environment" }
+        }]
+      },
+      finishReason: "tool_calls"
+    }]);
     const configuredRuntime = await createConfiguredRuntime(runtimeConfig, {
       stateRootDir: stateRoot,
       executionBroker: fixtureBroker(doctorReport([{
@@ -453,11 +464,14 @@ describe("configured runtime execution capabilities", () => {
       });
       await configuredRuntime.runtime.waitForOutcome(session.sessionId);
 
-      const request = gateway.requests[0] as ModelRequest;
-      expect(request.tools?.find((tool) =>
+      const initialRequest = gateway.requests[0] as ModelRequest;
+      expect(initialRequest.tools?.find((tool) =>
         tool.name === "environment_shell")).toBeUndefined();
-      expect(request.tools?.find((tool) =>
+      expect(initialRequest.tools?.find((tool) =>
         tool.name === "exec")).toBeUndefined();
+      expect(initialRequest.tools?.find((tool) =>
+        tool.name === "shell")?.inputSchema.properties).not.toHaveProperty("target");
+      const request = gateway.requests[1] as ModelRequest;
       const shell = request.tools?.find((tool) => tool.name === "shell");
       expect(shell?.inputSchema.properties).toMatchObject({
         target: {
@@ -709,82 +723,43 @@ describe("configured runtime execution capabilities", () => {
       const request = gateway.requests[0] as ModelRequest;
       expect(request.tools?.find((tool) => tool.name === "list")).toBeDefined();
       expect(request.tools?.find((tool) => tool.name === "grep")).toBeDefined();
-      expect(request.tools?.find((tool) => tool.name === "repository_stats")).toBeDefined();
+      expect(request.tools?.find((tool) => tool.name === "repository_stats")).toBeUndefined();
+      expect(request.tools?.find((tool) => tool.name === "load_tool_bundle")).toBeDefined();
       expect(request.tools?.find((tool) => tool.name === "load_skill")).toBeUndefined();
       const exec = request.tools?.find((tool) => tool.name === "exec");
       const shell = request.tools?.find((tool) => tool.name === "shell");
       const validate = request.tools?.find((tool) => tool.name === "validate");
       const foregroundAvailable = processCapabilities.foreground && expectedNetworkModes.length > 0;
       const backgroundAvailable = processCapabilities.background && expectedNetworkModes.length > 0;
-      if (foregroundAvailable) {
-        expect(validate === undefined).toBe(expectedShells.length > 0);
-        expect((shell ?? exec)?.inputSchema).toMatchObject({
-          properties: { network: { enum: expectedNetworkModes } }
-        });
-        expect(exec === undefined).toBe(expectedShells.length > 0);
-      } else {
-        expect(exec).toBeUndefined();
-        expect(validate).toBeUndefined();
+      expect(exec !== undefined).toBe(foregroundAvailable && expectedShells.length === 0);
+      expect(validate).toBeUndefined();
+      expect(shell !== undefined).toBe(foregroundAvailable && expectedShells.length > 0);
+      if (shell) {
+        expect(shell.inputSchema.properties).not.toHaveProperty("network");
+        expect(shell.inputSchema.properties).not.toHaveProperty("shell");
       }
       const spawn = request.tools?.find((tool) => tool.name === "process_spawn");
-      if (!backgroundAvailable) {
-        expect(request.tools?.find((tool) => tool.name === "process_spawn")).toBeUndefined();
-        expect(request.tools?.find((tool) => tool.name === "process_poll")).toBeUndefined();
-        expect(request.tools?.find((tool) => tool.name === "process_write")).toBeUndefined();
-        expect(request.tools?.find((tool) => tool.name === "process_terminate")).toBeUndefined();
-      } else {
-        const backgroundEntry = shell ?? spawn;
-        expect(backgroundEntry?.inputSchema).toMatchObject({
-          properties: { network: { enum: expectedNetworkModes } }
-        });
-        if (processCapabilities.pty) {
-          expect(backgroundEntry?.inputSchema).toMatchObject({
-            properties: { pty: { type: "boolean" } }
-          });
-        } else {
-          expect(backgroundEntry?.inputSchema).not.toMatchObject({
-            properties: { pty: expect.anything() }
-          });
-        }
-        expect(spawn === undefined).toBe(expectedShells.length > 0);
-        if (shell) {
-          expect(shell.inputSchema).toMatchObject({
-            properties: { background: { type: "boolean" } }
-          });
-        }
-        // Lifecycle controls are offered only after a durable process handle
-        // exists, independently of whether stdin is supported.
-        expect(request.tools?.find((tool) => tool.name === "process_write")).toBeUndefined();
-        expect(request.tools?.find((tool) => tool.name === "process_poll")).toBeUndefined();
-        expect(request.tools?.find((tool) => tool.name === "process_terminate")).toBeUndefined();
-      }
+      expect(spawn).toBeUndefined();
+      expect(request.tools?.find((tool) => tool.name === "process_poll")).toBeUndefined();
+      expect(request.tools?.find((tool) => tool.name === "process_write")).toBeUndefined();
+      expect(request.tools?.find((tool) => tool.name === "process_terminate")).toBeUndefined();
       const codeIntelAvailable = backgroundAvailable
         && processCapabilities.stdin
         && expectedNetworkModes.includes("none");
-      expect(request.tools?.find((tool) => tool.name === "lsp") !== undefined).toBe(codeIntelAvailable);
-      const executionSchema = JSON.stringify(
-        (shell ?? exec ?? validate)?.inputSchema
-      );
+      expect(request.tools?.find((tool) => tool.name === "lsp")).toBeUndefined();
+      const build = configuredRuntime.inspectHarness("analyze");
+      expect(build.toolPolicy.bundles.find((bundle) => bundle.id === "filesystem")?.tools)
+        .toContain("repository_stats");
+      const processTools = build.toolPolicy.bundles
+        .find((bundle) => bundle.id === "process_environment")?.tools ?? [];
+      expect(processTools.includes("exec")).toBe(foregroundAvailable && expectedShells.length === 0);
+      expect(processTools.includes("validate")).toBe(foregroundAvailable && expectedShells.length === 0);
+      expect(processTools.includes("process_spawn")).toBe(backgroundAvailable && expectedShells.length === 0);
+      expect(build.toolPolicy.bundles
+        .find((bundle) => bundle.id === "code_intelligence")?.tools.includes("lsp") ?? false)
+        .toBe(codeIntelAvailable);
       const directResolution = "directExecutableResolution" in processCapabilities
         && processCapabilities.directExecutableResolution === true;
-      if (!foregroundAvailable) {
-        expect(executionSchema).toBeUndefined();
-      } else if (directResolution) {
-        expect(executionSchema).toContain("resolved, pinned, and authorized");
-        expect(executionSchema).not.toContain("Unlisted bare commands are unavailable");
-      } else if (expectedRuntimeCommands.length > 0) {
-        for (const command of expectedRuntimeCommands) expect(executionSchema).toContain(command);
-        expect(executionSchema).toContain("Unlisted bare commands are unavailable");
-      } else {
-        expect(executionSchema).toContain("No general bare runtime command alias is verified");
-      }
-      if (expectedShells.length === 0) {
-        expect(shell).toBeUndefined();
-      } else {
-        expect(shell?.inputSchema).toMatchObject({
-          properties: { shell: { enum: expectedShells } }
-        });
-      }
       const runtimePrompt = request.messages
         .filter((message) => message.role === "system" || message.role === "developer")
         .map((message) => message.content)

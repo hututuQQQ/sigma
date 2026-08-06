@@ -211,9 +211,13 @@ async function runTerminalBenchCliImpl(argv, deps, signal) {
 
   const baseRunId = makeRunId(new Date(), options.provider, options.model);
   const runId = boundedBenchmarkRunId(baseRunId, options.runLabel);
-  const runDir = path.join(benchRootDir, runId);
+  // Formal runners can supply a private run root so task/verifier artifacts do
+  // not escape their evaluation vault. Ordinary benchmark invocations retain
+  // the established shared artifact location.
+  const runRootDir = deps.benchRootDir ?? benchRootDir;
+  const runDir = path.join(runRootDir, runId);
   const jobsDir = deps.harborJobsDir ?? portableHarborJobsDir(runDir);
-  const env = harborEnvForRun(runDir);
+  const env = harborEnvForRun(runDir, deps.env ?? process.env);
   const startedAt = new Date().toISOString();
   const baseRunner = deps.runProcess ?? runProcess;
   const runner = (command, args, runnerOptions = {}) => baseRunner(command, args, {

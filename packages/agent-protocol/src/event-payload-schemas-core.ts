@@ -1,10 +1,8 @@
 import { z } from "zod";
 import { dateTimeSchema, nonEmptyStringSchema } from "./domain-schemas.js";
 import {
-  assuranceResourcePolicySchema,
-  contextItemSchema,
-  runtimePromptStateSchema,
-  durableToolReceiptShape,
+  assuranceResourcePolicySchema, compiledHarnessPayloadSchema,
+  contextItemSchema, runtimePromptStateSchema, durableToolReceiptShape,
   modelImageSchema,
   modelMessageSchema,
   modelToolCallSchema,
@@ -260,9 +258,14 @@ export const coreEventPayloadSchemas = {
     modelRole: sharedSchemas.modelExecutionRoleSchema,
     budgetLimits: sharedSchemas.budgetLimitsSchema,
     assurancePolicy: assuranceResourcePolicySchema.optional(),
+    harnessCompilerVersion: nonEmptyStringSchema.optional(),
     parentSessionId: nonEmptyStringSchema.optional()
   }).strict(),
-  "run.started": z.object({ mode: runModeSchema, deadlineAt: dateTimeSchema.optional() }).strict(),
+  "run.started": z.object({
+    mode: runModeSchema,
+    deadlineAt: dateTimeSchema.optional(),
+    harness: compiledHarnessPayloadSchema.optional()
+  }).strict(),
   "run.suspended": suspensionSchema,
   "run.completed": z.object({
     kind: z.literal("completed"),

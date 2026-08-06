@@ -14,6 +14,10 @@ import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 import { assurancePolicyFromState } from "./assurance-policy.js";
 import { persistFrozenWorkspaceHookAssets } from "./frozen-hook-assets.js";
 import { emitSubjectAttestation, type SubjectAttestationContext } from "./subject-attestation.js";
+import {
+  HARNESS_COMPILER_VERSION,
+  persistRuntimeHarness
+} from "./runtime-harness.js";
 
 type DispatchHook = (
   session: RuntimeSession,
@@ -139,8 +143,10 @@ export async function initializeRuntimeSession(
     modelRole: session.services.modelRole,
     ...(session.identity.parentSessionId ? { parentSessionId: session.identity.parentSessionId } : {}),
     budgetLimits: session.durable.state.budget.limits,
-    assurancePolicy: assurancePolicyFromState(session.durable.state)
+    assurancePolicy: assurancePolicyFromState(session.durable.state),
+    harnessCompilerVersion: HARNESS_COMPILER_VERSION
   });
+  await persistRuntimeHarness(session, options.putArtifact, options.emit);
   await emitSubjectAttestation(session, options.subjectAttestation, options.emit);
   await emitResolvedProfile(session, options);
   await emitFrozenCustomization(session, options);

@@ -4,23 +4,29 @@ import type { AgentEventPayloadMap } from "agent-protocol";
 import { sessionAssurancePolicy } from "./assurance-policy.js";
 import { configuredRunDeadlineAt } from "./run-deadline.js";
 import type { RuntimeSession } from "./types.js";
+import type { FrozenHarnessBuild } from "./harness-compiler.js";
 
 export function beginNextRun(
   session: RuntimeSession,
   mode: RuntimeSession["durable"]["mode"],
-  runDeadlineMs?: number
+  runDeadlineMs?: number,
+  harness?: FrozenHarnessBuild
 ): void {
+  const effectiveMode = session.durable.legacyHarnessReadOnly ? "analyze" : mode;
+  const effectiveHarness = harness ?? session.durable.frozenHarness;
   const now = new Date().toISOString();
   session.durable.runId = randomUUID();
   session.durable.modelTurn = 0;
-  session.durable.mode = mode;
+  session.durable.mode = effectiveMode;
+  if (effectiveHarness) session.durable.frozenHarness = effectiveHarness;
   const state = createKernelState({
     sessionId: session.identity.sessionId,
     runId: session.durable.runId,
-    mode,
+    mode: effectiveMode,
     startedAt: now,
     deadlineAt: configuredRunDeadlineAt(runDeadlineMs),
-    assurancePolicy: sessionAssurancePolicy(session)
+    assurancePolicy: sessionAssurancePolicy(session),
+    harnessRequired: session.durable.state.harnessRequired
   });
   session.durable.state = {
     ...state,
@@ -30,6 +36,11 @@ export function beginNextRun(
     budget: session.durable.state.budget,
     frozenProfile: session.durable.state.frozenProfile,
     frozenCustomization: session.durable.state.frozenCustomization,
+    harnessRequired: session.durable.state.harnessRequired,
+    frozenHarness: harness
+      ? { artifactId: harness.digest, digest: harness.digest }
+      : session.durable.state.frozenHarness,
+    loadedToolBundles: session.durable.state.loadedToolBundles,
     frozenSkills: session.durable.state.frozenSkills,
     activeProcessIds: session.durable.state.activeProcessIds,
     // A completed run has already accepted this frontier as the new baseline;

@@ -20,6 +20,7 @@ import { runVersionCommand } from "./commands/version.js";
 import { runAcpCommand } from "./commands/acp.js";
 import { runAuthCommand } from "./commands/auth.js";
 import { runModelsCommand } from "./commands/models.js";
+import { runHarnessCommand } from "./commands/harness.js";
 import {
   loadCliConfig, parseArgs, workspaceCustomizationTrustMessage, workspaceMcpTrustMessage
 } from "./config.js";
@@ -113,6 +114,10 @@ async function dispatchCommand(
     case "replay": return await runReplayCommand(argv, { runtime: options.runtime });
     case "doctor": return await runDoctorCommand(argv, { runtimeFactoryDeps: options.runtimeFactoryDeps });
     case "sandbox": return await runSandboxCommand(argv);
+    case "harness": return await runHarnessCommand(argv, {
+      runtimeFactoryDeps: options.runtimeFactoryDeps,
+      stderr: options.stderr
+    });
     case "version": return await runVersionCommand(argv);
     case "init": return await runInitCommand(argv);
     case "completion":

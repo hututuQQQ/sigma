@@ -21,7 +21,7 @@ class Capture extends Writable {
 
 const catalog = {
   schemaVersion: 1 as const,
-  piVersion: "0.82.1",
+  piVersion: "0.84.0",
   providers: [{
     id: "example",
     name: "Example",

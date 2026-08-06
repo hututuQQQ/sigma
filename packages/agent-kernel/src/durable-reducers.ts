@@ -247,6 +247,33 @@ const customizationFrozen: KernelEventReducer = (state, event, payload) => {
   return { ...state, frozenCustomization: { artifactId: payload.artifactId, digest: payload.digest } };
 };
 
+const harnessCompiled: KernelEventReducer = (state, event, payload) => {
+  if (event.authority !== "runtime" || event.sessionId !== state.sessionId
+    || payload.schemaVersion !== 1
+    || typeof payload.digest !== "string" || !/^[a-f0-9]{64}$/u.test(payload.digest)
+    || typeof payload.artifactId !== "string" || !/^[a-f0-9]{64}$/u.test(payload.artifactId)
+    || payload.artifactId !== payload.digest) {
+    return state;
+  }
+  return {
+    ...state,
+    harnessRequired: true,
+    frozenHarness: { artifactId: payload.artifactId, digest: payload.digest }
+  };
+};
+
+const toolBundleLoaded: KernelEventReducer = (state, event, payload) => {
+  if (event.authority !== "runtime" || event.sessionId !== state.sessionId
+    || typeof payload.bundleId !== "string"
+    || typeof payload.harnessDigest !== "string"
+    || payload.harnessDigest !== state.frozenHarness?.digest
+    || state.loadedToolBundles?.includes(payload.bundleId)) return state;
+  return {
+    ...state,
+    loadedToolBundles: [...(state.loadedToolBundles ?? []), payload.bundleId].sort()
+  };
+};
+
 function validSkillLoadedPayload(payload: Record<string, JsonValue>): payload is Record<string, JsonValue> & {
   qualifiedName: string;
   digest: string;
@@ -337,6 +364,8 @@ export const durableReducers: Partial<Record<AgentEventType, KernelEventReducer>
   "review.waived": evidenceRecorded,
   "profile.resolved": profileResolved,
   "customization.frozen": customizationFrozen,
+  "harness.compiled": harnessCompiled,
+  "tool_bundle.loaded": toolBundleLoaded,
   "skill.loaded": skillLoaded,
   "process.spawned": processSpawned,
   "process.exited": processSettled,

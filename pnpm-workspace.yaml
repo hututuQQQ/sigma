@@ -2,8 +2,6 @@ packages:
   - "packages/*"
 overrides:
   qs: 6.15.2
-patchedDependencies:
-  '@earendil-works/pi-ai@0.82.1': 'patches/@earendil-works%2Fpi-ai@0.82.1.patch'
 supportedArchitectures:
   os:
     - current
@@ -40,3 +38,8 @@ allowBuilds:
   tree-sitter-python: true
   tree-sitter-rust: true
   tree-sitter-typescript: true
+minimumReleaseAgeExclude:
+  - '@earendil-works/pi-ai@0.84.0'
+  - '@earendil-works/pi-telemetry@0.84.0'
+patchedDependencies:
+  '@earendil-works/pi-ai@0.84.0': patches/@earendil-works__pi-ai@0.84.0.patch

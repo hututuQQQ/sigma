@@ -438,11 +438,11 @@ describe("OpenAI Codex subscription gateway", () => {
       ].join("|"))
       .sort()
       .join("\n");
-    expect(listPiProviders()).toHaveLength(39);
-    expect(models).toHaveLength(1_110);
-    expect(models.filter((model) => model.providerId !== "glm")).toHaveLength(1_109);
+    expect(listPiProviders()).toHaveLength(40);
+    expect(models).toHaveLength(1_154);
+    expect(models.filter((model) => model.providerId !== "glm")).toHaveLength(1_153);
     expect(createHash("sha256").update(catalogSummary).digest("hex"))
-      .toBe("e613a457d3db26fbb2ea0fc4fd04214ace80768ea5d252eb64dc9f5265238569");
+      .toBe("778dfa5f8e1c1ace09d393c19c515bee298d364c4f7ecd1746855a8dca9a0771");
     expect(OPENAI_CODEX_DEFAULT_MODEL).toBe("gpt-5.6-terra");
     expect(listOpenAICodexModels().map((model) => model.id)).toEqual([
       "gpt-5.3-codex-spark",
@@ -1160,7 +1160,7 @@ describe("dynamic Pi model refresh", () => {
       modelsStore: memoryModelsStore()
     });
 
-    expect(received).toEqual([replacement]);
+    expect(received).toEqual([replacement, replacement]);
     expect(credentials.current()).toEqual(replacement);
   });
 
@@ -1223,7 +1223,7 @@ describe("dynamic Pi model refresh", () => {
     const providerRefresh = vi.fn(async (context: RefreshContext) => {
       expect(context.allowNetwork).toBe(false);
       expect(context.credential).toBeUndefined();
-      await context.store.read();
+      expect(context.stored).toBeUndefined();
     });
     const credentials = genericCredentialStore();
     const store = memoryModelsStore();
@@ -1234,10 +1234,10 @@ describe("dynamic Pi model refresh", () => {
       refresh: providerRefresh
     }));
 
-    await hydratePiModelCache(models, credentials, store);
+    await hydratePiModelCache(models);
 
     expect(providerRefresh).toHaveBeenCalledOnce();
-    expect(store.read).toHaveBeenCalledWith("dynamic");
+    expect(store.read).toHaveBeenCalledWith("dynamic", expect.any(Object));
     expect(refreshOAuth).not.toHaveBeenCalled();
   });
 
@@ -1279,7 +1279,7 @@ describe("dynamic Pi model refresh", () => {
       modelsStore: memoryModelsStore()
     });
 
-    expect(firstRefresh).toHaveBeenCalledOnce();
+    expect(firstRefresh).toHaveBeenCalledTimes(2);
     expect(secondRefresh).not.toHaveBeenCalled();
   });
 });
@@ -1311,8 +1311,8 @@ describe("OpenAI Codex credential persistence", () => {
 
     const statuses = await listPiAuthStatuses(new MemoryCredentialStore());
 
-    expect(statuses).toHaveLength(39);
-    expect(new Set(statuses.map((status) => status.provider)).size).toBe(39);
+    expect(statuses).toHaveLength(40);
+    expect(new Set(statuses.map((status) => status.provider)).size).toBe(40);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 

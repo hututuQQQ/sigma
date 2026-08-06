@@ -5,7 +5,7 @@ export interface CommandDefinition {
   aliases?: string[];
   summary: string;
   mode?: RunMode;
-  handler: "run" | "tui" | "acp" | "auth" | "models" | "session" | "replay" | "doctor" | "sandbox" | "version" | "init" | "completion";
+  handler: "run" | "tui" | "acp" | "auth" | "models" | "session" | "replay" | "doctor" | "sandbox" | "harness" | "version" | "init" | "completion";
   sessionAction?: "list" | "cancel" | "resume" | "approve";
 }
 
@@ -24,6 +24,7 @@ export const SIGMA_COMMANDS: readonly CommandDefinition[] = [
   { name: "replay", summary: "Replay an event stream", handler: "replay" },
   { name: "doctor", summary: "Check runtime configuration", handler: "doctor" },
   { name: "sandbox", summary: "Check or prepare the native execution sandbox", handler: "sandbox" },
+  { name: "harness", summary: "Dry-inspect the Harness build without running a model", handler: "harness" },
   { name: "version", summary: "Print version information", handler: "version" },
   { name: "init", summary: "Create .agent/config.toml", handler: "init" },
   { name: "completion", summary: "Generate shell completion", handler: "completion" }

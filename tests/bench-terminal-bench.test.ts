@@ -181,12 +181,14 @@ describe("Terminal-Bench CLI verifier result handling", () => {
     process.env.AGENT_CLI_TARBALL = tarball;
     await writeFile(tarball, "frozen-stub", "utf8");
     const sha = createHash("sha256").update("frozen-stub").digest("hex");
+    const privateBenchRoot = path.join(fixtureDir, "evaluation-vault", "runs");
     let packageCalls = 0;
 
     const result = await runTerminalBenchCli([
       "--mode", "task", "--task-id", "selected-task", "--reuse-package",
       "--expected-archive-sha256", sha, "--run-label", "reuse-test"
     ], {
+      benchRootDir: privateBenchRoot,
       resolveHarborCommand: () => ({ command: "harbor", source: "test", exists: true }),
       packageAgentCli: async () => {
         packageCalls += 1;
@@ -213,6 +215,7 @@ describe("Terminal-Bench CLI verifier result handling", () => {
 
     try {
       expect(packageCalls).toBe(0);
+      expect(path.relative(privateBenchRoot, result.runDir)).not.toMatch(/^\.\.(?:[\\/]|$)/u);
       expect(result.report.agent_cli_sha256).toBe(sha);
       expect(result.report.package_reused).toBe(true);
     } finally {

@@ -85,7 +85,12 @@
     "bench:tb:report:all": "node scripts/bench-report.mjs --all",
     "bench:tb:formal": "node scripts/bench-terminal-bench-formal.mjs",
     "bench:tb:preregister": "node scripts/bench-terminal-bench-formal-preregistration.mjs",
-    "bench:tb:identity-archive": "node scripts/bench-task-identity-archive.mjs"
+    "bench:tb:identity-archive": "node scripts/bench-task-identity-archive.mjs",
+    "bench:tb:ab:preregister": "node scripts/bench-terminal-bench-formal-ab-preregistration.mjs",
+    "bench:tb:ab": "node scripts/bench-terminal-bench-formal-ab.mjs",
+    "bench:tb:ab:gate": "node scripts/bench-terminal-bench-formal-ab-gate.mjs",
+    "harness:freeze-candidate": "node scripts/freeze-flagship-candidate.mjs",
+    "harness:freeze-safety-report": "node scripts/freeze-safety-validation-report.mjs"
   },
   "devDependencies": {
     "@agentclientprotocol/sdk": "1.3.0",

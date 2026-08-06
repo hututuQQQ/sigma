@@ -39,6 +39,7 @@ import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
 import {
   completeAgentEventPayload,
+  persistCompiledHarnessFixture,
   persistEmptyCustomization
 } from "./testkit/agent-event-fixtures.js";
 
@@ -754,15 +755,15 @@ function settledMutationReservations(stored: AgentEventEnvelope[], type: "budget
     && reservationIds.has((item.payload as { reservationId?: string }).reservationId ?? "")).length;
 }
 
-function recoveryRuntime(
+async function recoveryRuntime(
   fixture: SeededRecovery,
   tryCompletion: boolean
-): {
+): Promise<{
   runtime: ReturnType<typeof createRuntime>;
   executions: { count: number };
   reviewer: CountingReviewer;
   gateway: RecoveryGateway;
-} {
+}> {
   const executions = { count: 0 };
   const reviewer = new CountingReviewer();
   const gateway = new RecoveryGateway(tryCompletion);
@@ -797,6 +798,24 @@ function recoveryRuntime(
       };
     }
   });
+  const stored = await events(fixture.store, fixture.sessionId);
+  const lastSeq = stored.at(-1)?.seq ?? 0;
+  await fixture.store.append({
+    schemaVersion: EVENT_SCHEMA_VERSION,
+    seq: lastSeq + 1,
+    eventId: randomUUID(),
+    sessionId: fixture.sessionId,
+    runId: fixture.runId,
+    occurredAt: new Date().toISOString(),
+    type: "harness.compiled",
+    authority: "runtime",
+    payload: await persistCompiledHarnessFixture(
+      fixture.storeRootDir,
+      fixture.sessionId,
+      gateway,
+      tools.descriptors().map((tool) => tool.name)
+    )
+  }, lastSeq);
   return {
     executions,
     reviewer,
@@ -817,7 +836,7 @@ describe("durable transaction fault-injection recovery", () => {
   for (const boundary of ["plan", "budget", "checkpoint"] as const) {
     it(`restarts once without duplicate execution after the ${boundary} boundary`, async () => {
       const fixture = await seedRecovery(boundary);
-      const { runtime, executions, reviewer } = recoveryRuntime(fixture, false);
+      const { runtime, executions, reviewer } = await recoveryRuntime(fixture, false);
       await runtime.command({ type: "resume", sessionId: fixture.sessionId });
       await expect(runtime.waitForOutcome(fixture.sessionId)).resolves.toMatchObject({ kind: "needs_input" });
       expect(executions.count).toBe(1);
@@ -831,7 +850,7 @@ describe("durable transaction fault-injection recovery", () => {
 
   it("never replays an open mutation and resumes only after the user keeps its sealed delta", async () => {
     const fixture = await seedRecovery("mutation");
-    const { runtime, executions, reviewer } = recoveryRuntime(fixture, true);
+    const { runtime, executions, reviewer } = await recoveryRuntime(fixture, true);
     await runtime.command({ type: "resume", sessionId: fixture.sessionId });
     await expect(runtime.waitForOutcome(fixture.sessionId)).resolves.toMatchObject({
       kind: "needs_input",
@@ -857,7 +876,7 @@ describe("durable transaction fault-injection recovery", () => {
 
   it("restores an open mutation without replay, duplicate charge, or false completion", async () => {
     const fixture = await seedRecovery("mutation");
-    const { runtime, executions, reviewer } = recoveryRuntime(fixture, false);
+    const { runtime, executions, reviewer } = await recoveryRuntime(fixture, false);
     await runtime.command({ type: "resume", sessionId: fixture.sessionId });
     await runtime.waitForOutcome(fixture.sessionId);
     await runtime.command({
@@ -882,7 +901,7 @@ describe("durable transaction fault-injection recovery", () => {
   ] as const) {
     it(`backfills ${boundary} idempotently without replay or gate bypass`, async () => {
       const fixture = await seedRecovery(boundary);
-      const { runtime, executions, reviewer, gateway } = recoveryRuntime(fixture, true);
+      const { runtime, executions, reviewer, gateway } = await recoveryRuntime(fixture, true);
       await runtime.command({ type: "resume", sessionId: fixture.sessionId });
       const outcome = await runtime.waitForOutcome(fixture.sessionId);
       const stored = await events(fixture.store, fixture.sessionId);
@@ -918,7 +937,7 @@ describe("durable transaction fault-injection recovery", () => {
 
   it("publishes a durable outcome-pending completion exactly once after restart", async () => {
     const fixture = await seedRecovery("completion");
-    const { runtime, executions, reviewer, gateway } = recoveryRuntime(fixture, true);
+    const { runtime, executions, reviewer, gateway } = await recoveryRuntime(fixture, true);
     await runtime.command({ type: "resume", sessionId: fixture.sessionId });
     await expect(runtime.waitForOutcome(fixture.sessionId)).resolves.toMatchObject({ kind: "completed" });
     expect(executions.count).toBe(0);

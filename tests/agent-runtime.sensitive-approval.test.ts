@@ -10,6 +10,7 @@ import type {
 import {
   EVENT_SCHEMA_VERSION,
   type AgentEventEnvelope,
+  type ModelGateway,
   type ToolCallPlan
 } from "../packages/agent-protocol/src/index.js";
 import { createChildAgentFactory, createRuntime } from "../packages/agent-runtime/src/testing.js";
@@ -27,6 +28,7 @@ import {
 } from "../scripts/smoke-fake-model.mjs";
 import {
   completeAgentEventPayload,
+  persistCompiledHarnessFixture,
   persistEmptyCustomization
 } from "./testkit/agent-event-fixtures.js";
 
@@ -98,6 +100,12 @@ function networkTurn(callId: string) {
   })]);
 }
 
+function processEnvironmentTurn() {
+  return fakeToolTurn([fakeToolCall("load-process-environment", "load_tool_bundle", {
+    bundleId: "process_environment"
+  })]);
+}
+
 const recoveredWritePlan: ToolCallPlan = {
   exactEffects: ["filesystem.write"],
   readPaths: ["result.txt"],
@@ -112,6 +120,8 @@ async function appendRecoveredWriteApproval(
   store: SegmentedJsonlStore,
   storeRootDir: string,
   workspacePath: string,
+  gateway: ModelGateway,
+  toolNames: readonly string[],
   options: {
     pendingContent: string;
     presentedContent: string;
@@ -160,6 +170,9 @@ async function appendRecoveredWriteApproval(
     turnId: 1, effectRevision: 5, requestId: call.id, callId: call.id,
     message: "approval required", remainingDeadlineMs: 60_000
   });
+  append("harness.compiled", await persistCompiledHarnessFixture(
+    storeRootDir, "sensitive-session", gateway, toolNames
+  ));
   for (const event of stored) await store.append(event, event.seq - 1);
   return stored.length;
 }
@@ -242,7 +255,7 @@ describe("sensitive per-call approvals", () => {
       const requests: ExecutionRequest[] = [];
       const store = new SegmentedJsonlStore({ rootDir: path.join(root, "state") });
       const runtime = createRuntime({
-        gateway: new SmokeFakeGateway([networkTurn("network-one"), networkTurn("network-two"), fakeFinalTurn()]),
+        gateway: new SmokeFakeGateway([processEnvironmentTurn(), networkTurn("network-one"), networkTurn("network-two"), fakeFinalTurn()]),
         tools: registerBuiltinTools(new EffectToolRegistry(), {
           broker: broker(requests), sandboxMode: "required", networkMode: "none",
           runtimeCommands: fixtureRuntimeCommands
@@ -272,7 +285,7 @@ describe("sensitive per-call approvals", () => {
     const requests: ExecutionRequest[] = [];
     const store = new SegmentedJsonlStore({ rootDir: path.join(root, "state") });
     const runtime = createRuntime({
-      gateway: new SmokeFakeGateway([networkTurn("network-one"), networkTurn("network-two"), fakeFinalTurn()]),
+      gateway: new SmokeFakeGateway([processEnvironmentTurn(), networkTurn("network-one"), networkTurn("network-two"), fakeFinalTurn()]),
       tools: registerBuiltinTools(new EffectToolRegistry(), {
         broker: broker(requests), sandboxMode: "required", networkMode: "none",
         runtimeCommands: fixtureRuntimeCommands
@@ -304,7 +317,7 @@ describe("sensitive per-call approvals", () => {
     fixtures.push(root);
     const store = new SegmentedJsonlStore({ rootDir: path.join(root, "state") });
     const runtime = createRuntime({
-      gateway: new SmokeFakeGateway([networkTurn("slow-human"), fakeFinalTurn()]),
+      gateway: new SmokeFakeGateway([processEnvironmentTurn(), networkTurn("slow-human"), fakeFinalTurn()]),
       tools: registerBuiltinTools(new EffectToolRegistry(), {
         broker: broker([]), runtimeCommands: fixtureRuntimeCommands
       }),
@@ -350,7 +363,7 @@ describe("sensitive per-call approvals", () => {
       return await append(event, expectedSeq);
     };
     const runtime = createRuntime({
-      gateway: new SmokeFakeGateway([networkTurn("approval-race"), fakeFinalTurn()]),
+      gateway: new SmokeFakeGateway([processEnvironmentTurn(), networkTurn("approval-race"), fakeFinalTurn()]),
       tools: registerBuiltinTools(new EffectToolRegistry(), {
         broker: broker([]), runtimeCommands: fixtureRuntimeCommands
       }),
@@ -396,7 +409,7 @@ describe("sensitive per-call approvals", () => {
     const requests: ExecutionRequest[] = [];
     const store = new SegmentedJsonlStore({ rootDir: path.join(root, "state") });
     const runtime = createRuntime({
-      gateway: new SmokeFakeGateway([networkTurn("network-denied"), fakeFinalTurn()]),
+      gateway: new SmokeFakeGateway([processEnvironmentTurn(), networkTurn("network-denied"), fakeFinalTurn()]),
       tools: registerBuiltinTools(new EffectToolRegistry(), {
         broker: broker(requests), runtimeCommands: fixtureRuntimeCommands
       }),
@@ -437,12 +450,21 @@ describe("sensitive per-call approvals", () => {
     fixtures.push(root);
     const storeRootDir = path.join(root, "state");
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
-    const lastSeq = await appendRecoveredWriteApproval(store, storeRootDir, root, {
-      pendingContent, presentedContent, presentedToolName
-    });
+    const gateway = new SmokeFakeGateway([]);
+    const tools = registerBuiltinTools(new EffectToolRegistry());
+    const lastSeq = await appendRecoveredWriteApproval(
+      store,
+      storeRootDir,
+      root,
+      gateway,
+      tools.descriptors().map((tool) => tool.name),
+      {
+        pendingContent, presentedContent, presentedToolName
+      }
+    );
     const runtime = createRuntime({
-      gateway: new SmokeFakeGateway([]),
-      tools: registerBuiltinTools(new EffectToolRegistry()),
+      gateway,
+      tools,
       store,
       storeRootDir,
       permissionMode: "ask",
@@ -475,7 +497,7 @@ describe("sensitive per-call approvals", () => {
     } finally {
       await cancelAndRelease(runtime, "sensitive-session", "test complete");
     }
-  });
+  }, 30_000);
 
   it("releaseSession waits for terminal persistence before fixture teardown", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-approval-release-"));
@@ -495,7 +517,7 @@ describe("sensitive per-call approvals", () => {
       return await append(event, expectedSeq);
     };
     const runtime = createRuntime({
-      gateway: new SmokeFakeGateway([networkTurn("release-wait")]),
+      gateway: new SmokeFakeGateway([processEnvironmentTurn(), networkTurn("release-wait")]),
       tools: registerBuiltinTools(new EffectToolRegistry(), {
         broker: broker([]), runtimeCommands: fixtureRuntimeCommands
       }),
@@ -664,7 +686,7 @@ describe("sensitive per-call approvals", () => {
     const requests: ExecutionRequest[] = [];
     const store = new SegmentedJsonlStore({ rootDir: path.join(root, "state") });
     const runtime = createRuntime({
-      gateway: new SmokeFakeGateway([networkTurn("child-network"), fakeFinalTurn()]),
+      gateway: new SmokeFakeGateway([processEnvironmentTurn(), networkTurn("child-network"), fakeFinalTurn()]),
       tools: registerBuiltinTools(new EffectToolRegistry(), {
         broker: broker(requests), runtimeCommands: fixtureRuntimeCommands
       }),
