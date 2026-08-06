@@ -84,7 +84,9 @@ function tokenizerMargin(spec: ModelSpec): number {
 function contextRequirement(spec: ModelSpec, constraints: ModelRouteConstraints): number {
   const margin = tokenizerMargin(spec);
   const input = Math.ceil((constraints.estimatedInputTokens ?? 0) * margin);
-  const output = Math.ceil((constraints.maxOutputTokens ?? spec.capabilities.maxOutputTokens) * margin);
+  // Only the locally counted prompt is approximate. The provider request's
+  // output limit is exact and must not consume tokenizer uncertainty again.
+  const output = Math.ceil(constraints.maxOutputTokens ?? spec.capabilities.maxOutputTokens);
   return input + output;
 }
 

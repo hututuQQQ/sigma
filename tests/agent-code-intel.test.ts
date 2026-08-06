@@ -22,6 +22,7 @@ import { codeIntelTool } from "../packages/agent-tools/src/index.js";
 
 class FakeTransport implements LspTransport {
   readonly methods: string[] = [];
+  readonly openedLanguageIds: string[] = [];
   private readonly decoder = new LspFrameDecoder();
   private readonly queued: Uint8Array[] = [];
   private readonly waiters: Array<(value: IteratorResult<Uint8Array>) => void> = [];
@@ -52,7 +53,11 @@ class FakeTransport implements LspTransport {
       }
       if (message.method === "shutdown") this.push({ jsonrpc: "2.0", id: message.id, result: null });
       if (message.method === "textDocument/didOpen") {
-        const uri = (message.params as { textDocument: { uri: string } }).textDocument.uri;
+        const textDocument = (message.params as {
+          textDocument: { uri: string; languageId: string };
+        }).textDocument;
+        const uri = textDocument.uri;
+        this.openedLanguageIds.push(textDocument.languageId);
         this.push({
           jsonrpc: "2.0",
           method: "textDocument/publishDiagnostics",
@@ -230,6 +235,26 @@ describe("agent-code-intel", () => {
     await writeFile(path.join(workspace, "fixture.ts"), "const answer = 43;", "utf8");
     await expect(client.symbols("fixture.ts")).resolves.toEqual([{ name: "answer", kind: 12 }]);
     expect(transport.methods.filter((method) => method === "textDocument/didChange")).toHaveLength(1);
+    await client.close();
+  });
+
+  it("uses JavaScript and TypeScript language IDs for modern module extensions", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-lsp-module-extensions-"));
+    const expected = [
+      ["fixture.mts", "typescript"],
+      ["fixture.cts", "typescript"],
+      ["fixture.mjs", "javascript"],
+      ["fixture.cjs", "javascript"]
+    ] as const;
+    for (const [file] of expected) {
+      await writeFile(path.join(workspace, file), "export const answer = 42;", "utf8");
+    }
+    const transport = new FakeTransport();
+    const client = new LspClient({ rootPath: workspace, transport });
+    for (const [file] of expected) {
+      await expect(client.symbols(file)).resolves.toEqual([{ name: "answer", kind: 12 }]);
+    }
+    expect(transport.openedLanguageIds).toEqual(expected.map(([, language]) => language));
     await client.close();
   });
 
@@ -448,6 +473,33 @@ describe("agent-code-intel", () => {
       expect.objectContaining({ ok: true })
     ]);
     expect(tool.descriptor).toMatchObject({ executionMode: "parallel", resourceKeys: [] });
+    expect(broker.spawnRequests).toHaveLength(1);
+  });
+
+  it("selects the TypeScript server for modern JavaScript and TypeScript modules", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-lsp-module-presets-"));
+    const files = ["fixture.mts", "fixture.cts", "fixture.mjs", "fixture.cjs"];
+    for (const file of files) {
+      await writeFile(path.join(workspace, file), "export const answer = 42;", "utf8");
+    }
+    const broker = new FakeLspBroker();
+    const tool = codeIntelTool({
+      broker,
+      presets: [{
+        id: "typescript", languages: ["typescript", "javascript"], executable: process.execPath,
+        args: ["server.mjs", "--stdio"], source: "configured", available: true
+      }]
+    });
+    const context = {
+      sessionId: "session", runId: "run", workspacePath: workspace, runMode: "analyze" as const,
+      signal: new AbortController().signal, heartbeat() {}, progress: async () => undefined,
+      createArtifact: async () => "artifact"
+    };
+    for (const [index, file] of files.entries()) {
+      await expect(tool.execute({
+        callId: `module-${index}`, name: "lsp", arguments: { operation: "symbols", file }
+      }, context)).resolves.toMatchObject({ ok: true });
+    }
     expect(broker.spawnRequests).toHaveLength(1);
   });
 

@@ -666,6 +666,51 @@ describe("capability-aware model routing", () => {
     }));
   });
 
+  it("applies approximate tokenizer margin only to locally estimated input", () => {
+    const fits = spec("deepseek/context-fit", {
+      capabilities: { ...capabilities, contextWindowTokens: 1_600, maxOutputTokens: 100 }
+    });
+    const fittingRouter = new ModelRouter(
+      [fits],
+      [route({ candidates: [fits.id], maxAttempts: 1 })],
+      (item) => gateway(item.id, async () => response("ok"))
+    );
+    expect(fittingRouter.resolve("main", {
+      estimatedInputTokens: 1_000,
+      maxOutputTokens: 100
+    }).candidates.map((item) => item.id)).toEqual([fits.id]);
+
+    const tooSmall = spec("deepseek/context-small", {
+      capabilities: { ...capabilities, contextWindowTokens: 1_599, maxOutputTokens: 100 }
+    });
+    const constrainedRouter = new ModelRouter(
+      [tooSmall],
+      [route({ candidates: [tooSmall.id], maxAttempts: 1 })],
+      (item) => gateway(item.id, async () => response("ok"))
+    );
+    try {
+      constrainedRouter.resolve("main", {
+        estimatedInputTokens: 1_000,
+        maxOutputTokens: 100
+      });
+      throw new Error("Expected the undersized context window to be rejected.");
+    } catch (error) {
+      expect(error).toMatchObject({
+        code: "model_route_unavailable",
+        rejected: [expect.objectContaining({
+          modelSpecId: tooSmall.id,
+          reason: "context",
+          detail: expect.stringContaining("1600 tokens")
+        })]
+      });
+    }
+
+    expect(modelReservationEstimate(fits, {
+      estimatedInputTokens: 1_000,
+      maxOutputTokens: 100
+    })).toMatchObject({ inputTokens: 1_500, outputTokens: 150 });
+  });
+
   it("routes image prompts by model-visible cost instead of base64 transport size", async () => {
     const imageModel = spec("deepseek/image", {
       capabilities: {

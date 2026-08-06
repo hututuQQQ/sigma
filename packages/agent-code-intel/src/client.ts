@@ -33,6 +33,7 @@ function languageId(filePath: string): string {
   const extension = path.extname(filePath).toLowerCase();
   return ({
     ".ts": "typescript", ".tsx": "typescriptreact", ".js": "javascript", ".jsx": "javascriptreact",
+    ".mts": "typescript", ".cts": "typescript", ".mjs": "javascript", ".cjs": "javascript",
     ".py": "python", ".rs": "rust", ".go": "go"
   } as Record<string, string>)[extension] ?? "plaintext";
 }

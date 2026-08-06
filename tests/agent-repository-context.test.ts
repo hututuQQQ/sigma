@@ -391,6 +391,14 @@ describe("host repository context", () => {
       expect(regex.complete).toBe(true);
       expect(regex.matches.map((match) => match.text)).toEqual(["alpha123", "alpha456"]);
 
+      const inlineFlags = await searchRepositoryText(
+        workspace,
+        new AbortController().signal,
+        { query: "(?i)^ALPHA[0-9]+$", regex: true, glob: "src/**/*.ts", limit: 10 }
+      );
+      expect(inlineFlags.matches.map((match) => match.text))
+        .toEqual(["alpha123", "alpha456"]);
+
       const outputLimited = await searchRepositoryText(workspace, new AbortController().signal, {
         query: "alpha",
         maxOutputBytes: 20,
