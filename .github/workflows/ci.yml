@@ -309,6 +309,9 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+      - name: Configure canonical macOS runner temp directory
+        shell: bash
+        run: echo "TMPDIR=${RUNNER_TEMP}" >> "${GITHUB_ENV}"
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}

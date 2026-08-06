@@ -158,7 +158,10 @@ function approvedWindowsNodeFixtureAvailable() {
 }
 
 const approvedWindowsPackageIt = windowsZipFixtureAvailable() && approvedWindowsNodeFixtureAvailable() ? it : it.skip;
-const linuxPackagingIt = process.platform === "win32" ? it.skip : it;
+// Linux archive normalization is itself part of the platform proof. Running
+// these cases on another host would require a trusted Linux container runtime;
+// the Linux CI/release jobs exercise them natively instead.
+const linuxPackagingIt = process.platform === "linux" ? it : it.skip;
 
 async function writeFakeWindowsNodeRuntimeZip(tmpDir: string, arch = "x64") {
   const runtimeRoot = path.join(tmpDir, "runtime-win");
@@ -620,7 +623,7 @@ describe("package-agent-cli", () => {
         product: "Sigma Code",
         package: {
           name: "agent-cli",
-          version: "0.1.5"
+          version: "0.1.6"
         }
       },
       metadata: {

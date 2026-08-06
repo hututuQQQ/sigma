@@ -117,6 +117,10 @@ jobs:
         run: |
           "TEMP=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "TMP=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Configure canonical macOS runner temp directory
+        if: runner.os == 'macOS'
+        shell: bash
+        run: echo "TMPDIR=${RUNNER_TEMP}" >> "${GITHUB_ENV}"
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
