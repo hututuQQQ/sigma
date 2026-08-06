@@ -75,8 +75,13 @@ jobs:
               echo "Release tags must point to a commit reachable from main." >&2
               exit 1
             }
-            test "$(git cat-file -t "${GITHUB_REF_NAME}^{tag}")" = tag || {
+            tag_ref="refs/tags/${GITHUB_REF_NAME}"
+            test "$(git cat-file -t "${tag_ref}")" = tag || {
               echo "Release tags must be annotated tags." >&2
+              exit 1
+            }
+            test "$(git rev-parse "${tag_ref}^{}")" = "${GITHUB_SHA}" || {
+              echo "Release tag target must equal the workflow commit." >&2
               exit 1
             }
           fi

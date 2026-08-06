@@ -8,7 +8,7 @@ import {
   expectedPublicReleaseAssets
 } from "../scripts/release/assemble-release-assets.mjs";
 
-const version = "0.1.6";
+const version = "0.1.7";
 
 function evidenceInputs(includeLiveEval = true): string[] {
   const runtime = [

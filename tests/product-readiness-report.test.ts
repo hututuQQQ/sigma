@@ -16,7 +16,7 @@ async function fixture(targetWrapper: Record<string, unknown>, providerSmoke?: R
   const rootDir = await mkdir(path.join(os.tmpdir(), `sigma-readiness-${Date.now()}-${Math.random().toString(16).slice(2)}`), { recursive: true });
   const artifactsDir = path.join(rootDir, ".artifacts");
   await writeJson(path.join(rootDir, "package.json"), {
-    version: "0.1.6",
+    version: "0.1.7",
     scripts: {
       "verify:product": "pnpm lint && pnpm test && pnpm smoke:product && pnpm smoke:tui-product && pnpm verify:package:agent-cli:windows:structure && pnpm product:readiness"
     }
@@ -66,7 +66,7 @@ async function fixture(targetWrapper: Record<string, unknown>, providerSmoke?: R
     },
     metadata: {
       schemaVersion: 1,
-      productVersion: "0.1.6",
+      productVersion: "0.1.7",
       releaseChannel: targetPlatform === "win32" ? "preview" : "stable",
       sigmaExec: { sha256: "a".repeat(64) },
       node: { sha256: "c".repeat(64) },
@@ -112,7 +112,7 @@ async function fixture(targetWrapper: Record<string, unknown>, providerSmoke?: R
         idleWriteDenied: true, spawnCalls: 0
       }
     },
-    productVersion: "0.1.6",
+    productVersion: "0.1.7",
     assets: {
       typescriptLanguageServerSha256: "e".repeat(64),
       pyrightSha256: "f".repeat(64)
@@ -149,7 +149,7 @@ async function promoteCurrentEvidence(
   {
     provenanceTrusted,
     windowsSignerPolicy,
-    version = "0.1.6"
+    version = "0.1.7"
   }: { provenanceTrusted: boolean; windowsSignerPolicy: boolean; version?: string }
 ) {
   const packageJsonPath = path.join(rootDir, "package.json");
@@ -509,7 +509,7 @@ describe("product readiness report", () => {
     await writeJson(packagePath, packageReport);
     const evidencePath = path.join(artifactsDir, "lsp-sandbox-smoke-win32-x64.json");
     const evidence = JSON.parse(await readFile(evidencePath, "utf8"));
-    evidence.productVersion = "0.1.6";
+    evidence.productVersion = "0.1.7";
     evidence.assets = {
       typescriptLanguageServerSha256: "0".repeat(64),
       pyrightSha256: "f".repeat(64)
