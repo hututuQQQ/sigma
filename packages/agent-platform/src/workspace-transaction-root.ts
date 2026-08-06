@@ -97,6 +97,49 @@ function assertRealDirectory(
   }
 }
 
+const TRUSTED_DARWIN_DIRECTORY_ALIASES = [
+  { alias: "/tmp", canonical: "/private/tmp" },
+  { alias: "/var", canonical: "/private/var" }
+] as const;
+
+/**
+ * Resolve only fixed, root-owned macOS directory aliases. The remaining path
+ * is kept lexical so user-controlled ancestor links and the final state-root
+ * entry still reach the strict lstat validation below.
+ */
+async function resolveTrustedDarwinDirectoryAlias(target: string): Promise<string> {
+  const resolvedTarget = path.resolve(target);
+  if (process.platform !== "darwin") return resolvedTarget;
+  for (const entry of TRUSTED_DARWIN_DIRECTORY_ALIASES) {
+    const relative = path.relative(entry.alias, resolvedTarget);
+    if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`)
+      || path.isAbsolute(relative)) continue;
+    const info = await lstat(entry.alias);
+    if (!info.isSymbolicLink() || info.uid !== 0) continue;
+    const canonicalAlias = await realpath(entry.alias);
+    if (canonicalAlias !== entry.canonical) continue;
+    return path.resolve(canonicalAlias, relative);
+  }
+  return resolvedTarget;
+}
+
+/** Resolve through the nearest existing ancestor without creating anything. */
+async function canonicalPathAllowMissing(target: string): Promise<string> {
+  const resolvedTarget = path.resolve(target);
+  let ancestor = resolvedTarget;
+  while (true) {
+    try {
+      const canonical = await realpath(ancestor);
+      return path.resolve(canonical, path.relative(ancestor, resolvedTarget));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) throw error;
+      ancestor = parent;
+    }
+  }
+}
+
 async function verifyPrivatePosixDirectory(directory: string, created: boolean): Promise<void> {
   if (process.platform === "win32") return;
   if (typeof process.getuid !== "function") {
@@ -132,7 +175,7 @@ async function lockExistingWindowsDirectories(
  * reparse-point validation while directory handles prevent replacement.
  */
 export async function ensurePrivateStateDirectory(directory: string): Promise<string> {
-  const target = path.resolve(directory);
+  const target = await resolveTrustedDarwinDirectoryAlias(directory);
   const chain = directoryChain(target);
   const locks: WindowsDirectoryLock[] = [];
   try {
@@ -188,10 +231,12 @@ export async function workspaceTransactionRoot(
     const platform = options.platform ?? process.platform;
     const workspace = await realpath(path.resolve(options.workspacePath));
     const requestedState = path.resolve(options.stateRootDir ?? defaultStateHome(options));
+    const canonicalRequestedState = await canonicalPathAllowMissing(requestedState);
     const workspaceInfo = await stat(workspace);
 
     let stateRoot: string | undefined;
-    if (!isInside(workspace, requestedState)) {
+    if (!isInside(workspace, requestedState)
+      && !isInside(workspace, canonicalRequestedState)) {
       stateRoot = await ensurePrivateStateDirectory(requestedState);
       if (isInside(workspace, stateRoot) || (await stat(stateRoot)).dev !== workspaceInfo.dev) {
         stateRoot = undefined;

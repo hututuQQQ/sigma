@@ -1,4 +1,4 @@
-import { lstat, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -55,6 +55,28 @@ describe("workspace transaction roots", () => {
     await expect(lstat(path.join(agent, "internal-state"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("checks canonical state containment before creating directories", async () => {
+    const container = await temporaryRoot();
+    const workspace = path.join(container, "workspace");
+    const linkedWorkspace = path.join(container, "linked-workspace");
+    const unintendedState = path.join(workspace, "unintended-state");
+    await mkdir(workspace);
+    const linked = await symlink(
+      workspace,
+      linkedWorkspace,
+      process.platform === "win32" ? "junction" : "dir"
+    ).then(() => true, () => false);
+    if (!linked) return;
+    const root = await workspaceTransactionRoot({
+      workspacePath: workspace,
+      stateRootDir: path.join(linkedWorkspace, "unintended-state"),
+      namespace: "unit-transaction"
+    });
+    expect(path.relative(workspace, root).startsWith("..")).toBe(true);
+    await expect(lstat(unintendedState)).rejects.toMatchObject({ code: "ENOENT" });
+    await cleanupWorkspaceTransactionRoot(root);
+  });
+
   it("rejects a preexisting linked state root", async () => {
     const container = await temporaryRoot();
     const workspace = path.join(container, "workspace");
@@ -69,6 +91,27 @@ describe("workspace transaction roots", () => {
       workspacePath: workspace, stateRootDir: state, namespace: "unit-transaction"
     })).rejects.toMatchObject({ code: "workspace_transaction_root_unavailable" });
   });
+
+  it.skipIf(process.platform !== "darwin")(
+    "accepts a state root beneath the macOS system /var alias",
+    async () => {
+      const aliasInfo = await lstat("/var");
+      if (!aliasInfo.isSymbolicLink()) return;
+      expect(aliasInfo.uid).toBe(0);
+      await expect(realpath("/var")).resolves.toBe("/private/var");
+
+      const container = await mkdtemp(path.join("/var", "tmp", "sigma-system-alias-"));
+      temporaryRoots.add(container);
+      const workspace = path.join(container, "workspace");
+      const state = path.join(container, "state");
+      await mkdir(workspace);
+      const root = await workspaceTransactionRoot({
+        workspacePath: workspace, stateRootDir: state, namespace: "unit-transaction"
+      });
+      expect(root.startsWith("/private/var/")).toBe(true);
+      await cleanupWorkspaceTransactionRoot(root);
+    }
+  );
 
   it("detects a directory identity swap while a lease is active", async () => {
     const container = await temporaryRoot();
