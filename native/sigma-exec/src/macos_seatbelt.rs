@@ -589,6 +589,7 @@ mod tests {
 
     #[test]
     fn platform_policy_keeps_firmlink_traversal_read_only() {
+        assert!(PLATFORM_POLICY.contains("file-read* file-test-existence (literal \"/\")"));
         assert!(PLATFORM_POLICY.contains("/System/Volumes/Data/Users"));
         assert!(!PLATFORM_POLICY.contains("file-write* (subpath \"/tmp\")"));
         assert!(!PLATFORM_POLICY.contains("com.apple.app-sandbox.read-write"));

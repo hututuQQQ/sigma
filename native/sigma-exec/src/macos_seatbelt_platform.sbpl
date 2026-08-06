@@ -38,6 +38,10 @@
   (literal "/private/etc/localtime")
   (path-ancestors "/System/Volumes/Data/private"))
 
+; Reading the root directory entry itself is required during process startup.
+; `literal` keeps this grant at `/` and does not expose any descendants.
+(allow file-read* file-test-existence (literal "/"))
+
 (allow file-read* file-test-existence
   (literal "/System/Library/CoreServices")
   (literal "/System/Library/CoreServices/.SystemVersionPlatform.plist")
