@@ -115,14 +115,22 @@ export function toolReceipt(value: unknown): ToolReceipt | null {
 
 export function receiptContent(receipt: ToolReceipt): string {
   const heading = `Tool result: ${receipt.ok ? "succeeded" : "failed"}`;
+  const serializedResult = receipt.result === undefined
+    ? undefined
+    : JSON.stringify(receipt.result);
+  const outputAlreadyProjectsResult = serializedResult !== undefined
+    && serializedResult === receipt.output;
   const diagnostics = [...new Set([
     ...receipt.outcome.diagnosticCodes,
     ...receipt.diagnostics
   ])].slice(0, 12).map((code) => compactString(code, 96));
-  const artifacts = (receipt.artifactRefs ?? []).slice(0, 6).map((artifact) =>
-    [compactString(artifact.artifactId, 128), compactString(artifact.name, 96), artifact.sizeBytes]
-      .filter((item) => item !== undefined)
-      .join(":"));
+  const artifacts = (receipt.artifactRefs ?? []).slice(0, 6).map((artifact) => ({
+    // artifactId is an opaque capability. Keep it exact and separate from
+    // presentation metadata so the model can pass it back to read_artifact.
+    artifactId: artifact.artifactId,
+    name: compactString(artifact.name, 96),
+    ...(artifact.sizeBytes === undefined ? {} : { sizeBytes: artifact.sizeBytes })
+  }));
   const delta = receipt.workspaceDelta;
   const changes = delta ? {
     added: delta.added.slice(0, 6).map((item) => compactString(item, 120)),
@@ -139,7 +147,9 @@ export function receiptContent(receipt: ToolReceipt): string {
       evidence: receipt.evidence.slice(0, 6).map((item) =>
         `${item.kind}:${item.status}:${compactString(item.summary, 120)}`)
     } : {}),
-    ...(receipt.result === undefined ? {} : { result: boundedJson(receipt.result) }),
+    ...(receipt.result === undefined || outputAlreadyProjectsResult
+      ? {}
+      : { result: boundedJson(receipt.result) }),
     ...(changes ? { changes } : {}),
     ...(receipt.artifacts.length > 0 && artifacts.length === 0
       ? { artifactIds: receipt.artifacts.slice(0, 6).map((item) => compactString(item, 128)) } : {}),

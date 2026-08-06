@@ -54,6 +54,9 @@ SUPPORTED_NETWORK_MODES = {"none", "full"}
 MAX_CONTEXT_TEXT_CHARS = 8_192
 MAX_PARTIAL_ARTIFACT_CHARS = 1_048_576
 MAX_TRACE_ARTIFACT_BYTES = 4 * 1_048_576
+TRACE_FLUSH_BYTES = 64 * 1_024
+TRACE_FLUSH_INTERVAL_SECONDS = 0.25
+RECOVERY_SNAPSHOT_INTERVAL_SECONDS = 1.0
 MAX_STREAM_LINE_CHARS = 65_536
 MAX_STREAM_RECORD_BYTES = 16 * 1_048_576
 MAX_CREDENTIAL_BRIDGE_BYTES = 1_048_576
@@ -692,15 +695,27 @@ def _write_utf8_artifact(path: pathlib.Path, value: str) -> None:
 
 
 class _BoundedJsonlWriter:
-    """Append-only JSONL writer with bounded recovery from artifact I/O failures."""
+    """Append-only JSONL writer with bounded, periodically flushed recovery."""
 
-    def __init__(self, path: pathlib.Path, maximum: int, *, reset: bool = False) -> None:
+    def __init__(
+        self,
+        path: pathlib.Path,
+        maximum: int,
+        *,
+        reset: bool = False,
+        flush_bytes: int = TRACE_FLUSH_BYTES,
+        flush_interval_seconds: float = TRACE_FLUSH_INTERVAL_SECONDS,
+    ) -> None:
         self.path = path
         self.maximum = max(0, maximum)
+        self._flush_bytes = max(1, flush_bytes)
+        self._flush_interval_seconds = max(0.0, flush_interval_seconds)
         self._lock = threading.Lock()
         self._pending = bytearray()
         self._write_failures = 0
         self._last_write_error: str | None = None
+        self._last_flush_monotonic = time.monotonic()
+        self._has_flushed_since_init = False
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if reset:
             self.path.unlink(missing_ok=True)
@@ -747,6 +762,8 @@ class _BoundedJsonlWriter:
         for attempt in range(max(1, attempts)):
             try:
                 self._write_pending_once()
+                self._last_flush_monotonic = time.monotonic()
+                self._has_flushed_since_init = True
                 return not self._pending
             except OSError as error:
                 self._record_failure(error)
@@ -777,10 +794,18 @@ class _BoundedJsonlWriter:
             reserve = min(len(marker), self.maximum)
             if logical_size + len(line) <= self.maximum - reserve:
                 self._pending.extend(line)
-                return self._flush_pending()
+                flush_due = (
+                    not self._has_flushed_since_init
+                    or len(self._pending) >= self._flush_bytes
+                    or time.monotonic() - self._last_flush_monotonic
+                    >= self._flush_interval_seconds
+                )
+                return self._flush_pending() if flush_due else True
             if logical_size + len(marker) <= self.maximum:
                 self._pending.extend(marker)
             self.truncated = True
+            # Make the terminal marker observable immediately; subsequent
+            # records are intentionally discarded.
             return self._flush_pending()
 
     def flush(self) -> bool:
@@ -991,6 +1016,12 @@ class _OutputRecorder:
         self.state_path = logs_dir / "runtime.partial.json"
         self._artifact_failures: dict[str, dict[str, Any]] = {}
         self._buffers = {"stdout": "", "stderr": ""}
+        self._stream_snapshot_dirty = {"stdout": False, "stderr": False}
+        self._last_stream_snapshot_monotonic: dict[str, float | None] = {
+            "stdout": None,
+            "stderr": None,
+        }
+        self._last_state_snapshot_monotonic: float | None = None
         self._pending_stdout = ""
         self._stream_chunks: dict[str, dict[str, Any]] = {}
         self._seen: set[tuple[str, ...]] = set()
@@ -1013,7 +1044,10 @@ class _OutputRecorder:
         self._trace_writer = _BoundedJsonlWriter(
             self.trace_path, MAX_TRACE_ARTIFACT_BYTES, reset=True
         )
-        self._write_state()
+        self._write_state(force=True)
+        # The empty initialization snapshot must not delay the first useful
+        # event snapshot.
+        self._last_state_snapshot_monotonic = None
 
     def _record_artifact_failure(self, path: pathlib.Path, error: OSError) -> None:
         key = path.name
@@ -1030,14 +1064,8 @@ class _OutputRecorder:
         self._buffers[stream] = _bounded_utf8_text(
             self._buffers[stream] + (text or ""), MAX_PARTIAL_ARTIFACT_CHARS
         )
-        path = self.stdout_path if stream == "stdout" else self.stderr_path
-        try:
-            _write_utf8_artifact(path, self._buffers[stream])
-        except OSError as error:
-            # Partial stdout/stderr are observational artifacts. The full
-            # bounded buffer remains in memory and the next callback rewrites
-            # it, so a transient host lock must not abort the agent process.
-            self._record_artifact_failure(path, error)
+        self._stream_snapshot_dirty[stream] = True
+        self._write_stream_snapshot(stream)
         if stream == "stdout" and text:
             lines = (self._pending_stdout + text).splitlines(keepends=True)
             self._pending_stdout = ""
@@ -1045,6 +1073,26 @@ class _OutputRecorder:
                 self._pending_stdout = _bounded_text(lines.pop(), MAX_STREAM_LINE_CHARS)
             for line in lines:
                 self._consume_line(line)
+
+    def _write_stream_snapshot(self, stream: str, *, force: bool = False) -> None:
+        if not self._stream_snapshot_dirty[stream]:
+            return
+        now = time.monotonic()
+        previous = self._last_stream_snapshot_monotonic[stream]
+        if (not force and previous is not None
+                and now - previous < RECOVERY_SNAPSHOT_INTERVAL_SECONDS):
+            return
+        # Count attempts, not only successes, so a transient host lock cannot
+        # turn a high-frequency model stream into an artifact retry storm.
+        self._last_stream_snapshot_monotonic[stream] = now
+        path = self.stdout_path if stream == "stdout" else self.stderr_path
+        try:
+            _write_utf8_artifact(path, self._buffers[stream])
+            self._stream_snapshot_dirty[stream] = False
+        except OSError as error:
+            # Partial stdout/stderr are observational artifacts. The bounded
+            # buffer remains in memory and a later or final snapshot retries.
+            self._record_artifact_failure(path, error)
 
     def _consume_line(self, line: str) -> None:
         for value in _decode_stream_line(line, self._stream_chunks):
@@ -1091,12 +1139,12 @@ class _OutputRecorder:
                 self.retry_count += 1
                 self.last_retry = _bounded_event(event)
             self.append_trace(_trace_record(event))
-            self._write_state()
+            self._write_state(force=event_type in TERMINAL_EVENT_TYPES)
             return
         if value.get("kind") == "result" or value.get("type") == "result":
             candidate = value.get("result")
             self.output_result = dict(candidate) if isinstance(candidate, dict) else dict(value)
-            self._write_state()
+            self._write_state(force=True)
             return
         if value.get("kind") == "error":
             error = value.get("error")
@@ -1108,7 +1156,7 @@ class _OutputRecorder:
                 "message": str(error_record.get("message") or "agent CLI returned an error"),
                 **({"failureKind": failure} if failure else {}),
             }
-            self._write_state()
+            self._write_state(force=True)
 
     def append_trace(self, record: dict[str, Any]) -> None:
         self._trace_writer.append(record)
@@ -1125,6 +1173,7 @@ class _OutputRecorder:
 
     def finish_artifacts(self) -> list[str]:
         """Flush recoverable artifact state and return bounded diagnostics."""
+        self.flush_recovery_snapshots()
         self._trace_writer.flush()
         warnings = []
         trace_warning = self._trace_writer.artifact_warning()
@@ -1136,6 +1185,12 @@ class _OutputRecorder:
                 f"last error: {state['last_error']}"
             )
         return warnings
+
+    def flush_recovery_snapshots(self) -> None:
+        """Persist the latest bounded stream and accounting state."""
+        for stream in self._buffers:
+            self._write_stream_snapshot(stream, force=True)
+        self._write_state(force=True)
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -1164,7 +1219,13 @@ class _OutputRecorder:
             ),
         }
 
-    def _write_state(self) -> None:
+    def _write_state(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if (not force and self._last_state_snapshot_monotonic is not None
+                and now - self._last_state_snapshot_monotonic
+                < RECOVERY_SNAPSHOT_INTERVAL_SECONDS):
+            return
+        self._last_state_snapshot_monotonic = now
         state = self.snapshot()
         try:
             self.state_path.write_text(
@@ -2332,6 +2393,8 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
         process_cleanup: dict[str, Any] | None = None,
     ) -> tuple[pathlib.Path, pathlib.Path]:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
+        if recorder is not None:
+            recorder.flush_recovery_snapshots()
         stdout = _bounded_utf8_text(_stdout_text(result), MAX_PARTIAL_ARTIFACT_CHARS)
         stderr = _bounded_utf8_text(_stderr_text(result), MAX_PARTIAL_ARTIFACT_CHARS)
         if recorder is not None:
@@ -2460,6 +2523,7 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             writer = _BoundedJsonlWriter(trace_path, MAX_TRACE_ARTIFACT_BYTES, reset=True)
             for record in self._trace_records(events, summary):
                 writer.append(record)
+            writer.flush()
         return summary_path, trace_path
 
     def _tarball_from_env(self) -> pathlib.Path | None:

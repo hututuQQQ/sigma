@@ -36,6 +36,7 @@ import { aggregateReviewerUsage } from "./reviewer-accounting.js";
 import {
   protocolFailureResponse
 } from "./reviewer-turn-protocol.js";
+import { deterministicSamplingOptions } from "./model-request-policy.js";
 import {
   activeInspectionRequired,
   isVerdictTool,
@@ -196,7 +197,7 @@ export class ModelReviewer implements ReviewerPort {
       signal,
       tools,
       ...(toolChoice ? { toolChoice } : {}),
-      temperature: 0,
+      ...deterministicSamplingOptions(this.gateway),
       maxOutputTokens: prepared.maxOutputTokens,
       messages: requestMessages
     };

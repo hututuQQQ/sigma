@@ -52,7 +52,7 @@ function position(input: Record<string, JsonValue>): LspPosition {
 
 function languageFor(file: string): string {
   return ({
-    ".ts": "typescript", ".tsx": "typescriptreact", ".js": "javascript", ".jsx": "javascriptreact",
+    ".ts": "typescript", ".tsx": "typescriptreact", ".js": "javascript", ".jsx": "javascriptreact", ".mts": "typescript", ".cts": "typescript", ".mjs": "javascript", ".cjs": "javascript",
     ".py": "python", ".rs": "rust", ".go": "go"
   } as Record<string, string>)[path.extname(file).toLowerCase()] ?? "";
 }

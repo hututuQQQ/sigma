@@ -4,6 +4,7 @@ import {
   BoundedRegexMatcher,
   literalLineMatches,
   MAX_REPOSITORY_REGEX_CHARACTERS,
+  repositoryRegexPattern,
   type RepositoryLineMatch
 } from "./repository-regex-search.js";
 import { withHostRepositorySnapshot } from "./repository-host-snapshot.js";
@@ -264,7 +265,8 @@ function resolvedOptions(
   }
   if (regex) {
     try {
-      RegExp(options.query, "u");
+      const pattern = repositoryRegexPattern(options.query);
+      RegExp(pattern.source, pattern.flags);
     } catch (error) {
       throw new Error(
         `Invalid repository regex: ${error instanceof Error ? error.message : String(error)}`,

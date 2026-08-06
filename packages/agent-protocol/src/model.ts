@@ -26,6 +26,8 @@ export interface ModelMessage {
   images?: ModelImage[];
   reasoningContent?: string;
   toolCallId?: string;
+  /** Provider-native tool result status. Only meaningful for tool messages. */
+  isError?: boolean;
   toolCalls?: ModelToolCall[];
   providerState?: ModelProviderState;
 }
@@ -72,6 +74,12 @@ export interface ModelCapabilities {
   structuredOutput: boolean;
   promptCache: boolean;
   tokenizer: "provider" | "approximate";
+  /**
+   * The active provider/wire profile accepts an explicit sampling temperature.
+   * Omitted means unknown and preserves the caller's request for third-party
+   * gateways; `false` requires the harness to omit the field entirely.
+   */
+  temperatureControl?: boolean;
   /** The selected model accepts image blocks in user messages. */
   imageInput?: boolean;
   /**

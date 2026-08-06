@@ -125,6 +125,15 @@ class InspectableGateway implements ModelGateway {
   async countTokens(): Promise<number> { return 100; }
 }
 
+class ToolSchemaHeavyGateway extends InspectableGateway {
+  override async countTokens(
+    _messages: ModelMessage[],
+    tools: ModelToolDefinition[] = []
+  ): Promise<number> {
+    return tools.length > 0 ? 200 : 100;
+  }
+}
+
 function requestInputResponse(): ModelResponse {
   return {
     message: {
@@ -450,6 +459,52 @@ describe("provider-measured model budget settlement", () => {
       type: "run.failed",
       payload: { kind: "recoverable_failure", code: "budget_exhausted" }
     });
+  });
+
+  it("uses a final text-only fallback when tool schemas no longer fit the measured ledger", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-context-fallback-workspace-"));
+    const state = await mkdtemp(path.join(os.tmpdir(), "sigma-context-fallback-state-"));
+    await writeFile(path.join(workspace, "seed.txt"), "seed\n", "utf8");
+    const gateway = new ToolSchemaHeavyGateway([{
+      message: {
+        role: "assistant",
+        content: "I inspected the workspace before the input boundary.",
+        toolCalls: [{
+          id: "read-before-context-fallback",
+          name: "read",
+          arguments: { path: "seed.txt" }
+        }]
+      },
+      finishReason: "tool_calls",
+      usage: measuredUsage(450, 10)
+    }, stopResponse("Completed work preserved at the input boundary.")]);
+    const runtime = createRuntime({
+      gateway,
+      store: new SegmentedJsonlStore({ rootDir: state }),
+      storeRootDir: state,
+      tools: registerBuiltinTools(new EffectToolRegistry()),
+      permissionMode: "auto",
+      outputReserveTokens: 100
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" }, {
+      inputTokens: 600, outputTokens: 1_000, costMicroUsd: 10_000_000, modelTurns: 10,
+      toolCalls: 1_000, children: 32, maxDepth: 4
+    });
+    await runtime.command({
+      type: "submit",
+      sessionId: session.sessionId,
+      text: "Inspect the workspace and report the result."
+    });
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "completed",
+      message: "Completed work preserved at the input boundary."
+    });
+    expect(gateway.requests).toHaveLength(2);
+    expect(gateway.requests[0]!.tools.length).toBeGreaterThan(0);
+    expect(gateway.requests[1]).toMatchObject({ toolChoice: "none", tools: [] });
+    expect(gateway.requests[1]!.messages.some((message) =>
+      message.content.includes("final model turn allowed"))).toBe(true);
   });
 
   it("continues useful work while an explicit deadline is still live", async () => {

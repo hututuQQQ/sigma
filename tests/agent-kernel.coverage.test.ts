@@ -244,7 +244,9 @@ describe("agent-kernel protocol behavior", () => {
     state = settle(state, "write", false, ["filesystem.write"]);
     expect(state.phase).toBe("ready_model");
     expect(state.receipts).toHaveLength(1);
-    expect(state.messages.at(-1)).toMatchObject({ role: "tool", toolCallId: "write" });
+    expect(state.messages.at(-1)).toMatchObject({
+      role: "tool", toolCallId: "write", isError: true
+    });
     expect(state.proposedOutcome).toBeUndefined();
     assertKernelInvariants(state);
   });

@@ -234,7 +234,8 @@ function replayMessages(model: PiModel<Api>): ModelMessage[] {
     {
       role: "tool",
       content: "gateway matches",
-      toolCallId: "prior_search"
+      toolCallId: "prior_search",
+      isError: true
     },
     { role: "user", content: "Continue." }
   ];
@@ -265,6 +266,7 @@ function request(model: PiModel<Api>): ModelRequest {
     ],
     toolChoice: "auto",
     maxOutputTokens: 4_096,
+    temperature: 0,
     signal: new AbortController().signal
   };
 }
@@ -338,6 +340,11 @@ describe.each(apiFamilies)("Pi %s API family contract", (api) => {
       "toolResult",
       "user"
     ]);
+    expect(call.context.messages.filter((message) => message.role === "toolResult"))
+      .toEqual([
+        expect.objectContaining({ toolCallId: "prior_read", isError: false }),
+        expect.objectContaining({ toolCallId: "prior_search", isError: true })
+      ]);
     const replay = call.context.messages[1] as AssistantMessage;
     expect(replay).toMatchObject({
       api,
@@ -353,6 +360,12 @@ describe.each(apiFamilies)("Pi %s API family contract", (api) => {
     expect(call.options.maxTokens).toBe(api === "anthropic-messages" ? 16_384 : 4_096);
     expect(call.options.signal).toBeInstanceOf(AbortSignal);
     expect(call.options.toolChoice).toBe("auto");
+    expect(gateway.capabilities.temperatureControl)
+      .toBe(api !== "openai-codex-responses");
+    expect(Object.hasOwn(call.options, "temperature"))
+      .toBe(api !== "openai-codex-responses");
+    expect(call.options.temperature)
+      .toBe(api === "openai-codex-responses" ? undefined : 0);
     expect(call.options.transport).toBe(
       api === "openai-codex-responses" ? "auto" : undefined
     );

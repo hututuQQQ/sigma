@@ -274,6 +274,22 @@ describe("agent-kernel boundary contracts", () => {
     expect(content).toContain('"changes"');
     expect(content).toContain("artifactRefs");
     expect(receiptContent(receipt("minimal"))).not.toContain("workspaceDelta");
+
+    const projectedOnce = {
+      ...receipt("structured"),
+      output: JSON.stringify({ status: "updated", revision: 3 }),
+      result: { status: "updated", revision: 3 }
+    };
+    const deduplicated = receiptContent(projectedOnce);
+    expect(deduplicated.match(/"revision":3/gu)).toHaveLength(1);
+    expect(deduplicated).not.toContain('\\"revision\\"');
+
+    const distinct = receiptContent({
+      ...projectedOnce,
+      result: { status: "updated", revision: 4 }
+    });
+    expect(distinct).toContain('"revision":3');
+    expect(distinct).toContain('\\"revision\\":4');
   });
 
   it("projects pending tools and optimistic outcome revisions", () => {
