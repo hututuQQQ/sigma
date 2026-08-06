@@ -20,7 +20,8 @@ function verifiedShells(
   const seen = new Set<string>();
   return input.map((raw, index) => {
     const shell = protocolRecord(raw, `Broker verified shell[${index}]`);
-    if (shell.kind !== "powershell" && shell.kind !== "cmd" && shell.kind !== "bash") {
+    if (shell.kind !== "powershell" && shell.kind !== "cmd"
+      && shell.kind !== "bash" && shell.kind !== "zsh") {
       throw new BrokerProtocolError("Broker verified shell kind is invalid.");
     }
     const executable = stringValue(shell.executable, "Broker verified shell executable");

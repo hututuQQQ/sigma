@@ -1,5 +1,5 @@
 export interface BrokerVerifiedShell {
-  kind: "powershell" | "cmd" | "bash";
+  kind: "powershell" | "cmd" | "bash" | "zsh";
   executable: string;
   verified: true;
   /** The sandbox proved that the shell can launch separately trusted executables. */
