@@ -29,7 +29,7 @@ jobs:
       prerelease: ${{ steps.release.outputs.prerelease }}
       live_eval_override: ${{ steps.release.outputs.live_eval_override }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Require main or an exact version tag
@@ -121,7 +121,7 @@ jobs:
       ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
       BIGMODEL_API_KEY: ${{ secrets.BIGMODEL_API_KEY }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Configure canonical Windows runner temp directory
         if: runner.os == 'Windows'
         run: |
@@ -328,7 +328,7 @@ jobs:
     timeout-minutes: 75
     steps:
       - name: Checkout matching Sigma Code source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: hututuQQQ/sigma-code
           ref: ${{ github.event_name == 'push' && github.ref_name || inputs.sigma_code_ref }}
@@ -436,7 +436,7 @@ jobs:
           test "$(uname -s)" = Darwin
           test "$(uname -m)" = arm64
       - name: Checkout matching Sigma Code source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: hututuQQQ/sigma-code
           ref: ${{ github.event_name == 'push' && github.ref_name || inputs.sigma_code_ref }}
@@ -684,7 +684,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
