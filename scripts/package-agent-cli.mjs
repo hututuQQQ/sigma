@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { chmod, cp, lstat, mkdir, mkdtemp, open, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, cp, lstat, mkdir, mkdtemp, open, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -20,7 +20,13 @@ import {
 } from "./windows-release-signing.mjs";
 import { sigmaManifest } from "./lib/sigma-manifest.mjs";
 import { compareGlibcVersions, inspectLinuxElf } from "./linux-elf.mjs";
-import { assertArm64MachO, assertArm64MachOBytes, inspectMachOBytes, machoFileTypes } from "./macho.mjs";
+import {
+  assertArm64MachO,
+  assertArm64MachOBytes,
+  inspectMachOBytes,
+  isUniversalMachOBytes,
+  machoFileTypes
+} from "./macho.mjs";
 import {
   assertLinuxRuntimeLibraryInventory,
   linuxMinimumGlibc,
@@ -777,6 +783,41 @@ async function darwinNativeModulePaths(rootDir) {
   }
   await visit(rootDir);
   return nativeModules.sort((left, right) => left.localeCompare(right, "en"));
+}
+
+/** Converts copied universal native dependencies into strict ARM64 slices. */
+export async function normalizeDarwinNativeModules(bundleDir, options = {}) {
+  const platform = options.platform ?? process.platform;
+  const arch = options.arch ?? process.arch;
+  if (platform !== "darwin" || arch !== "arm64") {
+    throw new Error("Darwin native modules must be normalized on a native Apple Silicon host.");
+  }
+  const runLipo = options.spawnSync ?? spawnSync;
+  const normalized = [];
+  for (const filePath of await darwinNativeModulePaths(bundleDir)) {
+    if (!isUniversalMachOBytes(await readFile(filePath))) continue;
+    const temporary = await mkdtemp(path.join(path.dirname(filePath), ".sigma-arm64-"));
+    const output = path.join(temporary, path.basename(filePath));
+    try {
+      const result = runLipo(
+        "/usr/bin/lipo",
+        [filePath, "-thin", "arm64", "-output", output],
+        { encoding: "utf8", windowsHide: true }
+      );
+      if (result.error || result.status !== 0) {
+        const detail = String(result.stderr ?? result.error?.message ?? "unknown lipo failure").trim();
+        throw new Error(`Could not extract the ARM64 slice from ${filePath}: ${detail}`);
+      }
+      await assertArm64MachO(output, [machoFileTypes.bundle, machoFileTypes.dylib]);
+      const source = await lstat(filePath);
+      await chmod(output, source.mode & 0o777);
+      await rename(output, filePath);
+      normalized.push(path.relative(bundleDir, filePath).replaceAll(path.sep, "/"));
+    } finally {
+      await rm(temporary, { recursive: true, force: true });
+    }
+  }
+  return normalized;
 }
 
 export async function verifyDarwinRuntimeMachO(bundleDir, nodePath, brokerPath) {
@@ -1849,9 +1890,15 @@ async function stagePortableRuntime(context) {
     options.nodeVersionProbe ?? inspectBundledNodeVersion
   );
   const sigmaExec = await copySigmaExec(rootDir, bundleDir, targetPlatform, targetArch, env);
+  const thinnedNativeModules = targetPlatform === "darwin"
+    ? await normalizeDarwinNativeModules(bundleDir, {
+        spawnSync: options.darwinLipoSpawnSync
+      })
+    : [];
   const darwinCompatibility = targetPlatform === "darwin" ? {
     minimumSystemVersion: sigmaManifest.release.macosMinimumSystemVersion,
     sandbox: "seatbelt+sandbox-exec+forkpty",
+    thinnedNativeModules,
     machO: await verifyDarwinRuntimeMachO(bundleDir, nodeRuntime.bundledNodePath, sigmaExec.destination),
     validated: true
   } : null;

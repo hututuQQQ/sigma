@@ -7,6 +7,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   packageAgentCli,
+  normalizeDarwinNativeModules,
   patchWindowsAppContainerNode,
   pinnedNodeVersion,
   nodeRuntimeArchiveName,
@@ -303,6 +304,40 @@ describe("package-agent-cli", () => {
     await expect(packageAgentCli({
       rootDir: process.cwd(), targetPlatform: "linux", targetArch: "arm64"
     })).rejects.toThrow("Unsupported Sigma Code release target 'linux-arm64'");
+  });
+
+  it("uses fixed Apple lipo to thin copied universal native modules to ARM64", async () => {
+    const bundleDir = await mkdtemp(path.join(os.tmpdir(), "sigma-darwin-native-"));
+    const nativeModule = path.join(bundleDir, "node_modules", "fsevents", "fsevents.node");
+    await mkdir(path.dirname(nativeModule), { recursive: true });
+    const universal = Buffer.alloc(32);
+    universal.set([0xca, 0xfe, 0xba, 0xbe]);
+    await writeFile(nativeModule, universal);
+    const calls: Array<{ command: string; args: string[] }> = [];
+    try {
+      const normalized = await normalizeDarwinNativeModules(bundleDir, {
+        platform: "darwin",
+        arch: "arm64",
+        spawnSync: (command: string, args: string[]) => {
+          calls.push({ command, args });
+          const thin = Buffer.alloc(32);
+          thin.set([0xcf, 0xfa, 0xed, 0xfe]);
+          thin.writeUInt32LE(0x0100000c, 4);
+          thin.writeUInt32LE(0x8, 12);
+          writeFileSync(args.at(-1)!, thin);
+          return { status: 0, stdout: "", stderr: "" };
+        }
+      });
+      expect(normalized).toEqual(["node_modules/fsevents/fsevents.node"]);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.command).toBe("/usr/bin/lipo");
+      expect(calls[0]!.args.slice(1, 4)).toEqual(["-thin", "arm64", "-output"]);
+      const thinned = await readFile(nativeModule);
+      expect([...thinned.subarray(0, 4)]).toEqual([0xcf, 0xfa, 0xed, 0xfe]);
+      expect(thinned.readUInt32LE(4)).toBe(0x0100000c);
+    } finally {
+      await rm(bundleDir, { recursive: true, force: true });
+    }
   });
 
   it("rejects a workspace product version that differs from the manifest", async () => {

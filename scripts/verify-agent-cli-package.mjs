@@ -696,7 +696,9 @@ async function verifyDarwinCompatibility(bundleDir, metadata, manifest, targetPl
   if (targetArch !== "arm64") throw new Error("The supported Darwin Runtime target is ARM64 only.");
   const record = metadata.darwinCompatibility;
   if (!record || record.minimumSystemVersion !== sigmaManifest.release.macosMinimumSystemVersion
-    || record.sandbox !== "seatbelt+sandbox-exec+forkpty" || record.validated !== true) {
+    || record.sandbox !== "seatbelt+sandbox-exec+forkpty" || record.validated !== true
+    || !Array.isArray(record.thinnedNativeModules)
+    || record.thinnedNativeModules.some((name) => typeof name !== "string" || !name.endsWith(".node"))) {
     throw new Error("Darwin compatibility metadata is missing or invalid.");
   }
   assertExactJson(manifest.darwinCompatibility, record, "Integrity Darwin compatibility evidence");
@@ -705,6 +707,10 @@ async function verifyDarwinCompatibility(bundleDir, metadata, manifest, targetPl
     path.join(bundleDir, "bin", "node"),
     path.join(bundleDir, "bin", "sigma-exec")
   );
+  const inspectedPaths = new Set(inspected.map((entry) => entry.path));
+  if (record.thinnedNativeModules.some((name) => !inspectedPaths.has(name))) {
+    throw new Error("Darwin thinned native-module evidence is not present in the Mach-O inventory.");
+  }
   assertExactJson(inspected, record.machO, "Darwin ARM64 Mach-O inventory");
   return true;
 }

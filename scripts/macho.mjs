@@ -24,6 +24,10 @@ function startsWith(buffer, marker) {
   return buffer.length >= marker.length && buffer.subarray(0, marker.length).equals(marker);
 }
 
+export function isUniversalMachOBytes(bytes) {
+  return Buffer.isBuffer(bytes) && FAT_MAGICS.some((magic) => startsWith(bytes, magic));
+}
+
 function hexadecimal(value) {
   return `0x${value.toString(16).padStart(8, "0")}`;
 }
@@ -39,7 +43,7 @@ export function inspectMachOBytes(bytes, label = "binary") {
   if (!Buffer.isBuffer(bytes) || bytes.length < 32) {
     throw new Error(`${label} has a truncated executable header.`);
   }
-  if (FAT_MAGICS.some((magic) => startsWith(bytes, magic))) {
+  if (isUniversalMachOBytes(bytes)) {
     throw new Error(`${label} is a universal/fat Mach-O; a single ARM64 slice is required.`);
   }
   if (startsWith(bytes, Buffer.from([0x7f, 0x45, 0x4c, 0x46]))) {
