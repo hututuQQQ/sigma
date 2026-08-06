@@ -237,6 +237,7 @@ export function shellInvocation(shell: ShellKind, command: string): { executable
     );
   }
   if (shell === "cmd") return normalizeWindowsShellInvocation("cmd.exe", ["/d", "/s", "/c", command]);
+  if (shell === "zsh") return { executable: "zsh", args: ["-lc", command] };
   return { executable: "bash", args: ["-lc", command] };
 }
 

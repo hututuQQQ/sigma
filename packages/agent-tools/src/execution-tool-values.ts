@@ -60,8 +60,10 @@ export function resolvedShell(
   }
   const platform = options.executionPlatform ?? process.platform;
   const preference: ShellKind[] = platform === "win32"
-    ? ["powershell", "cmd", "bash"]
-    : ["bash", "powershell", "cmd"];
+    ? ["powershell", "cmd", "bash", "zsh"]
+    : platform === "darwin"
+    ? ["zsh", "bash", "powershell", "cmd"]
+    : ["bash", "zsh", "powershell", "cmd"];
   const selected = preference.find((shell) => available.includes(shell));
   if (selected) return selected;
   throw Object.assign(new Error(
@@ -168,7 +170,7 @@ export function executionToolSchema(
 }
 
 export function shellInvocation(shell: string, command: string): { executable: string; args: string[] } {
-  if (shell === "powershell" || shell === "cmd" || shell === "bash") {
+  if (shell === "powershell" || shell === "cmd" || shell === "bash" || shell === "zsh") {
     return platformShellInvocation(shell, command);
   }
   throw new Error(`Unsupported shell '${shell}'.`);

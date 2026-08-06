@@ -91,6 +91,27 @@ describe("workspace transaction roots", () => {
     }
   });
 
+  it("reads only stable direct regular-file children through a directory lease", async () => {
+    const container = await temporaryRoot();
+    const root = path.join(container, "transaction");
+    await mkdir(root);
+    await writeFile(path.join(root, "value.txt"), "leased value\n", "utf8");
+    const lease = await pinWorkspaceTransactionDirectories([root]);
+    const signal = new AbortController().signal;
+    try {
+      await expect(lease.readDirectoryFile(root, "value.txt", 1024, signal)).resolves
+        .toEqual({ bytes: Buffer.from("leased value\n"), rejected: false });
+      await expect(lease.readDirectoryFile(root, "missing.txt", 1024, signal)).resolves
+        .toEqual({ bytes: null, rejected: false });
+      await expect(lease.readDirectoryFile(root, "../value.txt", 1024, signal)).rejects
+        .toMatchObject({ code: "workspace_transaction_root_unavailable" });
+    } finally {
+      await lease.close();
+    }
+    await expect(lease.readDirectoryFile(root, "value.txt", 1024, signal)).rejects
+      .toMatchObject({ code: "workspace_transaction_root_unavailable" });
+  });
+
   it("pins long Unicode Windows paths through namespaced directory handles", async () => {
     if (process.platform !== "win32") return;
     const container = await temporaryRoot();

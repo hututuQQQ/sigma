@@ -4,6 +4,8 @@ mod container_boundary;
 mod linux_hardening;
 #[cfg(target_os = "linux")]
 mod linux_mount_source;
+#[cfg(target_os = "macos")]
+mod macos_seatbelt;
 #[cfg(target_os = "linux")]
 mod managed_server;
 mod output;
@@ -15,7 +17,7 @@ mod repository_lease;
 mod repository_transaction;
 mod sandbox;
 mod scratch;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod unix_pty;
 mod web;
 #[cfg(windows)]
@@ -355,8 +357,12 @@ fn main() {
     if let Some(code) = linux_hardening::try_run_internal_mode() {
         std::process::exit(code);
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     if let Some(code) = unix_pty::try_run_internal_mode() {
+        std::process::exit(code);
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(code) = macos_seatbelt::try_run_internal_mode() {
         std::process::exit(code);
     }
     #[cfg(target_os = "linux")]

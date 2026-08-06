@@ -19,6 +19,11 @@ export function assertSigmaManifest(value = sigmaManifest) {
   if (!Array.isArray(value.release?.targets) || value.release.targets.length === 0) {
     throw new Error("sigma-manifest.json requires release targets.");
   }
+  if (!value.release.targets.includes("darwin-arm64")
+    || value.release.macosMinimumSystemVersion !== "13.5"
+    || value.release.githubPrerelease !== true) {
+    throw new Error("sigma-manifest.json must declare the darwin-arm64 macOS 13.5 release target.");
+  }
   const patch = value.release.windowsNodePatch;
   for (const key of ["sourceSha256", "unsignedPatchedSha256", "normalizedContentSha256"]) {
     if (!digest.test(String(patch?.[key] ?? ""))) throw new Error(`Invalid Windows Node patch ${key}.`);

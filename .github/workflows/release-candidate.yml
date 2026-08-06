@@ -2,6 +2,11 @@ name: Release verification and publication
 
 on:
   workflow_dispatch:
+    inputs:
+      sigma_code_ref:
+        description: Sigma Code branch or tag to pair with this Runtime dry-run
+        required: true
+        default: main
   push:
     tags: ["v*"]
 
@@ -38,14 +43,16 @@ jobs:
           import { appendFileSync, readFileSync } from "node:fs";
 
           const { version } = JSON.parse(readFileSync("package.json", "utf8"));
-          const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u;
+          const manifest = JSON.parse(readFileSync("sigma-manifest.json", "utf8"));
+          const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u;
           if (!semver.test(version)) throw new Error(`package.json contains invalid SemVer: ${version}`);
+          if (manifest.productVersion !== version) throw new Error("package and Sigma manifest versions differ.");
+          if (manifest.release?.githubPrerelease !== true) {
+            throw new Error("This preview release must be explicitly configured as a GitHub prerelease.");
+          }
           const expectedTag = `v${version}`;
           if (process.env.GITHUB_EVENT_NAME === "push" && process.env.GITHUB_REF_NAME !== expectedTag) {
             throw new Error(`Release tag ${process.env.GITHUB_REF_NAME} must exactly equal ${expectedTag}.`);
-          }
-          if (process.env.GITHUB_EVENT_NAME === "workflow_dispatch" && process.env.GITHUB_REF !== "refs/heads/main") {
-            throw new Error("Manual release verification must run from main.");
           }
           const overrideTag = (process.env.RELEASE_LIVE_EVAL_OVERRIDE_TAG ?? "").trim();
           const overrideReason = (process.env.RELEASE_LIVE_EVAL_OVERRIDE_REASON ?? "").trim();
@@ -59,13 +66,17 @@ jobs:
             && process.env.GITHUB_REF_NAME === overrideTag;
           appendFileSync(
             process.env.GITHUB_OUTPUT,
-            `version=${version}\nprerelease=${version.includes("-")}\nlive_eval_override=${liveEvalOverride}\n`
+            `version=${version}\nprerelease=true\nlive_eval_override=${liveEvalOverride}\n`,
           );
           NODE
           if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
             git fetch origin main --no-tags
             git merge-base --is-ancestor "${GITHUB_SHA}" origin/main || {
               echo "Release tags must point to a commit reachable from main." >&2
+              exit 1
+            }
+            test "$(git cat-file -t "${GITHUB_REF_NAME}^{tag}")" = tag || {
+              echo "Release tags must be annotated tags." >&2
               exit 1
             }
           fi
@@ -80,46 +91,67 @@ jobs:
           - os: ubuntu-24.04
             label: linux-x64
             release: linux
-            channel: stable release
+            archive: agent-cli-linux-x64.tgz
+            channel: stable Runtime
           - os: windows-2022
             label: win32-x64
             release: windows
+            archive: agent-cli-win32-x64.zip
             channel: unsigned preview
+          - os: macos-15
+            label: darwin-arm64
+            release: macos
+            archive: agent-cli-darwin-arm64.tgz
+            channel: Apple Silicon preview
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
     env:
       DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
       GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
+      ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+      BIGMODEL_API_KEY: ${{ secrets.BIGMODEL_API_KEY }}
     steps:
       - uses: actions/checkout@v4
-      - name: Configure canonical runner temp directory
+      - name: Configure canonical Windows runner temp directory
         if: runner.os == 'Windows'
         run: |
           "TEMP=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "TMP=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Configure canonical macOS runner temp directory
+        if: runner.os == 'macOS'
+        shell: bash
+        run: echo "TMPDIR=${RUNNER_TEMP}" >> "${GITHUB_ENV}"
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install pinned pnpm (Linux)
+      - name: Require native Apple Silicon
+        if: runner.os == 'macOS'
         shell: bash
+        run: |
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          test "$(node -p process.arch)" = arm64
+      - name: Install pinned pnpm (POSIX)
         if: runner.os != 'Windows'
+        shell: bash
         run: npm install --global "pnpm@${PNPM_VERSION}" && test "$(pnpm --version)" = "${PNPM_VERSION}"
       - name: Install pinned pnpm (Windows)
         if: runner.os == 'Windows'
         run: |
           npm install --global "pnpm@$env:PNPM_VERSION"
-          if ((pnpm --version).Trim() -ne $env:PNPM_VERSION) { throw "Unexpected pnpm version: $(pnpm --version)" }
-      - name: Install pinned Rust and coverage toolchain
-        shell: bash
+          if ((pnpm --version).Trim() -ne $env:PNPM_VERSION) { throw "Unexpected pnpm version." }
+      - name: Install pinned Rust and coverage toolchain (POSIX)
         if: runner.os != 'Windows'
+        shell: bash
         run: |
           rustup toolchain install "${RUST_VERSION}" --profile minimal --component llvm-tools-preview
           rustup default "${RUST_VERSION}"
           rustup toolchain install "${RUST_COVERAGE_TOOLCHAIN}" --profile minimal --component llvm-tools-preview
           cargo install cargo-llvm-cov --version "${CARGO_LLVM_COV_VERSION}" --locked
-      - name: Install pinned Rust and coverage toolchain
+      - name: Install pinned Rust and coverage toolchain (Windows)
         if: runner.os == 'Windows'
         run: |
           rustup toolchain install $env:RUST_VERSION --profile minimal --component llvm-tools-preview
@@ -140,18 +172,20 @@ jobs:
           fi
       - name: Install Windows ConPTY dependency
         if: runner.os == 'Windows'
-        run: "python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r scripts/ci/windows-pty-requirements.txt"
+        run: >-
+          python -m pip install --disable-pip-version-check --only-binary=:all:
+          --require-hashes -r scripts/ci/windows-pty-requirements.txt
       - name: Install workspace
         run: pnpm install --frozen-lockfile
-      - name: Configure release provenance trust (Linux)
-        if: runner.os == 'Linux'
+      - name: Configure release provenance trust (POSIX)
+        if: runner.os != 'Windows'
         shell: bash
         env:
           RELEASE_PROVENANCE_PRIVATE_KEY_PEM: ${{ secrets.AGENT_RELEASE_SIGNING_PRIVATE_KEY_PEM }}
           RELEASE_PROVENANCE_PUBLIC_KEY_PEM: ${{ secrets.AGENT_RELEASE_TRUSTED_PUBLIC_KEY_PEM }}
         run: |
           if [[ -z "${RELEASE_PROVENANCE_PRIVATE_KEY_PEM}" || -z "${RELEASE_PROVENANCE_PUBLIC_KEY_PEM}" ]]; then
-            echo "AGENT_RELEASE_SIGNING_PRIVATE_KEY_PEM and AGENT_RELEASE_TRUSTED_PUBLIC_KEY_PEM secrets are required." >&2
+            echo "Release provenance signing keys are required." >&2
             exit 1
           fi
           umask 077
@@ -169,43 +203,35 @@ jobs:
         run: |
           if ([string]::IsNullOrWhiteSpace($env:RELEASE_PROVENANCE_PRIVATE_KEY_PEM) -or
               [string]::IsNullOrWhiteSpace($env:RELEASE_PROVENANCE_PUBLIC_KEY_PEM)) {
-            throw "AGENT_RELEASE_SIGNING_PRIVATE_KEY_PEM and AGENT_RELEASE_TRUSTED_PUBLIC_KEY_PEM secrets are required."
+            throw "Release provenance signing keys are required."
           }
           $privateKey = Join-Path $env:RUNNER_TEMP "release-provenance-private.pem"
           $publicKey = Join-Path $env:RUNNER_TEMP "release-provenance-public.pem"
           $utf8 = [System.Text.UTF8Encoding]::new($false)
-          [System.IO.File]::WriteAllText($privateKey, $env:RELEASE_PROVENANCE_PRIVATE_KEY_PEM, $utf8)
-          [System.IO.File]::WriteAllText($publicKey, $env:RELEASE_PROVENANCE_PUBLIC_KEY_PEM, $utf8)
-          "AGENT_RELEASE_SIGNING_PRIVATE_KEY_FILE=$privateKey" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "AGENT_RELEASE_TRUSTED_PUBLIC_KEY_FILES=$publicKey" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - name: Verify release target
+          [IO.File]::WriteAllText($privateKey, $env:RELEASE_PROVENANCE_PRIVATE_KEY_PEM, $utf8)
+          [IO.File]::WriteAllText($publicKey, $env:RELEASE_PROVENANCE_PUBLIC_KEY_PEM, $utf8)
+          "AGENT_RELEASE_SIGNING_PRIVATE_KEY_FILE=$privateKey" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "AGENT_RELEASE_TRUSTED_PUBLIC_KEY_FILES=$publicKey" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Verify complete release target
         run: pnpm verify:release:${{ matrix.release }}
       - name: Stage public provenance key
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          mkdir -p .artifacts
           cp -- "${AGENT_RELEASE_TRUSTED_PUBLIC_KEY_FILES}" .artifacts/release-provenance-public.pem
           chmod 0644 .artifacts/release-provenance-public.pem
-      - name: Remove release signing material (Linux)
-        if: always() && runner.os == 'Linux'
-        shell: bash
-        run: |
-          for file in "${AGENT_RELEASE_SIGNING_PRIVATE_KEY_FILE:-}" "${AGENT_RELEASE_TRUSTED_PUBLIC_KEY_FILES:-}"; do
-            if [[ -n "${file}" ]]; then rm -f -- "${file}"; fi
-          done
-      - name: Remove release signing material (Windows)
-        if: always() && runner.os == 'Windows'
-        run: |
-          if (-not [string]::IsNullOrWhiteSpace($env:AGENT_RELEASE_SIGNING_PRIVATE_KEY_FILE)) {
-            Remove-Item -LiteralPath $env:AGENT_RELEASE_SIGNING_PRIVATE_KEY_FILE -Force -ErrorAction SilentlyContinue
-          }
-          if (-not [string]::IsNullOrWhiteSpace($env:AGENT_RELEASE_TRUSTED_PUBLIC_KEY_FILES)) {
-            Remove-Item -LiteralPath $env:AGENT_RELEASE_TRUSTED_PUBLIC_KEY_FILES -Force -ErrorAction SilentlyContinue
-          }
       - name: Require all five live scenarios and zero safety failures
         if: needs.metadata.outputs.live_eval_override != 'true'
-        run: pnpm eval:agent -- --suite quick --repeat 1 --skip-package --eval-root .artifacts/eval-rc
+        run: >-
+          pnpm eval:agent -- --suite quick --repeat 1 --skip-package
+          --run-dir .artifacts/eval-rc
+      - name: Preserve live scenario evidence (POSIX)
+        if: needs.metadata.outputs.live_eval_override != 'true' && runner.os != 'Windows'
+        shell: bash
+        run: cp .artifacts/eval-rc/run.json .artifacts/live-eval-quick-${{ matrix.label }}.json
+      - name: Preserve live scenario evidence (Windows)
+        if: needs.metadata.outputs.live_eval_override != 'true' && runner.os == 'Windows'
+        run: Copy-Item .artifacts/eval-rc/run.json .artifacts/live-eval-quick-${{ matrix.label }}.json
       - name: Record authorized live-evaluation override
         if: needs.metadata.outputs.live_eval_override == 'true' && runner.os == 'Linux'
         shell: bash
@@ -215,11 +241,10 @@ jobs:
         run: |
           node --input-type=module <<'NODE'
           import { mkdirSync, writeFileSync } from "node:fs";
-
           const reason = (process.env.RELEASE_LIVE_EVAL_OVERRIDE_REASON ?? "").trim();
           if (!reason) throw new Error("Live-evaluation override reason is missing.");
           mkdirSync(".artifacts", { recursive: true });
-          const record = {
+          writeFileSync(".artifacts/release-live-evaluation-override.json", `${JSON.stringify({
             schemaVersion: 1,
             kind: "sigma.release-live-evaluation-override",
             tag: process.env.GITHUB_REF_NAME,
@@ -227,57 +252,76 @@ jobs:
             commit: process.env.GITHUB_SHA,
             reason,
             authorizedBy: process.env.GITHUB_ACTOR,
-            recordedAt: new Date().toISOString()
-          };
-          writeFileSync(
-            ".artifacts/release-live-evaluation-override.json",
-            `${JSON.stringify(record, null, 2)}\n`
-          );
+            recordedAt: new Date().toISOString(),
+          }, null, 2)}\n`);
           NODE
-      - name: Upload verified release assets
+      - name: Remove release signing material (POSIX)
+        if: always() && runner.os != 'Windows'
+        shell: bash
+        run: |
+          for file in "${AGENT_RELEASE_SIGNING_PRIVATE_KEY_FILE:-}" "${AGENT_RELEASE_TRUSTED_PUBLIC_KEY_FILES:-}"; do
+            if [[ -n "${file}" ]]; then rm -f -- "${file}"; fi
+          done
+      - name: Remove release signing material (Windows)
+        if: always() && runner.os == 'Windows'
+        run: |
+          foreach ($file in @($env:AGENT_RELEASE_SIGNING_PRIVATE_KEY_FILE, $env:AGENT_RELEASE_TRUSTED_PUBLIC_KEY_FILES)) {
+            if (-not [string]::IsNullOrWhiteSpace($file)) {
+              Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue
+            }
+          }
+      - name: Upload verified Runtime and evidence inputs
         uses: actions/upload-artifact@v4
         with:
-          name: release-${{ matrix.label }}-${{ github.run_id }}
+          name: release-input-runtime-${{ matrix.label }}-${{ github.run_id }}
           if-no-files-found: error
+          include-hidden-files: true
           path: |
-            .artifacts/agent-cli-${{ matrix.label }}.${{ matrix.release == 'windows' && 'zip' || 'tgz' }}
-            .artifacts/agent-cli-${{ matrix.label }}.${{ matrix.release == 'windows' && 'zip' || 'tgz' }}.sha256
+            .artifacts/${{ matrix.archive }}
+            .artifacts/${{ matrix.archive }}.sha256
             .artifacts/agent-cli-${{ matrix.label }}.sbom.cdx.json
             .artifacts/agent-cli-${{ matrix.label }}.provenance.json
+            .artifacts/agent-cli-package-verify-${{ matrix.label }}.json
+            .artifacts/sandbox-smoke-${{ matrix.label }}.json
+            .artifacts/lsp-sandbox-smoke-${{ matrix.label }}.json
+            .artifacts/product-readiness-${{ matrix.label }}.json
+            .artifacts/product-readiness-${{ matrix.label }}.md
+            .artifacts/live-eval-quick-${{ matrix.label }}.json
       - name: Upload public provenance key
         if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
-          name: release-public-key-${{ github.run_id }}
+          name: release-input-public-key-${{ github.run_id }}
           if-no-files-found: error
           path: .artifacts/release-provenance-public.pem
       - name: Upload live-evaluation override record
         if: needs.metadata.outputs.live_eval_override == 'true' && runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
-          name: release-live-eval-override-${{ github.run_id }}
+          name: release-input-live-eval-override-${{ github.run_id }}
           if-no-files-found: error
           path: .artifacts/release-live-evaluation-override.json
-      - name: Upload candidate evidence
+      - name: Upload complete candidate diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: rc-${{ matrix.label }}-${{ github.run_id }}
           if-no-files-found: warn
           include-hidden-files: true
+          retention-days: 90
           path: .artifacts/**
 
-  desktop:
+  desktop_windows:
     name: Build Sigma Code Windows x64 installer
     needs: [metadata, verify]
     runs-on: windows-2022
-    timeout-minutes: 60
+    timeout-minutes: 75
     steps:
       - name: Checkout matching Sigma Code source
         uses: actions/checkout@v4
         with:
           repository: hututuQQQ/sigma-code
-          ref: ${{ github.event_name == 'push' && github.ref_name || 'main' }}
+          ref: ${{ github.event_name == 'push' && github.ref_name || inputs.sigma_code_ref }}
           path: sigma-code
       - uses: pnpm/action-setup@v4
         with:
@@ -291,37 +335,27 @@ jobs:
       - name: Download verified Windows Runtime
         uses: actions/download-artifact@v4
         with:
-          name: release-win32-x64-${{ github.run_id }}
+          name: release-input-runtime-win32-x64-${{ github.run_id }}
           path: runtime-assets
       - name: Verify and extract matching Runtime
         env:
           RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           $archive = Join-Path $env:GITHUB_WORKSPACE "runtime-assets/agent-cli-win32-x64.zip"
-          $sidecar = "$archive.sha256"
-          $expectedHash = ((Get-Content -LiteralPath $sidecar -Raw).Trim() -split '\s+')[0].ToLowerInvariant()
+          $expectedHash = ((Get-Content -LiteralPath "$archive.sha256" -Raw).Trim() -split '\s+')[0].ToLowerInvariant()
           $actualHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($actualHash -ne $expectedHash) { throw "Sigma Runtime checksum mismatch." }
           Expand-Archive -LiteralPath $archive -DestinationPath (Join-Path $env:GITHUB_WORKSPACE "runtime-assets")
-          $metadataPath = Join-Path $env:GITHUB_WORKSPACE "runtime-assets/agent-cli-win32-x64/package-metadata.json"
-          $metadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
-          if ($metadata.productVersion -ne $env:RELEASE_VERSION) {
-            throw "Runtime version $($metadata.productVersion) does not match $env:RELEASE_VERSION."
-          }
+          $metadata = Get-Content "$env:GITHUB_WORKSPACE/runtime-assets/agent-cli-win32-x64/package-metadata.json" -Raw | ConvertFrom-Json
+          if ($metadata.productVersion -ne $env:RELEASE_VERSION) { throw "Runtime version mismatch." }
       - name: Require matching Sigma Code version
         working-directory: sigma-code
         env:
           RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
-          foreach ($manifest in @(
-            "apps/server/package.json",
-            "apps/desktop/package.json",
-            "apps/web/package.json",
-            "packages/contracts/package.json"
-          )) {
-            $version = (Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json).version
-            if ($version -ne $env:RELEASE_VERSION) {
-              throw "$manifest version $version does not match $env:RELEASE_VERSION."
+          foreach ($manifest in @("apps/server/package.json", "apps/desktop/package.json", "apps/web/package.json", "packages/contracts/package.json")) {
+            if ((Get-Content $manifest -Raw | ConvertFrom-Json).version -ne $env:RELEASE_VERSION) {
+              throw "$manifest does not match release version $env:RELEASE_VERSION."
             }
           }
       - name: Install Sigma Code workspace
@@ -335,133 +369,404 @@ jobs:
           SIGMACODE_DESKTOP_VERSION: ${{ needs.metadata.outputs.version }}
           SIGMACODE_DESKTOP_UPDATE_REPOSITORY: hututuQQQ/sigma
         run: pnpm run dist:desktop:win:x64
-      - name: Verify installer asset set
+      - name: Run desktop smoke
+        working-directory: sigma-code
+        run: pnpm test:desktop-smoke
+      - name: Verify unsigned installer and write evidence
+        working-directory: sigma-code
         env:
           RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           $assetRoot = Join-Path $env:GITHUB_WORKSPACE "desktop-assets"
           $installer = Join-Path $assetRoot "Sigma-Code-$env:RELEASE_VERSION-x64.exe"
-          $blockmap = "$installer.blockmap"
-          $updateManifest = Join-Path $assetRoot "latest.yml"
-          foreach ($asset in @($installer, $blockmap, $updateManifest)) {
-            if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) {
-              throw "Missing Sigma Code release asset: $asset"
-            }
+          foreach ($asset in @($installer, "$installer.blockmap", (Join-Path $assetRoot "latest.yml"))) {
+            if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) { throw "Missing desktop asset: $asset" }
           }
-          $signature = Get-AuthenticodeSignature -LiteralPath $installer
-          if ($signature.Status -ne "NotSigned") {
-            throw "Expected an unsigned preview installer, got Authenticode status $($signature.Status)."
+          if ((Get-AuthenticodeSignature -LiteralPath $installer).Status -ne "NotSigned") {
+            throw "Windows preview installer unexpectedly has an Authenticode signature."
           }
-          $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
-          $line = "$hash  $([IO.Path]::GetFileName($installer))`n"
-          [IO.File]::WriteAllText("$installer.sha256", $line, [Text.UTF8Encoding]::new($false))
-      - name: Upload verified desktop assets
+          $env:SIGMACODE_SOURCE_COMMIT = (git rev-parse HEAD).Trim()
+          node scripts/desktop-release-evidence.ts `
+            --artifact $installer `
+            --runtime-provenance "$env:GITHUB_WORKSPACE/runtime-assets/agent-cli-win32-x64.provenance.json" `
+            --platform win32 --arch x64 --version $env:RELEASE_VERSION `
+            --signing-mode unsigned --codesign not-signed `
+            --gatekeeper not-applicable --stapler not-applicable
+      - name: Upload public Windows desktop input
         uses: actions/upload-artifact@v4
         with:
-          name: release-desktop-win32-x64-${{ github.run_id }}
+          name: release-input-desktop-win32-x64-${{ github.run_id }}
           if-no-files-found: error
           path: |
             desktop-assets/Sigma-Code-${{ needs.metadata.outputs.version }}-x64.exe
             desktop-assets/Sigma-Code-${{ needs.metadata.outputs.version }}-x64.exe.sha256
+            desktop-assets/Sigma-Code-${{ needs.metadata.outputs.version }}-x64.exe.desktop-provenance.json
+            desktop-assets/Sigma-Code-${{ needs.metadata.outputs.version }}-x64.exe.signing.json
+      - name: Retain Windows updater inputs for 90 days
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-updater-win32-x64-${{ github.run_id }}
+          if-no-files-found: error
+          retention-days: 90
+          path: |
             desktop-assets/Sigma-Code-${{ needs.metadata.outputs.version }}-x64.exe.blockmap
             desktop-assets/latest.yml
 
+  desktop_macos:
+    name: Build and verify Sigma Code macOS ARM64 DMG
+    needs: [metadata, verify]
+    runs-on: macos-15
+    timeout-minutes: 90
+    outputs:
+      signing_mode: ${{ steps.apple.outputs.signing_mode }}
+    steps:
+      - name: Require native Apple Silicon
+        shell: bash
+        run: |
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+      - name: Checkout matching Sigma Code source
+        uses: actions/checkout@v4
+        with:
+          repository: hututuQQQ/sigma-code
+          ref: ${{ github.event_name == 'push' && github.ref_name || inputs.sigma_code_ref }}
+          path: sigma-code
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.10.0
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.13.1
+          cache: pnpm
+          cache-dependency-path: sigma-code/pnpm-lock.yaml
+      - name: Download verified macOS Runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: release-input-runtime-darwin-arm64-${{ github.run_id }}
+          path: runtime-assets
+      - name: Verify and extract matching Runtime
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          archive="${GITHUB_WORKSPACE}/runtime-assets/agent-cli-darwin-arm64.tgz"
+          expected="$(awk '{print $1}' "${archive}.sha256")"
+          actual="$(shasum -a 256 "${archive}" | awk '{print $1}')"
+          test "${actual}" = "${expected}"
+          tar -xzf "${archive}" -C "${GITHUB_WORKSPACE}/runtime-assets"
+          node --input-type=module <<'NODE'
+          import { readFileSync } from "node:fs";
+          const metadata = JSON.parse(readFileSync("runtime-assets/agent-cli-darwin-arm64/package-metadata.json", "utf8"));
+          if (metadata.productVersion !== process.env.RELEASE_VERSION) throw new Error("Runtime version mismatch.");
+          NODE
+      - name: Require matching Sigma Code version
+        working-directory: sigma-code
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync } from "node:fs";
+          for (const name of ["apps/server/package.json", "apps/desktop/package.json", "apps/web/package.json", "packages/contracts/package.json"]) {
+            const version = JSON.parse(readFileSync(name, "utf8")).version;
+            if (version !== process.env.RELEASE_VERSION) throw new Error(`${name} version ${version} does not match ${process.env.RELEASE_VERSION}.`);
+          }
+          NODE
+      - name: Resolve Apple signing mode and reject partial secrets
+        id: apple
+        shell: bash
+        env:
+          CSC_LINK_SECRET: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD_SECRET: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_API_KEY_SECRET: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID_SECRET: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_SECRET: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_TEAM_ID_SECRET: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          names=(CSC_LINK CSC_KEY_PASSWORD APPLE_API_KEY APPLE_API_KEY_ID APPLE_API_ISSUER APPLE_TEAM_ID)
+          values=("${CSC_LINK_SECRET}" "${CSC_KEY_PASSWORD_SECRET}" "${APPLE_API_KEY_SECRET}" "${APPLE_API_KEY_ID_SECRET}" "${APPLE_API_ISSUER_SECRET}" "${APPLE_TEAM_ID_SECRET}")
+          configured=0
+          for value in "${values[@]}"; do [[ -n "${value}" ]] && configured=$((configured + 1)); done
+          if [[ ${configured} -ne 0 && ${configured} -ne 6 ]]; then
+            missing=()
+            for index in "${!names[@]}"; do [[ -z "${values[$index]}" ]] && missing+=("${names[$index]}"); done
+            echo "Apple signing credentials are partially configured; missing: ${missing[*]}" >&2
+            exit 1
+          fi
+          if [[ ${configured} -eq 0 ]]; then
+            echo "signing_mode=unsigned" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          [[ "${APPLE_TEAM_ID_SECRET}" =~ ^[A-Z0-9]{10}$ ]] || {
+            echo "APPLE_TEAM_ID must be a 10-character team ID." >&2
+            exit 1
+          }
+          umask 077
+          api_key_path="${RUNNER_TEMP}/AuthKey_${APPLE_API_KEY_ID_SECRET}.p8"
+          printf '%s' "${APPLE_API_KEY_SECRET}" > "${api_key_path}"
+          {
+            echo "CSC_LINK=${CSC_LINK_SECRET}"
+            echo "CSC_KEY_PASSWORD=${CSC_KEY_PASSWORD_SECRET}"
+            echo "APPLE_API_KEY=${api_key_path}"
+            echo "APPLE_API_KEY_ID=${APPLE_API_KEY_ID_SECRET}"
+            echo "APPLE_API_ISSUER=${APPLE_API_ISSUER_SECRET}"
+            echo "APPLE_TEAM_ID=${APPLE_TEAM_ID_SECRET}"
+          } >> "${GITHUB_ENV}"
+          echo "signing_mode=signed" >> "${GITHUB_OUTPUT}"
+      - name: Install Sigma Code workspace
+        working-directory: sigma-code
+        run: pnpm install --frozen-lockfile
+      - name: Build native ARM64 DMG and updater ZIP
+        working-directory: sigma-code
+        env:
+          SIGMACODE_DESKTOP_SIGMA_RUNTIME: ${{ github.workspace }}/runtime-assets/agent-cli-darwin-arm64
+          SIGMACODE_DESKTOP_OUTPUT_DIR: ${{ github.workspace }}/desktop-assets
+          SIGMACODE_DESKTOP_VERSION: ${{ needs.metadata.outputs.version }}
+          SIGMACODE_DESKTOP_UPDATE_REPOSITORY: hututuQQQ/sigma
+        run: pnpm run dist:desktop:dmg:arm64
+      - name: Mount DMG and verify application, Runtime, and smoke launch
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+          SIGNING_MODE: ${{ steps.apple.outputs.signing_mode }}
+        run: |
+          set -euo pipefail
+          dmg="${GITHUB_WORKSPACE}/desktop-assets/Sigma-Code-${RELEASE_VERSION}-arm64.dmg"
+          zip="${GITHUB_WORKSPACE}/desktop-assets/Sigma-Code-${RELEASE_VERSION}-arm64.zip"
+          manifest="${GITHUB_WORKSPACE}/desktop-assets/latest-mac.yml"
+          test -f "${dmg}"
+          test -f "${zip}"
+          test -f "${manifest}"
+          mount_point="${RUNNER_TEMP}/sigma-code-dmg"
+          mkdir -p "${mount_point}"
+          hdiutil attach -nobrowse -readonly -mountpoint "${mount_point}" "${dmg}"
+          cleanup() {
+            if [[ -n "${app_pid:-}" ]]; then kill "${app_pid}" >/dev/null 2>&1 || true; fi
+            hdiutil detach "${mount_point}" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          app="$(find "${mount_point}" -maxdepth 1 -name '*.app' -type d -print -quit)"
+          test -n "${app}"
+          plist="${app}/Contents/Info.plist"
+          test "$(plutil -extract CFBundleIdentifier raw "${plist}")" = io.github.hututuqqq.sigmacode
+          test "$(plutil -extract CFBundleShortVersionString raw "${plist}")" = "${RELEASE_VERSION}"
+          test "$(plutil -extract LSMinimumSystemVersion raw "${plist}")" = 13.5
+          executable="${app}/Contents/MacOS/sigma-code"
+          test "$(lipo -archs "${executable}")" = arm64
+          runtime="${app}/Contents/Resources/sigma-runtime"
+          test -x "${runtime}/bin/node"
+          test -x "${runtime}/bin/sigma-exec"
+          while IFS= read -r binary; do
+            file "${binary}" | grep -q 'Mach-O 64-bit.*arm64'
+            test "$(lipo -archs "${binary}")" = arm64
+            if [[ "${SIGNING_MODE}" == signed ]]; then codesign --verify --strict --verbose=2 "${binary}"; fi
+          done < <(find "${runtime}" -type f \( -name node -o -name sigma-exec -o -name '*.node' \) -print)
+          RUNTIME_ROOT="${runtime}" node --input-type=module <<'NODE'
+          import { createHash } from "node:crypto";
+          import { readFileSync } from "node:fs";
+          import path from "node:path";
+          const root = process.env.RUNTIME_ROOT;
+          const manifest = JSON.parse(readFileSync(path.join(root, "integrity-manifest.json"), "utf8"));
+          for (const entry of manifest.entries) {
+            if (!entry.sha256) continue;
+            const digest = createHash("sha256").update(readFileSync(path.join(root, entry.path))).digest("hex");
+            if (digest !== entry.sha256) throw new Error(`Runtime integrity mismatch: ${entry.path}`);
+          }
+          NODE
+          "${runtime}/bin/agent" doctor --json > "${RUNNER_TEMP}/embedded-runtime-doctor.json"
+          node --input-type=module <<'NODE'
+          import { readFileSync } from "node:fs";
+          const report = JSON.parse(readFileSync(process.env.RUNNER_TEMP + "/embedded-runtime-doctor.json", "utf8"));
+          const raw = JSON.stringify(report);
+          for (const capability of ["seatbelt+sandbox-exec+forkpty", "full", "none"]) {
+            if (!raw.includes(capability)) throw new Error(`Embedded Runtime doctor omitted ${capability}.`);
+          }
+          NODE
+          if [[ "${SIGNING_MODE}" == signed ]]; then
+            codesign --verify --deep --strict --verbose=4 "${app}"
+            spctl --assess --type execute --verbose=4 "${app}"
+            xcrun stapler validate "${app}"
+          else
+            signature_details="$(codesign -dv --verbose=4 "${app}" 2>&1 || true)"
+            if grep -q '^Authority=' <<<"${signature_details}"; then
+              echo "Unsigned preview unexpectedly carries a trusted signing authority." >&2
+              exit 1
+            fi
+            if spctl --assess --type execute "${app}" >/dev/null 2>&1; then
+              echo "Unsigned preview unexpectedly passed Gatekeeper assessment." >&2
+              exit 1
+            fi
+          fi
+          smoke_root="${RUNNER_TEMP}/sigma-code-packaged-smoke"
+          workspace="${smoke_root}/workspace"
+          mkdir -p "${workspace}"
+          printf 'macOS packaged workspace smoke\n' > "${workspace}/README.md"
+          SIGMACODE_HOME="${smoke_root}/state" "${executable}" --disable-gpu >"${smoke_root}.log" 2>&1 &
+          app_pid=$!
+          backend_ready=false
+          for _ in $(seq 1 30); do
+            kill -0 "${app_pid}"
+            if curl --fail --silent --max-time 2 http://127.0.0.1:3773/ >/dev/null; then
+              backend_ready=true
+              break
+            fi
+            sleep 1
+          done
+          test "${backend_ready}" = true
+          if grep -E 'MODULE_NOT_FOUND|Cannot find module|Uncaught (Error|TypeError|ReferenceError)' "${smoke_root}.log"; then
+            exit 1
+          fi
+          kill "${app_pid}"
+          wait "${app_pid}" || true
+          app_pid=""
+      - name: Write desktop checksum and provenance
+        working-directory: sigma-code
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+          SIGNING_MODE: ${{ steps.apple.outputs.signing_mode }}
+        run: |
+          if [[ "${SIGNING_MODE}" == signed ]]; then
+            codesign=pass; gatekeeper=pass; stapler=pass
+          else
+            codesign=not-signed; gatekeeper=not-applicable; stapler=not-applicable
+          fi
+          export SIGMACODE_SOURCE_COMMIT="$(git rev-parse HEAD)"
+          node scripts/desktop-release-evidence.ts \
+            --artifact "${GITHUB_WORKSPACE}/desktop-assets/Sigma-Code-${RELEASE_VERSION}-arm64.dmg" \
+            --runtime-provenance "${GITHUB_WORKSPACE}/runtime-assets/agent-cli-darwin-arm64.provenance.json" \
+            --platform darwin --arch arm64 --version "${RELEASE_VERSION}" \
+            --signing-mode "${SIGNING_MODE}" --codesign "${codesign}" \
+            --gatekeeper "${gatekeeper}" --stapler "${stapler}"
+      - name: Remove Apple signing material
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "${APPLE_API_KEY:-}" ]]; then rm -f -- "${APPLE_API_KEY}"; fi
+      - name: Upload public macOS desktop input
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-input-desktop-darwin-arm64-${{ github.run_id }}
+          if-no-files-found: error
+          path: |
+            desktop-assets/Sigma-Code-${{ needs.metadata.outputs.version }}-arm64.dmg
+            desktop-assets/Sigma-Code-${{ needs.metadata.outputs.version }}-arm64.dmg.sha256
+            desktop-assets/Sigma-Code-${{ needs.metadata.outputs.version }}-arm64.dmg.desktop-provenance.json
+            desktop-assets/Sigma-Code-${{ needs.metadata.outputs.version }}-arm64.dmg.signing.json
+      - name: Retain macOS updater inputs for 90 days
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-updater-darwin-arm64-${{ github.run_id }}
+          if-no-files-found: error
+          retention-days: 90
+          path: |
+            desktop-assets/Sigma-Code-${{ needs.metadata.outputs.version }}-arm64.zip
+            desktop-assets/Sigma-Code-${{ needs.metadata.outputs.version }}-arm64.zip.blockmap
+            desktop-assets/Sigma-Code-${{ needs.metadata.outputs.version }}-arm64.dmg.blockmap
+            desktop-assets/latest-mac.yml
+
   publish:
-    name: Publish GitHub Release
+    name: Publish and re-verify six-asset prerelease
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    needs: [metadata, verify, desktop]
+    needs: [metadata, verify, desktop_windows, desktop_macos]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - name: Download verified release assets
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Download verified release inputs
         uses: actions/download-artifact@v4
         with:
-          pattern: release-*-${{ github.run_id }}
-          path: release-assets
+          pattern: release-input-*-${{ github.run_id }}
+          path: release-inputs
           merge-multiple: true
-      - name: Require the complete release asset set
+      - name: Assemble exact public attachment whitelist
         shell: bash
         env:
-          RELEASE_LIVE_EVAL_OVERRIDE: ${{ needs.metadata.outputs.live_eval_override }}
           RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+          RELEASE_LIVE_EVAL_OVERRIDE: ${{ needs.metadata.outputs.live_eval_override }}
         run: |
-          node --input-type=module <<'NODE'
-          import { readdirSync } from "node:fs";
-
-          const expected = [
-            "agent-cli-linux-x64.tgz",
-            "agent-cli-linux-x64.tgz.sha256",
-            "agent-cli-linux-x64.sbom.cdx.json",
-            "agent-cli-linux-x64.provenance.json",
-            "agent-cli-win32-x64.zip",
-            "agent-cli-win32-x64.zip.sha256",
-            "agent-cli-win32-x64.sbom.cdx.json",
-            "agent-cli-win32-x64.provenance.json",
-            "release-provenance-public.pem",
-            `Sigma-Code-${process.env.RELEASE_VERSION}-x64.exe`,
-            `Sigma-Code-${process.env.RELEASE_VERSION}-x64.exe.sha256`,
-            `Sigma-Code-${process.env.RELEASE_VERSION}-x64.exe.blockmap`,
-            "latest.yml"
-          ];
-          if (process.env.RELEASE_LIVE_EVAL_OVERRIDE === "true") {
-            expected.push("release-live-evaluation-override.json");
-          }
-          const actual = new Set(readdirSync("release-assets"));
-          const missing = expected.filter((name) => !actual.has(name));
-          if (missing.length > 0) throw new Error(`Missing release assets: ${missing.join(", ")}`);
-          NODE
-      - name: Create immutable GitHub Release
+          args=(--input release-inputs --output release-assets --version "${RELEASE_VERSION}")
+          if [[ "${RELEASE_LIVE_EVAL_OVERRIDE}" == true ]]; then args+=(--include-live-eval-override); fi
+          node scripts/release/assemble-release-assets.mjs "${args[@]}"
+      - name: Create public prerelease
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
-          RELEASE_PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
+          SIGNING_MODE: ${{ needs.desktop_macos.outputs.signing_mode }}
           RELEASE_LIVE_EVAL_OVERRIDE: ${{ needs.metadata.outputs.live_eval_override }}
           RELEASE_LIVE_EVAL_OVERRIDE_REASON: ${{ vars.RELEASE_LIVE_EVAL_OVERRIDE_REASON }}
         run: |
-          options=(--verify-tag --generate-notes --title "Sigma Code ${GITHUB_REF_NAME}")
-          if [[ "${RELEASE_PRERELEASE}" == "true" ]]; then
-            options+=(--prerelease)
+          if [[ "${SIGNING_MODE}" == signed ]]; then
+            mac_status="Developer ID signed, hardened, notarized, stapled, and Gatekeeper-verified."
+            gatekeeper_note="It should open normally after download."
           else
-            options+=(--latest)
+            mac_status="Unsigned preview; no Developer ID or notarization credentials were configured."
+            gatekeeper_note="On first launch, right-click the app and choose Open, or allow it in System Settings > Privacy & Security."
           fi
-          release_notes="$(cat <<'EOF'
+          cat > release-notes.md <<EOF
           ## Platform status
 
-          - **Linux x64:** stable release. The archive passed the complete release-readiness gate.
-          - **Windows x64:** **unsigned preview**. The archive passed package, sandbox, live-product, checksum, SBOM, and signed-provenance verification, but its executables do not have a trusted Authenticode signature. Windows SmartScreen or Smart App Control may warn or block execution.
-          - **Sigma Code Windows x64 installer:** **unsigned preview** containing both the desktop UI and the verified Sigma Runtime from this release. Install it to use Sigma Code without separately installing Node.js or the agent CLI. The matching blockmap and update manifest enable Sigma-owned desktop updates.
+          - **Sigma Code macOS ARM64 preview:** Apple Silicon only, macOS 13.5 or newer. ${mac_status} ${gatekeeper_note}
+          - **Sigma Code Windows x64:** unsigned preview installer containing the verified Runtime.
+          - **Sigma Runtime Linux x64:** stable portable Runtime.
+          - **Sigma Runtime Windows x64:** unsigned portable preview.
 
-          Verify the matching SHA-256 sidecar before running the installer. Verify the archive sidecars and signed provenance before extracting either Runtime archive. Windows assets are not trusted signed Windows binaries.
+          This public prerelease intentionally contains exactly six downloadable attachments. Updater ZIPs, blockmaps, and `latest*.yml` remain available as 90-day workflow artifacts and are intentionally not attached until a future latest release.
+
+          Verify downloads with `SHA256SUMS.txt`. The evidence ZIP contains three-platform Runtime SBOM/provenance and checks, desktop provenance/signing status, the public verification key, and build source metadata.
           EOF
-          )"
-          if [[ "${RELEASE_LIVE_EVAL_OVERRIDE}" == "true" ]]; then
-            release_notes="${release_notes}
+          if [[ "${RELEASE_LIVE_EVAL_OVERRIDE}" == true ]]; then
+            cat >> release-notes.md <<EOF
 
           ## Live evaluation exception
 
           The quick-five live evaluation gate was explicitly skipped for this tag: ${RELEASE_LIVE_EVAL_OVERRIDE_REASON}
-
-          All deterministic platform, security, live-provider, package, checksum, SBOM, and signed-provenance gates still passed. See \`release-live-evaluation-override.json\` for the audit record."
+          The signed override record is included in the evidence ZIP.
+          EOF
           fi
-          assets=(
-            "release-assets/agent-cli-linux-x64.tgz#Linux x64 — stable"
-            "release-assets/agent-cli-linux-x64.tgz.sha256"
-            "release-assets/agent-cli-linux-x64.sbom.cdx.json"
-            "release-assets/agent-cli-linux-x64.provenance.json"
-            "release-assets/agent-cli-win32-x64.zip#Windows x64 Runtime — UNSIGNED PREVIEW"
-            "release-assets/agent-cli-win32-x64.zip.sha256"
-            "release-assets/agent-cli-win32-x64.sbom.cdx.json"
-            "release-assets/agent-cli-win32-x64.provenance.json"
-            "release-assets/release-provenance-public.pem"
-            "release-assets/Sigma-Code-${RELEASE_VERSION}-x64.exe#Sigma Code Windows x64 installer — UI + Runtime (UNSIGNED PREVIEW)"
-            "release-assets/Sigma-Code-${RELEASE_VERSION}-x64.exe.sha256"
-            "release-assets/Sigma-Code-${RELEASE_VERSION}-x64.exe.blockmap"
-            "release-assets/latest.yml"
-          )
-          if [[ "${RELEASE_LIVE_EVAL_OVERRIDE}" == "true" ]]; then
-            assets+=("release-assets/release-live-evaluation-override.json")
-          fi
+          mapfile -t assets < <(find release-assets -maxdepth 1 -type f -print | sort)
+          test "${#assets[@]}" -eq 6
           gh release create "${GITHUB_REF_NAME}" "${assets[@]}" \
-            --repo "${GITHUB_REPOSITORY}" --notes "${release_notes}" "${options[@]}"
+            --repo "${GITHUB_REPOSITORY}" --verify-tag --prerelease \
+            --latest=false \
+            --title "Sigma Code ${GITHUB_REF_NAME} macOS ARM64 preview" \
+            --notes-file release-notes.md
+      - name: Re-download and verify GitHub digests, checksums, evidence, and status
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          mkdir post-release
+          gh release download "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --dir post-release
+          node --input-type=module <<'NODE'
+          import { createHash } from "node:crypto";
+          import { execFileSync } from "node:child_process";
+          import { readFileSync, readdirSync } from "node:fs";
+          import path from "node:path";
+          const version = process.env.RELEASE_VERSION;
+          const expected = [
+            `Sigma-Code-${version}-arm64.dmg`, `Sigma-Code-${version}-x64.exe`,
+            "agent-cli-linux-x64.tgz", "agent-cli-win32-x64.zip", "SHA256SUMS.txt",
+            `sigma-release-evidence-${version}.zip`,
+          ].sort();
+          const actual = readdirSync("post-release").sort();
+          if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error(`Unexpected release assets: ${actual}`);
+          const release = JSON.parse(execFileSync("gh", ["api", `repos/${process.env.GITHUB_REPOSITORY}/releases/tags/${process.env.GITHUB_REF_NAME}`], { encoding: "utf8" }));
+          if (release.draft || !release.prerelease) throw new Error("Release is not a public prerelease.");
+          for (const asset of release.assets) {
+            if (!asset.digest?.startsWith("sha256:")) throw new Error(`GitHub digest missing for ${asset.name}.`);
+            const actualDigest = createHash("sha256").update(readFileSync(path.join("post-release", asset.name))).digest("hex");
+            if (asset.digest !== `sha256:${actualDigest}`) throw new Error(`GitHub digest mismatch for ${asset.name}.`);
+          }
+          NODE
+          (cd post-release && sha256sum --check SHA256SUMS.txt)
+          unzip -t "post-release/sigma-release-evidence-${RELEASE_VERSION}.zip"
+          latest_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name 2>/dev/null || true)"
+          test "${latest_tag}" != "${GITHUB_REF_NAME}"

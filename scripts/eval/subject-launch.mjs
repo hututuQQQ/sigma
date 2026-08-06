@@ -281,7 +281,9 @@ function assertRuntimeEntries(metadata, node, broker) {
 export async function loadPackagedSubjectLaunch(bundleRoot, options = {}) {
   const targetPlatform = options.targetPlatform ?? process.platform;
   const targetArch = options.targetArch ?? process.arch;
-  if (!new Set(["linux", "win32"]).has(targetPlatform)) throw new Error("Unsupported packaged subject platform.");
+  if (!new Set(["linux", "win32", "darwin"]).has(targetPlatform)) {
+    throw new Error("Unsupported packaged subject platform.");
+  }
   const readBundleJson = await packagedBundleReader(bundleRoot);
   const packageJson = await readBundleJson("package.json", "Package manifest");
   const metadata = await readBundleJson("package-metadata.json", "Package metadata");

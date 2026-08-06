@@ -34,7 +34,8 @@ function stableCode(value, fallback) {
 }
 
 function subjectMetadata(input = {}) {
-  const platform = input.platform === "win32" || input.platform === "linux" ? input.platform : DEFAULT_PLATFORM;
+  const platform = ["win32", "linux", "darwin"].includes(input.platform)
+    ? input.platform : DEFAULT_PLATFORM;
   return {
     productDigest: subjectDigest(input.productDigest),
     configurationDigest: subjectDigest(input.configurationDigest),

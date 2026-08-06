@@ -6,6 +6,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import {
+  assertBrokerTarget,
   assertMetadata,
   parseArguments,
   portableLayout,
@@ -19,6 +20,15 @@ async function fileDigest(filePath: string): Promise<string> {
 }
 
 describe("bundled LSP sandbox smoke", () => {
+  it("accepts canonical broker aliases for Apple Silicon", () => {
+    expect(() => assertBrokerTarget(
+      { platform: "macos", architecture: "aarch64" }, "darwin", "arm64"
+    )).not.toThrow();
+    expect(() => assertBrokerTarget(
+      { platform: "darwin", architecture: "x86_64" }, "darwin", "arm64"
+    )).toThrow("does not match arm64");
+  });
+
   it("resolves portable inputs without host PATH assumptions", () => {
     expect(parseArguments([
       "--bundle", "release",
@@ -37,9 +47,12 @@ describe("bundled LSP sandbox smoke", () => {
       pyrightEntry: path.resolve("release", "node_modules", "pyright", "langserver.index.js"),
       mcpModule: path.resolve("release", "node_modules", "agent-mcp", "dist", "index.js")
     });
-    expect(() => parseArguments([
+    expect(parseArguments([
       "--bundle", "release", "--broker", "broker", "--target-platform", "darwin", "--output", "out"
-    ])).toThrow("--target-platform must be 'linux' or 'win32'");
+    ])).toMatchObject({ targetPlatform: "darwin" });
+    expect(() => parseArguments([
+      "--bundle", "release", "--broker", "broker", "--target-platform", "freebsd", "--output", "out"
+    ])).toThrow("--target-platform must be 'linux', 'win32', or 'darwin'");
   });
 
   it("binds the exact bundled Node runtime to its Windows compatibility proof", () => {
@@ -115,7 +128,7 @@ describe("bundled LSP sandbox smoke", () => {
     const digest = "a".repeat(64);
     const metadata = {
       schemaVersion: 1,
-      productVersion: "0.1.5",
+      productVersion: "0.1.6",
       targetPlatform: "win32",
       targetArch: "x64",
       sigmaExec: { path: "bin/sigma-exec.exe", sha256: digest }
@@ -126,7 +139,7 @@ describe("bundled LSP sandbox smoke", () => {
     )).toThrow("unsupported_schema_version");
     expect(() => assertMetadata(
       { ...metadata, productVersion: "0.1.1" }, "win32", broker, digest, layout
-    )).toThrow("must match sigma-manifest.json productVersion '0.1.5'");
+    )).toThrow("must match sigma-manifest.json productVersion '0.1.6'");
   });
 
   it("rejects unknown package metadata without rewriting the artifact", async () => {
@@ -134,7 +147,7 @@ describe("bundled LSP sandbox smoke", () => {
     const metadataPath = path.join(root, "package-metadata.json");
     const metadata = {
       schemaVersion: 999,
-      productVersion: "0.1.5",
+      productVersion: "0.1.6",
       targetPlatform: "win32",
       targetArch: "x64",
       sigmaExec: { path: "bin/sigma-exec.exe", sha256: "a".repeat(64) }

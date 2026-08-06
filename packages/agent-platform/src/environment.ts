@@ -1,4 +1,4 @@
-export type ShellKind = "powershell" | "cmd" | "bash";
+export type ShellKind = "powershell" | "cmd" | "bash" | "zsh";
 
 export interface RuntimeEnvironment {
   platform: NodeJS.Platform;

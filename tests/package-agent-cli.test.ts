@@ -7,6 +7,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   packageAgentCli,
+  normalizeDarwinNativeModules,
   patchWindowsAppContainerNode,
   pinnedNodeVersion,
   nodeRuntimeArchiveName,
@@ -25,7 +26,7 @@ async function writeBuiltPackage(
   rootDir: string,
   packageName: string,
   dependencies: Record<string, string> = {},
-  version = "0.1.5"
+  version = "0.1.6"
 ) {
   const packageDir = path.join(rootDir, "packages", packageName);
   await mkdir(path.join(packageDir, "dist"), { recursive: true });
@@ -101,7 +102,7 @@ async function writeFakeNodeRuntimeTarball(tmpDir: string, arch = "x64") {
   const nodePath = path.join(runtimeDir, "bin", "node");
   await writeFile(nodePath, `#!/usr/bin/env sh
 if [ "$1" = "--version" ]; then echo "${pinnedNodeVersion}"; exit 0; fi
-if [ "$2" = "version" ]; then echo '{"product":"Sigma Code","package":{"name":"agent-cli","version":"0.1.5"},"runtime":{"node":"${pinnedNodeVersion}"}}'; exit 0; fi
+if [ "$2" = "version" ]; then echo '{"product":"Sigma Code","package":{"name":"agent-cli","version":"0.1.6"},"runtime":{"node":"${pinnedNodeVersion}"}}'; exit 0; fi
 exec "${process.execPath}" "$@"
 `, "utf8");
   await chmod(nodePath, 0o755);
@@ -158,7 +159,10 @@ function approvedWindowsNodeFixtureAvailable() {
 }
 
 const approvedWindowsPackageIt = windowsZipFixtureAvailable() && approvedWindowsNodeFixtureAvailable() ? it : it.skip;
-const linuxPackagingIt = process.platform === "win32" ? it.skip : it;
+// Linux archive normalization is itself part of the platform proof. Running
+// these cases on another host would require a trusted Linux container runtime;
+// the Linux CI/release jobs exercise them natively instead.
+const linuxPackagingIt = process.platform === "linux" ? it : it.skip;
 
 async function writeFakeWindowsNodeRuntimeZip(tmpDir: string, arch = "x64") {
   const runtimeRoot = path.join(tmpDir, "runtime-win");
@@ -183,7 +187,7 @@ async function writePackageFixture() {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), "sigma-package-agent-cli-"));
   await writeFile(
     path.join(rootDir, "package.json"),
-    `${JSON.stringify({ name: "sigma", version: "0.1.5", private: true, license: "MIT" })}\n`,
+    `${JSON.stringify({ name: "sigma", version: "0.1.6", private: true, license: "MIT" })}\n`,
     "utf8"
   );
   await writeFile(path.join(rootDir, "LICENSE"), "MIT License\n", "utf8");
@@ -270,7 +274,7 @@ async function writePackagingWorkspace(
   brokerArch: "x64" | "arm64" = "x64"
 ) {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), "sigma-package-agent-cli-"));
-  const version = "0.1.5";
+  const version = "0.1.6";
   await writeFile(
     path.join(rootDir, "package.json"),
     `${JSON.stringify({ name: "sigma", version, private: true, license: "MIT" })}\n`,
@@ -294,8 +298,46 @@ async function writePackagingWorkspace(
 }
 
 describe("package-agent-cli", () => {
-  it("rejects non-Tier-1 architectures", async () => {
-    await expect(packageAgentCli({ rootDir: process.cwd(), targetArch: "arm64" })).rejects.toThrow("AGENT_TARGET_ARCH");
+  it("accepts the Darwin archive name and rejects non-Tier-1 target pairs", async () => {
+    expect(nodeRuntimeArchiveName("darwin", "arm64"))
+      .toBe(`node-${pinnedNodeVersion}-darwin-arm64.tar.gz`);
+    await expect(packageAgentCli({
+      rootDir: process.cwd(), targetPlatform: "linux", targetArch: "arm64"
+    })).rejects.toThrow("Unsupported Sigma Code release target 'linux-arm64'");
+  });
+
+  it("uses fixed Apple lipo to thin copied universal native modules to ARM64", async () => {
+    const bundleDir = await mkdtemp(path.join(os.tmpdir(), "sigma-darwin-native-"));
+    const nativeModule = path.join(bundleDir, "node_modules", "fsevents", "fsevents.node");
+    await mkdir(path.dirname(nativeModule), { recursive: true });
+    const universal = Buffer.alloc(32);
+    universal.set([0xca, 0xfe, 0xba, 0xbe]);
+    await writeFile(nativeModule, universal);
+    const calls: Array<{ command: string; args: string[] }> = [];
+    try {
+      const normalized = await normalizeDarwinNativeModules(bundleDir, {
+        platform: "darwin",
+        arch: "arm64",
+        spawnSync: (command: string, args: string[]) => {
+          calls.push({ command, args });
+          const thin = Buffer.alloc(32);
+          thin.set([0xcf, 0xfa, 0xed, 0xfe]);
+          thin.writeUInt32LE(0x0100000c, 4);
+          thin.writeUInt32LE(0x8, 12);
+          writeFileSync(args.at(-1)!, thin);
+          return { status: 0, stdout: "", stderr: "" };
+        }
+      });
+      expect(normalized).toEqual(["node_modules/fsevents/fsevents.node"]);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.command).toBe("/usr/bin/lipo");
+      expect(calls[0]!.args.slice(1, 4)).toEqual(["-thin", "arm64", "-output"]);
+      const thinned = await readFile(nativeModule);
+      expect([...thinned.subarray(0, 4)]).toEqual([0xcf, 0xfa, 0xed, 0xfe]);
+      expect(thinned.readUInt32LE(4)).toBe(0x0100000c);
+    } finally {
+      await rm(bundleDir, { recursive: true, force: true });
+    }
   });
 
   it("rejects a workspace product version that differs from the manifest", async () => {
@@ -616,7 +658,7 @@ describe("package-agent-cli", () => {
         product: "Sigma Code",
         package: {
           name: "agent-cli",
-          version: "0.1.5"
+          version: "0.1.6"
         }
       },
       metadata: {

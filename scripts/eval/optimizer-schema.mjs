@@ -152,7 +152,11 @@ function assertSubject(value) {
   digest(value.productDigest, "observation.subject.productDigest");
   digest(value.configurationDigest, "observation.subject.configurationDigest");
   digest(value.environmentDigest, "observation.subject.environmentDigest");
-  enumValue(value.platform, new Set(["win32", "linux", "unavailable"]), "observation.subject.platform");
+  enumValue(
+    value.platform,
+    new Set(["win32", "linux", "darwin", "unavailable"]),
+    "observation.subject.platform"
+  );
   code(value.surface, "observation.subject.surface");
   code(value.provider, "observation.subject.provider");
   requiredString(value.model, "observation.subject.model", 128);

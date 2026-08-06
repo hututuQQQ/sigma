@@ -33,8 +33,8 @@ export function parseArguments(argv) {
   for (const key of ["bundle", "broker", "targetPlatform", "output"]) {
     if (!options[key]) throw new Error(`--${key.replace(/[A-Z]/gu, (letter) => `-${letter.toLowerCase()}`)} is required.`);
   }
-  if (!["linux", "win32"].includes(options.targetPlatform)) {
-    throw new Error("--target-platform must be 'linux' or 'win32'.");
+  if (!["linux", "win32", "darwin"].includes(options.targetPlatform)) {
+    throw new Error("--target-platform must be 'linux', 'win32', or 'darwin'.");
   }
   return options;
 }
@@ -181,9 +181,13 @@ export function portableNodeToolchain(api, layout, metadata, integrityManifest, 
   };
 }
 
-function assertBrokerTarget(doctor, targetPlatform, targetArch) {
-  const platforms = targetPlatform === "win32" ? ["win32", "windows"] : ["linux"];
-  const architectures = targetArch === "x64" ? ["x64", "x86_64", "amd64"] : [targetArch];
+export function assertBrokerTarget(doctor, targetPlatform, targetArch) {
+  const platforms = targetPlatform === "win32"
+    ? ["win32", "windows"]
+    : targetPlatform === "darwin" ? ["darwin", "macos"] : ["linux"];
+  const architectures = targetArch === "x64"
+    ? ["x64", "x86_64", "amd64"]
+    : targetArch === "arm64" ? ["arm64", "aarch64"] : [targetArch];
   if (!platforms.includes(String(doctor.platform).toLowerCase())) {
     throw new Error(`Broker platform '${String(doctor.platform)}' does not match ${targetPlatform}.`);
   }

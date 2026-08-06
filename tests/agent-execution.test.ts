@@ -631,6 +631,16 @@ describe("agent-execution protocol validation", () => {
     ]);
     expect(parseDoctor({
       ...doctor,
+      platform: "macos",
+      capabilities: {
+        ...doctor.capabilities,
+        shells: [{ kind: "zsh", executable: "/bin/zsh", verified: true, supportsChildProcesses: true }]
+      }
+    }).capabilities.shells).toEqual([
+      { kind: "zsh", executable: "/bin/zsh", verified: true, supportsChildProcesses: true }
+    ]);
+    expect(parseDoctor({
+      ...doctor,
       sandbox: { ...doctor.sandbox, hardening: { ...doctor.sandbox.hardening, landlockAbi: undefined } }
     }).sandbox.hardening).not.toHaveProperty("landlockAbi");
     expect(() => parseDoctor({ ...doctor, protocolVersion: 999 })).toThrow(BrokerProtocolError);

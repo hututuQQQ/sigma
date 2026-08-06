@@ -93,6 +93,7 @@ describe("agent-platform execution boundary", () => {
       ? { executable: "cmd.exe", args: ["/d", "/s", "/c", "chcp 65001>nul & echo ok"] }
       : { executable: "cmd.exe", args: ["/d", "/s", "/c", "echo ok"] });
     expect(shellInvocation("bash", "echo ok")).toEqual({ executable: "bash", args: ["-lc", "echo ok"] });
+    expect(shellInvocation("zsh", "echo ok")).toEqual({ executable: "zsh", args: ["-lc", "echo ok"] });
   });
 
   it("normalizes broker cancellation into the process result contract", async () => {

@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { chmod, cp, lstat, mkdir, mkdtemp, open, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, cp, lstat, mkdir, mkdtemp, open, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -20,6 +20,13 @@ import {
 } from "./windows-release-signing.mjs";
 import { sigmaManifest } from "./lib/sigma-manifest.mjs";
 import { compareGlibcVersions, inspectLinuxElf } from "./linux-elf.mjs";
+import {
+  assertArm64MachO,
+  assertArm64MachOBytes,
+  inspectMachOBytes,
+  isUniversalMachOBytes,
+  machoFileTypes
+} from "./macho.mjs";
 import {
   assertLinuxRuntimeLibraryInventory,
   linuxMinimumGlibc,
@@ -41,8 +48,8 @@ export const windowsAppContainerNodeCompatibility = Object.freeze({
 });
 export const windowsNodeGlobalPipeMarker = Buffer.from("\\\\?\\pipe\\uv\\%llu-%lu\0", "ascii");
 export const windowsNodeLocalPipeMarker = Buffer.from("\\\\?\\pipe\\LOCAL\\%u-%u\0", "ascii");
-export const supportedTargetPlatforms = new Set(["linux", "win32"]);
-export const supportedTargetArchitectures = new Set(["x64"]);
+export const supportedTargetPlatforms = new Set(["linux", "win32", "darwin"]);
+export const supportedTargetArchitectures = new Set(["x64", "arm64"]);
 export const supportedReleaseTargets = new Set(sigmaManifest.release.targets);
 export const portablePackages = Object.freeze([
   "agent-execution",
@@ -187,6 +194,9 @@ export function defaultNodeRuntimeTarballPath(artifactsDir, targetArch = "x64") 
 export function nodeRuntimeArchiveName(targetPlatform = "linux", targetArch = "x64") {
   const resolved = resolvePlatformArch(targetPlatform, targetArch);
   if (resolved.targetPlatform === "linux") return nodeRuntimeTarballName(resolved.targetArch);
+  if (resolved.targetPlatform === "darwin") {
+    return `node-${pinnedNodeVersion}-darwin-${resolved.targetArch}.tar.gz`;
+  }
   return `node-${pinnedNodeVersion}-win-${resolved.targetArch}.zip`;
 }
 
@@ -556,7 +566,7 @@ async function copyNodeRuntime(
   nodeArchiveIntegrity,
   nodeVersionProbe
 ) {
-  const platformName = targetPlatform === "win32" ? "win" : "linux";
+  const platformName = targetPlatform === "win32" ? "win" : targetPlatform;
   const archiveRoot = `node-${pinnedNodeVersion}-${platformName}-${targetArch}`;
   const nodeEntry = targetPlatform === "win32"
     ? `${archiveRoot}/node.exe`
@@ -575,18 +585,21 @@ async function copyNodeRuntime(
   const sourceBytes = extractArchiveMemberBytes(nodeArchiveIntegrity.archiveBytes, nodeEntry, {
     label: `Node runtime archive ${path.basename(resolvedRuntime.runtimeArchive)}`
   });
-  if (targetPlatform === "linux") {
+  if (targetPlatform === "linux" || targetPlatform === "darwin") {
+    const nodeBinaryTarget = targetPlatform === "darwin"
+      ? assertArm64MachOBytes(sourceBytes, "Bundled Darwin Node", [machoFileTypes.executable])
+      : null;
     const bundledNodePath = path.join(bundleDir, "bin", "node");
     await writeFile(bundledNodePath, sourceBytes);
     await chmod(bundledNodePath, 0o755).catch(() => undefined);
     let nodeVersionOutput = null;
-    if (process.platform !== "win32") {
+    if (process.platform === targetPlatform && process.arch === targetArch) {
       nodeVersionOutput = await nodeVersionProbe(bundledNodePath);
       if (nodeVersionOutput !== pinnedNodeVersion) {
         throw new Error(`bundled node version ${nodeVersionOutput} does not match pinned ${pinnedNodeVersion}`);
       }
     }
-    return { ...resolvedRuntime, bundledNodePath, nodeVersionOutput, compatibility: null };
+    return { ...resolvedRuntime, bundledNodePath, nodeVersionOutput, compatibility: null, nodeBinaryTarget };
   }
 
   const bundledNodePath = path.join(bundleDir, "bin", "node.exe");
@@ -738,17 +751,88 @@ async function inspectPeExecutable(handle, filePath) {
 export async function inspectSigmaExecBinary(filePath) {
   const handle = await open(filePath, "r");
   try {
-    const prefix = await readExecutableBytes(handle, 20, 0, filePath);
+    const prefix = await readExecutableBytes(handle, 32, 0, filePath);
     if (prefix.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))) {
       return inspectElfPrefix(prefix, filePath);
     }
     if (prefix[0] === 0x4d && prefix[1] === 0x5a) {
       return await inspectPeExecutable(handle, filePath);
     }
-    throw new Error(`sigma-exec is not a recognized ELF or PE executable: ${filePath}`);
+    if (prefix.subarray(0, 4).equals(Buffer.from([0xcf, 0xfa, 0xed, 0xfe]))
+      || prefix.subarray(0, 4).equals(Buffer.from([0xfe, 0xed, 0xfa, 0xcf]))) {
+      const inspection = inspectMachOBytes(prefix, filePath);
+      if (inspection.fileType !== machoFileTypes.executable) {
+        throw new Error(`sigma-exec Mach-O binary is not an executable image: ${filePath}`);
+      }
+      return inspection;
+    }
+    throw new Error(`sigma-exec is not a recognized ELF, PE, or Mach-O executable: ${filePath}`);
   } finally {
     await handle.close();
   }
+}
+
+async function darwinNativeModulePaths(rootDir) {
+  const nativeModules = [];
+  async function visit(directory) {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const absolute = path.join(directory, entry.name);
+      if (entry.isDirectory()) await visit(absolute);
+      else if (entry.isFile() && entry.name.endsWith(".node")) nativeModules.push(absolute);
+    }
+  }
+  await visit(rootDir);
+  return nativeModules.sort((left, right) => left.localeCompare(right, "en"));
+}
+
+/** Converts copied universal native dependencies into strict ARM64 slices. */
+export async function normalizeDarwinNativeModules(bundleDir, options = {}) {
+  const platform = options.platform ?? process.platform;
+  const arch = options.arch ?? process.arch;
+  if (platform !== "darwin" || arch !== "arm64") {
+    throw new Error("Darwin native modules must be normalized on a native Apple Silicon host.");
+  }
+  const runLipo = options.spawnSync ?? spawnSync;
+  const normalized = [];
+  for (const filePath of await darwinNativeModulePaths(bundleDir)) {
+    if (!isUniversalMachOBytes(await readFile(filePath))) continue;
+    const temporary = await mkdtemp(path.join(path.dirname(filePath), ".sigma-arm64-"));
+    const output = path.join(temporary, path.basename(filePath));
+    try {
+      const result = runLipo(
+        "/usr/bin/lipo",
+        [filePath, "-thin", "arm64", "-output", output],
+        { encoding: "utf8", windowsHide: true }
+      );
+      if (result.error || result.status !== 0) {
+        const detail = String(result.stderr ?? result.error?.message ?? "unknown lipo failure").trim();
+        throw new Error(`Could not extract the ARM64 slice from ${filePath}: ${detail}`);
+      }
+      await assertArm64MachO(output, [machoFileTypes.bundle, machoFileTypes.dylib]);
+      const source = await lstat(filePath);
+      await chmod(output, source.mode & 0o777);
+      await rename(output, filePath);
+      normalized.push(path.relative(bundleDir, filePath).replaceAll(path.sep, "/"));
+    } finally {
+      await rm(temporary, { recursive: true, force: true });
+    }
+  }
+  return normalized;
+}
+
+export async function verifyDarwinRuntimeMachO(bundleDir, nodePath, brokerPath) {
+  const files = [nodePath, brokerPath, ...await darwinNativeModulePaths(bundleDir)];
+  const inspections = [];
+  for (const filePath of files) {
+    const allowed = filePath.endsWith(".node")
+      ? [machoFileTypes.bundle, machoFileTypes.dylib]
+      : [machoFileTypes.executable];
+    inspections.push({
+      path: path.relative(bundleDir, filePath).replaceAll(path.sep, "/"),
+      ...await assertArm64MachO(filePath, allowed)
+    });
+  }
+  return inspections;
 }
 
 async function copySigmaExec(rootDir, bundleDir, targetPlatform, targetArch, env) {
@@ -1064,7 +1148,10 @@ async function addPackageComponents(rootDir, packageNames, targetPlatform, targe
 }
 
 function addRuntimeComponents(components, context) {
-  const { assetsByPath, targetPlatform, targetArch, nodeArchiveIntegrity, nodeRuntime, linuxCompatibility } = context;
+  const {
+    assetsByPath, targetPlatform, targetArch, nodeArchiveIntegrity, nodeRuntime,
+    linuxCompatibility, darwinCompatibility
+  } = context;
   const nodePath = `bin/${targetPlatform === "win32" ? "node.exe" : "node"}`;
   const brokerPath = `bin/${sigmaExecFileName(targetPlatform)}`;
   components.set("sigma:bundled-node", portableAssetComponent(assetsByPath.get(nodePath), targetPlatform, targetArch, {
@@ -1078,6 +1165,10 @@ function addRuntimeComponents(components, context) {
         { name: "sigma:rpath", value: String(linuxCompatibility.node.rpath ?? "") },
         { name: "sigma:max-glibc", value: String(linuxCompatibility.node.maxGlibc ?? "") }
       ] : []),
+      ...(darwinCompatibility ? [{
+        name: "sigma:minimum-system-version",
+        value: darwinCompatibility.minimumSystemVersion
+      }] : []),
       ...nodeCompatibilityProperties(nodeRuntime.compatibility)
     ]
   }));
@@ -1188,7 +1279,7 @@ function portableSbomDocument(components, releaseVersion, targetPlatform, target
 
 async function writePortableSbom(
   rootDir, bundleDir, packageNames, targetPlatform, targetArch,
-  sigmaExec, nodeArchiveIntegrity, nodeRuntime, linuxCompatibility
+  sigmaExec, nodeArchiveIntegrity, nodeRuntime, linuxCompatibility, darwinCompatibility
 ) {
   const components = await addPackageComponents(
     rootDir, packageNames, targetPlatform, targetArch
@@ -1207,7 +1298,7 @@ async function writePortableSbom(
   const assetsByPath = new Map(assetEntries.map((entry) => [entry.path, entry]));
   const context = {
     rootDir, assetsByPath, assetEntries, targetPlatform, targetArch,
-    releaseVersion, sigmaExec, nodeArchiveIntegrity, nodeRuntime, linuxCompatibility
+    releaseVersion, sigmaExec, nodeArchiveIntegrity, nodeRuntime, linuxCompatibility, darwinCompatibility
   };
   addRuntimeComponents(components, context);
   await addLanguageComponents(components, context);
@@ -1218,7 +1309,9 @@ async function writePortableSbom(
   return sbomPath;
 }
 
-async function writeIntegrityManifest(bundleDir, targetPlatform, targetArch, nodeRuntime, linuxCompatibility) {
+async function writeIntegrityManifest(
+  bundleDir, targetPlatform, targetArch, nodeRuntime, linuxCompatibility, darwinCompatibility
+) {
   const nodePath = `bin/${targetPlatform === "win32" ? "node.exe" : "node"}`;
   const brokerPath = `bin/${sigmaExecFileName(targetPlatform)}`;
   const manifest = {
@@ -1228,6 +1321,7 @@ async function writeIntegrityManifest(bundleDir, targetPlatform, targetArch, nod
     targetArch,
     ...(nodeRuntime.compatibility ? { nodeCompatibility: nodeRuntime.compatibility } : {}),
     ...(linuxCompatibility ? { linuxCompatibility } : {}),
+    ...(darwinCompatibility ? { darwinCompatibility } : {}),
     // At this point the only files not yet present are this self-referential
     // manifest and package-metadata.json, which references its digest. Cover
     // every other file in the portable bundle rather than a list of roots.
@@ -1358,6 +1452,7 @@ async function writeReleaseSidecars(
   nodeArchiveIntegrity,
   nodeRuntime,
   linuxCompatibility,
+  darwinCompatibility,
   releaseSigningPrivateKey
 ) {
   const archiveSha256 = await sha256File(outputPath);
@@ -1374,10 +1469,11 @@ async function writeReleaseSidecars(
       buildDefinition: {
         buildType: "https://sigma-code.dev/build-types/portable-cli",
         externalParameters: { version: release.version, targetPlatform, targetArch },
-        ...((nodeRuntime.compatibility || linuxCompatibility) ? {
+        ...((nodeRuntime.compatibility || linuxCompatibility || darwinCompatibility) ? {
           internalParameters: {
             ...(nodeRuntime.compatibility ? { nodeCompatibility: nodeRuntime.compatibility } : {}),
-            ...(linuxCompatibility ? { linuxCompatibility } : {})
+            ...(linuxCompatibility ? { linuxCompatibility } : {}),
+            ...(darwinCompatibility ? { darwinCompatibility } : {})
           }
         } : {}),
         resolvedDependencies: [
@@ -1471,6 +1567,7 @@ exit /b %ERRORLEVEL%
 }
 
 function releaseChannelFor(version, targetPlatform, windowsSignerPolicyVerified) {
+  if (targetPlatform === "darwin") return "preview";
   if (targetPlatform === "win32" && windowsSignerPolicyVerified !== true) {
     return "preview";
   }
@@ -1483,7 +1580,9 @@ function createBundleReadme(targetPlatform, targetArch, nodeRuntime, releaseChan
   const agent = isWindows ? String.raw`.\bin\agent.cmd` : "./bin/agent";
   const sigma = isWindows ? String.raw`.\bin\sigma.cmd` : "./bin/sigma";
   const workspace = isWindows ? String.raw`D:\path\to\repo` : "/path/to/repo";
-  const platformLabel = isWindows ? `Windows ${targetArch}` : `Linux ${targetArch}`;
+  const platformLabel = isWindows
+    ? `Windows ${targetArch}`
+    : targetPlatform === "darwin" ? `macOS ${targetArch}` : `Linux ${targetArch}`;
   const releaseDescription = releaseChannel === "stable"
     ? "stable CLI"
     : `${releaseChannel} prerelease CLI`;
@@ -1495,7 +1594,13 @@ function createBundleReadme(targetPlatform, targetArch, nodeRuntime, releaseChan
 > Authenticode signature. Windows SmartScreen or Smart App Control may warn or block
 > execution.
 `
-    : "";
+    : targetPlatform === "darwin" ? `
+> [!WARNING]
+> This ARM64 macOS Runtime is a preview. The containing desktop application may be
+> unsigned when Apple credentials are unavailable; follow the GitHub Release's
+> Gatekeeper instructions and verify SHA-256 provenance before testing.
+`
+      : "";
   return `# Sigma Code CLI Bundle
 
 This archive contains the Sigma Code ${sigmaManifest.productVersion}
@@ -1638,6 +1743,17 @@ function createBundleArchive(outputPath, artifactsDir, bundleName, targetPlatfor
     return;
   }
 
+  if (targetPlatform === "darwin") {
+    const result = spawnSync("tar", ["-czf", outputPath, "-C", artifactsDir, bundleName], {
+      cwd: rootDir,
+      encoding: "utf8"
+    });
+    if (result.error || result.status !== 0) {
+      throw new Error(`failed to create agent-cli macOS tarball: ${result.stderr || result.stdout || result.error?.message}`);
+    }
+    return;
+  }
+
   const bundleDir = path.join(artifactsDir, bundleName);
   const tarZip = spawnSync("tar", ["-a", "-cf", outputPath, "-C", artifactsDir, bundleName], {
     cwd: rootDir,
@@ -1774,6 +1890,18 @@ async function stagePortableRuntime(context) {
     options.nodeVersionProbe ?? inspectBundledNodeVersion
   );
   const sigmaExec = await copySigmaExec(rootDir, bundleDir, targetPlatform, targetArch, env);
+  const thinnedNativeModules = targetPlatform === "darwin"
+    ? await normalizeDarwinNativeModules(bundleDir, {
+        spawnSync: options.darwinLipoSpawnSync
+      })
+    : [];
+  const darwinCompatibility = targetPlatform === "darwin" ? {
+    minimumSystemVersion: sigmaManifest.release.macosMinimumSystemVersion,
+    sandbox: "seatbelt+sandbox-exec+forkpty",
+    thinnedNativeModules,
+    machO: await verifyDarwinRuntimeMachO(bundleDir, nodeRuntime.bundledNodePath, sigmaExec.destination),
+    validated: true
+  } : null;
   const linuxCompatibility = await stageLinuxCompatibility(context, nodeRuntime, sigmaExec);
   const brokerContentIdentity = await preSigningBrokerIdentity(targetPlatform, sigmaExec);
   const windowsSigningStage = await runWindowsSigningStage({
@@ -1786,7 +1914,14 @@ async function stagePortableRuntime(context) {
     spawn: options.windowsSigningSpawnSync ?? spawnSync
   });
   await verifyWindowsSignedContent(nodeRuntime, sigmaExec, brokerContentIdentity, targetPlatform);
-  return { nodeArchiveIntegrity, nodeRuntime, sigmaExec, linuxCompatibility, windowsSigningStage };
+  return {
+    nodeArchiveIntegrity,
+    nodeRuntime,
+    sigmaExec,
+    linuxCompatibility,
+    darwinCompatibility,
+    windowsSigningStage
+  };
 }
 
 async function writeBundleEntrypoints(context, nodeRuntime, signing) {
@@ -1832,6 +1967,11 @@ async function writeBundleEntrypoints(context, nodeRuntime, signing) {
     "utf8"
   );
   await cp(path.join(rootDir, "LICENSE"), path.join(bundleDir, "LICENSE"));
+  if (targetPlatform === "darwin") {
+    await cp(path.join(rootDir, "THIRD_PARTY_NOTICES.md"), path.join(bundleDir, "THIRD_PARTY_NOTICES.md"));
+    await mkdir(path.join(bundleDir, "LICENSES"), { recursive: true });
+    await cp(path.join(rootDir, "LICENSES", "Apache-2.0.txt"), path.join(bundleDir, "LICENSES", "Apache-2.0.txt"));
+  }
 }
 
 function inspectBundleSigning(context, runtime) {
@@ -1847,14 +1987,16 @@ function inspectBundleSigning(context, runtime) {
 
 async function writeBundleEvidence(context, runtime, signing) {
   const { rootDir, bundleDir, packages, targetPlatform, targetArch } = context;
-  const { sigmaExec, nodeArchiveIntegrity, nodeRuntime, linuxCompatibility } = runtime;
+  const {
+    sigmaExec, nodeArchiveIntegrity, nodeRuntime, linuxCompatibility, darwinCompatibility
+  } = runtime;
   const tokenizerAssets = await copyTokenizerAssets(rootDir, bundleDir);
   const sbomPath = await writePortableSbom(
     rootDir, bundleDir, packages, targetPlatform, targetArch,
-    sigmaExec, nodeArchiveIntegrity, nodeRuntime, linuxCompatibility
+    sigmaExec, nodeArchiveIntegrity, nodeRuntime, linuxCompatibility, darwinCompatibility
   );
   const integrity = await writeIntegrityManifest(
-    bundleDir, targetPlatform, targetArch, nodeRuntime, linuxCompatibility
+    bundleDir, targetPlatform, targetArch, nodeRuntime, linuxCompatibility, darwinCompatibility
   );
   return { tokenizerAssets, sbomPath, integrity, signing };
 }
@@ -1909,6 +2051,7 @@ function packageMetadata(context, runtime, evidence) {
   return {
     sigmaExec: sigmaExecPackageMetadata(context, runtime, integrity),
     ...(runtime.linuxCompatibility ? { linuxCompatibility: runtime.linuxCompatibility } : {}),
+    ...(runtime.darwinCompatibility ? { darwinCompatibility: runtime.darwinCompatibility } : {}),
     assets: bundleAssetMetadata(integrity, tokenizerAssets),
     integrity: {
       algorithm: "sha256", manifest: "integrity-manifest.json",
@@ -1954,7 +2097,7 @@ async function finalizePackage(context, runtime, evidence) {
   return writeReleaseSidecars(
     outputPath, evidence.sbomPath, release, targetPlatform, context.targetArch,
     evidence.integrity, evidence.signing, runtime.nodeArchiveIntegrity, runtime.nodeRuntime,
-    runtime.linuxCompatibility,
+    runtime.linuxCompatibility, runtime.darwinCompatibility,
     options.releaseSigningPrivateKey ?? loadReleaseProvenancePrivateKey(env)
   );
 }

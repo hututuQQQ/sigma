@@ -8,6 +8,8 @@ export interface SigmaManifest {
   readonly toolchains: Readonly<Record<"node" | "pnpm" | "rust" | "rustCoverage", string>>;
   readonly release: {
     readonly targets: readonly string[];
+    readonly macosMinimumSystemVersion: string;
+    readonly githubPrerelease: boolean;
     readonly windowsNodePatch: Readonly<Record<string, string>>;
   };
   readonly evaluation: { readonly provider: string; readonly model: string };

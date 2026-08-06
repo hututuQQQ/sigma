@@ -133,8 +133,11 @@ describe("agent experience evaluation runner", () => {
     expect(resolveEvaluatorHost("win32", "x64")).toMatchObject({
       packageTarget: "windows", targetPlatform: "win32", targetArch: "x64"
     });
+    expect(resolveEvaluatorHost("darwin", "arm64")).toMatchObject({
+      packageTarget: "macos", targetPlatform: "darwin", targetArch: "arm64"
+    });
     for (const [platform, arch] of [
-      ["darwin", "x64"], ["darwin", "arm64"], ["linux", "arm64"], ["win32", "arm64"],
+      ["darwin", "x64"], ["linux", "arm64"], ["win32", "arm64"],
       ["freebsd", "x64"], ["linux", "riscv64"]
     ]) {
       expect(() => resolveEvaluatorHost(platform, arch)).toThrowError(expect.objectContaining({
