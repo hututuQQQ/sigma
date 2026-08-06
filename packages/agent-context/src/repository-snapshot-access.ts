@@ -1,6 +1,7 @@
 import path from "node:path";
+import type { WorkspaceTransactionDirectoryLease } from "agent-platform";
 import {
-  readStableBoundedText,
+  decodeStableBoundedText,
   type StableTextRead
 } from "./repository-path-metadata.js";
 import { safeAutomaticFilePath } from "./repository-path-safety.js";
@@ -13,13 +14,20 @@ export interface RepositorySnapshotAccess {
 
 /** Reads direct children through directory descriptors held by one host snapshot. */
 export class HostRepositorySnapshotAccess implements RepositorySnapshotAccess {
-  private readonly directories = new Map<string, string>();
+  private readonly directories = new Map<string, {
+    directory: string;
+    lease: WorkspaceTransactionDirectoryLease;
+  }>();
   private files = new Set<string>();
   private closed = false;
 
-  bindDirectory(relative: string, pinnedPath: string): void {
+  bindDirectory(
+    relative: string,
+    lease: WorkspaceTransactionDirectoryLease,
+    directory: string
+  ): void {
     if (this.closed) throw new Error("Repository snapshot access is closed.");
-    this.directories.set(relative, pinnedPath);
+    this.directories.set(relative, { directory, lease });
   }
 
   restrictFiles(files: readonly string[]): void {
@@ -34,11 +42,14 @@ export class HostRepositorySnapshotAccess implements RepositorySnapshotAccess {
     const normalized = relative.replaceAll("\\", "/");
     if (normalized !== relative) return rejectedRead();
     const parent = path.posix.dirname(normalized);
-    const pinnedParent = this.directories.get(parent === "." ? "" : parent);
-    if (!pinnedParent) return rejectedRead();
-    return await readStableBoundedText(
-      path.join(pinnedParent, path.posix.basename(normalized)), maxBytes, signal
-    );
+    const boundParent = this.directories.get(parent === "." ? "" : parent);
+    if (!boundParent) return rejectedRead();
+    return decodeStableBoundedText(await boundParent.lease.readDirectoryFile(
+      boundParent.directory,
+      path.posix.basename(normalized),
+      maxBytes,
+      signal
+    ));
   }
 
   close(): void {

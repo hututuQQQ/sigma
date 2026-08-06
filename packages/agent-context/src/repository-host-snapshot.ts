@@ -8,7 +8,7 @@ import {
 import createIgnore from "ignore";
 import { boundedDirectoryEntries } from "./repository-directory-entries.js";
 import {
-  readStableBoundedText,
+  decodeStableBoundedText,
   type RepositorySnapshot
 } from "./repository-path-metadata.js";
 import {
@@ -58,7 +58,6 @@ interface HostQueueEntry {
 
 interface ResolvedHostQueueEntry extends HostQueueEntry {
   directory: string;
-  pinnedDirectory: string;
 }
 
 interface LockedHostQueueEntry extends ResolvedHostQueueEntry {
@@ -110,7 +109,7 @@ function ignoredByScope(scope: IgnoreScope | undefined, candidate: string, direc
 }
 
 async function extendIgnoreScope(
-  directory: string,
+  entry: LockedHostQueueEntry,
   relative: string,
   parent: IgnoreScope | undefined,
   state: HostScanState,
@@ -119,7 +118,9 @@ async function extendIgnoreScope(
   if (scanLimitReached(state, signal)) return { accepted: false };
   let loaded;
   try {
-    loaded = await readStableBoundedText(path.join(directory, ".gitignore"), MAX_IGNORE_BYTES, signal);
+    loaded = decodeStableBoundedText(await entry.lease.readDirectoryFile(
+      entry.directory, ".gitignore", MAX_IGNORE_BYTES, signal
+    ));
   } catch {
     signal.throwIfAborted();
     state.truncated = true;
@@ -178,7 +179,7 @@ async function scanDirectory(
   await state.beforeDirectoryScanned?.(queueEntry.relative, queueEntry.directory);
   try {
     const extended = await extendIgnoreScope(
-      queueEntry.pinnedDirectory, queueEntry.relative, queueEntry.ignoreScope, state, signal
+      queueEntry, queueEntry.relative, queueEntry.ignoreScope, state, signal
     );
     if (!extended.accepted || scanLimitReached(state, signal)) return;
     const filesStart = state.files.length;
@@ -240,11 +241,10 @@ async function pinResolvedBatch(
     await activeLease.verify();
     const pinnedEntries = entries.map((entry) => ({
       ...entry,
-      pinnedDirectory: activeLease.pinnedPath(entry.directory),
       lease: activeLease
     }));
     for (const entry of pinnedEntries) {
-      state.access.bindDirectory(entry.relative, entry.pinnedDirectory);
+      state.access.bindDirectory(entry.relative, activeLease, entry.directory);
     }
     state.leases.push(activeLease);
     state.lockedDirectories += entries.length;
@@ -292,7 +292,7 @@ async function pinDirectoryEntries(
     try {
       const directory = path.resolve(workspace, entry.relative || ".");
       await state.afterDirectoryResolved?.(entry.relative, directory);
-      resolved.push({ ...entry, directory, pinnedDirectory: directory });
+      resolved.push({ ...entry, directory });
     } catch {
       signal.throwIfAborted();
       state.truncated = true;

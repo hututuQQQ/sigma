@@ -14,6 +14,7 @@ export { WorkspaceTransactionRootError } from "./workspace-transaction-errors.js
 export {
   pinWorkspaceTransactionDirectories,
   pinWorkspaceTransactionPaths,
+  type WorkspaceLeasedFileRead,
   type WorkspaceTransactionDirectoryLease
 } from "./workspace-transaction-lease.js";
 

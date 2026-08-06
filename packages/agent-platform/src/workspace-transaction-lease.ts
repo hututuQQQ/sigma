@@ -5,12 +5,18 @@ import {
   darwinDirectoryEntries,
   type WorkspaceDirectoryEntry
 } from "./darwin-directory-entries.js";
+import {
+  readLeasedDirectoryFile,
+  type WorkspaceLeasedFileRead
+} from "./workspace-leased-file.js";
 import { WorkspaceTransactionRootError } from "./workspace-transaction-errors.js";
 import {
   lockWindowsPaths,
   type WindowsDirectoryLock,
   type WindowsPathLockRequest
 } from "./windows-directory-lock.js";
+
+export type { WorkspaceLeasedFileRead } from "./workspace-leased-file.js";
 
 export interface WorkspaceTransactionDirectoryLease {
   /**
@@ -21,6 +27,13 @@ export interface WorkspaceTransactionDirectoryLease {
   pinnedPath(target: string): string;
   /** Enumerates a leased directory through the pinned OS handle. */
   directoryEntries(target: string): AsyncIterable<WorkspaceDirectoryEntry>;
+  /** Reads one direct regular-file child through the pinned directory. */
+  readDirectoryFile(
+    target: string,
+    name: string,
+    maxBytes: number,
+    signal: AbortSignal
+  ): Promise<WorkspaceLeasedFileRead>;
   verify(): Promise<void>;
   close(): Promise<void>;
 }
@@ -125,6 +138,38 @@ function leasedDirectoryEntries(
   return pathDirectoryEntries(pinnedDescriptorPath(requestedTarget, paths, handles, indexes));
 }
 
+async function leasedDirectoryFile(
+  requestedTarget: string,
+  name: string,
+  maxBytes: number,
+  signal: AbortSignal,
+  paths: readonly WindowsPathLockRequest[],
+  handles: readonly OpenPathHandle[],
+  indexes: ReadonlyMap<string, number>,
+  closed: boolean
+): Promise<WorkspaceLeasedFileRead> {
+  if (closed) throw new WorkspaceTransactionRootError("Workspace transaction path lease is closed.");
+  const index = indexes.get(identity(requestedTarget));
+  const target = index === undefined ? undefined : paths[index];
+  if (index === undefined || !target) {
+    throw new WorkspaceTransactionRootError(
+      `Workspace transaction path is not covered by this lease: ${requestedTarget}`
+    );
+  }
+  if (target.kind !== "directory") {
+    throw new WorkspaceTransactionRootError(
+      `Workspace transaction path is not a directory: ${requestedTarget}`
+    );
+  }
+  return await readLeasedDirectoryFile(
+    pinnedDescriptorPath(requestedTarget, paths, handles, indexes),
+    handles[index]?.fd,
+    name,
+    maxBytes,
+    signal
+  );
+}
+
 /** Pins transaction directories during a mutation and revalidates their path identities. */
 export async function pinWorkspaceTransactionDirectories(
   requestedPaths: readonly string[]
@@ -176,6 +221,9 @@ export async function pinWorkspaceTransactionPaths(
       },
       directoryEntries: (requestedTarget) => leasedDirectoryEntries(
         requestedTarget, paths, handles, indexes, closed
+      ),
+      readDirectoryFile: (requestedTarget, name, maxBytes, signal) => leasedDirectoryFile(
+        requestedTarget, name, maxBytes, signal, paths, handles, indexes, closed
       ),
       verify: async () => {
         if (closed) throw new WorkspaceTransactionRootError("Workspace transaction path lease is closed.");

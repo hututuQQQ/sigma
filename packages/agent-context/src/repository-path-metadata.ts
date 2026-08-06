@@ -42,6 +42,19 @@ export interface StableTextRead {
   rejected: boolean;
 }
 
+export function decodeStableBoundedText(
+  loaded: { bytes: Buffer | null; rejected: boolean }
+): StableTextRead {
+  if (loaded.rejected || loaded.bytes === null) {
+    return { content: null, rejected: loaded.rejected };
+  }
+  try {
+    return { content: fatalUtf8Decoder.decode(loaded.bytes), rejected: false };
+  } catch {
+    return { content: null, rejected: true };
+  }
+}
+
 export interface MetadataBudget {
   signal: AbortSignal;
   deadline?: number;
@@ -137,14 +150,7 @@ async function readVerifiedHandle(
     || !sameStableFileState(openedAfter, pathAfter)) {
     return { content: null, rejected: true };
   }
-  try {
-    return {
-      content: fatalUtf8Decoder.decode(bytes),
-      rejected: false
-    };
-  } catch {
-    return { content: null, rejected: true };
-  }
+  return decodeStableBoundedText({ bytes, rejected: false });
 }
 
 export async function readStableBoundedText(
