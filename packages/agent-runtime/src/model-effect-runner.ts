@@ -40,6 +40,7 @@ import { prepareModelAttempt } from "./model-turn-preparation.js";
 import { LongHorizonCoordinator } from "./long-horizon-coordinator.js";
 import type { ReviewCoordinator } from "./review-coordinator.js";
 import { finishSolvingBudgetBoundary } from "./solving-budget-boundary.js";
+import { modelRequestTraceObservation } from "./model-request-trace-observation.js";
 
 type RequestModelEffect = Extract<KernelEffect, { type: "request_model" }>;
 
@@ -230,6 +231,7 @@ export class ModelEffectRunner {
       cacheMode: plan.cacheMode,
       promptState: turn.promptState,
       frameMode: turn.frameMode,
+      traceObservation: modelRequestTraceObservation(plan, turn),
       toolChoice: turn.toolChoice ?? null
     });
     await this.longHorizon.markRepairTurnConsumed(session);

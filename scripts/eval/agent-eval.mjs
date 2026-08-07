@@ -27,6 +27,9 @@ function evaluationOptions(flags) {
     model: typeof flags.model === "string" ? flags.model : undefined,
     reasoningEffort: typeof flags["reasoning-effort"] === "string"
       ? flags["reasoning-effort"] : undefined,
+    agentProfile: typeof flags["agent-profile"] === "string"
+      ? flags["agent-profile"] : undefined,
+    traceAttribution: flags["trace-attribution"] === true,
     ...(repeat === undefined ? {} : { repeat }),
     scenarios: typeof flags.scenario === "string"
       ? flags.scenario.split(",").map((item) => item.trim()).filter(Boolean) : [],
@@ -48,6 +51,7 @@ export async function runAgentEvalCli(argv = process.argv.slice(2), deps = {}) {
   });
   process.stdout.write(`Evaluation run: ${result.runDir}\n`);
   process.stdout.write(`Report: ${result.reportPath}\n`);
+  if (result.traceReportPath) process.stdout.write(`Trace attribution: ${result.traceReportPath}\n`);
   return { ...result, exitCode: result.run.status === "stable" ? 0 : 1 };
 }
 

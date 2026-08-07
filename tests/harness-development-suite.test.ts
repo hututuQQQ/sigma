@@ -32,6 +32,7 @@ describe("flagship Harness development suite", () => {
       provider: "openai-codex",
       model: "gpt-5.6-sol",
       reasoningEffort: "max",
+      profile: "standard",
       repeat: 3
     });
     expect(JSON.stringify({ selected, manifest })).not.toMatch(
@@ -51,12 +52,29 @@ describe("flagship Harness development suite", () => {
       "--provider", "openai-codex",
       "--model", "gpt-5.6-sol",
       "--reasoning-effort", "max",
+      "--agent-profile", "standard",
+      "--trace-attribution",
       "--repeat", "3"
     ]));
     await expect(runHarnessDevelopmentCli(["--repeat", "1"], {
       runAgentEvalCli: runner
     })).rejects.toThrow(/controls are frozen/u);
     await expect(runHarnessDevelopmentCli(["--scenario", "one"], {
+      runAgentEvalCli: runner
+    })).rejects.toThrow(/controls are frozen/u);
+    await expect(runHarnessDevelopmentCli(["--model", "different"], {
+      runAgentEvalCli: runner
+    })).rejects.toThrow(/controls are frozen/u);
+    await expect(runHarnessDevelopmentCli(["--provider", "different"], {
+      runAgentEvalCli: runner
+    })).rejects.toThrow(/controls are frozen/u);
+    await expect(runHarnessDevelopmentCli(["--reasoning-effort", "low"], {
+      runAgentEvalCli: runner
+    })).rejects.toThrow(/controls are frozen/u);
+    await expect(runHarnessDevelopmentCli(["--agent-profile", "strict"], {
+      runAgentEvalCli: runner
+    })).rejects.toThrow(/controls are frozen/u);
+    await expect(runHarnessDevelopmentCli(["--trace-attribution"], {
       runAgentEvalCli: runner
     })).rejects.toThrow(/controls are frozen/u);
   });

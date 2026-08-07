@@ -7,6 +7,7 @@ import {
   durableToolReceiptShape,
   modelImageSchema,
   modelMessageSchema,
+  modelPromptTraceObservationSchema,
   modelToolCallSchema,
   runModeSchema,
   sharedSchemas,
@@ -319,6 +320,7 @@ export const coreEventPayloadSchemas = {
     cacheMode: z.enum(["prefix_cache", "provider_window"]),
     promptState: runtimePromptStateSchema,
     frameMode: z.enum(["full", "delta"]),
+    traceObservation: modelPromptTraceObservationSchema.optional(),
     /** Durable record of the recovery policy actually sent to the provider. */
     toolChoice: z.enum(["auto", "required", "none"]).nullable().optional()
   }).strict(),

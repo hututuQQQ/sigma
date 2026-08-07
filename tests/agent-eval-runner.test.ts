@@ -287,6 +287,100 @@ describe("agent experience evaluation runner", () => {
     expect(await readFile(result.runPath, "utf8")).not.toContain("test-secret-value-12345");
   });
 
+  it("writes trace attribution after the subject without forwarding evaluator identity", async () => {
+    const fixture = await manifest();
+    const runDir = path.join(fixture.root, "trace-artifacts");
+    let subjectInput: Record<string, unknown> | undefined;
+    const result = await runEvaluation({
+      suite: "quick",
+      manifestPath: fixture.manifestPath,
+      runDir,
+      provider: "openai-codex",
+      model: "gpt-5.6-sol",
+      reasoningEffort: "max",
+      agentProfile: "standard",
+      traceAttribution: true
+    }, {
+      secrets: { DEEPSEEK_API_KEY: "trace-secret-value-12345" },
+      prepareSubject: async () => ({
+        subjectKind: "fake", cliEntry: "fake", nodePath: "fake",
+        subjectDigest: "a".repeat(64), harnessCompilerDigest: "b".repeat(64)
+      }),
+      runSubject: async (input: Record<string, unknown>) => {
+        subjectInput = input;
+        await writeFile(path.join(String(input.artifactDir), "subject.stdout.log"), "fake subject\n", "utf8");
+        await writeFile(path.join(String(input.artifactDir), "subject.stderr.log"), "", "utf8");
+        return {
+          exitCode: 0,
+          sessionId: "session",
+          durationMs: 6_000,
+          result: { status: "completed", finishReason: "completed", finalMessage: "Done." },
+          events: successfulEvents()
+        };
+      }
+    });
+    expect(subjectInput).toMatchObject({
+      provider: "openai-codex", model: "gpt-5.6-sol", reasoningEffort: "max", agentProfile: "standard"
+    });
+    expect(subjectInput).not.toHaveProperty("traceAttribution");
+    expect(subjectInput).not.toHaveProperty("scenarioId");
+    expect(subjectInput).not.toHaveProperty("verifier");
+    expect(result.traceReportPath).toBe(path.join(runDir, "trace-attribution.json"));
+    const aggregate = JSON.parse(await readFile(result.traceReportPath, "utf8"));
+    expect(aggregate).toMatchObject({
+      schemaVersion: 1,
+      kind: "trace_attribution_aggregate",
+      configuration: {
+        provider: "openai-codex", model: "gpt-5.6-sol", reasoningEffort: "max", profile: "standard"
+      },
+      totals: { attempts: 1, successfulAttempts: 1, modelTurns: 1 }
+    });
+    const attempt = result.run.attempts[0];
+    expect(attempt.traceAttribution).toMatchObject({
+      schemaVersion: 1,
+      summary: { successful: true, finalStatus: "completed" }
+    });
+    const perAttempt = JSON.parse(await readFile(
+      path.join(runDir, attempt.artifacts.traceAttribution), "utf8"
+    ));
+    expect(perAttempt.source).toMatchObject({
+      harnessDigest: "a".repeat(64), compilerDigest: "b".repeat(64), compilerActivation: "inspection_only"
+    });
+    expect(JSON.stringify({ aggregate, perAttempt })).not.toContain("trace-secret-value-12345");
+  });
+
+  it("fails closed as evaluator infrastructure when trace attribution cannot be written", async () => {
+    const fixture = await manifest();
+    const runDir = path.join(fixture.root, "trace-write-failure");
+    const result = await runEvaluation({
+      suite: "quick",
+      manifestPath: fixture.manifestPath,
+      runDir,
+      traceAttribution: true
+    }, {
+      secrets: { DEEPSEEK_API_KEY: "trace-write-secret-12345" },
+      prepareSubject: async () => ({ subjectKind: "fake", cliEntry: "fake", nodePath: "fake" }),
+      runSubject: async (input: Record<string, unknown>) => {
+        await writeFile(path.join(String(input.artifactDir), "subject.stdout.log"), "fake subject\n", "utf8");
+        await writeFile(path.join(String(input.artifactDir), "subject.stderr.log"), "", "utf8");
+        await mkdir(path.join(String(input.artifactDir), "trace-attribution.json"));
+        return {
+          exitCode: 0, sessionId: "session", durationMs: 6_000,
+          result: { status: "completed", finishReason: "completed", finalMessage: "Done." },
+          events: successfulEvents()
+        };
+      }
+    });
+    expect(result.run.status).toBe("inconclusive");
+    expect(result.run.attempts[0]).toMatchObject({
+      validity: "invalid",
+      validityDetail: { owner: "evaluator", phase: "trace_attribution" }
+    });
+    expect(result.run.infrastructureErrors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ phase: "trace_attribution" })
+    ]));
+  });
+
   it("CAS-persists credential refreshes, preserves concurrent logins, and advances later attempts", async () => {
     const fixture = await manifest({ repeat: 3 });
     const runDir = path.join(fixture.root, "credential-artifacts");

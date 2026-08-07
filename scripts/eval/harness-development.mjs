@@ -9,6 +9,7 @@ export const HARNESS_DEVELOPMENT_BINDING = Object.freeze({
   provider: "openai-codex",
   model: "gpt-5.6-sol",
   reasoningEffort: "max",
+  profile: "standard",
   repeat: 3,
   scenarios: Object.freeze([
     "line-count-readonly",
@@ -55,6 +56,8 @@ export async function runHarnessDevelopmentCli(
     "--provider", binding.provider,
     "--model", binding.model,
     "--reasoning-effort", binding.reasoningEffort,
+    "--agent-profile", binding.profile,
+    "--trace-attribution",
     "--repeat", String(binding.repeat),
     "--scenario", binding.scenarios.join(",")
   ], evaluationDeps);

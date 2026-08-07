@@ -135,6 +135,7 @@ export async function runTuiSubject(options) {
     provider = sigmaManifest.evaluation.provider,
     model = sigmaManifest.evaluation.model,
     reasoningEffort = "provider_default",
+    agentProfile = "standard",
     eventStreamTimeoutMs = 10_000
   } = options;
   await Promise.all([mkdir(artifactDir, { recursive: true }), mkdir(controllerDir, { recursive: true })]);
@@ -151,6 +152,7 @@ export async function runTuiSubject(options) {
       "--model", model,
       ...(reasoningEffort === "provider_default"
         ? [] : ["--reasoning-effort", reasoningEffort]),
+      "--agent-profile", agentProfile,
       "--permission-mode", permissionPolicy === "auto" ? "auto" : "ask"
     ]),
     workspace,
