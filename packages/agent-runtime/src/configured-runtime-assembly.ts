@@ -8,7 +8,7 @@ import { connectMcpServers } from "./composition-mcp.js";
 import type { RuntimeMcpHttpServerConfig } from "./composition-mcp.js";
 import { createRuntime } from "./create-runtime.js";
 import { auditDurableChildren } from "./durable-children.js";
-import { brokerRuntimeEnvironment } from "./execution-capabilities.js";
+import { configuredRuntimeEnvironment } from "./execution-capabilities.js";
 import type { RuntimeCustomization } from "./customization.js";
 import type { createRoleGateways } from "./model-composition.js";
 import type { SubjectAttestationContext } from "./subject-attestation.js";
@@ -126,13 +126,7 @@ export function createComposedRuntime(input: {
     execution,
     managedEnvironmentMode: config.managedEnvironmentMode ?? "disabled",
     managedNetworkMode: config.networkMode ?? "full",
-    runtimeEnvironment: {
-      ...brokerRuntimeEnvironment(executionReport),
-      executionMode: config.executionMode ?? "sandboxed",
-      writeScope: config.writeScope ?? "workspace",
-      enclosingContainerAttestationDigest:
-        executionReport.capabilities.enclosingContainerRoot?.attestationDigest
-    },
+    runtimeEnvironment: configuredRuntimeEnvironment(executionReport, config),
     subjectAttestation,
     skills: customization.skills,
     hooks: customization.hookDefinitions,

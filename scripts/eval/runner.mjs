@@ -4,7 +4,8 @@ import { access, copyFile, cp, lstat, mkdir, readFile, readdir, realpath, rm, wr
 import os from "node:os";
 import path from "node:path";
 import {
-  artifactSecretValues as collectArtifactSecretValues, createRedactor, digest, evalRootDir, fixtureRootDir, loadEvalSecrets,
+  artifactSecretValues as collectArtifactSecretValues, canonicalJson, createRedactor,
+  credentialSecretValues, digest, evalRootDir, fixtureRootDir, loadEvalProviderAccess,
   makeRunId, relativeArtifact, rootDir, subjectEnvironment, writeJson
 } from "./common.mjs";
 import { listSessions, readSession, resolveWorkspaceStateRoot } from "./event-store.mjs";
@@ -24,7 +25,7 @@ import {
 import { sigmaManifest } from "../lib/sigma-manifest.mjs";
 
 const DEFAULT_MANIFEST = path.join(fixtureRootDir, "manifest.json");
-let measuredToolchainPromise;
+const measuredToolchainPromises = new Map();
 
 export function packageManagerInvocation(args, options = {}) {
   const platform = options.platform ?? process.platform;
@@ -54,12 +55,14 @@ export async function measureEvaluationToolchain(options = {}) {
     ]);
     const pnpm = parsedVersion(pnpmResult, "pnpm");
     const rust = parsedVersion(rustResult, "rust");
+    const evaluationProvider = options.provider ?? sigmaManifest.evaluation.provider;
+    const evaluationModel = options.model ?? sigmaManifest.evaluation.model;
     const actual = {
       node: process.versions.node,
       pnpm: pnpm.value,
       rust: rust.value,
-      provider: sigmaManifest.evaluation.provider,
-      model: sigmaManifest.evaluation.model,
+      provider: evaluationProvider,
+      model: evaluationModel,
       platform: process.platform,
       arch: process.arch,
       nodeBinaryDigest: digest(nodeBytes)
@@ -68,8 +71,8 @@ export async function measureEvaluationToolchain(options = {}) {
       node: sigmaManifest.toolchains.node,
       pnpm: sigmaManifest.toolchains.pnpm,
       rust: sigmaManifest.toolchains.rust,
-      provider: sigmaManifest.evaluation.provider,
-      model: sigmaManifest.evaluation.model
+      provider: evaluationProvider,
+      model: evaluationModel
     };
     const mismatches = [
       ...(pnpm.error ? [pnpm.error] : []),
@@ -86,8 +89,16 @@ export async function measureEvaluationToolchain(options = {}) {
     };
   };
   if (options.noCache === true) return await perform();
-  measuredToolchainPromise ??= perform();
-  return await measuredToolchainPromise;
+  const cacheKey = JSON.stringify({
+    provider: options.provider ?? sigmaManifest.evaluation.provider,
+    model: options.model ?? sigmaManifest.evaluation.model,
+    platform: process.platform,
+    arch: process.arch
+  });
+  if (!measuredToolchainPromises.has(cacheKey)) {
+    measuredToolchainPromises.set(cacheKey, perform());
+  }
+  return await measuredToolchainPromises.get(cacheKey);
 }
 
 export function resolveEvaluatorHost(platform = process.platform, arch = process.arch) {
@@ -467,11 +478,12 @@ async function appendExternalReport(stateRoot, attempt) {
 
 function subjectConfiguration(context, fixtureSnapshot) {
   const { scenario, subject, sourceGitSha, evaluatorDigest, verifierDigest, frozenRunPolicy,
-    toolchainMeasurement } = context;
+    toolchainMeasurement, provider, model, reasoningEffort } = context;
   const budget = frozenRunPolicy.budget;
   const configuration = {
-    provider: "deepseek",
-    model: sigmaManifest.evaluation.model,
+    provider,
+    model,
+    reasoningEffort,
     surface: scenario.surface,
     permissionPolicy: scenario.permissionPolicy,
     platform: process.platform,
@@ -496,6 +508,7 @@ function subjectConfiguration(context, fixtureSnapshot) {
   configuration.environmentDigest = digest({
     provider: configuration.provider,
     model: configuration.model,
+    reasoningEffort: configuration.reasoningEffort,
     surface: configuration.surface,
     permissionPolicy: configuration.permissionPolicy,
     platform: configuration.platform,
@@ -727,7 +740,9 @@ function invalidateAttempt(attempt, detail) {
 }
 
 async function prepareAttemptExecution(context, deps, lifecycle) {
-  const { scenario, manifestDir, subject, secrets, frozenRunPolicy } = context;
+  const {
+    scenario, manifestDir, subject, secrets, credentialDocument, frozenRunPolicy
+  } = context;
   const { attemptArtifactDir, sandboxRoot } = lifecycle;
   const controllerDir = path.join(sandboxRoot, "controller");
   const stateHome = path.join(sandboxRoot, "state");
@@ -738,6 +753,15 @@ async function prepareAttemptExecution(context, deps, lifecycle) {
     mkdir(attemptArtifactDir, { recursive: true }), mkdir(controllerDir, { recursive: true }),
     mkdir(stateHome, { recursive: true }), mkdir(homeDir, { recursive: true }), mkdir(tempDir, { recursive: true })
   ]);
+  if (credentialDocument) {
+    const credentialDirectory = path.join(homeDir, ".sigma");
+    await mkdir(credentialDirectory, { recursive: true, mode: 0o700 });
+    await writeFile(
+      path.join(credentialDirectory, "auth.json"),
+      `${JSON.stringify(credentialDocument)}\n`,
+      { encoding: "utf8", mode: 0o600 }
+    );
+  }
   const fixtureDirectory = path.resolve(manifestDir, scenario.fixture.workspace);
   const workspace = await seedWorkspace({
     attemptRoot: sandboxRoot,
@@ -783,7 +807,7 @@ async function prepareAttemptExecution(context, deps, lifecycle) {
 }
 
 async function executeAttemptSubject(context, lifecycle, prepared) {
-  const { scenario, subject, redactor } = context;
+  const { scenario, subject, redactor, provider, model, reasoningEffort } = context;
   const { attemptArtifactDir, startedAt } = lifecycle;
   const { runSubject, workspace, stateHome, promptPath, env, controllerDir, driverSpec } = prepared;
   lifecycle.phase = "subject";
@@ -798,7 +822,10 @@ async function executeAttemptSubject(context, lifecycle, prepared) {
       artifactDir: attemptArtifactDir,
       controllerDir,
       redactor,
-      subject
+      subject,
+      provider,
+      model,
+      reasoningEffort
     };
     const result = await runSubject(launcherInput);
     lifecycle.subjectResult = result;
@@ -1225,11 +1252,75 @@ async function scanAttemptSecrets(context, lifecycle, attempt, secretValues) {
   for (const file of exposures) addSafetyViolation(attempt, { code: "secret_in_artifact", file });
 }
 
-async function finalizeAttempt(context, lifecycle, result, secretValues) {
+async function finalizeAttempt(context, lifecycle, result, secretValues, deps) {
   const { redactor } = context;
+  let credentialFailure;
+  try {
+    await persistEvaluationCredential(context, lifecycle, deps);
+  } catch (error) {
+    credentialFailure = error;
+  }
   await scanAttemptSecrets(context, lifecycle, result.attempt, secretValues);
+  if (credentialFailure) throw credentialFailure;
   await writeJson(path.join(lifecycle.attemptArtifactDir, "attempt.json"), result.attempt, redactor);
   if (result.stateRoot) await appendExternalReport(result.stateRoot, result.attempt);
+}
+
+function credentialsEqual(left, right) {
+  return left !== undefined && right !== undefined
+    && canonicalJson(left) === canonicalJson(right);
+}
+
+function selectedCredentialDocument(provider, credential) {
+  return { version: 1, credentials: { [provider]: structuredClone(credential) } };
+}
+
+function registerCredentialSecrets(context, credential) {
+  for (const value of credentialSecretValues(credential)) {
+    if (!context.artifactSecretValues.includes(value)) context.artifactSecretValues.push(value);
+  }
+}
+
+async function credentialStoreFactory(deps) {
+  if (deps.credentialStoreFactory) return deps.credentialStoreFactory;
+  const credentialModule = new URL(
+    "../../packages/agent-pi/dist/index.js",
+    import.meta.url
+  ).href;
+  const { FileCredentialStore } = await import(credentialModule);
+  return (filePath) => new FileCredentialStore({ filePath });
+}
+
+async function persistEvaluationCredential(context, lifecycle, deps) {
+  if (!context.credentialSourcePath || !context.credentialDocument) return;
+  const isolatedPath = path.join(lifecycle.sandboxRoot, "home", ".sigma", "auth.json");
+  try {
+    const createCredentialStore = await credentialStoreFactory(deps);
+    const isolated = createCredentialStore(isolatedPath);
+    const replacement = await isolated.read(context.provider);
+    if (!replacement) {
+      throw new Error(`Isolated evaluation credential for '${context.provider}' disappeared.`);
+    }
+    registerCredentialSecrets(context, replacement);
+    const seeded = context.credentialDocument.credentials?.[context.provider];
+    if (!seeded) {
+      throw new Error(`Evaluation credential seed for '${context.provider}' is unavailable.`);
+    }
+    const host = createCredentialStore(context.credentialSourcePath);
+    const accepted = await host.modify(context.provider, async (current) => {
+      if (!credentialsEqual(current, seeded)) return undefined;
+      return credentialsEqual(replacement, seeded) ? undefined : replacement;
+    });
+    if (!accepted) {
+      throw new Error(`Host evaluation credential for '${context.provider}' disappeared.`);
+    }
+    registerCredentialSecrets(context, accepted);
+    if (context.credentialState) {
+      context.credentialState.document = selectedCredentialDocument(context.provider, accepted);
+    }
+  } finally {
+    await rm(isolatedPath, { force: true });
+  }
 }
 
 async function cleanupAttempt(context, lifecycle, attempt) {
@@ -1261,7 +1352,7 @@ async function runAttempt(context, deps = {}) {
   try {
     const result = await executeAttemptCoreSafely(context, deps, lifecycle);
     let finalizationError;
-    try { await finalizeAttempt(context, lifecycle, result, secretValues); } catch (error) { finalizationError = error; }
+    try { await finalizeAttempt(context, lifecycle, result, secretValues, deps); } catch (error) { finalizationError = error; }
     cleanupManaged = true;
     const cleanupFailed = await cleanupAttempt(context, lifecycle, result.attempt);
     if (cleanupFailed && !finalizationError) {
@@ -1275,7 +1366,7 @@ async function runAttempt(context, deps = {}) {
 }
 
 async function resolveEvaluationInput(options) {
-  const { suite, subjectKind } = validateEvaluationOptions(options);
+  const { suite, subjectKind, provider, model, reasoningEffort } = validateEvaluationOptions(options);
   const manifestPath = path.resolve(options.manifestPath ?? DEFAULT_MANIFEST);
   const manifestDir = path.dirname(manifestPath);
   const manifest = await loadEvalManifest(manifestPath);
@@ -1287,7 +1378,8 @@ async function resolveEvaluationInput(options) {
   const destination = evaluationDestination(options, runId);
   const runDir = await prepareRunDirectory(destination.destination);
   return {
-    suite, subjectKind, manifestDir, scenarios, repeat, frozenRunPolicy: structuredClone(frozenRunPolicy), runId,
+    suite, subjectKind, provider, model, reasoningEffort,
+    manifestDir, scenarios, repeat, frozenRunPolicy: structuredClone(frozenRunPolicy), runId,
     effectiveEvalRoot: destination.root, runDir
   };
 }
@@ -1302,7 +1394,27 @@ function validateEvaluationOptions(options) {
   if (options.skipPackage && subjectKind !== "package") {
     throw new Error("--skip-package is valid only with --subject package.");
   }
-  return { suite, subjectKind };
+  return { suite, subjectKind, ...evaluationModelSelection(options) };
+}
+
+function evaluationModelSelection(options) {
+  const provider = options.provider ?? sigmaManifest.evaluation.provider;
+  const model = options.model ?? sigmaManifest.evaluation.model;
+  const reasoningEffort = options.reasoningEffort ?? "provider_default";
+  if (typeof provider !== "string" || provider.trim().length === 0
+    || typeof model !== "string" || model.trim().length === 0) {
+    throw new Error("Evaluation provider and model must be non-empty strings.");
+  }
+  if (![
+    "provider_default", "none", "low", "medium", "high", "xhigh", "max"
+  ].includes(reasoningEffort)) {
+    throw new Error("Evaluation reasoning effort is unsupported.");
+  }
+  return {
+    provider: provider.trim(),
+    model: model.trim(),
+    reasoningEffort
+  };
 }
 
 function selectEvaluationScenarios(manifest, suite, requested) {
@@ -1341,16 +1453,29 @@ function evaluationDestination(options, runId) {
 }
 
 async function prepareEvaluationContext(input, options, deps) {
-  const { suite, repeat, scenarios, runDir, manifestDir, frozenRunPolicy } = input;
-  const secrets = deps.secrets ?? loadEvalSecrets(options.envPath);
-  const artifactSecretValues = deps.artifactSecretValues ?? collectArtifactSecretValues(secrets);
-  const redactor = createRedactor(artifactSecretValues);
+  const {
+    suite, repeat, scenarios, runDir, manifestDir, frozenRunPolicy, provider, model
+  } = input;
+  const providerAccess = deps.providerAccess ?? (deps.secrets
+    ? {
+        environmentSecrets: deps.secrets,
+        credentialDocument: null,
+        credentialSourcePath: null,
+        secretValues: collectArtifactSecretValues(deps.secrets)
+      }
+    : loadEvalProviderAccess(provider, { envPath: options.envPath }));
+  const secrets = providerAccess.environmentSecrets;
+  const artifactSecretValues = deps.artifactSecretValues ?? [...new Set([
+    ...collectArtifactSecretValues(secrets),
+    ...(providerAccess.secretValues ?? [])
+  ])];
+  const redactor = (value) => createRedactor(artifactSecretValues)(value);
   const sourceGitSha = await gitSha(path.resolve(options.subjectWorkspace ?? rootDir));
   const evaluatorDigest = await evaluatorSourceDigest();
   const verifierDigest = await verifierSourceDigest(manifestDir, scenarios);
   const toolchainMeasurement = deps.measureToolchain
     ? await deps.measureToolchain(options)
-    : await measureEvaluationToolchain();
+    : await measureEvaluationToolchain({ provider, model });
   const schedule = [];
   for (let repetition = 1; repetition <= repeat; repetition += 1) {
     const ordered = [...scenarios].sort((left, right) => digest({ seed: frozenRunPolicy.seed, repetition, id: left.id })
@@ -1374,7 +1499,14 @@ async function prepareEvaluationContext(input, options, deps) {
     attempts: scheduleProjection
   }, redactor);
   return {
-    ...input, secrets, artifactSecretValues, redactor, sourceGitSha, evaluatorDigest, verifierDigest,
+    ...input,
+    secrets,
+    credentialDocument: providerAccess.credentialDocument ?? null,
+    credentialSourcePath: providerAccess.credentialSourcePath ?? null,
+    credentialState: providerAccess.credentialDocument
+      ? { document: structuredClone(providerAccess.credentialDocument) }
+      : null,
+    artifactSecretValues, redactor, sourceGitSha, evaluatorDigest, verifierDigest,
     toolchainMeasurement, schedule, scheduleDigest,
     startedAt: new Date().toISOString()
   };
@@ -1441,12 +1573,16 @@ async function preparationFailureAttempt(context, item, error) {
     manifestDir: context.manifestDir,
     subject: { subjectKind: "unavailable" },
     secrets: context.secrets,
+    credentialDocument: context.credentialDocument,
     artifactSecretValues: context.artifactSecretValues,
     redactor: context.redactor,
     sourceGitSha: context.sourceGitSha,
     evaluatorDigest: context.evaluatorDigest,
     verifierDigest: context.verifierDigest,
     toolchainMeasurement: context.toolchainMeasurement,
+    provider: context.provider,
+    model: context.model,
+    reasoningEffort: context.reasoningEffort,
     frozenRunPolicy: context.frozenRunPolicy
   }, lifecycle, error);
   await writeJson(path.join(lifecycle.attemptArtifactDir, "attempt.json"), attempt, context.redactor);
@@ -1465,8 +1601,12 @@ async function executeEvaluationSchedule(context, preparation, deps, infrastruct
     }
     return attempts;
   }
-  const { schedule, runId, runDir, manifestDir, secrets, artifactSecretValues, redactor,
-    sourceGitSha, evaluatorDigest, verifierDigest, frozenRunPolicy, toolchainMeasurement } = context;
+  const {
+    schedule, runId, runDir, manifestDir, secrets, credentialDocument, credentialSourcePath,
+    credentialState,
+    artifactSecretValues, redactor, sourceGitSha, evaluatorDigest, verifierDigest,
+    frozenRunPolicy, toolchainMeasurement, provider, model, reasoningEffort
+  } = context;
   if (subject) {
     for (const item of schedule) {
       deps.onProgress?.({ type: "attempt.started", scenarioId: item.scenario.id, repetition: item.repetition });
@@ -1480,13 +1620,19 @@ async function executeEvaluationSchedule(context, preparation, deps, infrastruct
           subject,
           verifierRuntime,
           secrets,
+          credentialDocument: credentialState?.document ?? credentialDocument,
+          credentialSourcePath,
+          credentialState,
           artifactSecretValues,
           redactor,
           sourceGitSha,
           evaluatorDigest,
           verifierDigest,
           toolchainMeasurement,
-          frozenRunPolicy
+          frozenRunPolicy,
+          provider,
+          model,
+          reasoningEffort
         }, deps);
         attempts.push(attempt);
         infrastructureErrors.push(...attemptInfrastructureErrors(attempt, item));
@@ -1507,7 +1653,8 @@ async function executeEvaluationSchedule(context, preparation, deps, infrastruct
 
 function rawEvaluationRun(context, subject, verifierRuntime, attempts, infrastructureErrors) {
   const { runId, suite, repeat, startedAt, sourceGitSha, evaluatorDigest, verifierDigest,
-    scenarios, frozenRunPolicy, scheduleDigest, toolchainMeasurement } = context;
+    scenarios, frozenRunPolicy, scheduleDigest, toolchainMeasurement,
+    provider, model, reasoningEffort } = context;
   const firstEnvironmentDigest = attempts[0]?.subject?.environmentDigest ?? null;
   return {
     schemaVersion: 1,
@@ -1521,7 +1668,7 @@ function rawEvaluationRun(context, subject, verifierRuntime, attempts, infrastru
     finishedAt: new Date().toISOString(),
     subject: rawRunSubject(
       subject, verifierRuntime, sourceGitSha, evaluatorDigest, verifierDigest,
-      firstEnvironmentDigest, toolchainMeasurement
+      firstEnvironmentDigest, toolchainMeasurement, provider, model, reasoningEffort
     ),
     scenarios: scenarios.map((scenario) => ({ scenarioId: scenario.id, scenarioDigest: digest(scenario) })),
     attempts,
@@ -1534,10 +1681,19 @@ function subjectValue(subject, key) {
 }
 
 function rawRunSubject(
-  subject, verifierRuntime, sourceGitSha, evaluatorDigest, verifierDigest, environmentDigest, toolchainMeasurement
+  subject,
+  verifierRuntime,
+  sourceGitSha,
+  evaluatorDigest,
+  verifierDigest,
+  environmentDigest,
+  toolchainMeasurement,
+  provider,
+  model,
+  reasoningEffort
 ) {
   return {
-    provider: "deepseek", model: sigmaManifest.evaluation.model,
+    provider, model, reasoningEffort,
     platform: process.platform, arch: process.arch, gitSha: sourceGitSha,
     subjectKind: subjectValue(subject, "subjectKind") ?? "unavailable", surface: "mixed",
     evaluatorDigest, verifierDigest,

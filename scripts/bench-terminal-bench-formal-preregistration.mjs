@@ -14,6 +14,13 @@ import {
 const SHA256 = /^[a-f0-9]{64}$/u;
 const GIT_COMMIT = /^[a-f0-9]{40}$/u;
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+export const FORMAL_TOKEN_USAGE_PROXY = Object.freeze({
+  id: "uncached_input_plus_output_v1",
+  formula: "max(0,input_tokens-cache_read_tokens)+output_tokens",
+  scope: "all_model_roles",
+  reasoning_accounting: "included_in_output_tokens",
+  provider_cost_fallback: true
+});
 
 function record(value, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -89,6 +96,26 @@ export function sha256(value) {
     .digest("hex");
 }
 
+export function formalTokenUsageProxy(value) {
+  const usage = record(value, "formal token usage");
+  exactKeys(
+    usage,
+    ["input_tokens", "cache_read_tokens", "output_tokens"],
+    "formal token usage"
+  );
+  for (const [key, amount] of Object.entries(usage)) {
+    if (!Number.isSafeInteger(amount) || amount < 0) {
+      throw new Error(`formal token usage.${key} must be a non-negative safe integer.`);
+    }
+  }
+  const proxy = Math.max(0, usage.input_tokens - usage.cache_read_tokens)
+    + usage.output_tokens;
+  if (!Number.isSafeInteger(proxy)) {
+    throw new Error("Formal token usage proxy exceeds the safe integer range.");
+  }
+  return proxy;
+}
+
 export function formalSourceIdentitySha256(source) {
   return sha256(canonicalJson(source));
 }
@@ -143,6 +170,29 @@ function normalizedSolverControls(value) {
     cleanup_grace_sec: positiveInteger(
       controls.cleanup_grace_sec, "solver_controls.cleanup_grace_sec"
     )
+  };
+}
+
+function normalizedUsageAccounting(value) {
+  const accounting = record(value, "usage_accounting");
+  exactKeys(
+    accounting,
+    ["token_usage_proxy", "gate_precedence"],
+    "usage_accounting"
+  );
+  const proxy = record(accounting.token_usage_proxy, "usage_accounting.token_usage_proxy");
+  exactKeys(
+    proxy,
+    Object.keys(FORMAL_TOKEN_USAGE_PROXY),
+    "usage_accounting.token_usage_proxy"
+  );
+  if (canonicalJson(proxy) !== canonicalJson(FORMAL_TOKEN_USAGE_PROXY)
+    || accounting.gate_precedence !== "provider_cost_usd_then_token_usage_proxy") {
+    throw new Error("usage_accounting must use the registered formal Token usage proxy.");
+  }
+  return {
+    token_usage_proxy: { ...FORMAL_TOKEN_USAGE_PROXY },
+    gate_precedence: "provider_cost_usd_then_token_usage_proxy"
   };
 }
 
@@ -389,7 +439,7 @@ export function sigmaFormalRunPreregistration(draft, options = {}) {
     };
   });
   const payload = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     kind: "SigmaFormalRunPreregistration",
     formal_run_id: identifier(input.formal_run_id, "formal_run_id"),
     source,
@@ -403,6 +453,10 @@ export function sigmaFormalRunPreregistration(draft, options = {}) {
       task_selection_sha256: formalTaskSelectionSha256(tasks)
     },
     solver_controls: normalizedSolverControls(input.solver_controls),
+    usage_accounting: {
+      token_usage_proxy: { ...FORMAL_TOKEN_USAGE_PROXY },
+      gate_precedence: "provider_cost_usd_then_token_usage_proxy"
+    },
     execution: normalizedExecution({ ...executionDraft, batches }, tasks)
   };
   const manifest = {
@@ -416,10 +470,10 @@ export function validateFormalPreregistration(input, options = {}) {
   const manifest = record(input, "formal preregistration");
   exactKeys(manifest, [
     "schemaVersion", "kind", "formal_run_id", "source", "source_identity_sha256",
-    "archive_sha256", "model", "task_selection", "solver_controls", "execution",
+    "archive_sha256", "model", "task_selection", "solver_controls", "usage_accounting", "execution",
     "consumption_identity_sha256"
   ], "formal preregistration");
-  if (manifest.schemaVersion !== 1 || manifest.kind !== "SigmaFormalRunPreregistration") {
+  if (manifest.schemaVersion !== 2 || manifest.kind !== "SigmaFormalRunPreregistration") {
     throw new Error("Formal evaluation requires SigmaFormalRunPreregistration.");
   }
   const source = normalizedSource(manifest.source);
@@ -431,7 +485,7 @@ export function validateFormalPreregistration(input, options = {}) {
     manifest.task_selection, path.resolve(options.baseDir ?? process.cwd())
   );
   const normalized = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     kind: "SigmaFormalRunPreregistration",
     formal_run_id: identifier(manifest.formal_run_id, "formal_run_id"),
     source,
@@ -440,6 +494,7 @@ export function validateFormalPreregistration(input, options = {}) {
     model: normalizedModel(manifest.model),
     task_selection: taskSelection,
     solver_controls: normalizedSolverControls(manifest.solver_controls),
+    usage_accounting: normalizedUsageAccounting(manifest.usage_accounting),
     execution: normalizedExecution(manifest.execution, taskSelection.tasks),
     consumption_identity_sha256: digest(
       manifest.consumption_identity_sha256, "consumption_identity_sha256"

@@ -5,7 +5,7 @@ import type {
   WorkspaceCustomizationTrustAttestation,
   WorkspaceMcpTrustAttestation
 } from "agent-config";
-import type { ModelGateway, RuntimeClient } from "agent-protocol";
+import type { ModelGateway, RunMode, RuntimeClient } from "agent-protocol";
 import { loadPiRuntimeModelCatalog } from "agent-model";
 import type { ModelReasoningEffort } from "agent-model";
 import type {
@@ -34,6 +34,8 @@ import { createSubjectAttestationContext, type SubjectProductAttestation } from 
 import { subjectConfiguration } from "./subject-configuration.js";
 import { brokerRuntimeEnvironment } from "./execution-capabilities.js";
 import { createConfiguredTools } from "./configured-runtime-tools.js";
+import type { FrozenHarnessBuild } from "./harness-compiler.js";
+import { createConfiguredHarnessInspector } from "./configured-runtime-harness.js";
 import {
   configuredMcpClients,
   createComposedRuntime,
@@ -102,6 +104,8 @@ export interface ConfiguredRuntime {
   workspace: string;
   storeRootDir: string;
   execution: ExecutionBroker;
+  /** Compile an inspection-only identity for the current, unmodified runtime. */
+  inspectHarness(mode: RunMode): FrozenHarnessBuild;
   close(): Promise<void>;
 }
 export interface RuntimeFactoryOptions {
@@ -184,11 +188,15 @@ export async function createConfiguredRuntime(
       agentProfileHookRunner: deps.agentProfileHookRunner
     });
     runtimeReference.current = runtime;
+    const inspectHarness = createConfiguredHarnessInspector({
+      config, customization, tools, gateways, executionReport, options
+    });
     return {
       workspace,
       storeRootDir,
       runtime,
       execution,
+      inspectHarness,
       close: async () => await closeComposition(mcpClients, execution)
     };
   } catch (error) {

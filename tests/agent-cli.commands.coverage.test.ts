@@ -17,6 +17,7 @@ import type {
 } from "../packages/agent-protocol/src/index.js";
 import { runAgentCommand } from "../packages/agent-cli/src/index.js";
 import { runInitCommand } from "../packages/agent-cli/src/commands/init.js";
+import { runHarnessCommand } from "../packages/agent-cli/src/commands/harness.js";
 import { runReplayCommand } from "../packages/agent-cli/src/commands/replay.js";
 import { runSessionCommand, runSessionsCommand } from "../packages/agent-cli/src/commands/session.js";
 import type { ConfiguredRuntime } from "../packages/agent-runtime/src/index.js";
@@ -112,6 +113,7 @@ function configuredComposition(
     workspace: root,
     storeRootDir: root,
     execution: {} as ConfiguredRuntime["execution"],
+    inspectHarness: () => { throw new Error("Harness inspection was not configured."); },
     close
   };
 }
@@ -122,6 +124,82 @@ afterEach(() => {
 });
 
 describe("CLI init and replay branches", () => {
+  it("inspects a frozen Harness identity without creating or running a session", async () => {
+    const root = await workspace("sigma-harness-inspect-");
+    const stdout = new Capture();
+    const close = vi.fn(async () => undefined);
+    const build = {
+      schemaVersion: 1,
+      compilerVersion: "identity-1.0.0",
+      policyPackIds: ["sigma.runtime-default.identity.v1"],
+      activation: "inspection_only",
+      modifiesRuntime: false,
+      subject: {
+        provider: "fixture",
+        model: "fixture-model",
+        reasoningEffort: "max",
+        modelRole: "orchestrator",
+        runMode: "change",
+        modelCapabilitiesDigest: "a".repeat(64),
+        profileId: "standard",
+        profileDigest: "b".repeat(64)
+      },
+      promptPolicy: {
+        mode: "runtime_default",
+        modifiesPrompt: false,
+        systemBehaviorDigest: "c".repeat(64),
+        runtimeEnvironmentDigest: "e".repeat(64)
+      },
+      toolPolicy: {
+        mode: "runtime_default",
+        modifiesToolSurface: false,
+        initialTools: ["read"],
+        initialToolDefinitionsDigest: "d".repeat(64)
+      },
+      contextPolicy: { mode: "runtime_default", modifiesContext: false },
+      observationPolicy: { mode: "runtime_default", modifiesObservations: false },
+      runtimeCapabilities: {
+        executionMode: "sandboxed",
+        writeScope: "workspace",
+        managedEnvironment: false,
+        network: "full",
+        interactiveApprovals: false,
+        environment: {
+          platform: "linux",
+          arch: "x64",
+          defaultShell: "bash",
+          availableShells: ["bash"],
+          availableRuntimeCommands: [],
+          executionCapabilitiesVerified: true,
+          directExecutableResolution: true,
+          executionMode: "sandboxed",
+          writeScope: "workspace",
+          pathSeparator: "/"
+        }
+      },
+      policyDigest: "e".repeat(64),
+      canonicalJson: "{}",
+      digest: "f".repeat(64)
+    } as const;
+    const createRuntime = vi.fn(async () => ({
+      inspectHarness: vi.fn(() => build),
+      close
+    }));
+
+    await expect(runHarnessCommand([
+      "inspect", "--json", "--workspace", root,
+      "--provider", "fixture", "--model", "fixture-model",
+      "--reasoning-effort", "max"
+    ], {
+      stdout,
+      createRuntime: createRuntime as never
+    })).resolves.toBe(0);
+
+    expect(JSON.parse(stdout.text())).toEqual(build);
+    expect(createRuntime).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledOnce();
+  });
+
   it("prints init help and handles profiles, JSON, force, and existing files", async () => {
     const root = await workspace("sigma-init-coverage-");
     const help = new Capture();
@@ -469,6 +547,7 @@ describe("CLI command registry dispatch", () => {
     await expect(runAgentCommand(["cancel", "--help"])).resolves.toBe(0);
     await expect(runAgentCommand(["replay", "--help"])).resolves.toBe(0);
     await expect(runAgentCommand(["doctor", "--help"])).resolves.toBe(0);
+    await expect(runAgentCommand(["harness", "--help"])).resolves.toBe(0);
     await expect(runAgentCommand(["init", "--help"])).resolves.toBe(0);
     await expect(runAgentCommand(["version"])).resolves.toBe(0);
     expect(stdout).toHaveBeenCalled();

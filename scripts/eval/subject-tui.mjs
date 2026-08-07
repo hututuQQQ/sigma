@@ -131,7 +131,11 @@ function tuiRunResult(result, summary, startedAt) {
 export async function runTuiSubject(options) {
   const {
     workspace, stateHome, initialMessage, interactions, permissionPolicy, budget,
-    artifactDir, controllerDir = artifactDir, env, redactor, subject, eventStreamTimeoutMs = 10_000
+    artifactDir, controllerDir = artifactDir, env, redactor, subject,
+    provider = sigmaManifest.evaluation.provider,
+    model = sigmaManifest.evaluation.model,
+    reasoningEffort = "provider_default",
+    eventStreamTimeoutMs = 10_000
   } = options;
   await Promise.all([mkdir(artifactDir, { recursive: true }), mkdir(controllerDir, { recursive: true })]);
   const transcriptPath = path.join(controllerDir, "terminal.transcript.log");
@@ -143,8 +147,10 @@ export async function runTuiSubject(options) {
     command: tuiSubjectCommand(subject, [
       "tui",
       "--workspace", workspace,
-      "--provider", "deepseek",
-      "--model", sigmaManifest.evaluation.model,
+      "--provider", provider,
+      "--model", model,
+      ...(reasoningEffort === "provider_default"
+        ? [] : ["--reasoning-effort", reasoningEffort]),
       "--permission-mode", permissionPolicy === "auto" ? "auto" : "ask"
     ]),
     workspace,

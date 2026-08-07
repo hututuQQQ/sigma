@@ -76,6 +76,7 @@ if (args[0] === "session" && args[1] === "cancel") {
     process.exit(0);
   }, 150);
 } else {
+  writeFileSync(path.join(workspace, "solver.args.json"), JSON.stringify(args));
   let seq = 0;
   const emit = (type, payload = {}) => console.log(JSON.stringify({ kind: "event", event: {
     schemaVersion: 1, seq: ++seq, eventId: "event-" + seq, sessionId: "fake-session", runId: "fake-run",
@@ -101,6 +102,9 @@ if (args[0] === "session" && args[1] === "cancel") {
       budget: { wallTimeSec: 0.05, modelTurns: 8, toolCalls: 12, costUsd: 0.1 },
       artifactDir,
       redactor: String,
+      provider: "openai-codex",
+      model: "gpt-5.6-sol",
+      reasoningEffort: "max",
       subject: {
         subjectKind: "dev",
         nodePath: process.execPath,
@@ -111,6 +115,12 @@ if (args[0] === "session" && args[1] === "cancel") {
 
     expect(result.cancellation).toMatchObject({ reason: "experience_budget_exceeded", dimension: "wallTime", cancelExitCode: 0 });
     expect(result.events.some((event: { type: string }) => event.type === "run.cancelled")).toBe(true);
+    expect(JSON.parse(await readFile(path.join(workspace, "solver.args.json"), "utf8")))
+      .toEqual(expect.arrayContaining([
+        "--provider", "openai-codex",
+        "--model", "gpt-5.6-sol",
+        "--reasoning-effort", "max"
+      ]));
     await expect(access(path.join(workspace, "cancel.finished"))).resolves.toBeUndefined();
   });
 });

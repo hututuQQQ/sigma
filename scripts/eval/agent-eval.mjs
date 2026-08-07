@@ -23,6 +23,10 @@ function evaluationOptions(flags) {
   const repeat = flags.repeat === undefined ? undefined : positiveInteger(flags.repeat, 1, "--repeat");
   return {
     suite: typeof flags.suite === "string" ? flags.suite : "quick",
+    provider: typeof flags.provider === "string" ? flags.provider : undefined,
+    model: typeof flags.model === "string" ? flags.model : undefined,
+    reasoningEffort: typeof flags["reasoning-effort"] === "string"
+      ? flags["reasoning-effort"] : undefined,
     ...(repeat === undefined ? {} : { repeat }),
     scenarios: typeof flags.scenario === "string"
       ? flags.scenario.split(",").map((item) => item.trim()).filter(Boolean) : [],
