@@ -20,6 +20,7 @@ import { runTuiSubject } from "./subject-tui.mjs";
 import {
   buildAggregateTraceAttribution,
   buildTraceAttribution,
+  markTraceAttributionInfrastructureFailure,
   writeAggregateTraceAttribution,
   writeAttemptTraceAttribution
 } from "./trace-attribution.mjs";
@@ -1328,6 +1329,23 @@ async function scanAttemptSecrets(context, lifecycle, attempt, secretValues) {
   for (const file of exposures) addSafetyViolation(attempt, { code: "secret_in_artifact", file });
 }
 
+async function reconcileAttemptTraceAttribution(context, lifecycle, attempt) {
+  if (!lifecycle.traceAttribution || attempt.validity === "valid") return false;
+  const previous = lifecycle.traceAttribution;
+  const reconciled = markTraceAttributionInfrastructureFailure(previous);
+  lifecycle.traceAttribution = reconciled;
+  attempt.traceAttribution = {
+    schemaVersion: 1,
+    reportDigest: reconciled.report.reportDigest,
+    summary: reconciled.summary
+  };
+  if (reconciled === previous) return false;
+  await writeAttemptTraceAttribution(
+    lifecycle.attemptArtifactDir, reconciled.report, context.redactor
+  );
+  return true;
+}
+
 async function finalizeAttempt(context, lifecycle, result, secretValues, deps) {
   const { redactor } = context;
   let credentialFailure;
@@ -1337,6 +1355,7 @@ async function finalizeAttempt(context, lifecycle, result, secretValues, deps) {
     credentialFailure = error;
   }
   await scanAttemptSecrets(context, lifecycle, result.attempt, secretValues);
+  await reconcileAttemptTraceAttribution(context, lifecycle, result.attempt);
   if (credentialFailure) throw credentialFailure;
   await writeJson(path.join(lifecycle.attemptArtifactDir, "attempt.json"), result.attempt, redactor);
   if (result.stateRoot) await appendExternalReport(result.stateRoot, result.attempt);
@@ -1431,7 +1450,8 @@ async function runAttempt(context, deps = {}) {
     try { await finalizeAttempt(context, lifecycle, result, secretValues, deps); } catch (error) { finalizationError = error; }
     cleanupManaged = true;
     const cleanupFailed = await cleanupAttempt(context, lifecycle, result.attempt);
-    if (cleanupFailed && !finalizationError) {
+    const traceReconciled = await reconcileAttemptTraceAttribution(context, lifecycle, result.attempt);
+    if ((cleanupFailed || traceReconciled) && !finalizationError) {
       await writeJson(path.join(lifecycle.attemptArtifactDir, "attempt.json"), result.attempt, context.redactor);
     }
     if (finalizationError) throw finalizationError;
@@ -1771,28 +1791,36 @@ function rawEvaluationRun(context, subject, verifierRuntime, attempts, infrastru
 }
 
 function traceSummaries(attempts) {
-  return attempts.map((attempt) => attempt.traceAttribution?.summary ?? {
-    attemptId: attempt.attemptId,
-    scenarioId: attempt.scenarioId,
-    repetition: attempt.repetition,
-    successful: false,
-    finalStatus: "attribution_unavailable",
-    timeout: false,
-    infrastructureFailure: true,
-    totals: {
-      modelTurns: 0, toolCalls: 0, repeatedToolCalls: 0,
-      repeatedObservations: 0, repeatedReads: 0, repeatedValidations: 0,
-      turnCategories: {}, uncachedTokenProxy: { value: 0 },
-      providerCacheReadTokens: { value: 0 }, toolOutputRawBytes: { value: 0 },
-      toolOutputModelVisibleBytes: { value: 0 }, estimatedRequestComposition: {},
-      proxyCostAttribution: {}
-    },
-    timing: {
-      totalLatencyMs: null, timeToFirstActionMs: null,
-      timeToFirstMutationMs: null, completionTailMs: null
-    },
-    completionTailTurns: 0,
-    reportDigest: null
+  return attempts.map((attempt) => {
+    const observed = attempt.traceAttribution?.summary;
+    if (observed) return attempt.validity === "valid" ? observed : {
+      ...observed,
+      successful: false,
+      infrastructureFailure: true
+    };
+    return {
+      attemptId: attempt.attemptId,
+      scenarioId: attempt.scenarioId,
+      repetition: attempt.repetition,
+      successful: false,
+      finalStatus: "attribution_unavailable",
+      timeout: false,
+      infrastructureFailure: true,
+      totals: {
+        modelTurns: 0, toolCalls: 0, repeatedToolCalls: 0,
+        repeatedObservations: 0, repeatedReads: 0, repeatedValidations: 0,
+        turnCategories: {}, uncachedTokenProxy: { value: 0 },
+        providerCacheReadTokens: { value: 0 }, toolOutputRawBytes: { value: 0 },
+        toolOutputModelVisibleBytes: { value: 0 }, estimatedRequestComposition: {},
+        proxyCostAttribution: {}
+      },
+      timing: {
+        totalLatencyMs: null, timeToFirstActionMs: null,
+        timeToFirstMutationMs: null, completionTailMs: null
+      },
+      completionTailTurns: 0,
+      reportDigest: null
+    };
   });
 }
 

@@ -637,7 +637,8 @@ describe("agent experience evaluation runner", () => {
   it("marks verifier infrastructure failure invalid without observing correctness", async () => {
     const fixture = await manifest({ verifierCrash: true });
     const result = await runEvaluation({
-      suite: "quick", manifestPath: fixture.manifestPath, runDir: path.join(fixture.root, "verifier-crash")
+      suite: "quick", manifestPath: fixture.manifestPath,
+      runDir: path.join(fixture.root, "verifier-crash"), traceAttribution: true
     }, {
       secrets: { DEEPSEEK_API_KEY: "test-secret-value-12345" },
       prepareSubject: async () => ({ subjectKind: "fake", cliEntry: "fake", nodePath: "fake" }),
@@ -650,8 +651,17 @@ describe("agent experience evaluation runner", () => {
     expect(result.run.attempts[0]).toMatchObject({
       validity: "invalid",
       validityDetail: { owner: "verifier", code: "verifier_infrastructure_error" },
-      dimensions: { correctness: { status: "not_observed" }, delivery: { status: "not_observed" } }
+      dimensions: { correctness: { status: "not_observed" }, delivery: { status: "not_observed" } },
+      traceAttribution: { summary: { successful: false, infrastructureFailure: true } }
     });
+    const aggregate = JSON.parse(await readFile(result.traceReportPath, "utf8"));
+    expect(aggregate.totals).toMatchObject({ successfulAttempts: 0, infrastructureFailures: 1 });
+    const attempt = result.run.attempts[0];
+    const trace = JSON.parse(await readFile(
+      path.join(result.runDir, attempt.artifacts.traceAttribution), "utf8"
+    ));
+    expect(trace.terminal).toMatchObject({ successful: false, infrastructureFailure: true });
+    expect(trace.reportDigest).toBe(attempt.traceAttribution.reportDigest);
   });
 
   it("keeps a Sigma sandbox launch fault as a valid product reliability sample", async () => {

@@ -319,6 +319,27 @@ export function buildTraceAttribution(events, metadata = {}) {
   return { report, summary: attemptSummary(report, metadata) };
 }
 
+export function markTraceAttributionInfrastructureFailure(attribution) {
+  if (attribution.report.terminal.infrastructureFailure) return attribution;
+  const base = structuredClone(attribution.report);
+  delete base.reportDigest;
+  base.terminal = {
+    ...base.terminal,
+    infrastructureFailure: true,
+    successful: false
+  };
+  const report = reportWithDigest(base);
+  return {
+    report,
+    summary: {
+      ...attribution.summary,
+      successful: false,
+      infrastructureFailure: true,
+      reportDigest: report.reportDigest
+    }
+  };
+}
+
 function aggregateTotals(summaries) {
   const numberAt = (summary, path) => path.reduce((value, key) => value?.[key], summary);
   const sum = (path) => summaries.reduce((total, summary) => total + (numberAt(summary, path) ?? 0), 0);

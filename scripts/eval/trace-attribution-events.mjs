@@ -26,9 +26,14 @@ function changedDelta(delta) {
     .some((items) => Array.isArray(items) && items.length > 0);
 }
 
+function successfulRestoration(payload) {
+  return payload?.kind === "restoration" && payload.status === "passed";
+}
+
 function evidenceMutates(payload) {
   if (payload?.kind === "repository_delta") return true;
   if (payload?.kind === "checkpoint" && payload.data?.sourceSessionId) return true;
+  if (successfulRestoration(payload)) return true;
   return payload?.kind === "diagnostic"
     && payload.data?.source === "enclosing_container_mutation"
     && Array.isArray(payload.data?.diagnostic?.declaredPaths)

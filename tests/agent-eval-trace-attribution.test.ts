@@ -178,6 +178,48 @@ describe("neutral trace attribution", () => {
       item.currentRef && item.previousRef)).toBe(true);
   });
 
+  it("advances the repeat frontier after successful restoration evidence", () => {
+    const restorationTrace = (status: "passed" | "failed") => [
+      event(1, "session.created", { mode: "change" }),
+      event(2, "run.started", { mode: "change" }),
+      event(3, "checkpoint.sealed", {
+        checkpointId: "checkpoint", status: "sealed",
+        preManifestDigest: "a".repeat(64), postManifestDigest: "b".repeat(64),
+        delta: { added: [], modified: ["src/a.ts"], deleted: [] }
+      }),
+      ...modelEvents(4, 1),
+      requested(7, 1, "read-1", "read", { path: "src/a.ts", start: 1, end: 20 }),
+      receipt(8, 1, "read-1", "read", "alpha", ["filesystem.read"]),
+      event(9, "evidence.recorded", {
+        evidenceId: "restoration", sessionId: "session", runId: "run",
+        kind: "restoration", status, producer: { authority: "runtime" },
+        data: {
+          frontierRevision: 1,
+          frontierStateDigest: "b".repeat(64),
+          baselineManifestDigest: "a".repeat(64),
+          currentManifestDigest: "a".repeat(64),
+          repository: { status: "unchanged" }
+        }
+      }),
+      ...modelEvents(10, 2),
+      requested(13, 2, "read-2", "read", { path: "src/a.ts", start: 1, end: 20 }),
+      receipt(14, 2, "read-2", "read", "alpha", ["filesystem.read"]),
+      event(15, "run.completed", { kind: "completed" })
+    ];
+    const passed = buildTraceAttribution(restorationTrace("passed"), metadata()).report;
+    expect(passed.derived.repeats.toolCalls).toHaveLength(0);
+    expect(passed.derived.repeats.reads).toHaveLength(0);
+    expect(passed.derived.repeats.observations).toEqual(expect.arrayContaining([
+      expect.objectContaining({ mutationIntervened: true })
+    ]));
+    expect(passed.modelCalls[1].mutationFrontierRevision.start).toBe(2);
+
+    const failed = buildTraceAttribution(restorationTrace("failed"), metadata()).report;
+    expect(failed.derived.repeats.toolCalls).toHaveLength(1);
+    expect(failed.derived.repeats.reads).toHaveLength(1);
+    expect(failed.modelCalls[1].mutationFrontierRevision.start).toBe(1);
+  });
+
   it("marks recovery and user-input turns from events without interpreting task answers", () => {
     const events = [
       event(1, "session.created", { mode: "change" }),
