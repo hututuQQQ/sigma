@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
+import os from "node:os";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -85,6 +86,88 @@ export function loadEvalSecrets(filePath = path.join(rootDir, ".env"), base = pr
   return values;
 }
 
+function validCredential(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  if (value.type === "api_key") {
+    return (value.key === undefined || typeof value.key === "string")
+      && (value.env === undefined || Boolean(value.env && typeof value.env === "object"));
+  }
+  return value.type === "oauth"
+    && typeof value.access === "string"
+    && typeof value.refresh === "string"
+    && typeof value.expires === "number";
+}
+
+function credentialSecretValues(credential) {
+  const candidates = credential.type === "oauth"
+    ? [credential.access, credential.refresh]
+    : [credential.key, ...Object.values(credential.env ?? {})];
+  return candidates.filter((value) => typeof value === "string" && value.length >= 4);
+}
+
+/** Load only the selected provider's access material for an isolated eval
+ * subject. The reduced credential document is written to a disposable home;
+ * the host credential store is never copied wholesale. */
+function deepseekProviderAccess(options) {
+  const base = options.base ?? process.env;
+  const environmentSecrets = loadEvalSecrets(options.envPath, base);
+  return {
+    environmentSecrets,
+    credentialDocument: null,
+    credentialSourcePath: null,
+    secretValues: artifactSecretValues(environmentSecrets, base)
+  };
+}
+
+function evaluationCredentialPath(options) {
+  const base = options.base ?? process.env;
+  const configured = (base.SIGMA_HOST_CREDENTIAL_FILE
+    || base.SIGMA_CREDENTIAL_FILE)?.trim();
+  if (configured && !path.isAbsolute(configured)) {
+    throw new Error("credential_path_invalid: evaluation credential file must be absolute");
+  }
+  return path.resolve(
+    configured || path.join(options.homeDir ?? os.homedir(), ".sigma", "auth.json")
+  );
+}
+
+function storedProviderAccess(provider, options) {
+  const filePath = evaluationCredentialPath(options);
+  let document;
+  try {
+    document = JSON.parse(readFileSync(filePath, "utf8"));
+  } catch (error) {
+    throw new Error(`Evaluation credential store is unavailable at ${filePath}.`, {
+      cause: error
+    });
+  }
+  const credential = document?.version === 1
+    && document.credentials
+    && typeof document.credentials === "object"
+    && !Array.isArray(document.credentials)
+    ? document.credentials[provider]
+    : undefined;
+  if (!validCredential(credential)) {
+    throw new Error(`Evaluation provider '${provider}' is not authenticated in ${filePath}.`);
+  }
+  const credentialDocument = {
+    version: 1,
+    credentials: { [provider]: structuredClone(credential) }
+  };
+  return {
+    environmentSecrets: {},
+    credentialDocument,
+    credentialSourcePath: filePath,
+    secretValues: [...new Set(credentialSecretValues(credential))]
+  };
+}
+
+export function loadEvalProviderAccess(provider, options = {}) {
+  return provider === "deepseek"
+    ? deepseekProviderAccess(options)
+    : storedProviderAccess(provider, options);
+}
+
 const SECRET_ENV_KEY = /(?:api[_-]?key|token|secret|password|passwd|credential|private[_-]?key|authorization|cookie)/iu;
 
 export function artifactSecretValues(subjectSecrets, base = process.env) {
@@ -141,7 +224,9 @@ export function subjectEnvironment({ stateHome, homeDir, tempDir = path.join(hom
     XDG_CONFIG_HOME: path.join(homeDir, ".config"),
     XDG_DATA_HOME: path.join(homeDir, ".local", "share"),
     SIGMA_STATE_HOME: stateHome,
-    DEEPSEEK_API_KEY: secrets.DEEPSEEK_API_KEY,
+    ...(typeof secrets?.DEEPSEEK_API_KEY === "string"
+      ? { DEEPSEEK_API_KEY: secrets.DEEPSEEK_API_KEY }
+      : {}),
     CI: "1",
     NO_COLOR: "1",
     SIGMA_NO_COLOR: "1",

@@ -136,27 +136,50 @@ function spawnCapture(command, args, options = {}) {
   return { child, exited, getOutput: () => ({ stdout, stderr }) };
 }
 
-async function cancelSession({ sessionId, workspace, env, reason, subject }) {
+async function cancelSession({
+  sessionId,
+  workspace,
+  env,
+  reason,
+  subject,
+  provider = sigmaManifest.evaluation.provider,
+  model = sigmaManifest.evaluation.model,
+  reasoningEffort = "provider_default"
+}) {
   if (!sessionId) return { exitCode: 1, stderr: "Session id was not observed before cancellation." };
   const launch = subjectNodeLaunch(subject);
   const operation = spawnCapture(launch.executablePath, nodeCliArgs([
     "session", "cancel", sessionId,
     "--workspace", workspace,
-    "--provider", "deepseek",
-    "--model", sigmaManifest.evaluation.model,
+    "--provider", provider,
+    "--model", model,
+    ...(reasoningEffort === "provider_default"
+      ? [] : ["--reasoning-effort", reasoningEffort]),
     "--reason", reason
   ], subject), { cwd: workspace, env, timeoutMs: CANCEL_GRACE_MS });
   return await operation.exited;
 }
 
-function startCliSubject({ workspace, stateHome, promptPath, runMode, env, subject }) {
+function startCliSubject({
+  workspace,
+  stateHome,
+  promptPath,
+  runMode,
+  env,
+  subject,
+  provider = sigmaManifest.evaluation.provider,
+  model = sigmaManifest.evaluation.model,
+  reasoningEffort = "provider_default"
+}) {
   const command = runMode === "analyze" ? "inspect" : "run";
   const args = nodeCliArgs([
     command,
     "--workspace", workspace,
     "--prompt-file", promptPath,
-    "--provider", "deepseek",
-    "--model", sigmaManifest.evaluation.model,
+    "--provider", provider,
+    "--model", model,
+    ...(reasoningEffort === "provider_default"
+      ? [] : ["--reasoning-effort", reasoningEffort]),
     "--permission-mode", "auto",
     "--output-format", "stream-json"
   ], subject);
@@ -180,10 +203,16 @@ function startCliSubject({ workspace, stateHome, promptPath, runMode, env, subje
 export async function runCliSubject(options) {
   const {
     workspace, stateHome, promptPath, runMode, env, budget, artifactDir, redactor,
-    onEvent = () => undefined, subject = {}
+    onEvent = () => undefined, subject = {},
+    provider = sigmaManifest.evaluation.provider,
+    model = sigmaManifest.evaluation.model,
+    reasoningEffort = "provider_default"
   } = options;
   await mkdir(artifactDir, { recursive: true });
-  const { child, startedAt } = startCliSubject({ workspace, stateHome, promptPath, runMode, env, subject });
+  const { child, startedAt } = startCliSubject({
+    workspace, stateHome, promptPath, runMode, env, subject,
+    provider, model, reasoningEffort
+  });
   const events = [];
   let result;
   let stdout = "";
@@ -231,7 +260,10 @@ export async function runCliSubject(options) {
       // neutral external-stop request without thresholds, dimensions, scores,
       // or any other evaluation state.
       reason: "External controller requested stop.",
-      subject
+      subject,
+      provider,
+      model,
+      reasoningEffort
     }).then((cancelResult) => {
       cancellation.cancelExitCode = cancelResult.exitCode;
       if (cancelResult.exitCode !== 0 && !treeTerminationPromise) {

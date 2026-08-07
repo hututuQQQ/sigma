@@ -335,6 +335,64 @@ describe("configured runtime execution capabilities", () => {
     }
   });
 
+  it("keeps run requests identical after compiling an inspection-only Harness identity", async () => {
+    const root = await workspace();
+    const inspectedState = await mkdtemp(path.join(os.tmpdir(), "sigma-runtime-inspected-state-"));
+    const controlState = await mkdtemp(path.join(os.tmpdir(), "sigma-runtime-control-state-"));
+    fixtures.push(inspectedState, controlState);
+    const inspectedGateway = new CapturingGateway();
+    const controlGateway = new CapturingGateway();
+    const brokerReport = doctorReport([]);
+    const inspectedRuntime = await createConfiguredRuntime(configured(root), {
+      stateRootDir: inspectedState,
+      executionBroker: fixtureBroker(brokerReport),
+      gatewayFactory: () => inspectedGateway
+    }, { connectMcp: false, surface: "cli" });
+    const controlRuntime = await createConfiguredRuntime(configured(root), {
+      stateRootDir: controlState,
+      executionBroker: fixtureBroker(brokerReport),
+      gatewayFactory: () => controlGateway
+    }, { connectMcp: false, surface: "cli" });
+    try {
+      const build = inspectedRuntime.inspectHarness("analyze");
+      expect(build.activation).toBe("inspection_only");
+      expect(build.modifiesRuntime).toBe(false);
+
+      for (const runtime of [inspectedRuntime.runtime, controlRuntime.runtime]) {
+        const session = await runtime.createSession({ workspacePath: root, mode: "analyze" });
+        await runtime.command({
+          type: "submit",
+          sessionId: session.sessionId,
+          text: "Inspect the runtime capabilities.",
+          mode: "analyze"
+        });
+        await runtime.waitForOutcome(session.sessionId);
+      }
+
+      const inspectedRequest = inspectedGateway.requests[0]!;
+      const controlRequest = controlGateway.requests[0]!;
+      expect(build.toolPolicy.initialTools).toEqual(
+        inspectedRequest.tools?.map((tool) => tool.name)
+      );
+      expect({
+        messages: inspectedRequest.messages,
+        tools: inspectedRequest.tools,
+        toolChoice: inspectedRequest.toolChoice,
+        maxOutputTokens: inspectedRequest.maxOutputTokens,
+        temperature: inspectedRequest.temperature
+      }).toEqual({
+        messages: controlRequest.messages,
+        tools: controlRequest.tools,
+        toolChoice: controlRequest.toolChoice,
+        maxOutputTokens: controlRequest.maxOutputTokens,
+        temperature: controlRequest.temperature
+      });
+    } finally {
+      await inspectedRuntime.close();
+      await controlRuntime.close();
+    }
+  });
+
   it("carries broker-attested external mounts into every environment write policy", async () => {
     const root = await workspace();
     const report = doctorReport([], [], {

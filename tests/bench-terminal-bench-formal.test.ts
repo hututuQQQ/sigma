@@ -10,6 +10,8 @@ import {
 import {
   assertFrozenBatchControls,
   canonicalJson,
+  FORMAL_TOKEN_USAGE_PROXY,
+  formalTokenUsageProxy,
   formalPreregistrationConsumptionIdentity,
   loadFormalPreregistration,
   sha256,
@@ -121,6 +123,7 @@ function report(taskCount: number, passed: number, blocker = false) {
     usage: {
       input_tokens: taskCount * 10,
       cache_tokens: taskCount * 8,
+      cache_read_tokens: taskCount * 8,
       output_tokens: taskCount * 2
     },
     cost_usd: taskCount * 0.01,
@@ -163,12 +166,17 @@ describe("formal benchmark preregistration", () => {
     const value = manifest();
     expect(value).toMatchObject({
       kind: "SigmaFormalRunPreregistration",
+      schemaVersion: 2,
       model: {
         provider: "provider-fixture",
         name: "model-fixture",
         reasoning_effort: "max"
       },
       solver_controls: { max_turns: 73, command_timeout_sec: 41, cleanup_grace_sec: 17 },
+      usage_accounting: {
+        token_usage_proxy: FORMAL_TOKEN_USAGE_PROXY,
+        gate_precedence: "provider_cost_usd_then_token_usage_proxy"
+      },
       execution: { concurrency: 2, attempts_per_task: 1, retries: 0 }
     });
     expect(value.task_selection.task_selection_sha256).toMatch(/^[a-f0-9]{64}$/u);
@@ -186,6 +194,19 @@ describe("formal benchmark preregistration", () => {
     const excessiveCommandTimeout = draft();
     (excessiveCommandTimeout.solver_controls as Record<string, unknown>).command_timeout_sec = 601;
     expect(() => sigmaFormalRunPreregistration(excessiveCommandTimeout)).toThrow(/at most 600/u);
+  });
+
+  it("registers a deterministic uncached-input-plus-output usage proxy", () => {
+    expect(formalTokenUsageProxy({
+      input_tokens: 30,
+      cache_read_tokens: 24,
+      output_tokens: 6
+    })).toBe(12);
+    expect(() => formalTokenUsageProxy({
+      input_tokens: 30,
+      cache_tokens: 24,
+      output_tokens: 6
+    })).toThrow(/invalid field set/u);
   });
 
   it("rejects score thresholds, mutable task sources, and stale digests", () => {
@@ -340,6 +361,12 @@ describe("formal benchmark controller", () => {
       counts: { passed: 2, structured_blocker: 1 },
       failure_categories: { structured_blocker: 1 },
       lane_metrics: { verifier_reached: 2, verifier_passed: 2 }
+    });
+    expect(aggregate.usage_accounting).toMatchObject({
+      token_usage_proxy: {
+        id: "uncached_input_plus_output_v1",
+        value: 12
+      }
     });
     expect(aggregate).not.toHaveProperty("acceptance");
     expect(aggregate).not.toHaveProperty("minimum_passes");

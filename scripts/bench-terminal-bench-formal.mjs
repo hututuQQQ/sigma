@@ -18,6 +18,7 @@ import {
 import {
   assertFrozenBatchControls,
   canonicalJson,
+  formalTokenUsageProxy,
   loadFormalPreregistration,
   sha256,
   validateFormalPreregistration
@@ -432,6 +433,11 @@ export function aggregateFormalReports(manifest, batchRecords) {
     });
   const status = allBatchesRecorded ? executionComplete ? "complete" : "incomplete" : "running";
   const usage = aggregateNumericObjects(reports, "usage");
+  const tokenUsageProxy = formalTokenUsageProxy({
+    input_tokens: Number(usage.input_tokens ?? 0),
+    cache_read_tokens: Number(usage.cache_read_tokens ?? 0),
+    output_tokens: Number(usage.output_tokens ?? 0)
+  });
   return {
     schemaVersion: 1,
     kind: "SigmaFormalRunReport",
@@ -452,6 +458,13 @@ export function aggregateFormalReports(manifest, batchRecords) {
     failure_categories: aggregateFailureCategories(reports),
     lane_metrics: laneMetrics(tasks, reports[0]?.evaluation_lane ?? null),
     usage,
+    usage_accounting: {
+      ...manifest.usage_accounting,
+      token_usage_proxy: {
+        ...manifest.usage_accounting.token_usage_proxy,
+        value: tokenUsageProxy
+      }
+    },
     cost_usd: sumReports(reports, ["cost_usd"]),
     tasks
   };
@@ -473,6 +486,7 @@ function formalMarkdown(report) {
     `- Verifier reach/pass rate: ${report.lane_metrics.verifier_reached}/${report.lane_metrics.verifier_pass_rate ?? "n/a"}`,
     `- Counts: ${JSON.stringify(report.counts)}`,
     `- Failure categories: ${JSON.stringify(report.failure_categories)}`,
+    `- Token usage proxy (${report.usage_accounting.token_usage_proxy.id}): ${report.usage_accounting.token_usage_proxy.value}`,
     `- Cost USD: ${report.cost_usd}`,
     ""
   ];

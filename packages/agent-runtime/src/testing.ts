@@ -14,6 +14,7 @@ export * from "./create-runtime.js";
 export * from "./session-command-bus.js";
 export * from "./restore-session.js";
 export * from "./configured-runtime.js";
+export * from "./harness-compiler.js";
 export * from "./composition-supervision.js";
 export * from "./durable-children.js";
 export * from "./child-workspace-recovery.js";

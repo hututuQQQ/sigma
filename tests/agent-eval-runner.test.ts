@@ -204,7 +204,15 @@ describe("agent experience evaluation runner", () => {
     const fixture = await manifest({ repeat: 2 });
     const runDir = path.join(fixture.root, "artifacts");
     const subjectInputs: Array<Record<string, unknown>> = [];
-    const result = await runEvaluation({ suite: "quick", repeat: 2, manifestPath: fixture.manifestPath, runDir }, {
+    const result = await runEvaluation({
+      suite: "quick",
+      repeat: 2,
+      manifestPath: fixture.manifestPath,
+      runDir,
+      provider: "openai-codex",
+      model: "gpt-5.6-sol",
+      reasoningEffort: "max"
+    }, {
       secrets: { DEEPSEEK_API_KEY: "test-secret-value-12345" },
       prepareSubject: async () => ({ subjectKind: "fake", cliEntry: "fake", nodePath: "fake" }),
       runSubject: async (input: Record<string, unknown>) => {
@@ -224,6 +232,11 @@ describe("agent experience evaluation runner", () => {
     expect(subjectInputs[0]).not.toHaveProperty("allowedChanges");
     expect(subjectInputs[0]).not.toHaveProperty("expectedTerminal");
     expect(subjectInputs[0]).not.toHaveProperty("fixture");
+    expect(subjectInputs[0]).toMatchObject({
+      provider: "openai-codex",
+      model: "gpt-5.6-sol",
+      reasoningEffort: "max"
+    });
     expect(subjectInputs[0]?.driverSpec).toEqual({
       messages: ["Inspect the value and report completion."],
       surface: "cli",
@@ -243,6 +256,11 @@ describe("agent experience evaluation runner", () => {
       ]
     });
     expect(result).not.toHaveProperty("codexReviewPath");
+    expect(result.run.subject).toMatchObject({
+      provider: "openai-codex",
+      model: "gpt-5.6-sol",
+      reasoningEffort: "max"
+    });
     expect(await readFile(result.runPath, "utf8")).not.toContain("test-secret-value-12345");
   });
 
