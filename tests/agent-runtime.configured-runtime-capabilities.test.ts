@@ -393,6 +393,41 @@ describe("configured runtime execution capabilities", () => {
     }
   });
 
+  it("binds the broker-derived runtime environment into the Harness identity", async () => {
+    const root = await workspace();
+    const firstState = await mkdtemp(path.join(os.tmpdir(), "sigma-runtime-env-first-"));
+    const secondState = await mkdtemp(path.join(os.tmpdir(), "sigma-runtime-env-second-"));
+    fixtures.push(firstState, secondState);
+    const firstReport = doctorReport([]);
+    const secondReport = { ...doctorReport([]), architecture: "alternate-arch" };
+    const firstRuntime = await createConfiguredRuntime(configured(root), {
+      stateRootDir: firstState,
+      executionBroker: fixtureBroker(firstReport),
+      gatewayFactory: () => new CapturingGateway()
+    }, { connectMcp: false, surface: "cli" });
+    const secondRuntime = await createConfiguredRuntime(configured(root), {
+      stateRootDir: secondState,
+      executionBroker: fixtureBroker(secondReport),
+      gatewayFactory: () => new CapturingGateway()
+    }, { connectMcp: false, surface: "cli" });
+    try {
+      const first = firstRuntime.inspectHarness("analyze");
+      const second = secondRuntime.inspectHarness("analyze");
+      expect(first.toolPolicy.initialToolDefinitionsDigest)
+        .toBe(second.toolPolicy.initialToolDefinitionsDigest);
+      expect(first.promptPolicy.systemBehaviorDigest)
+        .toBe(second.promptPolicy.systemBehaviorDigest);
+      expect(first.promptPolicy.runtimeEnvironmentDigest)
+        .not.toBe(second.promptPolicy.runtimeEnvironmentDigest);
+      expect(first.runtimeCapabilities.environment.arch).toBe("fixture-arch");
+      expect(second.runtimeCapabilities.environment.arch).toBe("alternate-arch");
+      expect(first.digest).not.toBe(second.digest);
+    } finally {
+      await firstRuntime.close();
+      await secondRuntime.close();
+    }
+  });
+
   it("carries broker-attested external mounts into every environment write policy", async () => {
     const root = await workspace();
     const report = doctorReport([], [], {

@@ -4,8 +4,8 @@ import { access, copyFile, cp, lstat, mkdir, readFile, readdir, realpath, rm, wr
 import os from "node:os";
 import path from "node:path";
 import {
-  artifactSecretValues as collectArtifactSecretValues, createRedactor, digest, evalRootDir, fixtureRootDir,
-  loadEvalProviderAccess,
+  artifactSecretValues as collectArtifactSecretValues, canonicalJson, createRedactor,
+  credentialSecretValues, digest, evalRootDir, fixtureRootDir, loadEvalProviderAccess,
   makeRunId, relativeArtifact, rootDir, subjectEnvironment, writeJson
 } from "./common.mjs";
 import { listSessions, readSession, resolveWorkspaceStateRoot } from "./event-store.mjs";
@@ -1252,31 +1252,72 @@ async function scanAttemptSecrets(context, lifecycle, attempt, secretValues) {
   for (const file of exposures) addSafetyViolation(attempt, { code: "secret_in_artifact", file });
 }
 
-async function finalizeAttempt(context, lifecycle, result, secretValues) {
+async function finalizeAttempt(context, lifecycle, result, secretValues, deps) {
   const { redactor } = context;
-  await persistEvaluationCredential(context, lifecycle);
+  let credentialFailure;
+  try {
+    await persistEvaluationCredential(context, lifecycle, deps);
+  } catch (error) {
+    credentialFailure = error;
+  }
   await scanAttemptSecrets(context, lifecycle, result.attempt, secretValues);
+  if (credentialFailure) throw credentialFailure;
   await writeJson(path.join(lifecycle.attemptArtifactDir, "attempt.json"), result.attempt, redactor);
   if (result.stateRoot) await appendExternalReport(result.stateRoot, result.attempt);
 }
 
-async function persistEvaluationCredential(context, lifecycle) {
+function credentialsEqual(left, right) {
+  return left !== undefined && right !== undefined
+    && canonicalJson(left) === canonicalJson(right);
+}
+
+function selectedCredentialDocument(provider, credential) {
+  return { version: 1, credentials: { [provider]: structuredClone(credential) } };
+}
+
+function registerCredentialSecrets(context, credential) {
+  for (const value of credentialSecretValues(credential)) {
+    if (!context.artifactSecretValues.includes(value)) context.artifactSecretValues.push(value);
+  }
+}
+
+async function credentialStoreFactory(deps) {
+  if (deps.credentialStoreFactory) return deps.credentialStoreFactory;
+  const credentialModule = new URL(
+    "../../packages/agent-pi/dist/index.js",
+    import.meta.url
+  ).href;
+  const { FileCredentialStore } = await import(credentialModule);
+  return (filePath) => new FileCredentialStore({ filePath });
+}
+
+async function persistEvaluationCredential(context, lifecycle, deps) {
   if (!context.credentialSourcePath || !context.credentialDocument) return;
   const isolatedPath = path.join(lifecycle.sandboxRoot, "home", ".sigma", "auth.json");
   try {
-    const credentialModule = new URL(
-      "../../packages/agent-pi/dist/index.js",
-      import.meta.url
-    ).href;
-    const { FileCredentialStore } = await import(credentialModule);
-    const isolated = new FileCredentialStore({ filePath: isolatedPath });
+    const createCredentialStore = await credentialStoreFactory(deps);
+    const isolated = createCredentialStore(isolatedPath);
     const replacement = await isolated.read(context.provider);
     if (!replacement) {
       throw new Error(`Isolated evaluation credential for '${context.provider}' disappeared.`);
     }
-    const host = new FileCredentialStore({ filePath: context.credentialSourcePath });
-    await host.modify(context.provider, async (current) =>
-      JSON.stringify(current) === JSON.stringify(replacement) ? undefined : replacement);
+    registerCredentialSecrets(context, replacement);
+    const seeded = context.credentialDocument.credentials?.[context.provider];
+    if (!seeded) {
+      throw new Error(`Evaluation credential seed for '${context.provider}' is unavailable.`);
+    }
+    const host = createCredentialStore(context.credentialSourcePath);
+    const accepted = await host.modify(context.provider, async (current) => {
+      if (!credentialsEqual(current, seeded)) return undefined;
+      return credentialsEqual(replacement, seeded) ? undefined : replacement;
+    });
+    if (!accepted) {
+      throw new Error(`Host evaluation credential for '${context.provider}' disappeared.`);
+    }
+    registerCredentialSecrets(context, accepted);
+    if (context.credentialState) {
+      context.credentialState.document = selectedCredentialDocument(context.provider, accepted);
+    }
   } finally {
     await rm(isolatedPath, { force: true });
   }
@@ -1311,7 +1352,7 @@ async function runAttempt(context, deps = {}) {
   try {
     const result = await executeAttemptCoreSafely(context, deps, lifecycle);
     let finalizationError;
-    try { await finalizeAttempt(context, lifecycle, result, secretValues); } catch (error) { finalizationError = error; }
+    try { await finalizeAttempt(context, lifecycle, result, secretValues, deps); } catch (error) { finalizationError = error; }
     cleanupManaged = true;
     const cleanupFailed = await cleanupAttempt(context, lifecycle, result.attempt);
     if (cleanupFailed && !finalizationError) {
@@ -1428,7 +1469,7 @@ async function prepareEvaluationContext(input, options, deps) {
     ...collectArtifactSecretValues(secrets),
     ...(providerAccess.secretValues ?? [])
   ])];
-  const redactor = createRedactor(artifactSecretValues);
+  const redactor = (value) => createRedactor(artifactSecretValues)(value);
   const sourceGitSha = await gitSha(path.resolve(options.subjectWorkspace ?? rootDir));
   const evaluatorDigest = await evaluatorSourceDigest();
   const verifierDigest = await verifierSourceDigest(manifestDir, scenarios);
@@ -1462,6 +1503,9 @@ async function prepareEvaluationContext(input, options, deps) {
     secrets,
     credentialDocument: providerAccess.credentialDocument ?? null,
     credentialSourcePath: providerAccess.credentialSourcePath ?? null,
+    credentialState: providerAccess.credentialDocument
+      ? { document: structuredClone(providerAccess.credentialDocument) }
+      : null,
     artifactSecretValues, redactor, sourceGitSha, evaluatorDigest, verifierDigest,
     toolchainMeasurement, schedule, scheduleDigest,
     startedAt: new Date().toISOString()
@@ -1559,6 +1603,7 @@ async function executeEvaluationSchedule(context, preparation, deps, infrastruct
   }
   const {
     schedule, runId, runDir, manifestDir, secrets, credentialDocument, credentialSourcePath,
+    credentialState,
     artifactSecretValues, redactor, sourceGitSha, evaluatorDigest, verifierDigest,
     frozenRunPolicy, toolchainMeasurement, provider, model, reasoningEffort
   } = context;
@@ -1575,8 +1620,9 @@ async function executeEvaluationSchedule(context, preparation, deps, infrastruct
           subject,
           verifierRuntime,
           secrets,
-          credentialDocument,
+          credentialDocument: credentialState?.document ?? credentialDocument,
           credentialSourcePath,
+          credentialState,
           artifactSecretValues,
           redactor,
           sourceGitSha,

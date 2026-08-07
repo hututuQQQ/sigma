@@ -42,6 +42,29 @@ function successfulEvents(): Record<string, unknown>[] {
   ];
 }
 
+function jsonCredentialStore(filePath: string) {
+  return {
+    read: async (provider: string) => {
+      const document = JSON.parse(await readFile(filePath, "utf8"));
+      return document.credentials?.[provider];
+    },
+    modify: async (
+      provider: string,
+      update: (current: Record<string, unknown> | undefined) => Promise<Record<string, unknown> | undefined>
+    ) => {
+      const document = JSON.parse(await readFile(filePath, "utf8"));
+      const current = document.credentials?.[provider];
+      const replacement = await update(current);
+      if (replacement !== undefined) {
+        document.credentials[provider] = replacement;
+        await writeFile(filePath, `${JSON.stringify(document)}\n`, "utf8");
+        return replacement;
+      }
+      return current;
+    }
+  };
+}
+
 async function manifest(options: {
   verifierPass?: boolean;
   verifierCrash?: boolean;
@@ -262,6 +285,89 @@ describe("agent experience evaluation runner", () => {
       reasoningEffort: "max"
     });
     expect(await readFile(result.runPath, "utf8")).not.toContain("test-secret-value-12345");
+  });
+
+  it("CAS-persists credential refreshes, preserves concurrent logins, and advances later attempts", async () => {
+    const fixture = await manifest({ repeat: 3 });
+    const runDir = path.join(fixture.root, "credential-artifacts");
+    const hostPath = path.join(fixture.root, "host-auth.json");
+    const provider = "openai-codex";
+    const seed = {
+      type: "oauth", access: "seed-access-credential", refresh: "seed-refresh-credential", expires: 1
+    };
+    const acceptedRefresh = {
+      type: "oauth", access: "accepted-access-credential", refresh: "accepted-refresh-credential", expires: 2
+    };
+    const supersededRefresh = {
+      type: "oauth", access: "superseded-access-credential", refresh: "superseded-refresh-credential", expires: 3
+    };
+    const concurrentLogin = {
+      type: "oauth", access: "concurrent-access-credential", refresh: "concurrent-refresh-credential", expires: 4
+    };
+    await writeFile(hostPath, `${JSON.stringify({
+      version: 1,
+      credentials: { [provider]: seed, unrelated: { type: "api_key", key: "keep-unrelated" } }
+    })}\n`, "utf8");
+    const observed: Array<Record<string, unknown>> = [];
+
+    const result = await runEvaluation({
+      suite: "quick",
+      repeat: 3,
+      manifestPath: fixture.manifestPath,
+      runDir,
+      provider,
+      model: "gpt-5.6-sol",
+      reasoningEffort: "max"
+    }, {
+      providerAccess: {
+        environmentSecrets: {},
+        credentialDocument: { version: 1, credentials: { [provider]: seed } },
+        credentialSourcePath: hostPath,
+        secretValues: [seed.access, seed.refresh]
+      },
+      credentialStoreFactory: (filePath: string) => jsonCredentialStore(filePath),
+      prepareSubject: async () => ({ subjectKind: "fake", cliEntry: "fake", nodePath: "fake" }),
+      runSubject: async (input: Record<string, unknown>) => {
+        const env = input.env as Record<string, string>;
+        const isolatedPath = path.join(env.HOME, ".sigma", "auth.json");
+        const isolated = JSON.parse(await readFile(isolatedPath, "utf8"));
+        observed.push(isolated.credentials[provider]);
+        const attempt = observed.length;
+        const emitted = attempt === 1 ? acceptedRefresh
+          : attempt === 2 ? supersededRefresh
+          : concurrentLogin;
+        isolated.credentials[provider] = emitted;
+        await writeFile(isolatedPath, `${JSON.stringify(isolated)}\n`, "utf8");
+        if (attempt === 2) {
+          const host = JSON.parse(await readFile(hostPath, "utf8"));
+          host.credentials[provider] = concurrentLogin;
+          await writeFile(hostPath, `${JSON.stringify(host)}\n`, "utf8");
+        }
+        await writeFile(
+          path.join(String(input.artifactDir), "subject.stdout.log"),
+          `${emitted.access}\n`,
+          "utf8"
+        );
+        await writeFile(path.join(String(input.artifactDir), "subject.stderr.log"), "", "utf8");
+        return {
+          exitCode: 0,
+          sessionId: "session",
+          result: { status: "completed", finishReason: "completed", finalMessage: "Done." },
+          events: successfulEvents()
+        };
+      }
+    });
+
+    expect(observed).toEqual([seed, acceptedRefresh, concurrentLogin]);
+    const host = JSON.parse(await readFile(hostPath, "utf8"));
+    expect(host.credentials[provider]).toEqual(concurrentLogin);
+    expect(host.credentials.unrelated).toEqual({ type: "api_key", key: "keep-unrelated" });
+    expect(result.run.infrastructureErrors).toEqual([]);
+    const report = await readFile(result.runPath, "utf8");
+    for (const credential of [seed, acceptedRefresh, supersededRefresh, concurrentLogin]) {
+      expect(report).not.toContain(credential.access);
+      expect(report).not.toContain(credential.refresh);
+    }
   });
 
   it("rejects result-directed repetition overrides before preparing a subject", async () => {

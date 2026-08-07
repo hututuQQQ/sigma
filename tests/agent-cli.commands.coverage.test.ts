@@ -147,7 +147,8 @@ describe("CLI init and replay branches", () => {
       promptPolicy: {
         mode: "runtime_default",
         modifiesPrompt: false,
-        systemBehaviorDigest: "c".repeat(64)
+        systemBehaviorDigest: "c".repeat(64),
+        runtimeEnvironmentDigest: "e".repeat(64)
       },
       toolPolicy: {
         mode: "runtime_default",
@@ -162,7 +163,19 @@ describe("CLI init and replay branches", () => {
         writeScope: "workspace",
         managedEnvironment: false,
         network: "full",
-        interactiveApprovals: false
+        interactiveApprovals: false,
+        environment: {
+          platform: "linux",
+          arch: "x64",
+          defaultShell: "bash",
+          availableShells: ["bash"],
+          availableRuntimeCommands: [],
+          executionCapabilitiesVerified: true,
+          directExecutableResolution: true,
+          executionMode: "sandboxed",
+          writeScope: "workspace",
+          pathSeparator: "/"
+        }
       },
       policyDigest: "e".repeat(64),
       canonicalJson: "{}",

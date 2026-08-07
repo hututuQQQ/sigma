@@ -1,9 +1,11 @@
 import type { ModelReasoningEffort } from "agent-model";
+import type { BrokerDoctorReport } from "agent-execution";
 import type { ModelGateway, RunMode } from "agent-protocol";
 import { isToolAllowed } from "agent-tools";
 import type { RuntimeCustomization } from "./customization.js";
 import type { createConfiguredTools } from "./configured-runtime-tools.js";
 import { modelTools } from "./effect-helpers.js";
+import { configuredRuntimeEnvironment } from "./execution-capabilities.js";
 import {
   compileHarnessBuild,
   type FrozenHarnessBuild,
@@ -33,9 +35,10 @@ export function createConfiguredHarnessInspector(input: {
   customization: RuntimeCustomization;
   tools: ReturnType<typeof createConfiguredTools>;
   gateways: { orchestrator: ModelGateway };
+  executionReport: BrokerDoctorReport;
   options: HarnessInspectionOptions;
 }): (mode: RunMode) => FrozenHarnessBuild {
-  const { config, customization, tools, gateways, options } = input;
+  const { config, customization, tools, gateways, executionReport, options } = input;
   return (mode: RunMode): FrozenHarnessBuild => {
     const profile = customization.profile.profile;
     const sourceDescriptors = tools.modelDescriptors?.() ?? tools.descriptors();
@@ -73,7 +76,8 @@ export function createConfiguredHarnessInspector(input: {
         writeScope: config.writeScope ?? "workspace",
         managedEnvironment: (config.managedEnvironmentMode ?? "disabled") === "required",
         network: config.networkMode ?? "full",
-        interactiveApprovals: options.interactiveApprovals ?? options.surface !== "cli"
+        interactiveApprovals: options.interactiveApprovals ?? options.surface !== "cli",
+        environment: configuredRuntimeEnvironment(executionReport, config)
       },
       resolvedAgentProfile: profile
     });

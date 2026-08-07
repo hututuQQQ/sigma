@@ -98,7 +98,7 @@ function validCredential(value) {
     && typeof value.expires === "number";
 }
 
-function credentialSecretValues(credential) {
+export function credentialSecretValues(credential) {
   const candidates = credential.type === "oauth"
     ? [credential.access, credential.refresh]
     : [credential.key, ...Object.values(credential.env ?? {})];

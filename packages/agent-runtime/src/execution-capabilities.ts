@@ -82,3 +82,19 @@ export function brokerRuntimeEnvironment(report: BrokerDoctorReport): RuntimeEnv
     executionCapabilitiesVerified: true
   };
 }
+
+export function configuredRuntimeEnvironment(
+  report: BrokerDoctorReport,
+  config: {
+    executionMode?: "sandboxed" | "container";
+    writeScope?: "workspace" | "enclosing-container";
+  }
+): RuntimeEnvironment {
+  return {
+    ...brokerRuntimeEnvironment(report),
+    executionMode: config.executionMode ?? "sandboxed",
+    writeScope: config.writeScope ?? "workspace",
+    enclosingContainerAttestationDigest:
+      report.capabilities.enclosingContainerRoot?.attestationDigest
+  };
+}

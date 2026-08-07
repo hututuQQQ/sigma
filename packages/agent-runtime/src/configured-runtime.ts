@@ -189,7 +189,7 @@ export async function createConfiguredRuntime(
     });
     runtimeReference.current = runtime;
     const inspectHarness = createConfiguredHarnessInspector({
-      config, customization, tools, gateways, options
+      config, customization, tools, gateways, executionReport, options
     });
     return {
       workspace,

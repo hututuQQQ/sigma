@@ -40,7 +40,19 @@ function input(): HarnessCompilerInput {
       writeScope: "workspace",
       managedEnvironment: false,
       network: "full",
-      interactiveApprovals: false
+      interactiveApprovals: false,
+      environment: {
+        platform: "linux",
+        arch: "x64",
+        defaultShell: "bash",
+        availableShells: ["bash"],
+        availableRuntimeCommands: ["node"],
+        executionCapabilitiesVerified: true,
+        directExecutableResolution: true,
+        executionMode: "sandboxed",
+        writeScope: "workspace",
+        pathSeparator: "/"
+      }
     },
     resolvedAgentProfile: strictReviewProfileFixture().profile
   };
@@ -98,6 +110,16 @@ describe("Harness identity compiler", () => {
     expect(changedSchema.digest).not.toBe(baseline.digest);
     expect(changedSchema.toolPolicy.initialToolDefinitionsDigest)
       .not.toBe(baseline.toolPolicy.initialToolDefinitionsDigest);
+
+    const environment = input();
+    environment.runtimeCapabilities = {
+      ...environment.runtimeCapabilities,
+      environment: { ...environment.runtimeCapabilities.environment, arch: "arm64" }
+    };
+    const changedEnvironment = compileHarnessBuild(environment);
+    expect(changedEnvironment.digest).not.toBe(baseline.digest);
+    expect(changedEnvironment.promptPolicy.runtimeEnvironmentDigest)
+      .not.toBe(baseline.promptPolicy.runtimeEnvironmentDigest);
   });
 
   it("rejects benchmark, task, and other undeclared compiler inputs", () => {

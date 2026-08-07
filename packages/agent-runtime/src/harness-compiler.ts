@@ -6,6 +6,7 @@ import type {
   ModelToolDefinition,
   RunMode
 } from "agent-protocol";
+import type { RuntimeEnvironment } from "agent-platform";
 import { baseContext } from "./runtime-context.js";
 
 export const HARNESS_BUILD_SCHEMA_VERSION = 1 as const;
@@ -22,6 +23,8 @@ export interface HarnessRuntimeCapabilities {
   managedEnvironment: boolean;
   network: "none" | "loopback" | "full";
   interactiveApprovals: boolean;
+  /** Exact broker-derived environment used to construct runtime:environment. */
+  environment: Readonly<RuntimeEnvironment>;
 }
 
 export interface HarnessCompilerInput {
@@ -55,6 +58,7 @@ export interface FrozenHarnessBuild {
     mode: "runtime_default";
     modifiesPrompt: false;
     systemBehaviorDigest: string;
+    runtimeEnvironmentDigest: string;
   }>;
   toolPolicy: Readonly<{
     mode: "runtime_default";
@@ -93,7 +97,8 @@ const RUNTIME_CAPABILITY_KEYS = [
   "writeScope",
   "managedEnvironment",
   "network",
-  "interactiveApprovals"
+  "interactiveApprovals",
+  "environment"
 ] as const;
 
 function sha256(value: string): string {
@@ -140,10 +145,20 @@ function deepFreeze<T>(value: T): T {
   return Object.freeze(value);
 }
 
-function systemBehaviorDigest(): string {
-  const behavior = baseContext().find((item) => item.id === "system:behavior")?.content;
-  if (!behavior) throw new Error("Sigma runtime behavior context is unavailable.");
-  return sha256(behavior);
+function promptContextDigests(environment: RuntimeEnvironment): {
+  systemBehaviorDigest: string;
+  runtimeEnvironmentDigest: string;
+} {
+  const context = baseContext(environment);
+  const behavior = context.find((item) => item.id === "system:behavior")?.content;
+  const runtimeEnvironment = context.find((item) => item.id === "runtime:environment")?.content;
+  if (!behavior || !runtimeEnvironment) {
+    throw new Error("Sigma runtime prompt context is unavailable.");
+  }
+  return {
+    systemBehaviorDigest: sha256(behavior),
+    runtimeEnvironmentDigest: sha256(runtimeEnvironment)
+  };
 }
 
 /**
@@ -170,7 +185,7 @@ export function compileHarnessBuild(input: HarnessCompilerInput): FrozenHarnessB
   const promptPolicy = {
     mode: "runtime_default" as const,
     modifiesPrompt: false as const,
-    systemBehaviorDigest: systemBehaviorDigest()
+    ...promptContextDigests(input.runtimeCapabilities.environment)
   };
   const policyDigest = sha256(canonicalHarnessJson({
     schemaVersion: HARNESS_BUILD_SCHEMA_VERSION,
