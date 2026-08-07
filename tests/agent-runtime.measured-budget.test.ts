@@ -214,6 +214,38 @@ describe("provider-measured model budget settlement", () => {
     });
     expect((promptEvents[0]!.payload as { requestDigest: string }).requestDigest)
       .toMatch(/^[a-f0-9]{64}$/u);
+    const observation = (promptEvents[0]!.payload as {
+      traceObservation: {
+        tokenAccuracy: string;
+        estimatedTokens: Record<string, number>;
+        visibleToolNames: string[];
+      };
+    }).traceObservation;
+    expect(observation.tokenAccuracy).toBe("estimated");
+    expect(observation.visibleToolNames).toEqual(
+      gateway.requests[0]!.tools.map((tool) => tool.name).sort()
+    );
+    expect(observation.estimatedTokens.total).toBe(
+      observation.estimatedTokens.systemBaseContext
+      + observation.estimatedTokens.toolSchema
+      + observation.estimatedTokens.conversationHistory
+      + observation.estimatedTokens.toolResults
+    );
+    const receipt = (await storedEvents(store, session.sessionId))
+      .find((event) => event.type === "tool.completed");
+    expect(receipt?.payload).toMatchObject({
+      traceObservation: {
+        schemaVersion: 1,
+        rawBytes: expect.any(Number),
+        modelVisibleBytes: expect.any(Number),
+        fullOutputDigest: expect.stringMatching(/^[a-f0-9]{64}$/u)
+      }
+    });
+    const receiptPayload = receipt?.payload as {
+      output: string;
+      traceObservation: { rawBytes: number };
+    };
+    expect(receiptPayload.traceObservation.rawBytes).toBe(Buffer.byteLength(receiptPayload.output));
   });
 
   it("uses one clean higher-headroom retry and then stops on another length finish", async () => {

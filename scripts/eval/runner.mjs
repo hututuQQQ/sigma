@@ -17,6 +17,13 @@ import {
   applySubjectLaunchEnvironment, createDevNodeLaunch, loadPackagedSubjectLaunch
 } from "./subject-launch.mjs";
 import { runTuiSubject } from "./subject-tui.mjs";
+import {
+  buildAggregateTraceAttribution,
+  buildTraceAttribution,
+  markTraceAttributionInfrastructureFailure,
+  writeAggregateTraceAttribution,
+  writeAttemptTraceAttribution
+} from "./trace-attribution.mjs";
 import { connectVerifierBroker, runPostVerifier } from "./verifier.mjs";
 import {
   copyWorkspaceEvidence, diffWorkspaceSnapshots, evaluatorLinkTargetRoot, gitDiff, seedWorkspace, snapshotWorkspace,
@@ -181,6 +188,10 @@ async function subjectIdentity({ subjectKind, cliTreeDigest, nodePath, brokerPat
   };
 }
 
+async function compilerDigest(filePath) {
+  return await readFile(filePath).then(digest);
+}
+
 async function prepareSubject(runDir, options = {}, redactor = String) {
   const host = resolveEvaluatorHost(options.platform, options.arch);
   const subjectKind = options.subjectKind ?? "package";
@@ -210,6 +221,9 @@ async function prepareSubject(runDir, options = {}, redactor = String) {
       subjectKind, cliEntry: subjectCliEntry, nodePath: process.execPath, brokerPath,
       launch: createDevNodeLaunch(process.execPath, subjectCliEntry),
       ...identity,
+      harnessCompilerDigest: await compilerDigest(
+        path.join(subjectRoot, "packages", "agent-runtime", "dist", "harness-compiler.js")
+      ),
       nativeSourceDigest: directoryDigest(await snapshotWorkspace(path.join(subjectRoot, "native", "sigma-exec", "src"))),
       nativeTarget: host.nativeTarget
     };
@@ -235,6 +249,9 @@ async function prepareSubject(runDir, options = {}, redactor = String) {
   });
   return {
     subjectKind, ...packaged, ...identity,
+    harnessCompilerDigest: await compilerDigest(
+      path.join(bundleRoot, "packages", "agent-runtime", "dist", "harness-compiler.js")
+    ),
     nativeSourceDigest: directoryDigest(await snapshotWorkspace(path.join(subjectRoot, "native", "sigma-exec", "src"))),
     nativeTarget: host.nativeTarget
   };
@@ -478,12 +495,13 @@ async function appendExternalReport(stateRoot, attempt) {
 
 function subjectConfiguration(context, fixtureSnapshot) {
   const { scenario, subject, sourceGitSha, evaluatorDigest, verifierDigest, frozenRunPolicy,
-    toolchainMeasurement, provider, model, reasoningEffort } = context;
+    toolchainMeasurement, provider, model, reasoningEffort, agentProfile } = context;
   const budget = frozenRunPolicy.budget;
   const configuration = {
     provider,
     model,
     reasoningEffort,
+    profile: agentProfile,
     surface: scenario.surface,
     permissionPolicy: scenario.permissionPolicy,
     platform: process.platform,
@@ -501,6 +519,7 @@ function subjectConfiguration(context, fixtureSnapshot) {
     cliTreeDigest: subject.cliTreeDigest ?? null,
     brokerDigest: subject.brokerDigest ?? null,
     subjectDigest: subject.subjectDigest ?? null,
+    harnessCompilerDigest: subject.harnessCompilerDigest ?? null,
     nativeSourceDigest: subject.nativeSourceDigest ?? null,
     nativeTarget: subject.nativeTarget ?? null,
     subjectKind: subject.subjectKind
@@ -509,6 +528,7 @@ function subjectConfiguration(context, fixtureSnapshot) {
     provider: configuration.provider,
     model: configuration.model,
     reasoningEffort: configuration.reasoningEffort,
+    profile: configuration.profile,
     surface: configuration.surface,
     permissionPolicy: configuration.permissionPolicy,
     platform: configuration.platform,
@@ -523,7 +543,7 @@ function subjectConfiguration(context, fixtureSnapshot) {
   return configuration;
 }
 
-function attemptArtifactPaths(runDir, attemptArtifactDir, surface, finalWorkspaceArtifact) {
+function attemptArtifactPaths(runDir, attemptArtifactDir, surface, finalWorkspaceArtifact, traceAttribution = false) {
   return {
     attempt: relativeArtifact(runDir, path.join(attemptArtifactDir, "attempt.json")),
     events: relativeArtifact(runDir, path.join(attemptArtifactDir, "events.json")),
@@ -533,6 +553,10 @@ function attemptArtifactPaths(runDir, attemptArtifactDir, surface, finalWorkspac
     diff: relativeArtifact(runDir, path.join(attemptArtifactDir, "git.diff")),
     workspaceDelta: relativeArtifact(runDir, path.join(attemptArtifactDir, "workspace-delta.json")),
     verifierWorkspaceDelta: relativeArtifact(runDir, path.join(attemptArtifactDir, "verifier-workspace-delta.json")),
+    ...(traceAttribution ? {
+      traceAttribution: relativeArtifact(runDir, path.join(attemptArtifactDir, "trace-attribution.json")),
+      traceAttributionMarkdown: relativeArtifact(runDir, path.join(attemptArtifactDir, "trace-attribution.md"))
+    } : {}),
     ...(finalWorkspaceArtifact ? { workspaceFinal: relativeArtifact(runDir, finalWorkspaceArtifact) } : {}),
     ...(surface === "tui" ? { tuiTranscript: relativeArtifact(runDir, path.join(attemptArtifactDir, "tui.transcript.log")) } : {})
   };
@@ -714,7 +738,16 @@ function infrastructureAttemptReport(context, lifecycle, evidence) {
     },
     failureChain: { primary: cause, contributing: [], terminal: cause },
     metrics,
-    artifacts: attemptArtifactPaths(runDir, attemptArtifactDir, scenario.surface)
+    artifacts: attemptArtifactPaths(
+      runDir, attemptArtifactDir, scenario.surface, undefined, Boolean(lifecycle.traceAttribution)
+    ),
+    ...(lifecycle.traceAttribution ? {
+      traceAttribution: {
+        schemaVersion: 1,
+        reportDigest: lifecycle.traceAttribution.report.reportDigest,
+        summary: lifecycle.traceAttribution.summary
+      }
+    } : {})
   };
 }
 
@@ -807,7 +840,7 @@ async function prepareAttemptExecution(context, deps, lifecycle) {
 }
 
 async function executeAttemptSubject(context, lifecycle, prepared) {
-  const { scenario, subject, redactor, provider, model, reasoningEffort } = context;
+  const { scenario, subject, redactor, provider, model, reasoningEffort, agentProfile } = context;
   const { attemptArtifactDir, startedAt } = lifecycle;
   const { runSubject, workspace, stateHome, promptPath, env, controllerDir, driverSpec } = prepared;
   lifecycle.phase = "subject";
@@ -825,7 +858,8 @@ async function executeAttemptSubject(context, lifecycle, prepared) {
       subject,
       provider,
       model,
-      reasoningEffort
+      reasoningEffort,
+      agentProfile
     };
     const result = await runSubject(launcherInput);
     lifecycle.subjectResult = result;
@@ -885,6 +919,39 @@ async function collectAttemptEvidence(context, lifecycle, prepared, subjectResul
   await writeFile(path.join(attemptArtifactDir, "git.diff"), redactor(git.diff), "utf8");
   await writeFile(path.join(attemptArtifactDir, "git.status.txt"), redactor(git.status), "utf8");
   return { stored, events, rawMetrics, metrics, delta, git };
+}
+
+function subjectTimedOut(subjectResult) {
+  return subjectResult.timedOut === true
+    || subjectResult.cancellation?.metric === "wallTimeSec"
+    || subjectResult.cancellation?.reason === "timeout";
+}
+
+async function collectTraceAttribution(context, lifecycle, _prepared, subjectResult, collected) {
+  if (!context.traceAttribution) return null;
+  lifecycle.phase = "trace_attribution";
+  const { report, summary } = buildTraceAttribution(collected.events, {
+    attemptId: lifecycle.attemptId,
+    sessionId: collected.stored.sessionId,
+    scenarioId: context.scenario.id,
+    repetition: context.repetition,
+    provider: context.provider,
+    model: context.model,
+    reasoningEffort: context.reasoningEffort,
+    profile: context.agentProfile,
+    runMode: "change",
+    harnessDigest: context.subject.subjectDigest ?? null,
+    compilerDigest: context.subject.harnessCompilerDigest ?? null,
+    startedAt: lifecycle.startedAt,
+    durationMs: subjectResult.durationMs,
+    finalStatus: subjectResult.result?.status,
+    timeout: subjectTimedOut(subjectResult),
+    infrastructureFailure: false,
+    redactor: context.redactor
+  });
+  await writeAttemptTraceAttribution(lifecycle.attemptArtifactDir, report, context.redactor);
+  lifecycle.traceAttribution = { report, summary };
+  return lifecycle.traceAttribution;
 }
 
 async function runVerifierWitness(context, lifecycle, prepared, subjectResult, collected, witness) {
@@ -1180,7 +1247,16 @@ function buildAttemptReport(context, lifecycle, collected, verified, evidence) {
       rawMetrics, safetyViolations, reliabilitySignals, subjectResult, expectedActual, validityCause
     ),
     metrics,
-    artifacts: attemptArtifactPaths(runDir, attemptArtifactDir, scenario.surface, finalWorkspaceArtifact),
+    artifacts: attemptArtifactPaths(
+      runDir, attemptArtifactDir, scenario.surface, finalWorkspaceArtifact, Boolean(lifecycle.traceAttribution)
+    ),
+    ...(lifecycle.traceAttribution ? {
+      traceAttribution: {
+        schemaVersion: 1,
+        reportDigest: lifecycle.traceAttribution.report.reportDigest,
+        summary: lifecycle.traceAttribution.summary
+      }
+    } : {}),
     ...(subjectResult.cancellation ? { cancellation: subjectResult.cancellation } : {})
   };
 }
@@ -1195,6 +1271,7 @@ async function runAttemptCore(context, deps, lifecycle) {
     )}`);
   }
   const collected = await collectAttemptEvidence(context, lifecycle, prepared, subjectResult, deps);
+  await collectTraceAttribution(context, lifecycle, prepared, subjectResult, collected);
   const verified = await verifyAttempt(context, lifecycle, prepared, subjectResult, collected);
   const safetyViolations = safetyViolationsFromEvidence(
     scenario, collected.delta, collected.rawMetrics, collected.events
@@ -1252,6 +1329,23 @@ async function scanAttemptSecrets(context, lifecycle, attempt, secretValues) {
   for (const file of exposures) addSafetyViolation(attempt, { code: "secret_in_artifact", file });
 }
 
+async function reconcileAttemptTraceAttribution(context, lifecycle, attempt) {
+  if (!lifecycle.traceAttribution || attempt.validity === "valid") return false;
+  const previous = lifecycle.traceAttribution;
+  const reconciled = markTraceAttributionInfrastructureFailure(previous);
+  lifecycle.traceAttribution = reconciled;
+  attempt.traceAttribution = {
+    schemaVersion: 1,
+    reportDigest: reconciled.report.reportDigest,
+    summary: reconciled.summary
+  };
+  if (reconciled === previous) return false;
+  await writeAttemptTraceAttribution(
+    lifecycle.attemptArtifactDir, reconciled.report, context.redactor
+  );
+  return true;
+}
+
 async function finalizeAttempt(context, lifecycle, result, secretValues, deps) {
   const { redactor } = context;
   let credentialFailure;
@@ -1261,6 +1355,7 @@ async function finalizeAttempt(context, lifecycle, result, secretValues, deps) {
     credentialFailure = error;
   }
   await scanAttemptSecrets(context, lifecycle, result.attempt, secretValues);
+  await reconcileAttemptTraceAttribution(context, lifecycle, result.attempt);
   if (credentialFailure) throw credentialFailure;
   await writeJson(path.join(lifecycle.attemptArtifactDir, "attempt.json"), result.attempt, redactor);
   if (result.stateRoot) await appendExternalReport(result.stateRoot, result.attempt);
@@ -1355,7 +1450,8 @@ async function runAttempt(context, deps = {}) {
     try { await finalizeAttempt(context, lifecycle, result, secretValues, deps); } catch (error) { finalizationError = error; }
     cleanupManaged = true;
     const cleanupFailed = await cleanupAttempt(context, lifecycle, result.attempt);
-    if (cleanupFailed && !finalizationError) {
+    const traceReconciled = await reconcileAttemptTraceAttribution(context, lifecycle, result.attempt);
+    if ((cleanupFailed || traceReconciled) && !finalizationError) {
       await writeJson(path.join(lifecycle.attemptArtifactDir, "attempt.json"), result.attempt, context.redactor);
     }
     if (finalizationError) throw finalizationError;
@@ -1366,7 +1462,7 @@ async function runAttempt(context, deps = {}) {
 }
 
 async function resolveEvaluationInput(options) {
-  const { suite, subjectKind, provider, model, reasoningEffort } = validateEvaluationOptions(options);
+  const { suite, subjectKind, provider, model, reasoningEffort, agentProfile } = validateEvaluationOptions(options);
   const manifestPath = path.resolve(options.manifestPath ?? DEFAULT_MANIFEST);
   const manifestDir = path.dirname(manifestPath);
   const manifest = await loadEvalManifest(manifestPath);
@@ -1378,7 +1474,8 @@ async function resolveEvaluationInput(options) {
   const destination = evaluationDestination(options, runId);
   const runDir = await prepareRunDirectory(destination.destination);
   return {
-    suite, subjectKind, provider, model, reasoningEffort,
+    suite, subjectKind, provider, model, reasoningEffort, agentProfile,
+    traceAttribution: options.traceAttribution === true,
     manifestDir, scenarios, repeat, frozenRunPolicy: structuredClone(frozenRunPolicy), runId,
     effectiveEvalRoot: destination.root, runDir
   };
@@ -1401,6 +1498,7 @@ function evaluationModelSelection(options) {
   const provider = options.provider ?? sigmaManifest.evaluation.provider;
   const model = options.model ?? sigmaManifest.evaluation.model;
   const reasoningEffort = options.reasoningEffort ?? "provider_default";
+  const agentProfile = options.agentProfile ?? "standard";
   if (typeof provider !== "string" || provider.trim().length === 0
     || typeof model !== "string" || model.trim().length === 0) {
     throw new Error("Evaluation provider and model must be non-empty strings.");
@@ -1410,10 +1508,14 @@ function evaluationModelSelection(options) {
   ].includes(reasoningEffort)) {
     throw new Error("Evaluation reasoning effort is unsupported.");
   }
+  if (typeof agentProfile !== "string" || agentProfile.trim().length === 0) {
+    throw new Error("Evaluation Agent Profile must be a non-empty string.");
+  }
   return {
     provider: provider.trim(),
     model: model.trim(),
-    reasoningEffort
+    reasoningEffort,
+    agentProfile: agentProfile.trim()
   };
 }
 
@@ -1583,6 +1685,8 @@ async function preparationFailureAttempt(context, item, error) {
     provider: context.provider,
     model: context.model,
     reasoningEffort: context.reasoningEffort,
+    agentProfile: context.agentProfile,
+    traceAttribution: context.traceAttribution,
     frozenRunPolicy: context.frozenRunPolicy
   }, lifecycle, error);
   await writeJson(path.join(lifecycle.attemptArtifactDir, "attempt.json"), attempt, context.redactor);
@@ -1605,7 +1709,8 @@ async function executeEvaluationSchedule(context, preparation, deps, infrastruct
     schedule, runId, runDir, manifestDir, secrets, credentialDocument, credentialSourcePath,
     credentialState,
     artifactSecretValues, redactor, sourceGitSha, evaluatorDigest, verifierDigest,
-    frozenRunPolicy, toolchainMeasurement, provider, model, reasoningEffort
+    frozenRunPolicy, toolchainMeasurement, provider, model, reasoningEffort,
+    agentProfile, traceAttribution
   } = context;
   if (subject) {
     for (const item of schedule) {
@@ -1632,7 +1737,9 @@ async function executeEvaluationSchedule(context, preparation, deps, infrastruct
           frozenRunPolicy,
           provider,
           model,
-          reasoningEffort
+          reasoningEffort,
+          agentProfile,
+          traceAttribution
         }, deps);
         attempts.push(attempt);
         infrastructureErrors.push(...attemptInfrastructureErrors(attempt, item));
@@ -1651,10 +1758,10 @@ async function executeEvaluationSchedule(context, preparation, deps, infrastruct
   return attempts;
 }
 
-function rawEvaluationRun(context, subject, verifierRuntime, attempts, infrastructureErrors) {
+function rawEvaluationRun(context, subject, verifierRuntime, attempts, infrastructureErrors, traceAggregate) {
   const { runId, suite, repeat, startedAt, sourceGitSha, evaluatorDigest, verifierDigest,
     scenarios, frozenRunPolicy, scheduleDigest, toolchainMeasurement,
-    provider, model, reasoningEffort } = context;
+    provider, model, reasoningEffort, agentProfile, traceAttribution } = context;
   const firstEnvironmentDigest = attempts[0]?.subject?.environmentDigest ?? null;
   return {
     schemaVersion: 1,
@@ -1668,12 +1775,76 @@ function rawEvaluationRun(context, subject, verifierRuntime, attempts, infrastru
     finishedAt: new Date().toISOString(),
     subject: rawRunSubject(
       subject, verifierRuntime, sourceGitSha, evaluatorDigest, verifierDigest,
-      firstEnvironmentDigest, toolchainMeasurement, provider, model, reasoningEffort
+      firstEnvironmentDigest, toolchainMeasurement, provider, model, reasoningEffort, agentProfile
     ),
     scenarios: scenarios.map((scenario) => ({ scenarioId: scenario.id, scenarioDigest: digest(scenario) })),
     attempts,
+    ...(traceAttribution && traceAggregate ? {
+      traceAttribution: {
+        schemaVersion: 1,
+        report: "trace-attribution.json",
+        markdown: "trace-attribution.md"
+      }
+    } : {}),
     infrastructureErrors
   };
+}
+
+function traceSummaries(attempts) {
+  return attempts.map((attempt) => {
+    const observed = attempt.traceAttribution?.summary;
+    if (observed) return attempt.validity === "valid" ? observed : {
+      ...observed,
+      successful: false,
+      infrastructureFailure: true
+    };
+    return {
+      attemptId: attempt.attemptId,
+      scenarioId: attempt.scenarioId,
+      repetition: attempt.repetition,
+      successful: false,
+      finalStatus: "attribution_unavailable",
+      timeout: false,
+      infrastructureFailure: true,
+      totals: {
+        modelTurns: 0, toolCalls: 0, repeatedToolCalls: 0,
+        repeatedObservations: 0, repeatedReads: 0, repeatedValidations: 0,
+        turnCategories: {}, uncachedTokenProxy: { value: 0 },
+        providerCacheReadTokens: { value: 0 }, toolOutputRawBytes: { value: 0 },
+        toolOutputModelVisibleBytes: { value: 0 }, estimatedRequestComposition: {},
+        proxyCostAttribution: {}
+      },
+      timing: {
+        totalLatencyMs: null, timeToFirstActionMs: null,
+        timeToFirstMutationMs: null, completionTailMs: null
+      },
+      completionTailTurns: 0,
+      reportDigest: null
+    };
+  });
+}
+
+async function writeTraceAggregate(context, attempts, infrastructureErrors) {
+  if (!context.traceAttribution) return null;
+  try {
+    const report = buildAggregateTraceAttribution(traceSummaries(attempts), {
+      runId: context.runId,
+      finishedAt: attempts.map((attempt) => attempt.finishedAt).sort().at(-1) ?? context.startedAt,
+      provider: context.provider,
+      model: context.model,
+      reasoningEffort: context.reasoningEffort,
+      profile: context.agentProfile,
+      runMode: "change"
+    });
+    const paths = await writeAggregateTraceAttribution(context.runDir, report, context.redactor);
+    return { report, ...paths };
+  } catch (error) {
+    const detail = context.redactor(error instanceof Error ? error.stack ?? error.message : String(error));
+    infrastructureErrors.push({ code: "trace_attribution_write_failed", phase: "trace_attribution", detail });
+    await writeFile(path.join(context.runDir, "trace-attribution-error.log"), `${detail}\n`, "utf8")
+      .catch(() => undefined);
+    return null;
+  }
 }
 
 function subjectValue(subject, key) {
@@ -1690,10 +1861,11 @@ function rawRunSubject(
   toolchainMeasurement,
   provider,
   model,
-  reasoningEffort
+  reasoningEffort,
+  agentProfile
 ) {
   return {
-    provider, model, reasoningEffort,
+    provider, model, reasoningEffort, profile: agentProfile,
     platform: process.platform, arch: process.arch, gitSha: sourceGitSha,
     subjectKind: subjectValue(subject, "subjectKind") ?? "unavailable", surface: "mixed",
     evaluatorDigest, verifierDigest,
@@ -1742,10 +1914,12 @@ export async function runEvaluation(options = {}, deps = {}) {
   const infrastructureErrors = [];
   const preparation = await prepareEvaluationSubject(context, options, deps, infrastructureErrors);
   const attempts = await executeEvaluationSchedule(context, preparation, deps, infrastructureErrors);
+  const traceAggregate = await writeTraceAggregate(context, attempts, infrastructureErrors);
   const rawRun = rawEvaluationRun(
-    context, preparation.subject, preparation.verifierRuntime, attempts, infrastructureErrors
+    context, preparation.subject, preparation.verifierRuntime, attempts, infrastructureErrors, traceAggregate
   );
-  return await writeSafeEvaluationReport(context, rawRun, infrastructureErrors);
+  const result = await writeSafeEvaluationReport(context, rawRun, infrastructureErrors);
+  return traceAggregate ? { ...result, traceReportPath: traceAggregate.jsonPath } : result;
 }
 
 export { prepareSubject, runAttempt };

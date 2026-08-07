@@ -131,8 +131,28 @@ export const durableToolReceiptShape = {
   evidence: z.array(evidenceRecordSchema),
   startedAt: dateTimeSchema,
   completedAt: dateTimeSchema,
+  traceObservation: z.object({
+    schemaVersion: z.literal(1),
+    rawBytes: z.number().int().nonnegative(),
+    modelVisibleBytes: z.number().int().nonnegative(),
+    fullOutputDigest: z.string().regex(/^[a-f0-9]{64}$/u)
+  }).strict().optional(),
   ...turnSchema
 };
+
+export const modelPromptTraceObservationSchema = z.object({
+  schemaVersion: z.literal(1),
+  tokenEstimator: z.literal("context_plan_approximate_tokens"),
+  tokenAccuracy: z.literal("estimated"),
+  estimatedTokens: z.object({
+    systemBaseContext: z.number().int().nonnegative(),
+    toolSchema: z.number().int().nonnegative(),
+    conversationHistory: z.number().int().nonnegative(),
+    toolResults: z.number().int().nonnegative(),
+    total: z.number().int().nonnegative()
+  }).strict(),
+  visibleToolNames: z.array(nonEmptyStringSchema)
+}).strict();
 
 export const contextItemSchema = z.object({
   id: nonEmptyStringSchema,

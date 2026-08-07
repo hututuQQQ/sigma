@@ -144,7 +144,8 @@ async function cancelSession({
   subject,
   provider = sigmaManifest.evaluation.provider,
   model = sigmaManifest.evaluation.model,
-  reasoningEffort = "provider_default"
+  reasoningEffort = "provider_default",
+  agentProfile = "standard"
 }) {
   if (!sessionId) return { exitCode: 1, stderr: "Session id was not observed before cancellation." };
   const launch = subjectNodeLaunch(subject);
@@ -155,6 +156,7 @@ async function cancelSession({
     "--model", model,
     ...(reasoningEffort === "provider_default"
       ? [] : ["--reasoning-effort", reasoningEffort]),
+    "--agent-profile", agentProfile,
     "--reason", reason
   ], subject), { cwd: workspace, env, timeoutMs: CANCEL_GRACE_MS });
   return await operation.exited;
@@ -169,7 +171,8 @@ function startCliSubject({
   subject,
   provider = sigmaManifest.evaluation.provider,
   model = sigmaManifest.evaluation.model,
-  reasoningEffort = "provider_default"
+  reasoningEffort = "provider_default",
+  agentProfile = "standard"
 }) {
   const command = runMode === "analyze" ? "inspect" : "run";
   const args = nodeCliArgs([
@@ -180,6 +183,7 @@ function startCliSubject({
     "--model", model,
     ...(reasoningEffort === "provider_default"
       ? [] : ["--reasoning-effort", reasoningEffort]),
+    "--agent-profile", agentProfile,
     "--permission-mode", "auto",
     "--output-format", "stream-json"
   ], subject);
@@ -206,12 +210,13 @@ export async function runCliSubject(options) {
     onEvent = () => undefined, subject = {},
     provider = sigmaManifest.evaluation.provider,
     model = sigmaManifest.evaluation.model,
-    reasoningEffort = "provider_default"
+    reasoningEffort = "provider_default",
+    agentProfile = "standard"
   } = options;
   await mkdir(artifactDir, { recursive: true });
   const { child, startedAt } = startCliSubject({
     workspace, stateHome, promptPath, runMode, env, subject,
-    provider, model, reasoningEffort
+    provider, model, reasoningEffort, agentProfile
   });
   const events = [];
   let result;
@@ -263,7 +268,8 @@ export async function runCliSubject(options) {
       subject,
       provider,
       model,
-      reasoningEffort
+      reasoningEffort,
+      agentProfile
     }).then((cancelResult) => {
       cancellation.cancelExitCode = cancelResult.exitCode;
       if (cancelResult.exitCode !== 0 && !treeTerminationPromise) {

@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sigmacode.biz/schemas/trace-attribution/v1",
+  "title": "Sigma neutral trace attribution v1",
+  "oneOf": [
+    { "$ref": "#/$defs/attempt" },
+    { "$ref": "#/$defs/aggregate" }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "eventRef": {
+      "type": ["object", "null"],
+      "properties": {
+        "eventId": { "type": "string", "minLength": 1 },
+        "seq": { "type": "integer", "minimum": 1 },
+        "type": { "type": "string", "minLength": 1 }
+      },
+      "required": ["eventId", "seq", "type"],
+      "additionalProperties": false
+    },
+    "tokenEstimate": {
+      "type": "object",
+      "properties": {
+        "accuracy": { "enum": ["estimated", "unavailable"] },
+        "estimator": { "const": "context_plan_approximate_tokens" },
+        "systemBaseContext": { "type": ["integer", "null"], "minimum": 0 },
+        "toolSchema": { "type": ["integer", "null"], "minimum": 0 },
+        "conversationHistory": { "type": ["integer", "null"], "minimum": 0 },
+        "toolResults": { "type": ["integer", "null"], "minimum": 0 },
+        "total": { "type": ["integer", "null"], "minimum": 0 }
+      },
+      "required": [
+        "accuracy", "estimator", "systemBaseContext", "toolSchema",
+        "conversationHistory", "toolResults", "total"
+      ],
+      "additionalProperties": false
+    },
+    "modelCall": {
+      "type": "object",
+      "properties": {
+        "callId": { "type": "string" },
+        "ordinal": { "type": "integer", "minimum": 1 },
+        "modelTurnId": { "type": "integer", "minimum": 1 },
+        "startRef": { "$ref": "#/$defs/eventRef" },
+        "completionRef": { "$ref": "#/$defs/eventRef" },
+        "configuration": {
+          "type": "object",
+          "properties": {
+            "provider": { "type": "string" },
+            "resolvedModel": { "type": "string" },
+            "reasoningEffort": { "type": "string" },
+            "profile": { "type": "string" },
+            "runMode": { "type": "string" },
+            "harnessDigest": { "type": ["string", "null"] },
+            "compilerDigest": { "type": ["string", "null"] },
+            "compilerActivation": { "const": "inspection_only" }
+          },
+          "required": [
+            "provider", "resolvedModel", "reasoningEffort", "profile", "runMode",
+            "harnessDigest", "compilerDigest", "compilerActivation"
+          ],
+          "additionalProperties": false
+        },
+        "request": {
+          "type": "object",
+          "properties": {
+            "requestDigest": { "type": ["string", "null"] },
+            "toolSchemaDigest": { "type": ["string", "null"] },
+            "visibleToolNames": { "type": "array", "items": { "type": "string" } },
+            "visibleToolNamesAccuracy": { "enum": ["runtime_exact", "unavailable"] },
+            "estimatedTokens": { "$ref": "#/$defs/tokenEstimate" }
+          },
+          "required": [
+            "requestDigest", "toolSchemaDigest", "visibleToolNames",
+            "visibleToolNamesAccuracy", "estimatedTokens"
+          ],
+          "additionalProperties": false
+        },
+        "usage": { "type": "object" },
+        "uncachedProxyAttribution": { "type": "object" },
+        "toolCallCount": { "type": "integer", "minimum": 0 },
+        "toolResults": { "type": "array", "items": { "type": "object" } },
+        "latency": { "type": "object" },
+        "mutationFrontierRevision": { "type": "object" },
+        "state": { "type": "object" },
+        "classification": { "type": "object" }
+      },
+      "required": [
+        "callId", "ordinal", "modelTurnId", "startRef", "completionRef", "configuration",
+        "request", "usage", "uncachedProxyAttribution", "toolCallCount", "toolResults",
+        "latency", "mutationFrontierRevision", "state", "classification"
+      ],
+      "additionalProperties": false
+    },
+    "attempt": {
+      "type": "object",
+      "properties": {
+        "$schema": { "const": "https://sigmacode.biz/schemas/trace-attribution/v1" },
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "trace_attribution_attempt" },
+        "attributionVersion": { "const": "trace-attribution-1.0.0" },
+        "generatedAt": { "type": ["string", "null"] },
+        "attemptId": { "type": "string" },
+        "sessionId": { "type": "string" },
+        "source": { "type": "object" },
+        "modelCalls": { "type": "array", "items": { "$ref": "#/$defs/modelCall" } },
+        "derived": { "type": "object" },
+        "totals": { "type": "object" },
+        "timing": { "type": "object" },
+        "terminal": { "type": "object" },
+        "reportDigest": { "$ref": "#/$defs/sha256" }
+      },
+      "required": [
+        "$schema", "schemaVersion", "kind", "attributionVersion", "generatedAt", "attemptId",
+        "sessionId", "source", "modelCalls", "derived", "totals", "timing", "terminal", "reportDigest"
+      ],
+      "additionalProperties": false
+    },
+    "aggregate": {
+      "type": "object",
+      "properties": {
+        "$schema": { "const": "https://sigmacode.biz/schemas/trace-attribution/v1" },
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "trace_attribution_aggregate" },
+        "attributionVersion": { "const": "trace-attribution-1.0.0" },
+        "runId": { "type": ["string", "null"] },
+        "generatedAt": { "type": ["string", "null"] },
+        "configuration": { "type": "object" },
+        "totals": { "type": "object" },
+        "tokenCostAttribution": { "type": "object" },
+        "estimatedRequestComposition": { "type": "object" },
+        "successfulAttemptDistributions": { "type": "object" },
+        "timingDistributions": { "type": "object" },
+        "scenarios": { "type": "array", "items": { "type": "object" } },
+        "attempts": { "type": "array", "items": { "type": "object" } },
+        "reportDigest": { "$ref": "#/$defs/sha256" }
+      },
+      "required": [
+        "$schema", "schemaVersion", "kind", "attributionVersion", "runId", "generatedAt",
+        "configuration", "totals", "tokenCostAttribution", "estimatedRequestComposition",
+        "successfulAttemptDistributions", "timingDistributions", "scenarios", "attempts", "reportDigest"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

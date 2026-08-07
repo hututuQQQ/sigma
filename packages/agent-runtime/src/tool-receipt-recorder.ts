@@ -1,4 +1,6 @@
+import { createHash } from "node:crypto";
 import type { ActiveModelTurn } from "agent-kernel";
+import { receiptContent } from "agent-kernel";
 import type { ToolOutcome, ToolReceipt } from "agent-protocol";
 import { turnPayload } from "./effect-runner-helpers.js";
 import type { EffectRunnerOptions } from "./effect-runner.js";
@@ -20,6 +22,15 @@ function durableToolReceipt(receipt: ToolReceipt): DurableToolReceipt {
       output: receipt.output,
       diagnosticCodes
     }
+  };
+}
+
+function traceObservation(receipt: DurableToolReceipt) {
+  return {
+    schemaVersion: 1 as const,
+    rawBytes: Buffer.byteLength(receipt.output, "utf8"),
+    modelVisibleBytes: Buffer.byteLength(receiptContent(receipt), "utf8"),
+    fullOutputDigest: createHash("sha256").update(receipt.output, "utf8").digest("hex")
   };
 }
 
@@ -60,11 +71,12 @@ export class ToolReceiptRecorder {
     modelTurn: ActiveModelTurn,
     name: string
   ): Promise<void> {
+    const durable = durableToolReceipt(receipt);
     const emissions: RuntimeEventEmission[] = [{
       type: receipt.ok ? "tool.completed" : "tool.failed",
       authority: "tool",
       payload: {
-        ...durableToolReceipt(receipt), name, ...turnPayload(modelTurn)
+        ...durable, name, traceObservation: traceObservation(durable), ...turnPayload(modelTurn)
       }
     } as RuntimeEventEmission];
     for (const evidence of receipt.evidence ?? []) {
