@@ -113,6 +113,7 @@ export function readTool(readScope: "workspace" | "host"): RegisteredEffectTool 
         limit: { type: "integer", minimum: 1 }
       },
       required: ["path"],
+      modelPresentation: { exposure: "direct" },
       possibleEffects: ["filesystem.read"],
       maximumEffects: ["filesystem.read", "filesystem.read.external"],
       executionMode: "parallel",

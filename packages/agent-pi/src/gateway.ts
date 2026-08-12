@@ -34,6 +34,7 @@ import {
   getPiModel,
   getPiProvider,
   OPENAI_CODEX_PROVIDER_ID,
+  piHostedToolSearchSupported,
   piBillingMode,
   type PiReasoningEffort
 } from "./models.js";
@@ -53,8 +54,8 @@ export interface PiModelGatewayOptions {
   idleTimeoutMs?: number;
   activeStreamTimeoutMs?: number;
   reasoningEffort?: PiReasoningEffort;
-  /** Override Sol's provider-hosted namespace search. Unsupported transports
-   * always keep the complete immediate function surface. */
+  /** Override provider-hosted deferred tool search. Unsupported model/transport
+   * combinations always keep the complete immediate function surface. */
   hostedToolSearch?: boolean;
 }
 
@@ -67,14 +68,36 @@ function fallbackModel(providerId: string, modelId: string): PiModel<Api> | unde
 }
 
 function hostedToolSearchEnabled(
-  provider: string,
-  model: PiModel<Api>,
+  supported: boolean,
   requested: boolean | undefined
 ): boolean {
-  if (provider !== OPENAI_CODEX_PROVIDER_ID) return false;
-  const compat = model.compat as { supportsToolSearch?: boolean } | undefined;
-  if (compat?.supportsToolSearch !== true) return false;
-  return requested ?? model.id === "gpt-5.6-sol";
+  if (!supported) return false;
+  return requested ?? true;
+}
+
+function piPayloadOptions(
+  provider: string,
+  codexInstructionNonce: string,
+  hostedToolSearch: boolean,
+  request: ModelRequest
+): { onPayload?: (payload: unknown) => unknown } {
+  if (provider === OPENAI_CODEX_PROVIDER_ID) {
+    return {
+      onPayload: (payload) => hostedToolSearchPayload(
+        codexPayload(payload, codexInstructionNonce),
+        hostedToolSearch,
+        request.tools
+      )
+    };
+  }
+  if (provider === "deepseek") {
+    return { onPayload: (payload) => deepSeekPayload(payload, request) };
+  }
+  return hostedToolSearch
+    ? {
+        onPayload: (payload) => hostedToolSearchPayload(payload, true, request.tools)
+      }
+    : {};
 }
 
 interface PiStreamLifecycle {
@@ -195,11 +218,6 @@ export class PiModelGateway implements ModelGateway {
       ? undefined
       : Math.max(1, Math.trunc(options.activeStreamTimeoutMs));
     this.reasoningEffort = options.reasoningEffort;
-    this.hostedToolSearch = hostedToolSearchEnabled(
-      this.provider,
-      this.piModel,
-      options.hostedToolSearch
-    );
     const capabilities = options.capabilities ?? {
       contextWindowTokens: piModel.contextWindow,
       maxOutputTokens: piModel.maxTokens,
@@ -210,13 +228,20 @@ export class PiModelGateway implements ModelGateway {
         || piModel.api === "openai-codex-responses",
       promptCache: true,
       tokenizer: "approximate",
-      imageInput: piModel.input.includes("image")
+      imageInput: piModel.input.includes("image"),
+      hostedToolSearch: piHostedToolSearchSupported(piModel)
     };
     this.capabilities = {
       ...capabilities,
+      hostedToolSearch: capabilities.hostedToolSearch
+        ?? piHostedToolSearchSupported(piModel),
       temperatureControl: capabilities.temperatureControl
         ?? piModel.api !== "openai-codex-responses"
     };
+    this.hostedToolSearch = hostedToolSearchEnabled(
+      this.capabilities.hostedToolSearch === true,
+      options.hostedToolSearch
+    );
   }
 
   async complete(request: ModelRequest): Promise<ModelResponse> {
@@ -252,16 +277,12 @@ export class PiModelGateway implements ModelGateway {
             request.maxOutputTokens
           ),
           ...(this.requestTimeoutMs ? { timeoutMs: this.requestTimeoutMs } : {}),
-          ...(this.provider === OPENAI_CODEX_PROVIDER_ID
-            ? {
-                onPayload: (payload: unknown) => hostedToolSearchPayload(
-                  codexPayload(payload, this.codexInstructionNonce),
-                  this.hostedToolSearch
-                )
-              }
-            : this.provider === "deepseek"
-              ? { onPayload: (payload: unknown) => deepSeekPayload(payload, request) }
-              : {}),
+          ...piPayloadOptions(
+            this.provider,
+            this.codexInstructionNonce,
+            this.hostedToolSearch,
+            request
+          ),
           onResponse: (response: { status: number }) => {
             responseStatus = response.status;
           }

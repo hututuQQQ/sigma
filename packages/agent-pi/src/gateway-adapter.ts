@@ -298,7 +298,7 @@ export function approximateModelInputTokens(
 ): number {
   return approximateTokens({
     messages: modelMessagesWithoutImagePayloads(messages),
-    tools
+    tools: tools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema }))
   }) + modelImageInputTokenEstimate(messages);
 }
 

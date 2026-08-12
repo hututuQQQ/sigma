@@ -1,5 +1,12 @@
-const MIN_HOSTED_TOOL_SEARCH_FUNCTIONS = 12;
+import type {
+  ModelToolDefinition,
+  ModelToolNamespace,
+  ModelToolPresentation
+} from "agent-protocol";
+
+const MIN_DEFERRED_FUNCTIONS = 12;
 const MAX_NAMESPACE_FUNCTIONS = 9;
+const MAX_INITIAL_VISIBLE_RATIO = 0.75;
 
 interface ResponsesTool {
   type?: unknown;
@@ -7,76 +14,16 @@ interface ResponsesTool {
   [key: string]: unknown;
 }
 
-interface NamespaceDefinition {
+interface ClassifiedFunction {
+  tool: ResponsesTool;
   name: string;
-  description: string;
+  presentation: ModelToolPresentation;
 }
 
-const NAMESPACES = {
-  workspace_read: {
-    name: "workspace_read",
-    description: "Read-only workspace, repository, code-intelligence, document, and image inspection."
-  },
-  workspace_write: {
-    name: "workspace_write",
-    description: "Structured workspace file creation, editing, patching, and deletion."
-  },
-  execution: {
-    name: "execution",
-    description: "Foreground and background command execution, validation, and process lifecycle control."
-  },
-  version_control: {
-    name: "version_control",
-    description: "Git status, diff inspection, and journaled repository transactions."
-  },
-  planning_state: {
-    name: "planning_state",
-    description: "Plans, budgets, artifacts, skills, checkpoints, and durable workspace state."
-  },
-  recovery: {
-    name: "recovery",
-    description: "Restore or confirm restoration of changes made during the current run."
-  },
-  delegation_review: {
-    name: "delegation_review",
-    description: "Subagent delegation, coordination, integration, and independent review."
-  },
-  user_coordination: {
-    name: "user_coordination",
-    description: "Request user input or report a concrete blocker."
-  },
-  connected_services: {
-    name: "connected_services",
-    description: "Network, web, MCP, and connected external-service capabilities."
-  },
-  additional_capabilities: {
-    name: "additional_capabilities",
-    description: "Additional runtime capabilities not covered by the primary namespaces."
-  }
-} as const satisfies Record<string, NamespaceDefinition>;
-
-const WORKSPACE_READ = new Set([
-  "read", "list", "grep", "batch_read", "repository_inspect", "repository_stats",
-  "lsp", "inspect_document", "inspect_image"
-]);
-const WORKSPACE_WRITE = new Set([
-  "write", "edit", "write_chunk", "delete_file", "apply_patch"
-]);
-const EXECUTION = new Set([
-  "shell", "exec", "validate", "process_spawn", "process_poll", "process_write",
-  "process_terminate", "process_handoff", "environment_prepare"
-]);
-const VERSION_CONTROL = new Set(["git_status", "git_diff", "git_transaction"]);
-const PLANNING_STATE = new Set([
-  "update_plan", "read_plan", "read_budget", "read_workspace_frontier",
-  "read_artifact", "load_skill", "list_checkpoints"
-]);
-const RECOVERY = new Set(["restore_run_changes", "confirm_run_restored"]);
-const DELEGATION_REVIEW = new Set([
-  "spawn_agent", "message_agent", "join_agent", "list_agents", "integrate_agent",
-  "request_review"
-]);
-const USER_COORDINATION = new Set(["request_user_input", "report_blocked"]);
+const DEFAULT_NAMESPACE = Object.freeze({
+  name: "additional_capabilities",
+  description: "Additional runtime capabilities available for deferred discovery."
+}) satisfies ModelToolNamespace;
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -89,37 +36,67 @@ function functionName(tool: unknown): string | undefined {
     ? candidate.name : undefined;
 }
 
-function namespaceFor(name: string): NamespaceDefinition {
-  if (WORKSPACE_READ.has(name)) return NAMESPACES.workspace_read;
-  if (WORKSPACE_WRITE.has(name)) return NAMESPACES.workspace_write;
-  if (EXECUTION.has(name)) return NAMESPACES.execution;
-  if (VERSION_CONTROL.has(name)) return NAMESPACES.version_control;
-  if (PLANNING_STATE.has(name)) return NAMESPACES.planning_state;
-  if (RECOVERY.has(name)) return NAMESPACES.recovery;
-  if (DELEGATION_REVIEW.has(name)) return NAMESPACES.delegation_review;
-  if (USER_COORDINATION.has(name)) return NAMESPACES.user_coordination;
-  if (name === "web_run" || name.startsWith("mcp_")) {
-    return NAMESPACES.connected_services;
+function validNamespace(namespace: ModelToolNamespace | undefined): ModelToolNamespace {
+  if (!namespace
+    || !/^[A-Za-z][A-Za-z0-9_-]{0,63}$/u.test(namespace.name)
+    || namespace.description.trim().length === 0) {
+    return DEFAULT_NAMESPACE;
   }
-  return NAMESPACES.additional_capabilities;
+  return namespace;
 }
 
-function chunkedNamespaces(functions: readonly ResponsesTool[]): Array<Record<string, unknown>> {
-  const grouped = new Map<string, { definition: NamespaceDefinition; tools: ResponsesTool[] }>();
-  for (const tool of functions) {
+function policyByName(
+  definitions: readonly ModelToolDefinition[]
+): ReadonlyMap<string, ModelToolPresentation> {
+  return new Map(definitions.map((definition) => [
+    definition.name,
+    {
+      exposure: definition.presentation?.exposure ?? "direct",
+      namespace: validNamespace(definition.presentation?.namespace)
+    }
+  ]));
+}
+
+function classifyFunctions(
+  tools: readonly unknown[],
+  definitions: readonly ModelToolDefinition[]
+): ClassifiedFunction[] {
+  const policies = policyByName(definitions);
+  return tools.flatMap((tool) => {
     const name = functionName(tool);
-    if (!name) continue;
-    const definition = namespaceFor(name);
+    if (!name) return [];
+    const candidate = tool as ResponsesTool;
+    const configured = policies.get(name);
+    const explicitlyDeferred = candidate.defer_loading === true;
+    return [{
+      tool: candidate,
+      name,
+      presentation: {
+        exposure: explicitlyDeferred ? "deferred" : configured?.exposure ?? "direct",
+        namespace: validNamespace(configured?.namespace)
+      }
+    }];
+  });
+}
+
+function chunkedNamespaces(
+  functions: readonly ClassifiedFunction[]
+): Array<Record<string, unknown>> {
+  const grouped = new Map<string, {
+    definition: ModelToolNamespace;
+    tools: ClassifiedFunction[];
+  }>();
+  for (const item of functions) {
+    const definition = validNamespace(item.presentation.namespace);
     const group = grouped.get(definition.name) ?? { definition, tools: [] };
-    group.tools.push(tool);
+    group.tools.push(item);
     grouped.set(definition.name, group);
   }
 
   const result: Array<Record<string, unknown>> = [];
   for (const { definition, tools } of [...grouped.values()]
     .sort((left, right) => left.definition.name.localeCompare(right.definition.name))) {
-    const ordered = [...tools].sort((left, right) =>
-      String(left.name).localeCompare(String(right.name)));
+    const ordered = [...tools].sort((left, right) => left.name.localeCompare(right.name));
     for (let offset = 0; offset < ordered.length; offset += MAX_NAMESPACE_FUNCTIONS) {
       const chunk = ordered.slice(offset, offset + MAX_NAMESPACE_FUNCTIONS);
       const part = Math.floor(offset / MAX_NAMESPACE_FUNCTIONS) + 1;
@@ -130,7 +107,7 @@ function chunkedNamespaces(functions: readonly ResponsesTool[]): Array<Record<st
         description: split
           ? `${definition.description} Capability group ${part}.`
           : definition.description,
-        tools: chunk.map((tool) => ({ ...tool, defer_loading: true }))
+        tools: chunk.map(({ tool }) => ({ ...tool, defer_loading: true }))
       });
     }
   }
@@ -150,12 +127,28 @@ function replayWithNamespaces(
   });
 }
 
+function serializedLength(value: unknown): number {
+  return JSON.stringify(value).length;
+}
+
+function visibleNamespace(namespace: Record<string, unknown>): Record<string, unknown> {
+  return {
+    type: namespace.type,
+    name: namespace.name,
+    description: namespace.description
+  };
+}
+
 /**
- * Convert a large Codex Responses function surface into provider-hosted,
- * deferred namespaces. The full trusted inventory remains in the request for
- * server-side search, while the model initially sees only namespace summaries.
+ * Keep the small, stable harness core immediately callable and move only the
+ * explicitly deferred long tail into provider-hosted namespaces. Presentation
+ * policy comes from tool metadata rather than provider, model, or tool names.
  */
-export function hostedToolSearchPayload(payload: unknown, enabled: boolean): unknown {
+export function hostedToolSearchPayload(
+  payload: unknown,
+  enabled: boolean,
+  definitions: readonly ModelToolDefinition[] = []
+): unknown {
   if (!enabled) return payload;
   const body = record(payload);
   if (!body || body.tool_choice === "none" || !Array.isArray(body.tools)) return payload;
@@ -164,11 +157,21 @@ export function hostedToolSearchPayload(payload: unknown, enabled: boolean): unk
     return candidate?.type === "namespace" || candidate?.type === "tool_search";
   })) return payload;
 
-  const functions = body.tools
-    .filter((tool): tool is ResponsesTool => functionName(tool) !== undefined);
-  if (functions.length < MIN_HOSTED_TOOL_SEARCH_FUNCTIONS) return payload;
+  const classified = classifyFunctions(body.tools, definitions);
+  const deferred = classified.filter((item) => item.presentation.exposure === "deferred");
+  if (deferred.length < MIN_DEFERRED_FUNCTIONS) return payload;
 
-  const namespaces = chunkedNamespaces(functions);
+  const namespaces = chunkedNamespaces(deferred);
+  const deferredTools = new Set(deferred.map((item) => item.tool));
+  const immediate = body.tools.filter((tool) => !deferredTools.has(tool as ResponsesTool));
+  const initialVisibleTools = [
+    ...immediate,
+    ...namespaces.map(visibleNamespace),
+    { type: "tool_search" }
+  ];
+  if (serializedLength(initialVisibleTools) / serializedLength(body.tools)
+    > MAX_INITIAL_VISIBLE_RATIO) return payload;
+
   const namespaceByFunction = new Map<string, string>();
   for (const namespace of namespaces) {
     if (typeof namespace.name !== "string" || !Array.isArray(namespace.tools)) continue;
@@ -177,15 +180,19 @@ export function hostedToolSearchPayload(payload: unknown, enabled: boolean): unk
       if (name) namespaceByFunction.set(name, namespace.name);
     }
   }
-  const immediate = body.tools.filter((tool) => functionName(tool) === undefined);
   return {
     ...body,
     input: replayWithNamespaces(body.input, namespaceByFunction),
-    tools: [...immediate, ...namespaces, { type: "tool_search" }]
+    tools: [
+      ...immediate,
+      ...namespaces,
+      { type: "tool_search" }
+    ]
   };
 }
 
 export const hostedToolSearchPolicy = Object.freeze({
-  minimumFunctions: MIN_HOSTED_TOOL_SEARCH_FUNCTIONS,
-  maximumFunctionsPerNamespace: MAX_NAMESPACE_FUNCTIONS
+  minimumDeferredFunctions: MIN_DEFERRED_FUNCTIONS,
+  maximumFunctionsPerNamespace: MAX_NAMESPACE_FUNCTIONS,
+  maximumInitialVisibleRatio: MAX_INITIAL_VISIBLE_RATIO
 });

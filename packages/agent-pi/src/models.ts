@@ -110,6 +110,14 @@ function pricing(model: Model<Api>): PiModelPricing | undefined {
   return piModelPricing(model, catalogEffectiveAt);
 }
 
+export function piHostedToolSearchSupported(model: Model<Api>): boolean {
+  const responsesTransport = model.api === "openai-responses"
+    || model.api === "openai-codex-responses"
+    || model.api === "azure-openai-responses";
+  const compat = model.compat as { supportsToolSearch?: boolean } | undefined;
+  return responsesTransport && compat?.supportsToolSearch === true;
+}
+
 function capabilities(model: Model<Api>): ModelCapabilities {
   const strictToolChoice = model.api === "openai-completions"
     || model.api === "openai-responses"
@@ -126,6 +134,7 @@ function capabilities(model: Model<Api>): ModelCapabilities {
     promptCache: true,
     tokenizer: "approximate",
     imageInput: model.input.includes("image"),
+    hostedToolSearch: piHostedToolSearchSupported(model),
     ...(strictToolChoice ? { strictToolChoice: true } : {})
   };
 }

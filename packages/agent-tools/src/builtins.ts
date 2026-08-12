@@ -70,6 +70,7 @@ function applyPatchTool(atomicPatchStateRootDir?: string): RegisteredEffectTool 
         preimageHashes: { type: "object", additionalProperties: { type: "string" } }
       },
       required: ["patch"],
+      modelPresentation: { exposure: "direct" },
       possibleEffects: ["filesystem.read", "filesystem.write"],
       availableModes: ["change"],
       maximumEffects: ["filesystem.read", "filesystem.write"],

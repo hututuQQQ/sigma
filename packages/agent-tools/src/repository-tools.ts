@@ -107,6 +107,7 @@ function listTool(listProvider: RepositoryListProvider): RegisteredEffectTool {
         path: { type: "string" }, glob: { type: "string" },
         limit: { type: "integer", minimum: 1, maximum: maximumListEntries }
       },
+      modelPresentation: { exposure: "direct" },
       contextPathArguments: ["path"],
       possibleEffects: ["filesystem.read"], executionMode: "parallel", resourceKeys: [], approval: "auto", idempotent: true, timeoutMs: 45_000
     }),
@@ -171,6 +172,7 @@ function grepTool(searchProvider: RepositoryTextSearchProvider): RegisteredEffec
         regex: { type: "boolean" },
         limit: { type: "integer", minimum: 1, maximum: maximumSearchMatches }
       },
+      modelPresentation: { exposure: "direct" },
       required: ["query"], possibleEffects: ["filesystem.read"], executionMode: "parallel", resourceKeys: [],
       contextPathArguments: ["path"], approval: "auto", idempotent: true, timeoutMs: 45_000
     }),
@@ -214,6 +216,7 @@ function gitReadTool(
   return {
     descriptor: schema({
       name, description, properties: {}, possibleEffects: ["filesystem.read", "process.spawn.readonly"], executionMode: "parallel",
+      modelPresentation: { exposure: "direct" },
       resourceKeys: ["workspace:git-read"], approval: "auto", idempotent: true, timeoutMs: 45_000
     }),
     async execute(request, context) {

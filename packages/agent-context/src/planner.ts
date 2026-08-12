@@ -48,7 +48,11 @@ export interface PlanContextOptions {
   maximumRawHistoryBlocks?: number;
 }
 function toolTokens(tools: ModelToolDefinition[]): number {
-  return tools.reduce((total, tool) => total + approximateTokens(JSON.stringify(tool)) + 8, 0);
+  return tools.reduce((total, tool) => total + approximateTokens(JSON.stringify({
+    name: tool.name,
+    description: tool.description,
+    inputSchema: tool.inputSchema
+  })) + 8, 0);
 }
 function optionalLimit(value: number | undefined): number {
   return value === undefined ? Number.POSITIVE_INFINITY : Math.max(0, Math.floor(value));
