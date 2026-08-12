@@ -613,6 +613,53 @@ describe("OpenAI Codex subscription gateway", () => {
     expect(JSON.stringify(captured[1]!.body.input)).toContain("README contents");
   });
 
+  it("enables hosted namespace search for large Sol tool surfaces and permits an explicit rollback", async () => {
+    const captured: Record<string, unknown>[] = [];
+    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      captured.push(requestBody(init));
+      return sse(completedTextEvents("Done."));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const tools = Array.from({ length: 12 }, (_, index) => ({
+      name: `optional_capability_${index}`,
+      description: `Optional capability ${index}.`,
+      inputSchema: {
+        type: "object",
+        properties: { query: { type: "string" } },
+        required: ["query"],
+        additionalProperties: false
+      } as JsonValue as Record<string, JsonValue>
+    }));
+    const request = {
+      messages: [{ role: "user" as const, content: "Give a short answer." }],
+      tools,
+      toolChoice: "auto" as const,
+      signal: new AbortController().signal
+    };
+    const automatic = new PiModelGateway({
+      provider: OPENAI_CODEX_PROVIDER_ID,
+      model: "gpt-5.6-sol",
+      credentials: new MemoryCredentialStore(oauth())
+    });
+    const rollback = new PiModelGateway({
+      provider: OPENAI_CODEX_PROVIDER_ID,
+      model: "gpt-5.6-sol",
+      credentials: new MemoryCredentialStore(oauth()),
+      hostedToolSearch: false
+    });
+
+    await automatic.complete(request);
+    await rollback.complete(request);
+
+    const automaticTools = captured[0]!.tools as Array<Record<string, unknown>>;
+    const rollbackTools = captured[1]!.tools as Array<Record<string, unknown>>;
+    expect(automaticTools.some((tool) => tool.type === "namespace")).toBe(true);
+    expect(automaticTools).toContainEqual({ type: "tool_search" });
+    expect(automaticTools.some((tool) => tool.type === "function")).toBe(false);
+    expect(rollbackTools).toHaveLength(12);
+    expect(rollbackTools.every((tool) => tool.type === "function")).toBe(true);
+  });
+
   it("refreshes an expired token under the credential-store mutation path", async () => {
     const previous = oauth({ access: jwt("old"), refresh: "old-refresh", expires: Date.now() - 1 });
     const refreshedAccess = jwt("refreshed");

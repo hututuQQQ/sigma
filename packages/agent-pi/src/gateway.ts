@@ -22,6 +22,7 @@ import {
   sanitizePiModelError,
   type PiModelErrorDiagnostics
 } from "./errors.js";
+import { hostedToolSearchPayload } from "./hosted-tool-search.js";
 import {
   approximateModelInputTokens,
   deepSeekPayload,
@@ -52,6 +53,9 @@ export interface PiModelGatewayOptions {
   idleTimeoutMs?: number;
   activeStreamTimeoutMs?: number;
   reasoningEffort?: PiReasoningEffort;
+  /** Override Sol's provider-hosted namespace search. Unsupported transports
+   * always keep the complete immediate function surface. */
+  hostedToolSearch?: boolean;
 }
 
 function fallbackModel(providerId: string, modelId: string): PiModel<Api> | undefined {
@@ -60,6 +64,17 @@ function fallbackModel(providerId: string, modelId: string): PiModel<Api> | unde
   return template
     ? { ...template, id: modelId, name: modelId }
     : undefined;
+}
+
+function hostedToolSearchEnabled(
+  provider: string,
+  model: PiModel<Api>,
+  requested: boolean | undefined
+): boolean {
+  if (provider !== OPENAI_CODEX_PROVIDER_ID) return false;
+  const compat = model.compat as { supportsToolSearch?: boolean } | undefined;
+  if (compat?.supportsToolSearch !== true) return false;
+  return requested ?? model.id === "gpt-5.6-sol";
 }
 
 interface PiStreamLifecycle {
@@ -158,6 +173,7 @@ export class PiModelGateway implements ModelGateway {
   private readonly idleTimeoutMs: number;
   private readonly activeStreamTimeoutMs?: number;
   private readonly reasoningEffort?: PiReasoningEffort;
+  private readonly hostedToolSearch: boolean;
   private readonly codexInstructionNonce = randomUUID();
 
   constructor(options: PiModelGatewayOptions) {
@@ -179,6 +195,11 @@ export class PiModelGateway implements ModelGateway {
       ? undefined
       : Math.max(1, Math.trunc(options.activeStreamTimeoutMs));
     this.reasoningEffort = options.reasoningEffort;
+    this.hostedToolSearch = hostedToolSearchEnabled(
+      this.provider,
+      this.piModel,
+      options.hostedToolSearch
+    );
     const capabilities = options.capabilities ?? {
       contextWindowTokens: piModel.contextWindow,
       maxOutputTokens: piModel.maxTokens,
@@ -233,8 +254,10 @@ export class PiModelGateway implements ModelGateway {
           ...(this.requestTimeoutMs ? { timeoutMs: this.requestTimeoutMs } : {}),
           ...(this.provider === OPENAI_CODEX_PROVIDER_ID
             ? {
-                onPayload: (payload: unknown) =>
-                  codexPayload(payload, this.codexInstructionNonce)
+                onPayload: (payload: unknown) => hostedToolSearchPayload(
+                  codexPayload(payload, this.codexInstructionNonce),
+                  this.hostedToolSearch
+                )
               }
             : this.provider === "deepseek"
               ? { onPayload: (payload: unknown) => deepSeekPayload(payload, request) }
