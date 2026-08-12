@@ -71,6 +71,7 @@ export function readBatchDescriptor(
       required: ["calls"],
       additionalProperties: false
     },
+    modelPresentation: { exposure: "direct" },
     possibleEffects: ["filesystem.read", "process.spawn.readonly"],
     maximumEffects: ["filesystem.read", "process.spawn.readonly"],
     availableModes: ["analyze", "change"],

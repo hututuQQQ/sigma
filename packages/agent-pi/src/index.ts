@@ -3,6 +3,7 @@ export * from "./credential-bridge.js";
 export * from "./credential-store.js";
 export * from "./errors.js";
 export * from "./gateway.js";
+export * from "./hosted-tool-search.js";
 export * from "./models.js";
 export * from "./models-store.js";
 export * from "./outbound-proxy.js";

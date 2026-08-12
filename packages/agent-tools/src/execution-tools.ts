@@ -233,6 +233,7 @@ function foregroundTool(kind: "exec" | "shell" | "validate", options: ExecutionT
   return {
     descriptor: {
       ...schema,
+      modelPresentation: { exposure: "direct" },
       ...(options.writeScope === "enclosing-container"
         && options.enclosingContainerRoot === true
         ? { brokerMutationAuthority: "disposable_enclosing_container" as const }

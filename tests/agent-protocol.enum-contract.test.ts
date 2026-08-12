@@ -253,6 +253,10 @@ describe("protocol enum and invariant contracts", () => {
       { kind: "hook_context_added", event: "pre_model", items: [item] },
       { kind: "recovery.retry_model", message: "retry" },
       {
+        kind: "context.capacity_recovery", source: "router", action: "terminal_fallback",
+        routeId: "default", rejections: [{ modelSpecId: "provider/model", detail: "context full" }]
+      },
+      {
         kind: "resource_boundary.submission", sourceOutcomeCode: "budget_exhausted",
         message: "submitted", decisionAuthority: "resource_boundary"
       },

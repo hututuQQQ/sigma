@@ -2,10 +2,10 @@ import { createHash } from "node:crypto";
 import { lstat, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import {
-  type JsonValue, type ModelGateway, type ModelToolCall, type ModelToolDefinition,
+  type JsonValue, type ModelToolCall, type ModelToolDefinition,
+  type ModelToolNamespace, type ModelToolPresentation,
   type ToolCallPlan, type ToolDescriptor, type ToolReceipt, type WorkspaceDelta
 } from "agent-protocol";
-import { planContext, type ContextPlan, type PlanContextOptions } from "agent-context";
 import { canonicalWorkspacePath, isInside, resolveWorkspacePath } from "agent-platform";
 import type { RuntimeSession } from "./types.js";
 import { failed } from "./tool-receipt.js";
@@ -13,6 +13,11 @@ import { failed } from "./tool-receipt.js";
 export {
   completionFailure
 } from "./completion-evidence-gate.js";
+export {
+  contextCapacityFailure,
+  providerSizedPlan,
+  type ContextCapacityFailure
+} from "./context-capacity.js";
 export { failed } from "./tool-receipt.js";
 export {
   projectModelToolDescriptors,
@@ -20,6 +25,113 @@ export {
   sessionSkillProjectionCapabilities,
   type ModelToolProjectionCapabilities
 } from "./model-tool-projection.js";
+
+const MODEL_TOOL_NAMESPACES = Object.freeze({
+  workspace_read: {
+    name: "workspace_read",
+    description: "Read-only workspace, repository, code-intelligence, document, and image inspection."
+  },
+  workspace_write: {
+    name: "workspace_write",
+    description: "Structured workspace file creation, editing, patching, and deletion."
+  },
+  execution: {
+    name: "execution",
+    description: "Foreground and background command execution, validation, and process lifecycle control."
+  },
+  version_control: {
+    name: "version_control",
+    description: "Git status, diff inspection, and journaled repository transactions."
+  },
+  planning_state: {
+    name: "planning_state",
+    description: "Plans, budgets, artifacts, skills, checkpoints, and durable workspace state."
+  },
+  recovery: {
+    name: "recovery",
+    description: "Restore or confirm restoration of changes made during the current run."
+  },
+  delegation_review: {
+    name: "delegation_review",
+    description: "Subagent delegation, coordination, integration, and independent review."
+  },
+  user_coordination: {
+    name: "user_coordination",
+    description: "Request user input or report a concrete blocker."
+  },
+  connected_services: {
+    name: "connected_services",
+    description: "Network, web, MCP, and connected external-service capabilities."
+  },
+  additional_capabilities: {
+    name: "additional_capabilities",
+    description: "Additional runtime capabilities not covered by the primary namespaces."
+  }
+} as const satisfies Record<string, ModelToolNamespace>);
+
+type DescriptorEffect = ToolDescriptor["possibleEffects"][number];
+
+const PRIORITY_NAMESPACE_RULES: readonly {
+  effects: readonly DescriptorEffect[];
+  namespace: ModelToolNamespace;
+}[] = [
+  {
+    effects: ["outcome.request_input", "outcome.report_blocked"],
+    namespace: MODEL_TOOL_NAMESPACES.user_coordination
+  },
+  { effects: ["agent.spawn"], namespace: MODEL_TOOL_NAMESPACES.delegation_review },
+  { effects: ["checkpoint.restore"], namespace: MODEL_TOOL_NAMESPACES.recovery }
+];
+
+const GENERAL_NAMESPACE_RULES: readonly {
+  effects: readonly DescriptorEffect[];
+  namespace: ModelToolNamespace;
+}[] = [
+  {
+    effects: ["process.spawn", "process.spawn.readonly", "process.handoff", "validation"],
+    namespace: MODEL_TOOL_NAMESPACES.execution
+  },
+  {
+    effects: ["network", "open_world"],
+    namespace: MODEL_TOOL_NAMESPACES.connected_services
+  },
+  {
+    effects: ["filesystem.write", "repository.write", "destructive"],
+    namespace: MODEL_TOOL_NAMESPACES.workspace_write
+  },
+  {
+    effects: ["filesystem.read", "filesystem.read.external"],
+    namespace: MODEL_TOOL_NAMESPACES.workspace_read
+  },
+  { effects: ["runtime.control"], namespace: MODEL_TOOL_NAMESPACES.planning_state }
+];
+
+function namespaceFromEffects(
+  effects: ReadonlySet<DescriptorEffect>,
+  rules: typeof PRIORITY_NAMESPACE_RULES
+): ModelToolNamespace | undefined {
+  return rules.find((rule) => rule.effects.some((effect) => effects.has(effect)))?.namespace;
+}
+
+function inferredModelToolNamespace(descriptor: ToolDescriptor): ModelToolNamespace {
+  const effects = new Set(descriptor.possibleEffects);
+  const priority = namespaceFromEffects(effects, PRIORITY_NAMESPACE_RULES);
+  if (priority) return priority;
+  if (descriptor.resourceKeys.some((key) =>
+    key.includes("git") || key.includes("repository"))) {
+    return MODEL_TOOL_NAMESPACES.version_control;
+  }
+  return namespaceFromEffects(effects, GENERAL_NAMESPACE_RULES)
+    ?? MODEL_TOOL_NAMESPACES.additional_capabilities;
+}
+
+export function modelToolPresentation(descriptor: ToolDescriptor): ModelToolPresentation {
+  return {
+    exposure: descriptor.modelPresentation?.exposure ?? "deferred",
+    namespace: descriptor.modelPresentation?.namespace
+      ?? inferredModelToolNamespace(descriptor)
+  };
+}
 
 function canonicalJsonValue(value: JsonValue): JsonValue {
   if (Array.isArray(value)) return value.map(canonicalJsonValue);
@@ -37,69 +149,9 @@ export function modelTools(descriptors: readonly ToolDescriptor[]): ModelToolDef
     .map((item) => ({
       name: item.name,
       description: item.description,
-      inputSchema: canonicalJsonValue(item.inputSchema) as ModelToolDefinition["inputSchema"]
+      inputSchema: canonicalJsonValue(item.inputSchema) as ModelToolDefinition["inputSchema"],
+      presentation: modelToolPresentation(item)
     }));
-}
-
-const PROACTIVE_CONTEXT_WINDOW_PERCENT = 90;
-
-function contextOverflowError(error: unknown): boolean {
-  return Boolean(error && typeof error === "object"
-    && (error as { code?: unknown }).code === "context_overflow");
-}
-
-export async function providerSizedPlan(
-  gateway: ModelGateway,
-  input: Omit<PlanContextOptions, "contextWindowTokens" | "promptCache"> & { maxInputTokens?: number }
-): Promise<ContextPlan> {
-  const providerLimit = gateway.capabilities.contextWindowTokens;
-  const { maxInputTokens, ...contextInput } = input;
-  const inputLimit = Math.min(providerLimit - input.outputReserveTokens, maxInputTokens ?? providerLimit);
-  // Keep replayable history below the provider's final context headroom so
-  // the existing archive path activates before a very large request reaches
-  // transport. Exact mandatory context still gets one full-window attempt.
-  const proactiveLimit = Math.floor(
-    providerLimit * PROACTIVE_CONTEXT_WINDOW_PERCENT / 100
-  );
-  let planningLimit = Math.min(
-    providerLimit,
-    Math.max(input.outputReserveTokens + 1, proactiveLimit)
-  );
-  let usedMandatoryFallback = planningLimit === providerLimit;
-  while (planningLimit > input.outputReserveTokens) {
-    let plan: ContextPlan;
-    try {
-      plan = planContext({
-        ...contextInput,
-        contextWindowTokens: planningLimit,
-        promptCache: gateway.capabilities.promptCache
-      });
-    } catch (error) {
-      if (!usedMandatoryFallback && contextOverflowError(error)) {
-        planningLimit = providerLimit;
-        usedMandatoryFallback = true;
-        continue;
-      }
-      throw error;
-    }
-    const tokens = await gateway.countTokens(plan.messages, input.tools);
-    const planningInputLimit = Math.min(
-      inputLimit,
-      planningLimit - input.outputReserveTokens
-    );
-    if (tokens <= planningInputLimit
-      && tokens + input.outputReserveTokens <= planningLimit) return plan;
-    const ratio = Math.min(
-      planningInputLimit / Math.max(1, tokens),
-      planningLimit / (tokens + input.outputReserveTokens)
-    );
-    const next = Math.min(planningLimit - 1, Math.floor(planningLimit * ratio * 0.98));
-    if (next <= input.outputReserveTokens) break;
-    planningLimit = next;
-  }
-  throw Object.assign(new Error("Provider tokenizer could not fit mandatory context and the newest user turn."), {
-    code: "context_overflow"
-  });
 }
 
 export function requestTargets(call: ModelToolCall, descriptor: ToolDescriptor): string[] {

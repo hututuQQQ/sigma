@@ -101,12 +101,15 @@ const UPDATE_PLAN_PROPERTIES: Record<string, JsonValue> = {
 
 function updatePlanTool(): RegisteredEffectTool {
   return {
-    descriptor: descriptor(
-      "update_plan",
-      "Update the durable work checklist only for work with several distinct milestones, multiple components, or substantial uncertainty; a focused inspect-edit-test fix does not require one. Keep 3-7 meaningful steps and update only at meaningful milestones or when evidence changes the approach, not after every small action. The runtime owns revisions, active-step normalization, dependencies, ownership, and evidence.",
-      UPDATE_PLAN_PROPERTIES,
-      ["plan"]
-    ),
+    descriptor: {
+      ...descriptor(
+        "update_plan",
+        "Update the durable work checklist only for work with several distinct milestones, multiple components, or substantial uncertainty; a focused inspect-edit-test fix does not require one. Keep 3-7 meaningful steps and update only at meaningful milestones or when evidence changes the approach, not after every small action. The runtime owns revisions, active-step normalization, dependencies, ownership, and evidence.",
+        UPDATE_PLAN_PROPERTIES,
+        ["plan"]
+      ),
+      modelPresentation: { exposure: "direct" }
+    },
     async execute(request, context) {
       const startedAt = new Date().toISOString();
       const input = object(request.arguments);

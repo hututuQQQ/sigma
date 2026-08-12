@@ -28,6 +28,29 @@ describe("session model-tool capability projection", () => {
     }
   });
 
+  it("projects a provider-neutral direct core and deferred capability metadata", () => {
+    const tools = new Map(modelTools(descriptors).map((tool) => [tool.name, tool]));
+    for (const name of [
+      "read", "write", "edit", "apply_patch", "shell",
+      "git_status", "git_diff", "update_plan", "request_user_input", "report_blocked"
+    ]) {
+      expect(tools.get(name)?.presentation?.exposure, name).toBe("direct");
+    }
+    const deferredNames = [
+      "inspect_document", "inspect_image", "lsp", "process_spawn", "load_skill",
+      "delete_file", "restore_run_changes", "spawn_agent"
+    ].filter((name) => tools.has(name));
+    expect(deferredNames.length).toBeGreaterThanOrEqual(5);
+    for (const name of deferredNames) {
+      expect(tools.get(name)?.presentation?.exposure, name).toBe("deferred");
+    }
+    expect(tools.get("inspect_image")?.presentation?.namespace?.name)
+      .toBe("workspace_read");
+    expect(tools.get("delete_file")?.presentation?.namespace?.name)
+      .toBe("workspace_write");
+    expect(JSON.stringify([...tools.values()])).not.toMatch(/gpt-|openai|anthropic|google/iu);
+  });
+
   it("offers batching only as a facade over auto-approved read-only tools", () => {
     const eligible = eligibleReadBatchDescriptors(descriptors);
     expect(eligible.map((item) => item.name)).toEqual(expect.arrayContaining([

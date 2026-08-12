@@ -22,6 +22,7 @@ import {
   sanitizePiModelError,
   type PiModelErrorDiagnostics
 } from "./errors.js";
+import { hostedToolSearchPayload } from "./hosted-tool-search.js";
 import {
   approximateModelInputTokens,
   deepSeekPayload,
@@ -33,6 +34,7 @@ import {
   getPiModel,
   getPiProvider,
   OPENAI_CODEX_PROVIDER_ID,
+  piHostedToolSearchSupported,
   piBillingMode,
   type PiReasoningEffort
 } from "./models.js";
@@ -52,6 +54,9 @@ export interface PiModelGatewayOptions {
   idleTimeoutMs?: number;
   activeStreamTimeoutMs?: number;
   reasoningEffort?: PiReasoningEffort;
+  /** Override provider-hosted deferred tool search. Unsupported model/transport
+   * combinations always keep the complete immediate function surface. */
+  hostedToolSearch?: boolean;
 }
 
 function fallbackModel(providerId: string, modelId: string): PiModel<Api> | undefined {
@@ -60,6 +65,39 @@ function fallbackModel(providerId: string, modelId: string): PiModel<Api> | unde
   return template
     ? { ...template, id: modelId, name: modelId }
     : undefined;
+}
+
+function hostedToolSearchEnabled(
+  supported: boolean,
+  requested: boolean | undefined
+): boolean {
+  if (!supported) return false;
+  return requested ?? true;
+}
+
+function piPayloadOptions(
+  provider: string,
+  codexInstructionNonce: string,
+  hostedToolSearch: boolean,
+  request: ModelRequest
+): { onPayload?: (payload: unknown) => unknown } {
+  if (provider === OPENAI_CODEX_PROVIDER_ID) {
+    return {
+      onPayload: (payload) => hostedToolSearchPayload(
+        codexPayload(payload, codexInstructionNonce),
+        hostedToolSearch,
+        request.tools
+      )
+    };
+  }
+  if (provider === "deepseek") {
+    return { onPayload: (payload) => deepSeekPayload(payload, request) };
+  }
+  return hostedToolSearch
+    ? {
+        onPayload: (payload) => hostedToolSearchPayload(payload, true, request.tools)
+      }
+    : {};
 }
 
 interface PiStreamLifecycle {
@@ -158,6 +196,7 @@ export class PiModelGateway implements ModelGateway {
   private readonly idleTimeoutMs: number;
   private readonly activeStreamTimeoutMs?: number;
   private readonly reasoningEffort?: PiReasoningEffort;
+  private readonly hostedToolSearch: boolean;
   private readonly codexInstructionNonce = randomUUID();
 
   constructor(options: PiModelGatewayOptions) {
@@ -189,13 +228,20 @@ export class PiModelGateway implements ModelGateway {
         || piModel.api === "openai-codex-responses",
       promptCache: true,
       tokenizer: "approximate",
-      imageInput: piModel.input.includes("image")
+      imageInput: piModel.input.includes("image"),
+      hostedToolSearch: piHostedToolSearchSupported(piModel)
     };
     this.capabilities = {
       ...capabilities,
+      hostedToolSearch: capabilities.hostedToolSearch
+        ?? piHostedToolSearchSupported(piModel),
       temperatureControl: capabilities.temperatureControl
         ?? piModel.api !== "openai-codex-responses"
     };
+    this.hostedToolSearch = hostedToolSearchEnabled(
+      this.capabilities.hostedToolSearch === true,
+      options.hostedToolSearch
+    );
   }
 
   async complete(request: ModelRequest): Promise<ModelResponse> {
@@ -231,14 +277,12 @@ export class PiModelGateway implements ModelGateway {
             request.maxOutputTokens
           ),
           ...(this.requestTimeoutMs ? { timeoutMs: this.requestTimeoutMs } : {}),
-          ...(this.provider === OPENAI_CODEX_PROVIDER_ID
-            ? {
-                onPayload: (payload: unknown) =>
-                  codexPayload(payload, this.codexInstructionNonce)
-              }
-            : this.provider === "deepseek"
-              ? { onPayload: (payload: unknown) => deepSeekPayload(payload, request) }
-              : {}),
+          ...piPayloadOptions(
+            this.provider,
+            this.codexInstructionNonce,
+            this.hostedToolSearch,
+            request
+          ),
           onResponse: (response: { status: number }) => {
             responseStatus = response.status;
           }

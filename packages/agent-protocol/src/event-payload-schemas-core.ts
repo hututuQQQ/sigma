@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { dateTimeSchema, nonEmptyStringSchema } from "./domain-schemas.js";
+import { contextCapacityRecoveryDiagnosticSchema } from "./event-diagnostic-schemas.js";
 import {
   assuranceResourcePolicySchema,
   contextItemSchema,
@@ -160,6 +161,7 @@ const diagnosticSchema = z.discriminatedUnion("kind", [
     items: z.array(contextItemSchema)
   }).strict(),
   z.object({ kind: z.literal("recovery.retry_model"), message: nonEmptyStringSchema }).strict(),
+  contextCapacityRecoveryDiagnosticSchema,
   z.object({ kind: z.literal("completion.advisory"), message: nonEmptyStringSchema }).strict(),
   z.object({
     kind: z.literal("assurance.review_transfer"),

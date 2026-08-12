@@ -63,6 +63,21 @@ export interface ModelToolDefinition {
   name: string;
   description: string;
   inputSchema: { [key: string]: JsonValue };
+  /** Provider-neutral presentation hints. Gateways that do not implement
+   * deferred tool loading ignore this metadata and expose the tool normally. */
+  presentation?: ModelToolPresentation;
+}
+
+export type ModelToolExposure = "direct" | "deferred";
+
+export interface ModelToolNamespace {
+  name: string;
+  description: string;
+}
+
+export interface ModelToolPresentation {
+  exposure: ModelToolExposure;
+  namespace?: ModelToolNamespace;
 }
 
 export interface ModelCapabilities {
@@ -95,6 +110,9 @@ export interface ModelCapabilities {
   requiresToolCallReasoningReplay?: boolean;
   /** A strict tool choice is implemented by temporarily disabling thinking. */
   strictToolChoiceDisablesReasoning?: boolean;
+  /** The selected provider/model/transport supports provider-hosted deferred
+   * tool search. This is a wire capability, never a model-name policy. */
+  hostedToolSearch?: boolean;
 }
 
 export type ModelFinishReason = "stop" | "length" | "tool_calls" | "content_filter" | "protocol_error";

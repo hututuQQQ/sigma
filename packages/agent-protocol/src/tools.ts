@@ -1,5 +1,5 @@
 import type { JsonValue } from "./json.js";
-import type { ModelToolCall } from "./model.js";
+import type { ModelToolCall, ModelToolPresentation } from "./model.js";
 import type {
   ArtifactRef,
   BudgetLedgerState,
@@ -36,6 +36,10 @@ export interface ToolDescriptor {
   name: string;
   description: string;
   inputSchema: { [key: string]: JsonValue };
+  /** Stable model-facing exposure. Direct tools form the small universal
+   * harness core; omitted tools are eligible for deferred discovery when the
+   * active gateway supports it. This never changes execution authority. */
+  modelPresentation?: Partial<ModelToolPresentation>;
   possibleEffects: ToolEffect[];
   /** Modes in which this tool may be planned, independent of maximum effects. */
   availableModes?: RunMode[];

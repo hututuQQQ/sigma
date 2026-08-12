@@ -148,6 +148,7 @@ function reportBlockedTool(): RegisteredEffectTool {
       required: ["code", "summary"],
       additionalProperties: false
     },
+    modelPresentation: { exposure: "direct" },
     possibleEffects: ["outcome.report_blocked"],
     executionMode: "sequential",
     resourceKeys: ["run:outcome"],
@@ -209,6 +210,7 @@ function requestUserInputTool(): RegisteredEffectTool {
       anyOf: [{ required: ["message"] }, { required: ["questions"] }],
       additionalProperties: false
     },
+    modelPresentation: { exposure: "direct" },
     possibleEffects: ["outcome.request_input"],
     executionMode: "sequential",
     resourceKeys: ["run:outcome"],

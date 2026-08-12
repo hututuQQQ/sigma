@@ -77,8 +77,16 @@ function capabilityFailure(spec: ModelSpec, required: Partial<ModelCapabilities>
 
 export const APPROXIMATE_TOKEN_RESERVATION_MARGIN = 1.5;
 
+/** Keep runtime planning and route admission on the same tokenizer-safety
+ * policy. Provider token counts are exact; local estimators retain headroom. */
+export function tokenizerReservationMargin(
+  tokenizer: "provider" | "exact" | "approximate"
+): number {
+  return tokenizer === "approximate" ? APPROXIMATE_TOKEN_RESERVATION_MARGIN : 1;
+}
+
 function tokenizerMargin(spec: ModelSpec): number {
-  return spec.tokenizer.accuracy === "approximate" ? APPROXIMATE_TOKEN_RESERVATION_MARGIN : 1;
+  return tokenizerReservationMargin(spec.tokenizer.accuracy);
 }
 
 function contextRequirement(spec: ModelSpec, constraints: ModelRouteConstraints): number {

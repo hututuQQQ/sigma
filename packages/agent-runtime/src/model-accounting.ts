@@ -9,10 +9,10 @@ import type {
   UsageRecord
 } from "agent-protocol";
 import {
-  APPROXIMATE_TOKEN_RESERVATION_MARGIN,
   builtinModelSpec,
   modelPricingRates,
   normalizeUsage,
+  tokenizerReservationMargin,
   type ModelRouteConstraints,
   type ModelReservationEstimate,
   type ModelSpec,
@@ -108,7 +108,9 @@ export async function prepareModelBudget(
     };
   }
   const counted = await gateway.countTokens(messages, tools);
-  const margin = spec?.tokenizer.accuracy === "exact" ? 1 : APPROXIMATE_TOKEN_RESERVATION_MARGIN;
+  const margin = tokenizerReservationMargin(
+    spec?.tokenizer.accuracy ?? gateway.capabilities.tokenizer
+  );
   const estimatedInputTokens = Math.max(1, Math.ceil(counted * margin));
   const reservedOutputTokens = Math.ceil(outputTokens * margin);
   return {

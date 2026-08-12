@@ -461,6 +461,18 @@ describe("OpenAI Codex subscription gateway", () => {
       defaultReasoningEffort: "medium"
     });
     expect(models.find((model) =>
+      model.providerId === OPENAI_CODEX_PROVIDER_ID
+      && model.id === "gpt-5.6-terra"
+    )?.capabilities.hostedToolSearch).toBe(true);
+    expect(models.find((model) =>
+      model.providerId === "openai"
+      && model.id === "gpt-5.4"
+    )?.capabilities.hostedToolSearch).toBe(true);
+    expect(models.find((model) =>
+      model.providerId === OPENAI_CODEX_PROVIDER_ID
+      && model.id === "gpt-5.3-codex-spark"
+    )?.capabilities.hostedToolSearch).toBe(false);
+    expect(models.find((model) =>
       model.providerId === "google"
       && model.id === "gemini-3-pro-preview"
     )).toMatchObject({
@@ -611,6 +623,119 @@ describe("OpenAI Codex subscription gateway", () => {
       .toContain("A prior answer with an obsolete replay shape.");
     expect(JSON.stringify(captured[1]!.body.input)).toContain("opaque-reasoning-signature");
     expect(JSON.stringify(captured[1]!.body.input)).toContain("README contents");
+  });
+
+  it("enables capability-driven hybrid search without a model-name special case and permits rollback", async () => {
+    const captured: Record<string, unknown>[] = [];
+    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      captured.push(requestBody(init));
+      return sse(completedTextEvents("Done."));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const tools = Array.from({ length: 18 }, (_, index) => ({
+      name: `optional_capability_${index}`,
+      description: `Optional capability ${index}.`,
+      inputSchema: {
+        type: "object",
+        properties: { query: { type: "string" } },
+        required: ["query"],
+        additionalProperties: false
+      } as JsonValue as Record<string, JsonValue>,
+      presentation: {
+        exposure: index < 6 ? "direct" as const : "deferred" as const,
+        namespace: {
+          name: index < 6 ? "stable_core" : "optional_runtime",
+          description: index < 6
+            ? "Stable core capabilities."
+            : "Optional runtime capabilities."
+        }
+      }
+    }));
+    const request = {
+      messages: [{ role: "user" as const, content: "Give a short answer." }],
+      tools,
+      toolChoice: "auto" as const,
+      signal: new AbortController().signal
+    };
+    const automatic = new PiModelGateway({
+      provider: OPENAI_CODEX_PROVIDER_ID,
+      model: "gpt-5.6-terra",
+      credentials: new MemoryCredentialStore(oauth())
+    });
+    const rollback = new PiModelGateway({
+      provider: OPENAI_CODEX_PROVIDER_ID,
+      model: "gpt-5.6-terra",
+      credentials: new MemoryCredentialStore(oauth()),
+      hostedToolSearch: false
+    });
+
+    await automatic.complete(request);
+    await rollback.complete(request);
+
+    const automaticTools = captured[0]!.tools as Array<Record<string, unknown>>;
+    const rollbackTools = captured[1]!.tools as Array<Record<string, unknown>>;
+    expect(automaticTools.some((tool) => tool.type === "namespace")).toBe(true);
+    expect(automaticTools).toContainEqual({ type: "tool_search" });
+    expect(automaticTools.filter((tool) => tool.type === "function")).toHaveLength(6);
+    expect(automaticTools.filter((tool) => tool.type === "function")
+      .every((tool) => tool.defer_loading === undefined)).toBe(true);
+    expect(rollbackTools).toHaveLength(18);
+    expect(rollbackTools.every((tool) => tool.type === "function")).toBe(true);
+  });
+
+  it("uses the same capability boundary for metered Responses models and rejects unsupported overrides", async () => {
+    const captured: Array<{ url: string; body: Record<string, unknown> }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (
+      input: string | URL | Request,
+      init?: RequestInit
+    ) => {
+      captured.push({ url: String(input), body: requestBody(init) });
+      return sse(completedTextEvents("Done."));
+    }));
+    const tools = Array.from({ length: 12 }, (_, index) => ({
+      name: `deferred_${index}`,
+      description: `Deferred capability ${index}.`,
+      inputSchema: {
+        type: "object",
+        properties: { query: { type: "string" } },
+        required: ["query"],
+        additionalProperties: false
+      } as JsonValue as Record<string, JsonValue>,
+      presentation: {
+        exposure: "deferred" as const,
+        namespace: {
+          name: "optional_runtime",
+          description: "Optional runtime capabilities."
+        }
+      }
+    }));
+    const request = {
+      messages: [{ role: "user" as const, content: "Give a short answer." }],
+      tools,
+      toolChoice: "auto" as const,
+      signal: new AbortController().signal
+    };
+    const supported = new PiModelGateway({
+      provider: "openai",
+      model: "gpt-5.4",
+      credentials: new ApiKeyCredentialStore("openai")
+    });
+    const unsupported = new PiModelGateway({
+      provider: OPENAI_CODEX_PROVIDER_ID,
+      model: "gpt-5.3-codex-spark",
+      credentials: new MemoryCredentialStore(oauth()),
+      hostedToolSearch: true
+    });
+
+    await supported.complete(request);
+    await unsupported.complete(request);
+
+    expect(captured[0]!.url).toBe("https://api.openai.com/v1/responses");
+    expect(captured[0]!.body.tools).toEqual(expect.arrayContaining([{ type: "tool_search" }]));
+    expect((captured[0]!.body.tools as Array<Record<string, unknown>>)
+      .some((tool) => tool.type === "namespace")).toBe(true);
+    expect((captured[1]!.body.tools as Array<Record<string, unknown>>)
+      .every((tool) => tool.type === "function")).toBe(true);
   });
 
   it("refreshes an expired token under the credential-store mutation path", async () => {
