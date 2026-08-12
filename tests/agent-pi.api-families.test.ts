@@ -393,7 +393,10 @@ describe.each(apiFamilies)("Pi %s API family contract", (api) => {
 
 describe("Pi Codex cache-preserving instruction projection", () => {
   it("keeps dynamic developer context at the input suffix and restores its wire role", async () => {
-    const model = contractModel("openai-codex-responses");
+    const model = {
+      ...contractModel("openai-codex-responses"),
+      provider: "codex-compatible-provider"
+    };
     const captured: CapturedCall[] = [];
     const gateway = new PiModelGateway({
       provider: model.provider,
@@ -409,6 +412,7 @@ describe("Pi Codex cache-preserving instruction projection", () => {
     await gateway.complete(modelRequest);
 
     const call = captured[0]!;
+    expect(call.options.transport).toBe("auto");
     expect(call.context.systemPrompt).not.toContain("latest durable runtime state");
     const suffix = call.context.messages.at(-1);
     expect(suffix).toMatchObject({ role: "user" });

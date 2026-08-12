@@ -55,12 +55,32 @@ const catalogEffectiveAt = generatedAt === undefined
   ? "2026-07-30"
   : new Date(generatedAt).toISOString().slice(0, 10);
 
-const recommendedModels = new Set<string>([
+const recommendedModelOrder = [
   "openai-codex/gpt-5.6-terra",
   "openai-codex/gpt-5.6-sol",
   "deepseek/deepseek-v4-pro",
   "glm/glm-5.2"
-]);
+] as const;
+const recommendedModels = new Set<string>(recommendedModelOrder);
+const providerEnvironmentAliases: Readonly<Record<string, Readonly<Record<string, readonly string[]>>>> = {
+  [GLM_PROVIDER_ID]: {
+    BASE_URL: ["ZAI_BASE_URL", "BIGMODEL_BASE_URL"]
+  }
+};
+
+export function piProviderEnvironmentValue(
+  providerId: string,
+  suffix: string,
+  env: NodeJS.ProcessEnv = process.env
+): string | undefined {
+  const prefix = providerId.replace(/[^a-z0-9]+/giu, "_").toUpperCase();
+  const keys = [`${prefix}_${suffix}`, ...(providerEnvironmentAliases[providerId]?.[suffix] ?? [])];
+  for (const key of keys) {
+    const value = env[key]?.trim();
+    if (value) return value;
+  }
+  return undefined;
+}
 
 const glmModel: Model<"openai-completions"> = {
   id: GLM_DEFAULT_MODEL,
@@ -126,11 +146,16 @@ function capabilities(model: Model<Api>): ModelCapabilities {
   return {
     contextWindowTokens: model.contextWindow,
     maxOutputTokens: model.maxTokens,
+    // Pi's model catalog contains chat transports whose uniform Context
+    // contract serializes function tools and multiple tool calls. Per-model
+    // custom specs can still narrow either capability at Sigma's route layer.
     tools: true,
     parallelTools: true,
     reasoning: model.reasoning,
     structuredOutput: model.api === "openai-responses"
       || model.api === "openai-codex-responses",
+    // This denotes Sigma's stable-prefix prompt layout. Individual Pi
+    // providers independently omit unsupported wire-level cache controls.
     promptCache: true,
     tokenizer: "approximate",
     imageInput: model.input.includes("image"),
@@ -286,11 +311,18 @@ export function getPiProvider(
   return models.getProvider(providerId);
 }
 
-export function defaultPiModel(providerId: string, env: NodeJS.ProcessEnv = process.env): string {
-  if (providerId === OPENAI_CODEX_PROVIDER_ID) return OPENAI_CODEX_DEFAULT_MODEL;
-  if (providerId === "deepseek") return env.DEEPSEEK_MODEL ?? "deepseek-v4-pro";
-  if (providerId === GLM_PROVIDER_ID) return env.GLM_MODEL ?? GLM_DEFAULT_MODEL;
-  const provider = getPiProvider(providerId);
+export function defaultPiModel(
+  providerId: string,
+  env: NodeJS.ProcessEnv = process.env,
+  models: Models = createPiModels()
+): string {
+  const configured = piProviderEnvironmentValue(providerId, "MODEL", env);
+  if (configured) return configured;
+  const provider = getPiProvider(providerId, models);
+  const preferredId = recommendedModelOrder.find((candidate) =>
+    candidate.startsWith(`${providerId}/`))?.slice(providerId.length + 1);
+  const preferred = preferredId ? provider?.getModels().find((model) => model.id === preferredId) : undefined;
+  if (preferred) return preferred.id;
   const first = provider?.getModels()[0];
   if (!first) throw new Error(`Provider '${providerId}' has no available models.`);
   return first.id;

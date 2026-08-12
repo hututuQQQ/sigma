@@ -179,6 +179,26 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             wrapped.index("printf command-completed"),
         )
 
+    async def test_agent_environment_uses_the_selected_provider_prefix(self):
+        module = import_portable_agent_module()
+        values = {
+            "FUTURE_PROVIDER_API_KEY": "future-secret",
+            "FUTURE_PROVIDER_BASE_URL": "https://future.example.test/v1",
+            "FUTURE_PROVIDER_MODEL": "future-model",
+            "DEEPSEEK_API_KEY": "unselected-secret",
+        }
+        with patch.dict(os.environ, values, clear=False):
+            environment = module.SigmaCliHarborAgent(
+                provider="future-provider",
+                extra_env={"SAFE_SETTING": "enabled"},
+            )._agent_env()
+
+        self.assertEqual(environment["FUTURE_PROVIDER_API_KEY"], "future-secret")
+        self.assertEqual(environment["FUTURE_PROVIDER_BASE_URL"], "https://future.example.test/v1")
+        self.assertEqual(environment["FUTURE_PROVIDER_MODEL"], "future-model")
+        self.assertEqual(environment["SAFE_SETTING"], "enabled")
+        self.assertNotIn("DEEPSEEK_API_KEY", environment)
+
     async def test_private_agent_environment_rejects_unsafe_shell_names_and_nul_values(self):
         module = import_portable_agent_module()
 
@@ -529,8 +549,9 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             module.SigmaCliHarborAgent(model="explicit-model", model_name="custom-model").model,
             "explicit-model",
         )
-        self.assertEqual(module.SigmaCliHarborAgent(provider="deepseek").model, "deepseek-v4-pro")
-        self.assertEqual(module.SigmaCliHarborAgent(provider="glm").model, "glm-5.2")
+        self.assertEqual(module.SigmaCliHarborAgent(provider="deepseek").model, "auto")
+        self.assertEqual(module.SigmaCliHarborAgent(provider="glm").model, "auto")
+        self.assertEqual(module.SigmaCliHarborAgent(provider="openai-codex").model, "auto")
         with self.assertRaisesRegex(ValueError, "execution_mode"):
             module.SigmaCliHarborAgent(execution_mode="host")
         self.assertEqual(module.SigmaCliHarborAgent().network_mode, "full")
@@ -571,6 +592,10 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             module.SigmaCliHarborAgent(command_timeout_sec=601)
         with self.assertRaisesRegex(ValueError, "reasoning_effort"):
             module.SigmaCliHarborAgent(reasoning_effort="extreme")
+        self.assertEqual(
+            module.SigmaCliHarborAgent(reasoning_effort="minimal").reasoning_effort,
+            "minimal",
+        )
 
     async def test_container_execution_mode_is_forwarded_without_host_opt_in(self):
         module = import_portable_agent_module()

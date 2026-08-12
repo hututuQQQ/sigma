@@ -64,13 +64,6 @@ function anthropicReasoningOptions(
   };
 }
 
-function bedrockModelMatchCandidates(model: Model<Api>): readonly string[] {
-  return [model.id, model.name].flatMap((value) => {
-    const lower = value.toLowerCase();
-    return [lower, lower.replace(/[\s_.:]+/gu, "-")];
-  });
-}
-
 function isAnthropicBedrockModel(model: Model<Api>): boolean {
   const id = model.id.toLowerCase();
   const name = model.name.toLowerCase();
@@ -82,16 +75,8 @@ function isAnthropicBedrockModel(model: Model<Api>): boolean {
 }
 
 function supportsBedrockAdaptiveThinking(model: Model<Api>): boolean {
-  return bedrockModelMatchCandidates(model).some((candidate) =>
-    [
-      "opus-4-6",
-      "opus-4-7",
-      "opus-4-8",
-      "opus-5",
-      "sonnet-4-6",
-      "sonnet-5",
-      "fable-5"
-    ].some((marker) => candidate.includes(marker)));
+  return typeof model.thinkingLevelMap?.xhigh === "string"
+    || typeof model.thinkingLevelMap?.max === "string";
 }
 
 function bedrockReasoningOptions(
@@ -123,30 +108,10 @@ function bedrockReasoningOptions(
   };
 }
 
-function isGemini3Pro(model: Model<Api>): boolean {
-  return /gemini-3(?:\.\d+)?-pro/u.test(model.id.toLowerCase());
-}
-
-function isGemini3Flash(model: Model<Api>): boolean {
-  const id = model.id.toLowerCase();
-  return /gemini-3(?:\.\d+)?-flash/u.test(id)
-    || id === "gemini-flash-latest"
-    || id === "gemini-flash-lite-latest";
-}
-
-function isGemma4(model: Model<Api>): boolean {
-  return /gemma-?4/u.test(model.id.toLowerCase());
-}
-
 function googleThinkingLevel(model: Model<Api>, level: ThinkingLevel): string {
   const normalized = budgetLevel(level);
-  if (isGemini3Pro(model)) {
-    return normalized === "minimal" || normalized === "low" ? "LOW" : "HIGH";
-  }
-  if (isGemma4(model)) {
-    return normalized === "minimal" || normalized === "low" ? "MINIMAL" : "HIGH";
-  }
-  return normalized.toUpperCase();
+  const mapped = model.thinkingLevelMap?.[normalized];
+  return typeof mapped === "string" ? mapped : normalized.toUpperCase();
 }
 
 function googleThinkingBudget(model: Model<Api>, level: ThinkingLevel): number {
@@ -182,9 +147,7 @@ function googleReasoningOptions(
   model: Model<Api>,
   level: ThinkingLevel
 ): Readonly<Record<string, unknown>> {
-  const usesThinkingLevel = isGemini3Pro(model)
-    || isGemini3Flash(model)
-    || (model.api === "google-generative-ai" && isGemma4(model));
+  const usesThinkingLevel = model.thinkingLevelMap !== undefined;
   return usesThinkingLevel
     ? {
         thinking: {

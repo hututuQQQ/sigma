@@ -1,7 +1,7 @@
 import {
   modelRoutesValue, modelSpecsValue, type ModelRouteConfigValue, type ModelSpecConfigValue
 } from "./model-catalog.js";
-import { assertMcpPersistentEffectsAllowed } from "agent-protocol";
+import { assertMcpPersistentEffectsAllowed, MODEL_REASONING_EFFORTS } from "agent-protocol";
 export type ConfigScalar = string | number | boolean;
 export type ConfigToolEffect =
   | "filesystem.read" | "filesystem.read.external" | "filesystem.write"
@@ -149,7 +149,7 @@ export const SIGMA_CONFIG_SCHEMA: readonly ConfigField[] = [
   }, hidden: true },
   { key: "provider", flag: "provider", env: "SIGMA_PROVIDER", toml: "model.provider", description: "Model provider", defaultValue: "openai-codex", parse: (raw) => stringValue(raw, "provider") },
   { key: "model", flag: "model", env: "SIGMA_MODEL", toml: "model.name", description: "Model name (auto selects provider default)", defaultValue: "auto", parse: (raw) => stringValue(raw, "model") },
-  { key: "reasoningEffort", flag: "reasoning-effort", env: "SIGMA_REASONING_EFFORT", toml: "model.reasoning_effort", description: "Model reasoning effort (auto uses the provider/model default)", defaultValue: "auto", parse: (raw) => enumValue(raw, "reasoningEffort", ["auto", "none", "low", "medium", "high", "xhigh", "max"] as const) },
+  { key: "reasoningEffort", flag: "reasoning-effort", env: "SIGMA_REASONING_EFFORT", toml: "model.reasoning_effort", description: "Model reasoning effort (auto uses the provider/model default)", defaultValue: "auto", parse: (raw) => enumValue(raw, "reasoningEffort", ["auto", ...MODEL_REASONING_EFFORTS] as const) },
   {
     key: "modelSpecs", flag: "model-spec", kind: "repeatable", env: "SIGMA_MODEL_SPECS", toml: "model.specs",
     description: "Model catalog spec JSON (repeatable)", defaultValue: [], parse: modelSpecsValue, hidden: true

@@ -42,6 +42,7 @@ describe("Sigma config", () => {
     const options = { env: {}, cwd: root, homeDir: home };
     expect(loadCliConfig({}, options).reasoningEffort).toBeUndefined();
     expect(loadCliConfig({ "reasoning-effort": "max" }, options).reasoningEffort).toBe("max");
+    expect(loadCliConfig({ "reasoning-effort": "minimal" }, options).reasoningEffort).toBe("minimal");
     expect(loadCliConfig({}, { ...options, env: { SIGMA_REASONING_EFFORT: "high" } }).reasoningEffort)
       .toBe("high");
     await mkdir(path.join(root, ".agent"));

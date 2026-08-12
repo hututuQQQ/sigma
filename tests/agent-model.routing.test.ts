@@ -11,8 +11,13 @@ import type { ModelSpecConfigValue } from "../packages/agent-config/src/index.js
 import {
   listPiAuthStatuses,
   listPiProviders,
+  piProviderEnvironmentValue,
+  type Api,
+  type AssistantMessage,
+  type AssistantMessageEvent,
   type Credential,
   type CredentialStore,
+  type Model as PiModel,
   type Models,
   type ModelsStore
 } from "../packages/agent-pi/src/index.js";
@@ -137,7 +142,82 @@ function credentialStore(providerId: string, credential: Credential): Credential
   };
 }
 
+function genericHealthModels(): Models {
+  const model: PiModel<Api> = {
+    id: "fixture-model",
+    name: "Fixture model",
+    api: "pi-messages",
+    provider: "fixture-provider",
+    baseUrl: "https://fixture-provider.example.test/v1",
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 8_192,
+    maxTokens: 1_024
+  };
+  const message: AssistantMessage = {
+    role: "assistant",
+    content: [{ type: "text", text: "OK" }],
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    usage: {
+      input: 4,
+      output: 1,
+      cacheRead: 0,
+      cacheWrite: 0,
+      reasoning: 0,
+      totalTokens: 5,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
+    },
+    stopReason: "stop",
+    timestamp: Date.now()
+  };
+  async function* events(): AsyncIterable<AssistantMessageEvent> {
+    yield { type: "start", partial: message };
+    yield { type: "text_delta", contentIndex: 0, delta: "OK", partial: message };
+    yield { type: "done", reason: "stop", message };
+  }
+  return {
+    getProviders: () => [],
+    getProvider: () => undefined,
+    getModels: () => [model],
+    getModel: (provider, id) => provider === model.provider && id === model.id ? model : undefined,
+    refresh: async () => ({ refreshed: [], errors: [] }) as never,
+    checkAuth: async () => ({ type: "api_key", source: "fixture" }) as never,
+    getAvailable: async () => [model],
+    getAuth: async () => ({
+      type: "api_key",
+      source: "fixture",
+      auth: { apiKey: "fixture-secret", baseUrl: model.baseUrl }
+    }) as never,
+    login: async () => { throw new Error("not interactive"); },
+    logout: async () => undefined,
+    stream: () => events() as never,
+    complete: async () => message,
+    streamSimple: () => events() as never,
+    completeSimple: async () => message
+  };
+}
+
 describe("provider health probe", () => {
+  it("executes a real gateway probe for a provider-neutral Pi transport", async () => {
+    const report = await checkProviderHealth({
+      provider: "fixture-provider",
+      model: "fixture-model",
+      signal: new AbortController().signal,
+      piModels: genericHealthModels()
+    });
+
+    expect(report).toMatchObject({
+      ok: true,
+      provider: "fixture-provider",
+      model: "fixture-model",
+      endpointHost: "fixture-provider.example.test",
+      message: "OK"
+    });
+  });
+
   it("probes the same configured default model used by runtime auto selection", async () => {
     vi.stubEnv("DEEPSEEK_MODEL", "configured-default-model");
     const fetchImpl = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
@@ -260,6 +340,14 @@ describe("provider health probe", () => {
   });
 });
 
+describe("provider environment conventions", () => {
+  it("resolves a future provider without adding a provider-specific branch", () => {
+    expect(piProviderEnvironmentValue("future-provider", "BASE_URL", {
+      FUTURE_PROVIDER_BASE_URL: "  https://future.example.test/v1  "
+    })).toBe("https://future.example.test/v1");
+  });
+});
+
 describe("capability-aware model routing", () => {
   it("classifies transport codes without treating configuration failures as retryable", () => {
     expect(classifyModelFailure(Object.assign(new Error("reset"), { code: "ECONNRESET" }))).toBe("network");
@@ -292,6 +380,16 @@ describe("capability-aware model routing", () => {
     }));
     expect(gateway).toMatchObject({ provider: "deepseek", model: "deepseek/custom" });
     expect(gateway.capabilities.contextWindowTokens).toBe(42_000);
+    const openAiGateway = createModelGatewayForSpec(spec("custom-openai", {
+      providerId: "openai",
+      upstreamModel: "future-openai-model",
+      capabilities: { ...capabilities, contextWindowTokens: 64_000 }
+    }));
+    expect(openAiGateway).toMatchObject({
+      provider: "openai",
+      model: "future-openai-model",
+      capabilities: expect.objectContaining({ contextWindowTokens: 64_000 })
+    });
   });
 
   it("hydrates Radius models from the local cache without network access", async () => {
@@ -388,20 +486,45 @@ describe("capability-aware model routing", () => {
   it("composes production fallback candidates and honors an explicit single-model route", () => {
     expect(productionModelCandidates(
       { provider: "deepseek", model: "auto" },
-      { DEEPSEEK_API_KEY: "primary", GLM_API_KEY: "fallback" }
+      { DEEPSEEK_MODEL: "deepseek-v4-pro" },
+      BUILTIN_MODEL_SPECS,
+      new Set(["deepseek", "glm"])
     ).map((item) => item.id)).toEqual(["deepseek/deepseek-v4-pro", "glm/glm-5.2"]);
     expect(productionModelCandidates(
       { provider: "glm", model: "auto", explicitSingleModelRoute: true },
-      { GLM_API_KEY: "primary", DEEPSEEK_API_KEY: "unused" }
+      {},
+      BUILTIN_MODEL_SPECS,
+      new Set(["glm", "deepseek"])
     ).map((item) => item.id)).toEqual(["glm/glm-5.2"]);
     expect(productionModelCandidates(
       { provider: "deepseek", model: "auto" },
-      { DEEPSEEK_API_KEY: "primary" }
+      {},
+      BUILTIN_MODEL_SPECS,
+      new Set(["deepseek"])
     ).map((item) => item.id)).toEqual(["deepseek/deepseek-v4-pro"]);
     expect(productionModelCandidates(
       { provider: "openai-codex", model: "gpt-5.6-terra" },
-      { OPENAI_API_KEY: "must-not-be-used", DEEPSEEK_API_KEY: "must-not-fallback" }
+      {},
+      BUILTIN_MODEL_SPECS,
+      new Set(["openai-codex", "deepseek"])
     ).map((item) => item.id)).toEqual(["openai-codex/gpt-5.6-terra"]);
+
+    const primary = spec("alpha/main", {
+      providerId: "alpha",
+      upstreamModel: "main",
+      recommended: true
+    });
+    const fallback = spec("beta/backup", {
+      providerId: "beta",
+      upstreamModel: "backup",
+      recommended: true
+    });
+    expect(productionModelCandidates(
+      { provider: "alpha", model: "main" },
+      {},
+      [primary, fallback],
+      new Set(["alpha", "beta"])
+    ).map((item) => item.id)).toEqual(["alpha/main", "beta/backup"]);
   });
 
   it("retries transient subscription failures without routing them to paid providers", async () => {
@@ -827,7 +950,7 @@ describe("capability-aware model routing", () => {
 
   it("keeps transport retries in the Sigma policy layer and reserves them", async () => {
     let calls = 0;
-    const only = spec("deepseek/a");
+    const only = spec("metered-provider/a", { providerId: "metered-provider" });
     const representative = gateway(only.id, async () => response("unused"));
     const retrying = gateway(only.id, async () => {
       calls += 1;
@@ -1446,6 +1569,32 @@ describe("normalized model usage", () => {
       costMicroUsd: null,
       billingMode: "subscription"
     });
+  });
+
+  it("matches built-in accounting metadata for providers outside the legacy trio", async () => {
+    const genericSpec = BUILTIN_MODEL_SPECS.find((item) =>
+      !["deepseek", "glm", "openai-codex"].includes(item.providerId)
+      && item.billingMode === "metered"
+      && item.pricing !== undefined);
+    expect(genericSpec).toBeDefined();
+    const genericGateway: ModelGateway = {
+      ...gateway("generic-metered", async () => response("ok")),
+      provider: genericSpec!.providerId,
+      model: genericSpec!.upstreamModel,
+      capabilities: genericSpec!.capabilities,
+      async countTokens() { return 4; }
+    };
+
+    const prepared = await prepareModelBudget(
+      genericGateway,
+      request().messages,
+      [],
+      10,
+      10_000_000
+    );
+
+    expect(prepared.spec?.id).toBe(genericSpec!.id);
+    expect(prepared.reserved.costMicroUsd).toBeGreaterThan(0);
   });
 
   it("allows null persisted cost only when usage is explicitly subscription billed", () => {

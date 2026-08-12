@@ -15,6 +15,7 @@ import {
 import { parse as parseToml } from "smol-toml";
 import { resolveWorkspaceMcpTrust } from "./workspace-mcp-trust.js";
 import { resolveWorkspaceCustomizationTrust } from "./workspace-customization-trust.js";
+import type { ModelReasoningEffort } from "agent-protocol";
 
 export interface ParsedArgs {
   flags: Record<string, unknown>;
@@ -25,7 +26,7 @@ export interface CliConfig {
   workspace: string;
   provider: string;
   model: string;
-  reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
+  reasoningEffort?: ModelReasoningEffort;
   agentProfile: string;
   permissionMode: "workspace-auto" | "ask" | "auto" | "deny";
   sandboxMode: "required";

@@ -46,6 +46,7 @@ interface ModelGatewayFactoryOptions {
 export interface ModelCompositionDeps {
   gatewayFactory?: (options: ModelGatewayFactoryOptions) => ModelGateway;
   catalogSpecs?: readonly ModelSpec[];
+  authenticatedProviders?: ReadonlySet<string>;
 }
 
 export interface ModelGateways {
@@ -62,33 +63,29 @@ const TOOL_ROLES = new Set<ModelExecutionRole>([
   "child_write"
 ]);
 
-function hasCredential(provider: ModelSpec["providerId"], env: NodeJS.ProcessEnv): boolean {
-  if (provider === "deepseek") return Boolean(env.DEEPSEEK_API_KEY?.trim());
-  if (provider === "glm") {
-    return Boolean(env.GLM_API_KEY?.trim() || env.ZAI_API_KEY?.trim() || env.BIGMODEL_API_KEY?.trim());
-  }
-  return false;
-}
-
 export function productionModelCandidates(
   config: Pick<ModelCompositionConfig, "provider" | "model" | "explicitSingleModelRoute">,
   env: NodeJS.ProcessEnv = process.env,
-  catalogSpecs: readonly ModelSpec[] = BUILTIN_MODEL_SPECS
+  catalogSpecs: readonly ModelSpec[] = BUILTIN_MODEL_SPECS,
+  authenticatedProviders: ReadonlySet<string> = new Set()
 ): ModelSpec[] {
   const model = selectedModel(config, env, catalogSpecs);
   const primary = catalogSpecs.find((spec) =>
     spec.providerId === config.provider && spec.upstreamModel === model);
   if (!primary) return [];
-  if (config.explicitSingleModelRoute || (primary.providerId !== "deepseek" && primary.providerId !== "glm")) {
+  if (config.explicitSingleModelRoute || primary.recommended !== true) {
     return [primary];
   }
-  const fallbackProvider = primary.providerId === "deepseek" ? "glm" : "deepseek";
-  const fallback = hasCredential(fallbackProvider, env)
-    ? catalogSpecs.find((spec) =>
-        spec.providerId === fallbackProvider
-        && spec.upstreamModel === defaultModel(fallbackProvider, env))
-    : undefined;
-  return fallback ? [primary, fallback] : [primary];
+  const seenProviders = new Set([primary.providerId]);
+  const fallback = catalogSpecs.filter((spec) => {
+    if (spec.recommended !== true
+      || spec.billingMode !== primary.billingMode
+      || !authenticatedProviders.has(spec.providerId)
+      || seenProviders.has(spec.providerId)) return false;
+    seenProviders.add(spec.providerId);
+    return true;
+  });
+  return [primary, ...fallback];
 }
 
 function injectedModelSpec(
@@ -100,7 +97,10 @@ function injectedModelSpec(
     id: `${provider}/${model}`,
     providerId: provider,
     upstreamModel: model,
-    billingMode: provider === "openai-codex" ? "subscription" : "unpriced",
+    // An injected gateway has no catalog-backed billing attestation. Treat it
+    // as unpriced regardless of provider name and require the normal explicit
+    // unpriced-cost opt-in whenever a monetary budget is active.
+    billingMode: "unpriced",
     capabilities: gateway.capabilities,
     tokenizer: { id: "injected/test-tokenizer", accuracy: "approximate" }
   };
@@ -159,7 +159,8 @@ function catalog(
   env: NodeJS.ProcessEnv,
   custom: readonly ModelSpec[],
   injected: ModelSpec | undefined,
-  catalogSpecs: readonly ModelSpec[]
+  catalogSpecs: readonly ModelSpec[],
+  authenticatedProviders: ReadonlySet<string>
 ): { primary: ModelSpec; specs: ModelSpec[]; routes: ModelRoute[] } {
   const model = selectedModel(config, env, catalogSpecs);
   const primary = catalogSpecs.find((spec) =>
@@ -177,12 +178,17 @@ function catalog(
   const explicitRoutes = (config.modelRoutes ?? []).map(configuredRoute);
   let routes: ModelRoute[];
   if (config.explicitSingleModelRoute
-    || (explicitRoutes.length === 0 && primary.providerId !== "deepseek" && primary.providerId !== "glm")) {
+    || (explicitRoutes.length === 0 && primary.recommended !== true)) {
     routes = [{ id: "default", candidates: [primary.id], fallbackOn: FALLBACK_ON, maxAttempts: 1 }];
   } else if (explicitRoutes.length > 0) {
     routes = explicitRoutes;
   } else {
-    const candidates = productionModelCandidates(config, env, catalogSpecs).map((spec) => spec.id);
+    const candidates = productionModelCandidates(
+      config,
+      env,
+      catalogSpecs,
+      authenticatedProviders
+    ).map((spec) => spec.id);
     if (!candidates.includes(primary.id)) candidates.unshift(primary.id);
     routes = [{ id: "default", candidates, fallbackOn: FALLBACK_ON, maxAttempts: candidates.length }];
   }
@@ -284,7 +290,14 @@ export function createRoleGateways(
   const options = gatewayOptions(config);
   const primary = primaryGateway(config.provider, model, knownPrimary, deps, options);
   const injected = knownPrimary ? undefined : injectedModelSpec(config.provider, model, primary);
-  const resolved = catalog(config, env, custom, injected, catalogSpecs);
+  const resolved = catalog(
+    config,
+    env,
+    custom,
+    injected,
+    catalogSpecs,
+    deps.authenticatedProviders ?? new Set()
+  );
   const gateways = new Map<string, ModelGateway>();
   for (const spec of resolved.specs) {
     const gateway = spec.id === resolved.primary.id

@@ -11,7 +11,7 @@ vi.mock("../packages/agent-model/dist/index.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("agent-model")>();
   return {
     ...actual,
-    checkProviderHealth: async (input: { provider: "deepseek" | "glm"; model: string }) => {
+    checkProviderHealth: async (input: { provider: string; model: string }) => {
       if (api.mode === "error") throw new Error("mock API failure");
       if (api.mode === "raw_error") throw "raw API failure";
       if (api.mode === "empty") {
