@@ -134,6 +134,50 @@ class ToolSchemaHeavyGateway extends InspectableGateway {
   }
 }
 
+class ContextRejectedGateway extends InspectableGateway {
+  readonly budgetToolCounts: number[] = [];
+
+  async budgetPlan(
+    _messages: ModelMessage[],
+    tools: ModelToolDefinition[],
+    maxOutputTokens: number,
+    remainingBudgetMicroUsd: number
+  ) {
+    this.budgetToolCounts.push(tools.length);
+    if (tools.length > 0) {
+      throw Object.assign(new Error("The route cannot admit this context."), {
+        code: "model_route_unavailable",
+        routeId: "default",
+        rejected: [{
+          modelSpecId: "fake/context-rejected",
+          reason: "context",
+          detail: "32001 tokens exceed candidate limits"
+        }]
+      });
+    }
+    const inputTokens = 150;
+    const outputTokens = Math.ceil(maxOutputTokens * 1.5);
+    return {
+      estimatedInputTokens: 100,
+      reservedInputTokens: inputTokens,
+      reservedOutputTokens: outputTokens,
+      reservedCostMicroUsd: 0,
+      reservedModelTurns: 1,
+      attemptReservations: [{ inputTokens, outputTokens, costMicroUsd: null }],
+      constraints: {
+        estimatedInputTokens: 100,
+        maxOutputTokens,
+        remainingBudgetMicroUsd,
+        maxAttempts: 1
+      }
+    };
+  }
+
+  routingIdentity() {
+    return { role: "orchestrator" as const, routeId: "default" };
+  }
+}
+
 function requestInputResponse(): ModelResponse {
   return {
     message: {
@@ -537,6 +581,53 @@ describe("provider-measured model budget settlement", () => {
     expect(gateway.requests[1]).toMatchObject({ toolChoice: "none", tools: [] });
     expect(gateway.requests[1]!.messages.some((message) =>
       message.content.includes("final model turn allowed"))).toBe(true);
+  });
+
+  it("recovers an all-context route rejection with one text-only terminal turn", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-route-context-workspace-"));
+    const state = await mkdtemp(path.join(os.tmpdir(), "sigma-route-context-state-"));
+    const gateway = new ContextRejectedGateway([
+      stopResponse("Context route recovered without replaying the failed request.")
+    ]);
+    const store = new SegmentedJsonlStore({ rootDir: state });
+    const runtime = createRuntime({
+      gateway,
+      store,
+      storeRootDir: state,
+      tools: registerBuiltinTools(new EffectToolRegistry()),
+      permissionMode: "auto",
+      outputReserveTokens: 100
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+    await runtime.command({
+      type: "submit",
+      sessionId: session.sessionId,
+      text: "Provide a concise status."
+    });
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "completed",
+      message: "Context route recovered without replaying the failed request."
+    });
+    expect(gateway.budgetToolCounts[0]).toBeGreaterThan(0);
+    expect(gateway.budgetToolCounts.at(-1)).toBe(0);
+    expect(gateway.requests).toHaveLength(1);
+    expect(gateway.requests[0]).toMatchObject({ toolChoice: "none", tools: [] });
+    const events = await storedEvents(store, session.sessionId);
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "diagnostic",
+      payload: {
+        kind: "context.capacity_recovery",
+        source: "router",
+        action: "terminal_fallback",
+        routeId: "default",
+        rejections: [{
+          modelSpecId: "fake/context-rejected",
+          detail: "32001 tokens exceed candidate limits"
+        }]
+      }
+    }));
+    expect(events.some((event) => event.type === "model.failed")).toBe(false);
   });
 
   it("continues useful work while an explicit deadline is still live", async () => {

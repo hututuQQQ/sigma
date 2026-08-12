@@ -16,6 +16,7 @@ import {
 import { isToolAllowed } from "agent-tools";
 import { refreshContextArchive } from "./context-archive-refresh.js";
 import {
+  contextCapacityFailure,
   projectModelToolDescriptors,
   sessionModelToolProjectionCapabilities
 } from "./effect-helpers.js";
@@ -51,8 +52,24 @@ interface ProjectedModelHistory {
 type BudgetedModelTurn = Awaited<ReturnType<typeof prepareBudgetedModelTurn>>;
 
 function contextBudgetExhausted(error: unknown): boolean {
-  return Boolean(error && typeof error === "object"
-    && (error as { code?: unknown }).code === "context_overflow");
+  return contextCapacityFailure(error) !== undefined;
+}
+
+async function emitContextCapacityRecovery(
+  options: EffectRunnerOptions,
+  session: RuntimeSession,
+  error: unknown,
+  action: "terminal_fallback" | "budget_exhausted"
+): Promise<void> {
+  const failure = contextCapacityFailure(error);
+  if (!failure) return;
+  await options.emit(session, "diagnostic", "runtime", {
+    kind: "context.capacity_recovery",
+    source: failure.source,
+    action,
+    ...(failure.routeId ? { routeId: failure.routeId } : {}),
+    rejections: [...failure.rejections]
+  });
 }
 
 function contextBudgetFailure(): PreparedModelAttempt {
@@ -312,6 +329,12 @@ export async function prepareModelAttempt(
   } catch (error) {
     if (!contextBudgetExhausted(error)) throw error;
     const fallback = await prepareTerminalContextFallback(options, session, preparation);
+    await emitContextCapacityRecovery(
+      options,
+      session,
+      error,
+      fallback ? "terminal_fallback" : "budget_exhausted"
+    );
     if (!fallback) return contextBudgetFailure();
     prepared = fallback.prepared;
     available = fallback.available;

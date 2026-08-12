@@ -43,6 +43,7 @@ export {
   APPROXIMATE_TOKEN_RESERVATION_MARGIN,
   mergeRequiredCapabilities,
   modelReservationEstimate,
+  tokenizerReservationMargin,
   type ModelRejection,
   type ModelReservationEstimate,
   type ModelResolution,

@@ -2,11 +2,10 @@ import { createHash } from "node:crypto";
 import { lstat, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import {
-  type JsonValue, type ModelGateway, type ModelToolCall, type ModelToolDefinition,
+  type JsonValue, type ModelToolCall, type ModelToolDefinition,
   type ModelToolNamespace, type ModelToolPresentation,
   type ToolCallPlan, type ToolDescriptor, type ToolReceipt, type WorkspaceDelta
 } from "agent-protocol";
-import { planContext, type ContextPlan, type PlanContextOptions } from "agent-context";
 import { canonicalWorkspacePath, isInside, resolveWorkspacePath } from "agent-platform";
 import type { RuntimeSession } from "./types.js";
 import { failed } from "./tool-receipt.js";
@@ -14,6 +13,11 @@ import { failed } from "./tool-receipt.js";
 export {
   completionFailure
 } from "./completion-evidence-gate.js";
+export {
+  contextCapacityFailure,
+  providerSizedPlan,
+  type ContextCapacityFailure
+} from "./context-capacity.js";
 export { failed } from "./tool-receipt.js";
 export {
   projectModelToolDescriptors,
@@ -148,67 +152,6 @@ export function modelTools(descriptors: readonly ToolDescriptor[]): ModelToolDef
       inputSchema: canonicalJsonValue(item.inputSchema) as ModelToolDefinition["inputSchema"],
       presentation: modelToolPresentation(item)
     }));
-}
-
-const PROACTIVE_CONTEXT_WINDOW_PERCENT = 90;
-
-function contextOverflowError(error: unknown): boolean {
-  return Boolean(error && typeof error === "object"
-    && (error as { code?: unknown }).code === "context_overflow");
-}
-
-export async function providerSizedPlan(
-  gateway: ModelGateway,
-  input: Omit<PlanContextOptions, "contextWindowTokens" | "promptCache"> & { maxInputTokens?: number }
-): Promise<ContextPlan> {
-  const providerLimit = gateway.capabilities.contextWindowTokens;
-  const { maxInputTokens, ...contextInput } = input;
-  const inputLimit = Math.min(providerLimit - input.outputReserveTokens, maxInputTokens ?? providerLimit);
-  // Keep replayable history below the provider's final context headroom so
-  // the existing archive path activates before a very large request reaches
-  // transport. Exact mandatory context still gets one full-window attempt.
-  const proactiveLimit = Math.floor(
-    providerLimit * PROACTIVE_CONTEXT_WINDOW_PERCENT / 100
-  );
-  let planningLimit = Math.min(
-    providerLimit,
-    Math.max(input.outputReserveTokens + 1, proactiveLimit)
-  );
-  let usedMandatoryFallback = planningLimit === providerLimit;
-  while (planningLimit > input.outputReserveTokens) {
-    let plan: ContextPlan;
-    try {
-      plan = planContext({
-        ...contextInput,
-        contextWindowTokens: planningLimit,
-        promptCache: gateway.capabilities.promptCache
-      });
-    } catch (error) {
-      if (!usedMandatoryFallback && contextOverflowError(error)) {
-        planningLimit = providerLimit;
-        usedMandatoryFallback = true;
-        continue;
-      }
-      throw error;
-    }
-    const tokens = await gateway.countTokens(plan.messages, input.tools);
-    const planningInputLimit = Math.min(
-      inputLimit,
-      planningLimit - input.outputReserveTokens
-    );
-    if (tokens <= planningInputLimit
-      && tokens + input.outputReserveTokens <= planningLimit) return plan;
-    const ratio = Math.min(
-      planningInputLimit / Math.max(1, tokens),
-      planningLimit / (tokens + input.outputReserveTokens)
-    );
-    const next = Math.min(planningLimit - 1, Math.floor(planningLimit * ratio * 0.98));
-    if (next <= input.outputReserveTokens) break;
-    planningLimit = next;
-  }
-  throw Object.assign(new Error("Provider tokenizer could not fit mandatory context and the newest user turn."), {
-    code: "context_overflow"
-  });
 }
 
 export function requestTargets(call: ModelToolCall, descriptor: ToolDescriptor): string[] {
