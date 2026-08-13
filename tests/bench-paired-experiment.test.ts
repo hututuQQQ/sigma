@@ -346,6 +346,11 @@ describe("paired Harness experiment", () => {
     expect(classifyBlockingCondition(base, {
       validity: "valid", failure_category: "api_error", last_error: "authentication failed"
     })).toBe("credential_or_provider_unavailable");
+    expect(classifyBlockingCondition(base, {
+      validity: "valid",
+      failure_category: "agent_crashed",
+      last_error: "Optional MCP worker quit with AuthRequired after the model had already started."
+    })).toBeNull();
   });
 
   it("preserves an attested task identity when Harbor fails before producing a trial", () => {

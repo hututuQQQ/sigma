@@ -24,7 +24,6 @@ const BLOCKING_FAILURES = new Set([
   "host_proxy_error", "host_encoding_error", "harbor_cli_error", "node_missing",
   "agent_setup_failed", "infrastructure_incomplete", "verifier_setup_failed"
 ]);
-const PROVIDER_BLOCKER = /(?:auth(?:entication|orization)?|credential|unauthori[sz]ed|invalid[_ -]?api[_ -]?key|rate[_ -]?limit|service unavailable|provider unavailable|connection (?:refused|reset)|could not resolve host)/iu;
 
 function required(value, label) {
   if (typeof value !== "string" || value.trim().length === 0) throw new Error(`${label} is required.`);
@@ -211,8 +210,7 @@ export function classifyBlockingCondition(report, task) {
   if (task?.validity === "infra_failed" || BLOCKING_FAILURES.has(task?.failure_category)) {
     return "infra_failed_attempt";
   }
-  const errorText = `${task?.last_error ?? ""}\n${task?.agent_exception?.message ?? ""}`;
-  if (task?.failure_category === "api_error" || PROVIDER_BLOCKER.test(errorText)) {
+  if (task?.failure_category === "api_error") {
     return "credential_or_provider_unavailable";
   }
   if (report.frozen_runtime_integrity === "failed" || report.docker_cleanup?.clean === false
