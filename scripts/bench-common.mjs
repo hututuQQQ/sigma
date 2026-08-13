@@ -1029,7 +1029,7 @@ export function buildHarborArgs(options) {
       "codex_cli_layout", "str", options.runtimeLayout ?? "npm-linux-x64", capabilities
     ));
     args.push("--ak", formatAgentKwarg("version", "str", options.runtimeVersion, capabilities));
-    args.push("--ak", formatAgentKwarg("model_name", "str", options.model, capabilities));
+    args.push("--model", options.model);
     args.push("--ak", formatAgentKwarg(
       "reasoning_effort", "str", options.reasoningEffort ?? "auto", capabilities
     ));
@@ -1981,7 +1981,7 @@ async function resolvedJobConfigForReport(runDir, config) {
   return existsSync(filePath) ? await readJsonSafe(filePath) : null;
 }
 
-async function runSlotIntegrityReasons(runDir, config) {
+export async function runSlotIntegrityReasons(runDir, config) {
   const slots = Array.isArray(config.run_slots) ? config.run_slots : [];
   if (slots.length === 0) return [];
   const reasons = [];
@@ -2018,14 +2018,14 @@ async function runSlotIntegrityReasons(runDir, config) {
     }
     const jobConfig = await readJsonSafe(configPath);
     if (config.mode !== "smoke") {
-      const kwargs = Array.isArray(jobConfig.agents) && jobConfig.agents.length === 1
+      const agentConfig = Array.isArray(jobConfig.agents) && jobConfig.agents.length === 1
         && jobConfig.agents[0] && typeof jobConfig.agents[0] === "object"
-        ? jobConfig.agents[0].kwargs : null;
+        ? jobConfig.agents[0] : null;
+      const kwargs = agentConfig?.kwargs;
       const frozenControls = config.harness === "codex" ? {
         codex_cli_sha256: config.runtime_archive_sha256,
         codex_cli_layout: config.runtime_layout,
         version: config.runtime_version,
-        model_name: config.model,
         reasoning_effort: config.reasoning_effort
       } : {
         network_mode: config.network_mode,
@@ -2042,6 +2042,10 @@ async function runSlotIntegrityReasons(runDir, config) {
             reasons.push(`Harbor run slot ${slot.run_slot} agent control ${key} does not match its frozen run.`);
           }
         }
+      }
+      if (config.harness === "codex" && typeof config.model === "string"
+        && agentConfig?.model_name !== config.model) {
+        reasons.push(`Harbor run slot ${slot.run_slot} agent control model_name does not match its frozen run.`);
       }
     }
     if (slot.harbor_task_identity) {

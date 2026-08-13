@@ -4,8 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  buildHarborArgs,
   buildHarborJobConfig,
   resolveRunOptions,
+  runSlotIntegrityReasons,
   taskSelectionIdentitySha256
 } from "../scripts/bench-common.mjs";
 import { analyzePairedExperiment } from "../scripts/bench-paired-analysis.mjs";
@@ -197,6 +199,69 @@ describe("paired Harness experiment", () => {
     expect(agent.kwargs).not.toHaveProperty("model_name");
     expect(agent.kwargs).not.toHaveProperty("agent_profile");
     expect(agent.kwargs).not.toHaveProperty("provider");
+  });
+
+  it("keeps the Codex model in Harbor's standard field across config and CLI integrity checks", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "sigma-codex-controls-"));
+    try {
+      const archive = path.resolve("codex.tgz");
+      const digest = "d".repeat(64);
+      const options = resolveRunOptions([
+        "--mode", "task", "--task-id", "fixture-task",
+        "--harness", "codex",
+        "--provider", "provider-fixture",
+        "--model", "model-fixture",
+        "--reasoning-effort", "max",
+        "--runtime-archive", archive,
+        "--runtime-version", "0.147.0",
+        "--runtime-layout", "npm-linux-x64",
+        "--reuse-package",
+        "--expected-archive-sha256", digest
+      ], {});
+      const jobConfig = buildHarborJobConfig(options, "jobs");
+      const configPath = path.join(directory, "resolved-job.config.json");
+      const bytes = `${JSON.stringify(jobConfig, null, 2)}\n`;
+      await writeFile(configPath, bytes, "utf8");
+      const config = {
+        mode: "task",
+        harness: "codex",
+        model: "model-fixture",
+        reasoning_effort: "max",
+        runtime_archive_sha256: digest,
+        runtime_layout: "npm-linux-x64",
+        runtime_version: "0.147.0",
+        run_slots: [{
+          run_slot: "slot-one",
+          resolved_job_config_path: "resolved-job.config.json",
+          job_config_sha256: createHash("sha256").update(bytes).digest("hex")
+        }]
+      };
+      await expect(runSlotIntegrityReasons(directory, config)).resolves.toEqual([]);
+
+      const args = buildHarborArgs({
+        ...options,
+        k: 1,
+        capabilities: {
+          agentFlag: "--agent",
+          agentKwargStyle: "plain",
+          taskLimitFlag: "-l",
+          taskSelectionFlag: "--task"
+        }
+      });
+      expect(args.slice(args.indexOf("--model"), args.indexOf("--model") + 2))
+        .toEqual(["--model", "model-fixture"]);
+      expect(args.some((item) => item.includes("model_name"))).toBe(false);
+
+      jobConfig.agents[0].model_name = "drifted-model";
+      const driftedBytes = `${JSON.stringify(jobConfig, null, 2)}\n`;
+      await writeFile(configPath, driftedBytes, "utf8");
+      config.run_slots[0].job_config_sha256 = createHash("sha256").update(driftedBytes).digest("hex");
+      await expect(runSlotIntegrityReasons(directory, config)).resolves.toEqual([
+        "Harbor run slot slot-one agent control model_name does not match its frozen run."
+      ]);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   it("consumes one ramp stage once and never retries its attempts", async () => {
