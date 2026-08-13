@@ -764,7 +764,6 @@ function benchmarkAgentKwargs(options, timeoutPlan = null) {
       codex_cli_sha256: options.expectedArchiveSha256,
       codex_cli_layout: options.runtimeLayout ?? "npm-linux-x64",
       version: options.runtimeVersion,
-      model_name: options.model,
       reasoning_effort: options.reasoningEffort ?? "auto"
     };
   }
@@ -818,6 +817,10 @@ export function buildHarborJobConfig(options, jobsDir, timeoutPlan = null, timeo
       }
     ]
   };
+
+  if (options.mode !== "smoke" && options.harness === "codex") {
+    config.agents[0].model_name = options.model;
+  }
 
   if (options.mode !== "smoke") {
     config.environment = {

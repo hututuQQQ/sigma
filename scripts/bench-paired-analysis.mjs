@@ -430,7 +430,7 @@ function pairedAnalysis(records, reference, comparison) {
       comparison_only_passes: wins,
       reference_only_passes: losses,
       ties: rows.length - wins - losses,
-      mcnemar_exact_two_sided_p: mcnemarExact(wins, losses)
+      mcnemar_exact_two_sided_p: rows.length > 0 ? mcnemarExact(wins, losses) : null
     },
     efficiency: metrics,
     trace: {
@@ -487,7 +487,7 @@ function markdown(report) {
     "",
     `- ${comparison}-only passes: ${report.paired.correctness.comparison_only_passes}`,
     `- ${reference}-only passes: ${report.paired.correctness.reference_only_passes}`,
-    `- Exact McNemar p-value: ${report.paired.correctness.mcnemar_exact_two_sided_p}`,
+    `- Exact McNemar p-value: ${report.paired.correctness.mcnemar_exact_two_sided_p ?? "n/a"}`,
     "",
     "## Paired efficiency (comparison / reference)",
     "",

@@ -166,10 +166,22 @@ function selectStage(manifest, completed, requested) {
 
 function exactTask(report, expectedIdentity) {
   const tasks = Array.isArray(report?.tasks) ? report.tasks : [];
-  if (tasks.length !== 1 || tasks[0]?.selection_identity_sha256 !== expectedIdentity) {
-    throw new Error("The benchmark report does not contain the frozen task identity exactly once.");
+  if (tasks.length === 1 && tasks[0]?.selection_identity_sha256 === expectedIdentity) {
+    return { task: tasks[0], identityEvidence: "task" };
   }
-  return tasks[0];
+  const slots = Array.isArray(report?.run_slots) ? report.run_slots : [];
+  const reportIncomplete = report?.incomplete_reason !== null
+    || Number(report?.trial_accounting?.expected) !== 1
+    || Number(report?.trial_accounting?.observed) !== 1
+    || Number(report?.trial_accounting?.missing) !== 0;
+  if (reportIncomplete && slots.length === 1
+    && slots[0]?.selection_identity_sha256 === expectedIdentity) {
+    return {
+      task: tasks.length === 1 ? tasks[0] : {},
+      identityEvidence: "run_slot_attestation"
+    };
+  }
+  throw new Error("The benchmark report does not contain the frozen task identity exactly once.");
 }
 
 export function classifyBlockingCondition(report, task) {
@@ -212,7 +224,8 @@ export function summarizePairedAttempt(context) {
   const expectedIdentity = taskSelectionIdentitySha256(
     manifest.selection.selected_tasks[pair.task_index]
   );
-  const task = exactTask(report, expectedIdentity);
+  const { task, identityEvidence } = exactTask(report, expectedIdentity);
+  const blockingCondition = classifyBlockingCondition(report, task);
   const inputTokens = numberOrZero(task.input_tokens);
   const cacheReadTokens = numberOrZero(task.cache_read_tokens ?? task.cache_tokens);
   const outputTokens = numberOrZero(task.output_tokens);
@@ -226,12 +239,13 @@ export function summarizePairedAttempt(context) {
     arm: arm.id,
     harness: arm.harness,
     order: pair.arms.indexOf(arm.id) + 1,
-    valid: task.validity === "valid",
-    passed: task.validity === "valid" && task.verifier_outcome === "passed",
+    valid: blockingCondition === null && task.validity === "valid",
+    passed: blockingCondition === null && task.validity === "valid" && task.verifier_outcome === "passed",
     agent_outcome: task.agent_outcome ?? null,
     verifier_outcome: task.verifier_outcome ?? null,
     failure_category: task.failure_category ?? null,
-    blocking_condition: classifyBlockingCondition(report, task),
+    blocking_condition: blockingCondition,
+    task_identity_evidence: identityEvidence,
     metrics: {
       duration_ms: numberOrZero(task.duration_ms),
       input_tokens: inputTokens,

@@ -11,7 +11,8 @@ import {
 import { analyzePairedExperiment } from "../scripts/bench-paired-analysis.mjs";
 import {
   classifyBlockingCondition,
-  runPairedExperiment
+  runPairedExperiment,
+  summarizePairedAttempt
 } from "../scripts/bench-paired-experiment.mjs";
 import {
   pairedExperimentPreregistration,
@@ -190,9 +191,10 @@ describe("paired Harness experiment", () => {
       codex_cli_sha256: digest,
       codex_cli_layout: "npm-linux-x64",
       version: "0.147.0",
-      model_name: "model-fixture",
       reasoning_effort: "max"
     });
+    expect(agent.model_name).toBe("model-fixture");
+    expect(agent.kwargs).not.toHaveProperty("model_name");
     expect(agent.kwargs).not.toHaveProperty("agent_profile");
     expect(agent.kwargs).not.toHaveProperty("provider");
   });
@@ -252,6 +254,43 @@ describe("paired Harness experiment", () => {
     expect(classifyBlockingCondition(base, {
       validity: "valid", failure_category: "api_error", last_error: "authentication failed"
     })).toBe("credential_or_provider_unavailable");
+  });
+
+  it("preserves an attested task identity when Harbor fails before producing a trial", () => {
+    const manifest = pairedExperimentPreregistration(draft(2, 1));
+    const stage = manifest.execution.stages[0];
+    const pair = stage.pairs[0];
+    const arm = manifest.arms.find((item) => item.id === pair.arms[0])!;
+    const expectedIdentity = taskSelectionIdentitySha256(
+      manifest.selection.selected_tasks[pair.task_index]
+    );
+    const summary = summarizePairedAttempt({
+      manifest,
+      stage,
+      pair,
+      arm,
+      result: {
+        runDir: "failed-run",
+        report: {
+          harness: arm.harness,
+          provider: manifest.model.provider,
+          model: manifest.model.name,
+          reasoning_effort: manifest.model.reasoning_effort,
+          dataset: manifest.task_catalog.dataset,
+          runtime_archive_sha256: arm.runtime.archive_sha256,
+          incomplete_reason: ["No Harbor trial result was produced."],
+          trial_accounting: { expected: 1, observed: 0, missing: 1 },
+          run_slots: [{ selection_identity_sha256: expectedIdentity }],
+          tasks: [{ failure_category: "harbor_cli_error", verifier_outcome: "not_run" }]
+        }
+      }
+    });
+    expect(summary).toMatchObject({
+      valid: false,
+      passed: false,
+      blocking_condition: "missing_or_incomplete_report",
+      task_identity_evidence: "run_slot_attestation"
+    });
   });
 
   it("packages an exact official platform archive and records content identity", async () => {
