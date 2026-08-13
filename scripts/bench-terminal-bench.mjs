@@ -204,6 +204,14 @@ export async function runTerminalBenchCli(argv, deps = {}) {
 }
 
 async function runTerminalBenchCliImpl(argv, deps, signal) {
+  const writeOutput = deps.writeOutput ?? ((text) => process.stdout.write(text));
+  const writeProgress = (text) => {
+    try {
+      writeOutput(text);
+    } catch (error) {
+      if (error?.code !== "EPIPE") throw error;
+    }
+  };
   const runtimeEnv = deps.env ?? process.env;
   loadDotEnv(undefined, runtimeEnv);
   const options = resolveRunOptions(argv, runtimeEnv);
@@ -280,12 +288,12 @@ async function runTerminalBenchCliImpl(argv, deps, signal) {
   await writeRunFiles(runDir, config, harborCommand, harborArgs, env);
 
   if (options.reusePackage) {
-    process.stdout.write(`Reusing SHA-pinned ${options.harness} runtime archive...\n`);
+    writeProgress(`Reusing SHA-pinned ${options.harness} runtime archive...\n`);
     await writeFile(path.join(runDir, "package.stdout.log"), "Reused existing SHA-pinned archive.\n", "utf8");
     await writeFile(path.join(runDir, "package.stderr.log"), "", "utf8");
     await writeFile(path.join(runDir, "package.raw.log"), "package_reused: true\n", "utf8");
   } else {
-    process.stdout.write(`Packaging Sigma agent CLI for Terminal-Bench...\n`);
+    writeProgress(`Packaging Sigma agent CLI for Terminal-Bench...\n`);
     const packageResult = await packager({
       cwd: rootDir,
       env: runtimeEnv,
@@ -329,7 +337,7 @@ async function runTerminalBenchCliImpl(argv, deps, signal) {
     );
   }
 
-  process.stdout.write(`Packaging portable Harbor runtime...\n`);
+  writeProgress(`Packaging portable Harbor runtime...\n`);
   const harborRuntimeResult = await harborRuntimePackager({
     cwd: rootDir,
     env: runtimeEnv,
@@ -405,7 +413,7 @@ async function runTerminalBenchCliImpl(argv, deps, signal) {
   };
   await writeJson(path.join(runDir, "config.json"), config);
 
-  process.stdout.write(`Inspecting Harbor CLI support...\n`);
+  writeProgress(`Inspecting Harbor CLI support...\n`);
   const versionResult = await runner(harborCommand, ["--version"], {
     cwd: rootDir,
     env,
@@ -443,7 +451,7 @@ async function runTerminalBenchCliImpl(argv, deps, signal) {
   let timeoutProbe = null;
   let timeoutPlan;
   if (options.mode !== "smoke") {
-    process.stdout.write(`Inspecting selected task timeout metadata...\n`);
+    writeProgress(`Inspecting selected task timeout metadata...\n`);
     const timeoutProbeJobsDir = path.join(runDir, "harbor-timeout-probe-jobs");
     const timeoutProbeConfig = buildHarborTimeoutProbeConfig(
       {
@@ -674,7 +682,7 @@ async function runTerminalBenchCliImpl(argv, deps, signal) {
     launchSlots,
     options.nConcurrentTrials,
     async (slot) => {
-      process.stdout.write(`Running Harbor benchmark slot ${slot.runSlot}: ${commandText(harborCommand, slot.args)}\n`);
+      writeProgress(`Running Harbor benchmark slot ${slot.runSlot}: ${commandText(harborCommand, slot.args)}\n`);
       const stdoutPath = path.join(runDir, `harbor-${slot.runSlot}.stdout.log`);
       const stderrPath = path.join(runDir, `harbor-${slot.runSlot}.stderr.log`);
       const rawPath = path.join(runDir, `result-${slot.runSlot}.raw.log`);
@@ -759,8 +767,8 @@ async function runTerminalBenchCliImpl(argv, deps, signal) {
 
   const report = await generateBenchReport(runDir);
 
-  process.stdout.write(`Benchmark artifacts: ${runDir}\n`);
-  process.stdout.write(`Report: ${path.join(runDir, "report.md")}\n`);
+  writeProgress(`Benchmark artifacts: ${runDir}\n`);
+  writeProgress(`Report: ${path.join(runDir, "report.md")}\n`);
   const exitCode = report?.status === "passed"
     ? cleanupAfter.clean ? 0 : 1
     : effectiveExitCode && effectiveExitCode !== 0
@@ -771,6 +779,11 @@ async function runTerminalBenchCliImpl(argv, deps, signal) {
 
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
+  for (const stream of [process.stdout, process.stderr]) {
+    stream.on("error", (error) => {
+      if (error?.code !== "EPIPE") throw error;
+    });
+  }
   try {
     const result = await runTerminalBenchCli(process.argv.slice(2));
     process.exitCode = result.exitCode;

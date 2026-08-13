@@ -187,6 +187,9 @@ describe("Terminal-Bench CLI verifier result handling", () => {
       "--mode", "task", "--task-id", "selected-task", "--reuse-package",
       "--expected-archive-sha256", sha, "--run-label", "reuse-test"
     ], {
+      writeOutput: () => {
+        throw Object.assign(new Error("progress consumer disconnected"), { code: "EPIPE" });
+      },
       resolveHarborCommand: () => ({ command: "harbor", source: "test", exists: true }),
       packageAgentCli: async () => {
         packageCalls += 1;
@@ -215,6 +218,7 @@ describe("Terminal-Bench CLI verifier result handling", () => {
       expect(packageCalls).toBe(0);
       expect(result.report.agent_cli_sha256).toBe(sha);
       expect(result.report.package_reused).toBe(true);
+      expect(result.report.status).toBe("passed");
     } finally {
       await removeRunArtifacts(result.runDir);
       if (previousTarball === undefined) delete process.env.AGENT_CLI_TARBALL;

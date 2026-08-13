@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
-import { constants } from "node:fs";
+import { appendFileSync, constants } from "node:fs";
 import { copyFile, mkdir, open, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -361,6 +361,7 @@ async function executePair(context, pair) {
     if (state.blocking) break;
     const arm = arms.get(armId);
     const receiptDir = path.join(outputDir, "receipts", safePathPart(stage.id), label);
+    const progressDir = path.join(outputDir, "progress", safePathPart(stage.id), label);
     const startedPath = path.join(receiptDir, `${safePathPart(armId)}.started.json`);
     const completedPath = path.join(receiptDir, `${safePathPart(armId)}.completed.json`);
     if (await jsonIfPresent(startedPath) || await jsonIfPresent(completedPath)) {
@@ -380,17 +381,22 @@ async function executePair(context, pair) {
       });
       dispatched = true;
     };
-    const runner = deps.runArm ?? (async (args) => runTerminalBenchCli(args, {
-      env: {
-        ...process.env,
-        AGENT_CLI_TARBALL: [...arms.values()].find((item) => item.harness === "sigma")?.archive,
-        CODEX_CLI_TARBALL: [...arms.values()].find((item) => item.harness === "codex")?.archive,
-        SIGMA_BENCH_HARNESS: arm.harness
-      },
-      benchRootDir: path.join(outputDir, "runs"),
-      packageHarborRuntime: async () => preparedRuntime,
-      beforeHarborDispatch
-    }));
+    const runner = deps.runArm ?? (async (args) => {
+      await mkdir(progressDir, { recursive: true });
+      const progressPath = path.join(progressDir, `${safePathPart(armId)}.log`);
+      return runTerminalBenchCli(args, {
+        env: {
+          ...process.env,
+          AGENT_CLI_TARBALL: [...arms.values()].find((item) => item.harness === "sigma")?.archive,
+          CODEX_CLI_TARBALL: [...arms.values()].find((item) => item.harness === "codex")?.archive,
+          SIGMA_BENCH_HARNESS: arm.harness
+        },
+        benchRootDir: path.join(outputDir, "runs"),
+        packageHarborRuntime: async () => preparedRuntime,
+        beforeHarborDispatch,
+        writeOutput: (text) => appendFileSync(progressPath, text, "utf8")
+      });
+    });
     let result;
     try {
       result = await runner(
@@ -600,16 +606,23 @@ export async function runPairedExperiment(argv = process.argv.slice(2), deps = {
 }
 
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
-if (isMain) runPairedExperiment().then((result) => {
-  process.stdout.write(`${JSON.stringify({
-    output: result.outputDir,
-    stage: result.stage,
-    status: result.status,
-    blocking_condition: result.blocking ?? null,
-    attempts: result.records.length
-  })}\n`);
-  if (result.status === "stopped") process.exitCode = 2;
-}).catch((error) => {
-  process.stderr.write(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
-  process.exitCode = 1;
-});
+if (isMain) {
+  for (const stream of [process.stdout, process.stderr]) {
+    stream.on("error", (error) => {
+      if (error?.code !== "EPIPE") throw error;
+    });
+  }
+  runPairedExperiment().then((result) => {
+    process.stdout.write(`${JSON.stringify({
+      output: result.outputDir,
+      stage: result.stage,
+      status: result.status,
+      blocking_condition: result.blocking ?? null,
+      attempts: result.records.length
+    })}\n`);
+    if (result.status === "stopped") process.exitCode = 2;
+  }).catch((error) => {
+    process.stderr.write(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
+    process.exitCode = 1;
+  });
+}
