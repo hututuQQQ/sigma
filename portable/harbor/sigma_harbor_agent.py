@@ -46,6 +46,8 @@ DECLARED_FAILURE_KINDS = FAILURE_KINDS - {"structured_blocker"}
 DOCTOR_REPORT_SCHEMA_VERSION = 1
 BROKER_PROTOCOL_VERSION = 1
 SUPPORTED_NETWORK_MODES = {"none", "full"}
+DOCTOR_API_PREFLIGHT_ATTEMPTS = 3
+RETRYABLE_DOCTOR_API_CATEGORIES = {"network", "rate_limit", "server", "timeout"}
 MAX_CONTEXT_TEXT_CHARS = 8_192
 MAX_PARTIAL_ARTIFACT_CHARS = 1_048_576
 MAX_TRACE_ARTIFACT_BYTES = 4 * 1_048_576
@@ -164,6 +166,26 @@ def _stderr_text(result: Any) -> str:
         if isinstance(value, str):
             return value
     return ""
+
+
+def _retryable_doctor_api_failure(doctor_json: Any) -> bool:
+    """Retry only a transient provider probe before any solving work starts."""
+    if not isinstance(doctor_json, dict):
+        return False
+    checks = doctor_json.get("checks")
+    if not isinstance(checks, list):
+        return False
+    blocking = [
+        check for check in checks
+        if isinstance(check, dict) and check.get("status") in {"error", "warning"}
+    ]
+    if len(blocking) != 1 or blocking[0].get("name") != "api":
+        return False
+    api_check = blocking[0]
+    return (
+        api_check.get("failure_kind") in {"api_error", "network_error"}
+        and api_check.get("error_category") in RETRYABLE_DOCTOR_API_CATEGORIES
+    )
 
 
 class _ExecResultView:
@@ -2673,35 +2695,62 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
         doctor_write_scope = (
             "workspace" if self.write_scope == "auto" else self.write_scope
         )
-        doctor_check = await self._exec_with_private_env(
-            environment,
-            " ".join([
-                "/usr/local/bin/agent doctor --workspace",
-                shlex.quote(self._workspace),
-                "--json --strict",
-                "--execution-mode",
-                shlex.quote(self.execution_mode),
-                "--network",
-                shlex.quote(self.network_mode),
-                "--read-scope",
-                shlex.quote(self.effective_read_scope),
-                "--write-scope",
-                shlex.quote(doctor_write_scope),
-                "--managed-environment-mode",
-                shlex.quote(self.managed_environment_mode),
-                "--reasoning-effort",
-                shlex.quote(self.reasoning_effort),
-                "--max-model-turns",
-                str(self.max_turns),
-                "--command-timeout-sec",
-                str(self.command_timeout_sec),
-                *( ["--check-api"] if self.check_api else [] ),
-            ]),
-            self._agent_env(),
-            timeout_sec=60,
-        )
+        doctor_command = " ".join([
+            "/usr/local/bin/agent doctor --workspace",
+            shlex.quote(self._workspace),
+            "--json --strict",
+            "--provider",
+            shlex.quote(self.provider),
+            "--model",
+            shlex.quote(self.model),
+            "--execution-mode",
+            shlex.quote(self.execution_mode),
+            "--network",
+            shlex.quote(self.network_mode),
+            "--read-scope",
+            shlex.quote(self.effective_read_scope),
+            "--write-scope",
+            shlex.quote(doctor_write_scope),
+            "--managed-environment-mode",
+            shlex.quote(self.managed_environment_mode),
+            "--reasoning-effort",
+            shlex.quote(self.reasoning_effort),
+            "--max-model-turns",
+            str(self.max_turns),
+            "--command-timeout-sec",
+            str(self.command_timeout_sec),
+            *( ["--check-api"] if self.check_api else [] ),
+        ])
+        doctor_attempts: list[dict[str, Any]] = []
+        for attempt in range(1, DOCTOR_API_PREFLIGHT_ATTEMPTS + 1):
+            doctor_check = await self._exec_with_private_env(
+                environment,
+                doctor_command,
+                self._agent_env(),
+                timeout_sec=60,
+            )
+            doctor_json = self._parse_doctor_json(_stdout_text(doctor_check))
+            retryable = self.check_api and _retryable_doctor_api_failure(doctor_json)
+            api_check = next((
+                check for check in doctor_json.get("checks", [])
+                if isinstance(check, dict) and check.get("name") == "api"
+            ), None) if isinstance(doctor_json, dict) else None
+            doctor_attempts.append({
+                "attempt": attempt,
+                "exit_code": _return_code(doctor_check),
+                "retryable_api_failure": retryable,
+                "api_check": api_check,
+            })
+            if (
+                _return_code(doctor_check) == 0
+                or not retryable
+                or attempt == DOCTOR_API_PREFLIGHT_ATTEMPTS
+            ):
+                break
+            await asyncio.sleep(2 ** (attempt - 1))
         doctor_record = self._setup_check_record("strict_doctor", doctor_check)
-        doctor_record["doctor_json"] = self._parse_doctor_json(_stdout_text(doctor_check))
+        doctor_record["doctor_json"] = doctor_json
+        doctor_record["preflight_attempts"] = doctor_attempts
         checks.append(doctor_record)
         if _return_code(doctor_check) != 0:
             self._write_setup_checks(checks, "agent_setup_failed")
