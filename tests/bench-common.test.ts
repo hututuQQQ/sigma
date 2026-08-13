@@ -936,6 +936,7 @@ describe("Terminal-Bench command construction", () => {
     expect(env.SIGMA_CONTAINER_NO_PROXY).toBe("localhost,127.0.0.1");
     expect(env.SIGMA_CONTAINER_APT_CONFIG).toMatch(/apt-network-retries\.conf$/u);
     expect(env.SIGMA_CONTAINER_APT_RETRY_WRAPPER).toMatch(/apt-network-retry$/u);
+    expect(env.SIGMA_CONTAINER_CURL_RETRY_WRAPPER).toMatch(/curl-network-retry$/u);
 
     const config = buildHarborJobConfig({ mode: "batch", tasks: [], env }, "jobs");
     expect(config.environment.extra_docker_compose).toEqual([

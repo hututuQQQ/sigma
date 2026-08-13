@@ -15,3 +15,4 @@ services:
       - "${SIGMA_CONTAINER_APT_CONFIG}:/etc/apt/apt.conf.d/80sigma-network-retries:ro"
       - "${SIGMA_CONTAINER_APT_RETRY_WRAPPER}:/usr/local/bin/apt:ro"
       - "${SIGMA_CONTAINER_APT_RETRY_WRAPPER}:/usr/local/bin/apt-get:ro"
+      - "${SIGMA_CONTAINER_CURL_RETRY_WRAPPER}:/usr/local/bin/curl:ro"

@@ -22,6 +22,7 @@ describe("package-harbor-runtime", () => {
     const proxyCompose = await readFile(result.proxyComposePath, "utf8");
     const aptNetworkConfig = await readFile(result.aptNetworkConfigPath, "utf8");
     const aptRetryWrapper = await readFile(result.aptRetryWrapperPath, "utf8");
+    const curlRetryWrapper = await readFile(result.curlRetryWrapperPath, "utf8");
     const readme = await readFile(path.join(result.harborRuntimeDir, "README.md"), "utf8");
     const packagedFiles = await readdir(result.harborRuntimeDir);
 
@@ -37,10 +38,14 @@ describe("package-harbor-runtime", () => {
     expect(proxyCompose).toContain("SIGMA_CONTAINER_HTTPS_PROXY");
     expect(proxyCompose).toContain("80sigma-network-retries");
     expect(proxyCompose).toContain("SIGMA_CONTAINER_APT_RETRY_WRAPPER");
+    expect(proxyCompose).toContain("SIGMA_CONTAINER_CURL_RETRY_WRAPPER");
     expect(aptNetworkConfig).toContain('Acquire::Retries "5";');
     expect(aptRetryWrapper).toContain("Transient APT network failure");
     expect(aptRetryWrapper).toContain("502[[:space:]]+Bad Gateway");
     expect(aptRetryWrapper).toContain('exit "$status"');
+    expect(curlRetryWrapper).toContain("Transient curl network failure");
+    expect(curlRetryWrapper).toContain("5|6|7|18|28|35|52|55|56|92");
+    expect(curlRetryWrapper).toContain('cat "$stdout_file"');
     expect(path.isAbsolute(result.agentCliTarball)).toBe(true);
     expect(packagedFiles.some((name) => name.endsWith(".json"))).toBe(false);
     expect(readme).not.toContain(removedHarborPackageName);

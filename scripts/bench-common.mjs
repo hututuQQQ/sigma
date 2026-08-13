@@ -46,6 +46,10 @@ export const harborAptRetryWrapperPath = path.join(
   harborRuntimeDir,
   "apt-network-retry"
 );
+export const harborCurlRetryWrapperPath = path.join(
+  harborRuntimeDir,
+  "curl-network-retry"
+);
 export const terminalBenchDataset = "terminal-bench/terminal-bench-2";
 export const portableAgentImportPath = "sigma_harbor_agent:SigmaCliHarborAgent";
 export const portableCodexAgentImportPath = "codex_harbor_agent:PortableCodex";
@@ -3194,7 +3198,8 @@ const containerProxyEnvironmentKeys = [
   "SIGMA_CONTAINER_ALL_PROXY",
   "SIGMA_CONTAINER_NO_PROXY",
   "SIGMA_CONTAINER_APT_CONFIG",
-  "SIGMA_CONTAINER_APT_RETRY_WRAPPER"
+  "SIGMA_CONTAINER_APT_RETRY_WRAPPER",
+  "SIGMA_CONTAINER_CURL_RETRY_WRAPPER"
 ];
 
 function normalizedProxyScheme(value) {
@@ -3249,7 +3254,8 @@ function containerProxyEnvironment(env) {
     SIGMA_CONTAINER_ALL_PROXY: all ?? https ?? http,
     SIGMA_CONTAINER_NO_PROXY: firstProxyValue(env, ["NO_PROXY", "no_proxy"]) ?? "",
     SIGMA_CONTAINER_APT_CONFIG: harborAptNetworkConfigPath,
-    SIGMA_CONTAINER_APT_RETRY_WRAPPER: harborAptRetryWrapperPath
+    SIGMA_CONTAINER_APT_RETRY_WRAPPER: harborAptRetryWrapperPath,
+    SIGMA_CONTAINER_CURL_RETRY_WRAPPER: harborCurlRetryWrapperPath
   };
 }
 
