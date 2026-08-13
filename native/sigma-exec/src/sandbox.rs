@@ -1212,7 +1212,17 @@ fn secret_key(key: &str) -> bool {
     parts.iter().any(|part| {
         matches!(
             *part,
-            "apikey" | "secret" | "token" | "password" | "passwd" | "credential"
+            "apikey"
+                | "authorization"
+                | "bearer"
+                | "cookie"
+                | "credential"
+                | "jwt"
+                | "password"
+                | "passwd"
+                | "pat"
+                | "secret"
+                | "token"
         )
     }) || parts
         .windows(2)
@@ -2559,6 +2569,10 @@ mod tests {
     fn recognizes_secret_environment_names() {
         assert!(secret_key("DEEPSEEK_API_KEY"));
         assert!(secret_key("accessToken"));
+        assert!(secret_key("GITHUB_PAT"));
+        assert!(secret_key("HTTP_AUTHORIZATION"));
+        assert!(secret_key("SESSION_COOKIE"));
+        assert!(secret_key("OIDC_JWT"));
         assert!(!secret_key("PATH"));
         assert!(!secret_key("TOKENIZERS_PARALLELISM"));
     }

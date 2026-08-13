@@ -1,6 +1,9 @@
 import {
   createPiModels,
   defaultPiModel,
+  getPiModel,
+  getPiProvider,
+  PiModelGateway,
   sanitizePiModelError,
   type CredentialStore,
   type Models
@@ -10,7 +13,7 @@ import { classifyModelFailure } from "./failure-policy.js";
 
 export interface ProviderHealthReport {
   ok: boolean;
-  provider: "deepseek" | "glm";
+  provider: string;
   model: string;
   endpointHost: string;
   latencyMs: number;
@@ -22,11 +25,15 @@ export interface ProviderHealthReport {
 const HEALTH_PROBE_MAX_OUTPUT_TOKENS = 32;
 const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 10_000;
 
-function endpointFor(provider: "deepseek" | "glm", baseUrl?: string): string {
-  return baseUrl ?? (provider === "deepseek"
-    ? process.env.DEEPSEEK_BASE_URL ?? "https://api.deepseek.com"
-    : process.env.GLM_BASE_URL ?? process.env.ZAI_BASE_URL ?? process.env.BIGMODEL_BASE_URL
-      ?? "https://open.bigmodel.cn/api/paas/v4");
+function endpointFor(
+  models: Models,
+  provider: string,
+  model: string,
+  baseUrl?: string
+): string {
+  const definition = getPiModel(provider, model, models)
+    ?? getPiProvider(provider, models)?.getModels()[0];
+  return baseUrl ?? definition?.baseUrl ?? getPiProvider(provider, models)?.baseUrl ?? "unknown";
 }
 
 function endpointHost(endpoint: string): string {
@@ -35,13 +42,7 @@ function endpointHost(endpoint: string): string {
 
 function safeErrorMessage(error: unknown, secrets: readonly string[] = []): string {
   let message = error instanceof Error ? error.message : String(error);
-  for (const key of [
-    ...secrets,
-    process.env.DEEPSEEK_API_KEY,
-    process.env.GLM_API_KEY,
-    process.env.ZAI_API_KEY,
-    process.env.BIGMODEL_API_KEY
-  ]) {
+  for (const key of secrets) {
     if (key) message = message.split(key).join("[redacted]");
   }
   return message.replace(/Bearer\s+[^\s]+/giu, "Bearer [redacted]").slice(0, 800);
@@ -131,11 +132,9 @@ async function executeProbe(input: {
 
 async function probeAuthentication(
   models: Models,
-  provider: "deepseek" | "glm",
-  fallbackEndpoint: string,
-  baseUrl: string | undefined
+  provider: string
 ): Promise<{
-  endpoint: string;
+  endpoint?: string;
   headers: Record<string, string>;
   secrets: string[];
 }> {
@@ -156,13 +155,75 @@ async function probeAuthentication(
     headers.authorization = `Bearer ${resolved.auth.apiKey}`;
   }
   return {
-    endpoint: baseUrl ?? resolved.auth.baseUrl ?? fallbackEndpoint,
+    ...(resolved.auth.baseUrl ? { endpoint: resolved.auth.baseUrl } : {}),
     headers,
     secrets: [
       ...(resolved.auth.apiKey ? [resolved.auth.apiKey] : []),
       ...Object.values(headers)
     ]
   };
+}
+
+async function executeGatewayProbe(input: {
+  provider: string;
+  model: string;
+  endpoint?: string;
+  signal: AbortSignal;
+  timeoutMs: number;
+  models: Models;
+}): Promise<string> {
+  const gateway = new PiModelGateway({
+    provider: input.provider,
+    model: input.model,
+    models: input.models,
+    ...(input.endpoint && input.endpoint !== "unknown" ? { baseUrl: input.endpoint } : {}),
+    requestTimeoutMs: input.timeoutMs,
+    idleTimeoutMs: input.timeoutMs,
+    activeStreamTimeoutMs: input.timeoutMs
+  });
+  const response = await gateway.complete({
+    messages: [{ role: "user", content: "Return exactly the text OK." }],
+    maxOutputTokens: HEALTH_PROBE_MAX_OUTPUT_TOKENS,
+    temperature: 0,
+    signal: input.signal
+  });
+  const text = response.message.content.trim() || response.message.reasoningContent?.trim() || "";
+  if (!text) throw new ModelGatewayError("Provider returned no textual output.", "protocol");
+  return text;
+}
+
+async function executeProviderProbe(input: {
+  provider: string;
+  model: string;
+  endpoint: string;
+  signal: AbortSignal;
+  timeoutMs: number;
+  models: Models;
+  authenticationHeaders: Record<string, string>;
+  fetchImpl?: typeof fetch;
+}): Promise<string> {
+  const definition = getPiModel(input.provider, input.model, input.models)
+    ?? getPiProvider(input.provider, input.models)?.getModels()[0];
+  // The injected fetch path keeps the low-level HTTP contract testable.
+  // Production probes always use Pi's provider transport so OAuth, ambient
+  // credentials, headers and API-specific payloads remain provider-owned.
+  if (input.fetchImpl && definition?.api === "openai-completions") {
+    return executeProbe({
+      endpoint: input.endpoint,
+      model: input.model,
+      signal: input.signal,
+      fetchImpl: input.fetchImpl,
+      headers: input.authenticationHeaders
+    });
+  }
+  return executeGatewayProbe({
+    provider: input.provider,
+    model: input.model,
+    endpoint: input.endpoint,
+    signal: input.signal,
+    timeoutMs: input.timeoutMs,
+    models: input.models
+  });
 }
 
 function failureCategory(error: unknown): ModelGatewayError["category"] {
@@ -174,7 +235,7 @@ function failureCategory(error: unknown): ModelGatewayError["category"] {
 }
 
 export async function checkProviderHealth(input: {
-  provider: "deepseek" | "glm";
+  provider: string;
   model: string;
   signal: AbortSignal;
   baseUrl?: string;
@@ -185,28 +246,29 @@ export async function checkProviderHealth(input: {
 }): Promise<ProviderHealthReport> {
   const models = input.piModels ?? createPiModels(input.credentials);
   const selectedModel = input.model === "auto"
-    ? defaultPiModel(input.provider)
+    ? defaultPiModel(input.provider, process.env, models)
     : input.model;
   const model = selectedModel;
-  let endpoint = endpointFor(input.provider, input.baseUrl);
+  let endpoint = input.baseUrl ?? "unknown";
   const startedAt = performance.now();
   let secrets: string[] = [];
-  const abort = healthProbeSignal(
-    input.signal,
-    Math.max(1, input.requestTimeoutMs ?? DEFAULT_HEALTH_PROBE_TIMEOUT_MS)
-  );
+  const timeoutMs = Math.max(1, input.requestTimeoutMs ?? DEFAULT_HEALTH_PROBE_TIMEOUT_MS);
+  const abort = healthProbeSignal(input.signal, timeoutMs);
   try {
-    const authentication = await probeAuthentication(
-      models, input.provider, endpoint, input.baseUrl
-    );
-    endpoint = authentication.endpoint;
+    const authentication = await probeAuthentication(models, input.provider);
+    endpoint = input.baseUrl
+      ?? authentication.endpoint
+      ?? endpointFor(models, input.provider, model);
     secrets = authentication.secrets;
-    const text = await executeProbe({
-      endpoint,
+    const text = await executeProviderProbe({
+      provider: input.provider,
       model,
+      endpoint,
       signal: abort.signal,
-      fetchImpl: input.fetchImpl ?? globalThis.fetch,
-      headers: authentication.headers
+      timeoutMs,
+      models,
+      authenticationHeaders: authentication.headers,
+      ...(input.fetchImpl ? { fetchImpl: input.fetchImpl } : {})
     });
     return {
       ok: true,

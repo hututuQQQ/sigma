@@ -121,16 +121,6 @@ function nodeCheck(): DoctorCheck {
 
 async function apiCheck(provider: string, model: string, enabled: boolean): Promise<DoctorCheck> {
   if (!enabled) return { name: "api", status: "skipped", message: "Pass --check-api to verify the provider." };
-  if (provider !== "deepseek" && provider !== "glm") {
-    const auth = await piAuthStatus(provider);
-    return auth.status === "authenticated"
-      ? {
-          name: "api",
-          status: "ok",
-          message: `${provider} credentials are configured; no billable model request was sent.`
-        }
-      : { name: "api", status: "error", message: `${provider} authentication is required.` };
-  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error("API check timed out.")), 15_000);
   try {

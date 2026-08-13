@@ -11,7 +11,7 @@ function retrySameProvider(category: ModelFailureCategory, spec: ModelSpec | und
     || category === "server"
     || category === "timeout"
     || category === "protocol"
-    || (category === "capacity" && spec?.providerId === "deepseek");
+    || (category === "capacity" && spec?.billingMode === "metered");
 }
 
 export function abortableDelay(delayMs: number, signal: AbortSignal): Promise<void> {

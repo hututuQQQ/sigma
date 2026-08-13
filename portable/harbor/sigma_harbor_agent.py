@@ -25,19 +25,14 @@ from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
 
-ENV_KEYS = [
-    "DEEPSEEK_API_KEY",
-    "GLM_API_KEY",
-    "ZAI_API_KEY",
-    "EXA_API_KEY",
-    "BIGMODEL_API_KEY",
-    "DEEPSEEK_BASE_URL",
-    "GLM_BASE_URL",
-    "ZAI_BASE_URL",
-]
+SHARED_ENV_KEYS = ("EXA_API_KEY",)
+PROVIDER_ENV_SUFFIXES = ("API_KEY", "BASE_URL", "MODEL")
+PROVIDER_ENV_ALIASES = {
+    "glm": ("ZAI_API_KEY", "BIGMODEL_API_KEY", "ZAI_BASE_URL", "BIGMODEL_BASE_URL"),
+}
 
 CHECKPOINT_RECOVERY_POLICIES = {"restore", "keep", "ask"}
-REASONING_EFFORTS = {"auto", "none", "low", "medium", "high", "xhigh", "max"}
+REASONING_EFFORTS = {"auto", "none", "minimal", "low", "medium", "high", "xhigh", "max"}
 MAX_EXTERNAL_RECOVERIES = 8
 RECOVERY_POLL_INTERVAL_SEC = 0.25
 MIN_CHECKPOINT_RECOVERY_TIMEOUT_SEC = 600
@@ -109,7 +104,15 @@ def _structured_blocker_code(payload: dict[str, Any]) -> str | None:
 
 
 def _default_model(provider: str) -> str:
-    return "glm-5.2" if provider == "glm" else "deepseek-v4-pro"
+    # Let Sigma's provider catalog choose the default. Keeping model selection
+    # here would require this portable adapter to mirror every provider update.
+    return "auto"
+
+
+def _provider_environment_keys(provider: str) -> tuple[str, ...]:
+    prefix = re.sub(r"[^A-Za-z0-9]+", "_", provider).strip("_").upper()
+    selected = tuple(f"{prefix}_{suffix}" for suffix in PROVIDER_ENV_SUFFIXES if prefix)
+    return (*SHARED_ENV_KEYS, *selected, *PROVIDER_ENV_ALIASES.get(provider, ()))
 
 
 def _return_code(result: Any) -> int:
@@ -1297,7 +1300,7 @@ class SigmaCliHarborAgent(BaseAgent):
         self.model = resolved_model
         if reasoning_effort not in REASONING_EFFORTS:
             raise ValueError(
-                "reasoning_effort must be one of: auto, none, low, medium, high, xhigh, max"
+                "reasoning_effort must be one of: auto, none, minimal, low, medium, high, xhigh, max"
             )
         self.reasoning_effort = reasoning_effort
         if agent_profile not in {"standard", "strict"}:
@@ -3228,7 +3231,11 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
         extra_env = getattr(self, "extra_env", {})
         if isinstance(extra_env, dict):
             env_vars.update({key: str(value) for key, value in extra_env.items()})
-        env_vars.update({key: os.environ[key] for key in ENV_KEYS if os.environ.get(key)})
+        env_vars.update({
+            key: os.environ[key]
+            for key in _provider_environment_keys(self.provider)
+            if os.environ.get(key)
+        })
         return env_vars
 
     async def _download_if_present(

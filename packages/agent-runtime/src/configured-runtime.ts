@@ -153,7 +153,8 @@ export async function createConfiguredRuntime(
         ? {
             ...deps,
             gatewayFactory: piCatalog.gatewayFactory,
-            catalogSpecs: piCatalog.specs
+            catalogSpecs: piCatalog.specs,
+            authenticatedProviders: piCatalog.authenticatedProviders
           }
         : deps,
       customization

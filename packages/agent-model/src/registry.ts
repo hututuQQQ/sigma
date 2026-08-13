@@ -4,6 +4,7 @@ import {
   listPiAuthStatuses,
   listPiModels,
   listPiProviders,
+  piProviderEnvironmentValue,
   PiModelGateway,
   type CredentialStore,
   type Models,
@@ -49,10 +50,7 @@ export function createModelGateway(options: CreateGatewayOptions): ModelGateway 
   const selectedModel = options.model ?? defaultModel(options.provider);
   const spec = builtinModelSpec(options.provider, selectedModel);
   const baseUrl = options.baseUrl
-    ?? (options.provider === "deepseek" ? process.env.DEEPSEEK_BASE_URL : undefined)
-    ?? (options.provider === "glm"
-      ? process.env.GLM_BASE_URL ?? process.env.ZAI_BASE_URL ?? process.env.BIGMODEL_BASE_URL
-      : undefined);
+    ?? piProviderEnvironmentValue(options.provider, "BASE_URL");
   return new PiModelGateway({
     ...gatewayOptions,
     model: selectedModel,
@@ -105,6 +103,7 @@ export function providerAdapter(provider: SupportedProvider): ProviderSpi {
 
 export interface PiRuntimeModelCatalog {
   specs: readonly ModelSpec[];
+  authenticatedProviders: ReadonlySet<string>;
   gatewayFactory(options: {
     provider: string;
     model: string;
@@ -135,9 +134,12 @@ export async function loadPiRuntimeModelCatalog(options: {
     );
     return method ? [[status.provider, method.billingMode] as const] : [];
   }));
+  const authenticatedProviders = new Set(statuses.flatMap((status) =>
+    status.status === "authenticated" ? [status.provider] : []));
   const specs = modelSpecsForPiCatalog(listPiModels(piModels), activeBillingModes);
   return {
     specs,
+    authenticatedProviders,
     gatewayFactory: (options) => {
       const { maxRetries: _policyRetries, ...transport } = options;
       void _policyRetries;

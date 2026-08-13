@@ -2,11 +2,15 @@ import type {
   AssuranceRequirement,
   ValidationClaimKind
 } from "agent-protocol";
+import { repositoryLanguage } from "agent-context";
 import type { RuntimeSession } from "./types.js";
 
-const HIGH_RISK_PATH = /(?:^|\/)(?:native|security|sandbox|permissions?|auth|completion|budget|release|deployment|agent-execution|agent-runtime)(?:\/|$)|(?:^|\/)(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock)$/iu;
-const SOURCE_PATH = /\.(?:[cm]?[jt]sx?|py|rs|go|java|kt|swift|c|cc|cpp|h|hpp)$/iu;
-const TEST_PATH = /(?:^|\/)(?:tests?|__tests__)(?:\/|$)|\.(?:test|spec)\.[cm]?[jt]sx?$/iu;
+const HIGH_RISK_PATH = /(?:^|\/)(?:native|security|sandbox|permissions?|auth|credentials?|secrets?|completion|budget|billing|payments?|cryptography?|migrations?|database|release|deployment|infrastructure|infra|workflows?|agent-execution|agent-runtime)(?:\/|$)|(?:^|\/)(?:dockerfile|compose\.ya?ml|cargo\.lock|gemfile\.lock|package-lock\.json|pnpm-lock\.yaml|poetry\.lock|uv\.lock|yarn\.lock)$/iu;
+const TEST_PATH = /(?:^|\/)(?:tests?|__tests__|spec)(?:\/|$)|(?:\.(?:test|spec)|_(?:test|spec))\.[^/]+$|(?:^|\/)test_[^/]+\.[^/]+$/iu;
+
+function sourcePath(value: string): boolean {
+  return repositoryLanguage(value) !== undefined;
+}
 
 function explicitAcceptanceClaims(goal: string): ValidationClaimKind[] {
   const claims: ValidationClaimKind[] = [];
@@ -30,11 +34,11 @@ export function assuranceRequirement(session: RuntimeSession): AssuranceRequirem
   const required = new Set<ValidationClaimKind>(explicitAcceptanceClaims(session.durable.state.plan.goal));
   if (changed.some((item) => TEST_PATH.test(item))) required.add("unit");
   if (changed.some((item) => /\.[cm]?tsx?$/iu.test(item))) required.add("typecheck");
-  if (changed.some((item) => SOURCE_PATH.test(item)) && required.size === 0) required.add("unit");
+  if (changed.some(sourcePath) && required.size === 0) required.add("unit");
   if (required.size === 0) required.add("acceptance");
   if (high) required.add("acceptance");
   return {
-    risk: high ? "high" : changed.some((item) => SOURCE_PATH.test(item)) ? "medium" : "low",
+    risk: high ? "high" : changed.some(sourcePath) ? "medium" : "low",
     requiredClaims: [...required],
     review: high ? "required" : "advisory"
   };
@@ -55,8 +59,8 @@ export function assurancePathsForClaim(
 ): string[] {
   if (claim === "typecheck") return paths.filter((item) => /\.[cm]?tsx?$/iu.test(item));
   if (claim === "unit" || claim === "integration") {
-    return paths.filter((item) => SOURCE_PATH.test(item) || TEST_PATH.test(item));
+    return paths.filter((item) => sourcePath(item) || TEST_PATH.test(item));
   }
-  if (claim === "lint") return paths.filter((item) => SOURCE_PATH.test(item) || /\.(?:json|ya?ml|toml)$/iu.test(item));
+  if (claim === "lint") return paths.filter((item) => sourcePath(item) || /\.(?:json|ya?ml|toml)$/iu.test(item));
   return [...paths];
 }

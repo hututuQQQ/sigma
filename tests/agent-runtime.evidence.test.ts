@@ -566,6 +566,42 @@ describe("assurance-coordinated mutation completion", () => {
     expect(assuranceRequirement(active)).toMatchObject({ requiredClaims: ["unit"] });
   });
 
+  it.each([
+    "src/service.cs",
+    "lib/service.rb",
+    "app/service.php",
+    "src/service.scala",
+    "lib/service.ex",
+    "scripts/check.sh",
+    "db/query.sql",
+    "ui/component.vue",
+    "src/service.zig"
+  ])("classifies repository-recognized source %s as code", (changedPath) => {
+    const active = frontierSession();
+    active.durable.state.mutationFrontier.changedPaths = [changedPath];
+
+    expect(assuranceRequirement(active)).toMatchObject({
+      risk: "medium",
+      requiredClaims: ["unit"],
+      review: "advisory"
+    });
+  });
+
+  it.each([
+    ".github/workflows/release.yml",
+    "database/migrations/001.sql",
+    "payments/checkout.ts",
+    "infrastructure/main.tf"
+  ])("requires review for security-sensitive path %s", (changedPath) => {
+    const active = frontierSession();
+    active.durable.state.mutationFrontier.changedPaths = [changedPath];
+
+    expect(assuranceRequirement(active)).toMatchObject({
+      risk: "high",
+      review: "required"
+    });
+  });
+
   it("turns recognized Node validation into current-frontier readiness", () => {
     const active = frontierSession();
     active.durable.state.mutationFrontier.changedPaths = ["src/code.mjs"];

@@ -128,7 +128,7 @@ function lateInstructionMessage(
   model: PiModel<Api>,
   codexInstructionNonce?: string
 ): Message {
-  const mappedContent = model.provider === "openai-codex" && codexInstructionNonce
+  const mappedContent = model.api === "openai-codex-responses" && codexInstructionNonce
     ? codexInstructionSentinel(role, codexInstructionNonce, content)
     : reminderContent({ role, content });
   return { role: "user", content: mappedContent, timestamp: Date.now() };

@@ -5,20 +5,16 @@ import {
   type Model,
   type Provider
 } from "@earendil-works/pi-ai";
-import type { ModelCapabilities } from "agent-protocol";
+import {
+  MODEL_REASONING_EFFORTS,
+  type ModelCapabilities,
+  type ModelReasoningEffort
+} from "agent-protocol";
 import { hasKnownPricing } from "./model-pricing.js";
 
 export type PiBillingMode = "metered" | "subscription" | "unpriced";
-export const PI_REASONING_EFFORTS = [
-  "none",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max"
-] as const;
-export type PiReasoningEffort = (typeof PI_REASONING_EFFORTS)[number];
+export const PI_REASONING_EFFORTS = MODEL_REASONING_EFFORTS;
+export type PiReasoningEffort = ModelReasoningEffort;
 export const DEFAULT_PI_REASONING_EFFORT: PiReasoningEffort = "medium";
 
 export interface PiAuthMethodDescriptor {

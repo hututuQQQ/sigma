@@ -33,7 +33,6 @@ import {
   createPiModels,
   getPiModel,
   getPiProvider,
-  OPENAI_CODEX_PROVIDER_ID,
   piHostedToolSearchSupported,
   piBillingMode,
   type PiReasoningEffort
@@ -59,11 +58,28 @@ export interface PiModelGatewayOptions {
   hostedToolSearch?: boolean;
 }
 
-function fallbackModel(providerId: string, modelId: string): PiModel<Api> | undefined {
-  if (providerId !== "deepseek" && providerId !== "glm") return undefined;
-  const template = getPiProvider(providerId)?.getModels()[0];
+function fallbackModel(
+  providerId: string,
+  modelId: string,
+  models: Models,
+  capabilities?: ModelCapabilities
+): PiModel<Api> | undefined {
+  // A custom catalog spec supplies Sigma's capabilities, tokenizer and pricing.
+  // Reuse the selected provider's wire contract for an upstream model that is
+  // newer than the bundled Pi catalog, regardless of provider identity.
+  const template = getPiProvider(providerId, models)?.getModels()[0];
   return template
-    ? { ...template, id: modelId, name: modelId }
+    ? {
+        ...template,
+        id: modelId,
+        name: modelId,
+        ...(capabilities ? {
+          reasoning: capabilities.reasoning,
+          contextWindow: capabilities.contextWindowTokens,
+          maxTokens: capabilities.maxOutputTokens,
+          input: capabilities.imageInput ? ["text", "image"] : ["text"]
+        } : {})
+      }
     : undefined;
 }
 
@@ -76,12 +92,12 @@ function hostedToolSearchEnabled(
 }
 
 function piPayloadOptions(
-  provider: string,
+  model: PiModel<Api>,
   codexInstructionNonce: string,
   hostedToolSearch: boolean,
   request: ModelRequest
 ): { onPayload?: (payload: unknown) => unknown } {
-  if (provider === OPENAI_CODEX_PROVIDER_ID) {
+  if (model.api === "openai-codex-responses") {
     return {
       onPayload: (payload) => hostedToolSearchPayload(
         codexPayload(payload, codexInstructionNonce),
@@ -90,7 +106,9 @@ function piPayloadOptions(
       )
     };
   }
-  if (provider === "deepseek") {
+  // DeepSeek requires reasoning to be disabled for forced/disabled tool use;
+  // this is a provider wire-compatibility rule, not a model routing policy.
+  if (model.provider === "deepseek") {
     return { onPayload: (payload) => deepSeekPayload(payload, request) };
   }
   return hostedToolSearch
@@ -207,7 +225,7 @@ export class PiModelGateway implements ModelGateway {
       options.modelsStore ?? new FileModelsStore()
     );
     const piModel = getPiModel(options.provider, options.model, this.models)
-      ?? fallbackModel(options.provider, options.model);
+      ?? fallbackModel(options.provider, options.model, this.models, options.capabilities);
     if (!piModel) throw new PiModelError("protocol", "protocol");
     this.piModel = options.baseUrl
       ? { ...piModel, baseUrl: options.baseUrl.replace(/\/+$/u, "") }
@@ -269,7 +287,7 @@ export class PiModelGateway implements ModelGateway {
           toolChoice: request.toolChoice,
           maxRetries: 0,
           ...(request.sessionId ? { sessionId: request.sessionId } : {}),
-          ...(this.provider === OPENAI_CODEX_PROVIDER_ID ? { transport: "auto" as const } : {}),
+          ...(this.piModel.api === "openai-codex-responses" ? { transport: "auto" as const } : {}),
           ...piReasoningStreamOptions(
             this.piModel,
             this.reasoningEffort,
@@ -278,7 +296,7 @@ export class PiModelGateway implements ModelGateway {
           ),
           ...(this.requestTimeoutMs ? { timeoutMs: this.requestTimeoutMs } : {}),
           ...piPayloadOptions(
-            this.provider,
+            this.piModel,
             this.codexInstructionNonce,
             this.hostedToolSearch,
             request

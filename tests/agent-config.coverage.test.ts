@@ -140,6 +140,7 @@ describe("agent-config single-source schema", () => {
     expect(() => field("writeScope").parse("host")).toThrow("must be one of");
     expect(field("provider").parse("other")).toBe("other");
     expect(field("reasoningEffort").parse("max")).toBe("max");
+    expect(field("reasoningEffort").parse("minimal")).toBe("minimal");
     expect(() => field("reasoningEffort").parse("extreme")).toThrow("must be one of");
     expect(() => field("workspace").parse(1)).toThrow("string");
     expect(() => field("workspace").parse(" ")).toThrow("non-empty");

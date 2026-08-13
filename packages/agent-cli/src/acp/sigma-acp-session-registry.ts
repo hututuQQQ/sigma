@@ -3,6 +3,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type * as acp from "@agentclientprotocol/sdk";
 import type { ModelReasoningEffort } from "agent-model";
+import { MODEL_REASONING_EFFORTS } from "agent-protocol";
 import type {
   PersistedAcpSession,
   ResolvedSession,
@@ -13,7 +14,7 @@ import { reasoningEffortForModel } from "./sigma-acp-shared.js";
 
 const SESSION_INDEX_FILE = "acp-sessions.json";
 const INDEX_VERSION = 1;
-const REASONING_EFFORTS = new Set(["none", "low", "medium", "high", "xhigh", "max"]);
+const REASONING_EFFORTS = new Set<string>(MODEL_REASONING_EFFORTS);
 
 interface PersistedAcpIndex {
   version: typeof INDEX_VERSION;

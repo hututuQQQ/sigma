@@ -112,6 +112,8 @@ export interface ModelSpec {
   pricing?: ModelPricing;
   supportedReasoningEfforts?: readonly PiReasoningEffort[];
   defaultReasoningEffort?: PiReasoningEffort;
+  /** Opts this model into provider-neutral automatic fallback composition. */
+  recommended?: boolean;
 }
 
 export type ModelReasoningEffort = PiReasoningEffort;
@@ -155,6 +157,7 @@ export function modelSpecsForPiCatalog(
       billingModes: model.billingModes,
       capabilities: model.capabilities,
       tokenizer: approximateTokenizer,
+      recommended: model.recommended,
       ...(model.supportedReasoningEfforts.length > 0
         ? { supportedReasoningEfforts: model.supportedReasoningEfforts }
         : {}),
@@ -175,12 +178,3 @@ export const BUILTIN_MODEL_SPECS: readonly ModelSpec[] = modelSpecsForPiCatalog(
 export function builtinModelSpec(provider: ModelSpec["providerId"], model?: string): ModelSpec | undefined {
   return BUILTIN_MODEL_SPECS.find((spec) => spec.providerId === provider && (!model || spec.upstreamModel === model));
 }
-
-export const DEFAULT_MODEL_ROUTES: readonly ModelRoute[] = [
-  {
-    id: "default",
-    candidates: ["openai-codex/gpt-5.6-terra"],
-    fallbackOn: ["rate_limit", "capacity", "network", "server", "timeout"],
-    maxAttempts: 1
-  }
-] as const;

@@ -480,6 +480,35 @@ describe("Sigma ACP v1 contract", () => {
     expect(await readFile(malformedPath, "utf8")).toBe(malformed);
   });
 
+  it("round-trips the minimal reasoning effort through the session index", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-acp-reasoning-"));
+    temporaryDirectories.push(root);
+    const options = {
+      agentVersion: "test",
+      runtimeFactory: async (): Promise<never> => {
+        throw new Error("Runtime must not start while reading the index.");
+      },
+      modelCatalog: async () => ({ currentModelId: "test/model", options: [] })
+    };
+    const now = new Date().toISOString();
+    await new SigmaAcpSessionRegistry(options).upsert(root, {
+      sessionId: "minimal-session",
+      runtimeSessionId: "runtime-session",
+      cwd: root,
+      modelId: "test/model",
+      reasoningEffort: "minimal",
+      mode: "analyze",
+      createdAt: now,
+      updatedAt: now,
+      started: false,
+      lastSeq: 0
+    });
+
+    await expect(new SigmaAcpSessionRegistry(options).index(root)).resolves.toMatchObject({
+      sessions: [expect.objectContaining({ reasoningEffort: "minimal" })]
+    });
+  });
+
   it("coalesces concurrent cold-session attachments into one runtime resume", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-acp-attach-"));
     temporaryDirectories.push(root);

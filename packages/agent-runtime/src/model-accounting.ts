@@ -63,8 +63,6 @@ function budgetAware(gateway: ModelGateway): gateway is BudgetAwareGateway {
 }
 
 function matchingSpec(gateway: ModelGateway): ModelSpec | undefined {
-  if (gateway.provider !== "deepseek" && gateway.provider !== "glm"
-    && gateway.provider !== "openai-codex") return undefined;
   return builtinModelSpec(gateway.provider, gateway.model);
 }
 

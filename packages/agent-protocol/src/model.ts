@@ -115,6 +115,18 @@ export interface ModelCapabilities {
   hostedToolSearch?: boolean;
 }
 
+/** Provider-neutral reasoning effort values accepted across every Sigma surface. */
+export const MODEL_REASONING_EFFORTS = [
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max"
+] as const;
+export type ModelReasoningEffort = (typeof MODEL_REASONING_EFFORTS)[number];
+
 export type ModelFinishReason = "stop" | "length" | "tool_calls" | "content_filter" | "protocol_error";
 export type ModelBillingMode = "metered" | "subscription" | "unpriced";
 
