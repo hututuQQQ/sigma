@@ -20,6 +20,7 @@ import {
   groupHarborTimeoutProbe,
   assertComparableBenchmarkReports,
   harborEnvForRun,
+  harborProxyComposePath,
   harborTaskExecutionIdentitySha256,
   harborRuntimeDir,
   parseHarborTimeoutProbe,
@@ -919,6 +920,37 @@ describe("Terminal-Bench command construction", () => {
     expect(portableEnv.PYTHONPYCACHEPREFIX).toContain(path.join("runtime-scratch", "pycache"));
   });
 
+  it("maps host loopback proxies into Docker without changing the Harbor controller proxy", () => {
+    const env = harborEnvForRun("run-dir", {
+      HTTP_PROXY: "htpp://127.0.0.1:7890",
+      HTTPS_PROXY: "http://localhost:7890",
+      ALL_PROXY: "socks5://[::1]:7891",
+      NO_PROXY: "localhost,127.0.0.1"
+    });
+
+    expect(env.HTTP_PROXY).toBe("http://127.0.0.1:7890");
+    expect(env.SIGMA_CONTAINER_PROXY_ENABLED).toBe("1");
+    expect(env.SIGMA_CONTAINER_HTTP_PROXY).toBe("http://host.docker.internal:7890");
+    expect(env.SIGMA_CONTAINER_HTTPS_PROXY).toBe("http://host.docker.internal:7890");
+    expect(env.SIGMA_CONTAINER_ALL_PROXY).toBe("socks5://host.docker.internal:7891");
+    expect(env.SIGMA_CONTAINER_NO_PROXY).toBe("localhost,127.0.0.1");
+
+    const config = buildHarborJobConfig({ mode: "batch", tasks: [], env }, "jobs");
+    expect(config.environment.extra_docker_compose).toEqual([
+      expect.stringMatching(/docker-compose-sigma-sandbox\.yaml$/u),
+      harborProxyComposePath
+    ]);
+  });
+
+  it("does not add the container proxy overlay when the host has no proxy", () => {
+    const env = harborEnvForRun("run-dir", {});
+    const config = buildHarborJobConfig({ mode: "batch", tasks: [], env }, "jobs");
+    expect(config.environment.extra_docker_compose).toEqual([
+      expect.stringMatching(/docker-compose-sigma-sandbox\.yaml$/u)
+    ]);
+    expect(env).not.toHaveProperty("SIGMA_CONTAINER_PROXY_ENABLED");
+  });
+
   it("passes only an absolute host credential file path to the Harbor controller", async () => {
     const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "sigma-harbor-credential-"));
     try {
@@ -968,6 +1000,9 @@ describe("Terminal-Bench command construction", () => {
 describe("failure classifier", () => {
   it("classifies common setup, API, timeout, and crash failures", () => {
     expect(classifyFailure({ logText: "ValueError: Unknown scheme for proxy URL URL('htpp://127.0.0.1:7890')" })).toBe(
+      "host_proxy_error"
+    );
+    expect(classifyFailure({ logText: "failed to connect: invalid peer certificate: UnknownIssuer" })).toBe(
       "host_proxy_error"
     );
     expect(classifyFailure({ logText: "UnicodeEncodeError: 'gbk' codec can't encode character '\\u2022'" })).toBe(

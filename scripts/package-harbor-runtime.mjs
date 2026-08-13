@@ -5,6 +5,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   defaultAgentCliTarballForEnv,
+  harborProxyComposePath as defaultHarborProxyComposePath,
   harborRuntimeDir as defaultHarborRuntimeDir,
   harborSandboxComposePath as defaultHarborSandboxComposePath,
   portableAgentImportPath,
@@ -97,6 +98,12 @@ export async function packageHarborRuntime(options = {}) {
   const sandboxComposePath = options.harborRuntimeDir || options.artifactsDir
     ? path.join(harborRuntimeDir, "docker-compose-sigma-sandbox.yaml")
     : defaultHarborSandboxComposePath;
+  const proxyComposeSourcePath = options.proxyComposeSourcePath
+    ? path.resolve(options.proxyComposeSourcePath)
+    : path.join(rootDir, "portable", "harbor", "docker-compose-sigma-proxy.yaml");
+  const proxyComposePath = options.harborRuntimeDir || options.artifactsDir
+    ? path.join(harborRuntimeDir, "docker-compose-sigma-proxy.yaml")
+    : defaultHarborProxyComposePath;
   const agentCliTarball = resolveAgentCliTarball(rootDir, artifactsDir, env, options);
 
   if (!existsSync(sourcePath)) {
@@ -108,6 +115,9 @@ export async function packageHarborRuntime(options = {}) {
   if (!existsSync(sandboxComposeSourcePath)) {
     throw new Error(`Portable Harbor sandbox Compose overlay is missing: ${sandboxComposeSourcePath}`);
   }
+  if (!existsSync(proxyComposeSourcePath)) {
+    throw new Error(`Portable Harbor proxy Compose overlay is missing: ${proxyComposeSourcePath}`);
+  }
   if (options.requireAgentCliTarball !== false && !existsSync(agentCliTarball)) {
     throw new Error(`Packaged agent CLI is missing: ${agentCliTarball}. Run pnpm package:agent-cli first.`);
   }
@@ -115,6 +125,7 @@ export async function packageHarborRuntime(options = {}) {
   const sourceText = await readFile(sourcePath, "utf8");
   const codexSourceText = await readFile(codexSourcePath, "utf8");
   const sandboxComposeText = await readFile(sandboxComposeSourcePath, "utf8");
+  const proxyComposeText = await readFile(proxyComposeSourcePath, "utf8");
   assertNoRemovedHarborAdapter(sourceText, "Portable Harbor runtime source");
   assertNoRemovedHarborAdapter(codexSourceText, "Portable Codex Harbor runtime source");
 
@@ -126,6 +137,7 @@ export async function packageHarborRuntime(options = {}) {
   await writeFile(runtimePath, sourceText, "utf8");
   await writeFile(codexRuntimePath, codexSourceText, "utf8");
   await writeFile(sandboxComposePath, sandboxComposeText, "utf8");
+  await writeFile(proxyComposePath, proxyComposeText, "utf8");
 
   const readmeText = runtimeReadme(agentCliTarball);
 
@@ -139,6 +151,7 @@ export async function packageHarborRuntime(options = {}) {
     runtimePath,
     codexRuntimePath,
     sandboxComposePath,
+    proxyComposePath,
     agentCliTarball
   };
 }

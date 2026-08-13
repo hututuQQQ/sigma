@@ -34,6 +34,10 @@ export const harborSandboxComposePath = path.join(
   harborRuntimeDir,
   "docker-compose-sigma-sandbox.yaml"
 );
+export const harborProxyComposePath = path.join(
+  harborRuntimeDir,
+  "docker-compose-sigma-proxy.yaml"
+);
 export const terminalBenchDataset = "terminal-bench/terminal-bench-2";
 export const portableAgentImportPath = "sigma_harbor_agent:SigmaCliHarborAgent";
 export const portableCodexAgentImportPath = "codex_harbor_agent:PortableCodex";
@@ -823,9 +827,17 @@ export function buildHarborJobConfig(options, jobsDir, timeoutPlan = null, timeo
   }
 
   if (options.mode !== "smoke") {
+    const extraDockerCompose = [
+      path.resolve(options.harborSandboxComposePath ?? harborSandboxComposePath)
+    ];
+    if (options.env?.SIGMA_CONTAINER_PROXY_ENABLED === "1") {
+      extraDockerCompose.push(
+        path.resolve(options.harborProxyComposePath ?? harborProxyComposePath)
+      );
+    }
     config.environment = {
       type: "docker",
-      extra_docker_compose: [path.resolve(options.harborSandboxComposePath ?? harborSandboxComposePath)]
+      extra_docker_compose: extraDockerCompose
     };
   }
 
@@ -1370,7 +1382,8 @@ export function classifyFailure(input = {}) {
     return declared;
   }
 
-  if (/unknown scheme for proxy url/i.test(logText) || /\bhtpp:\/\//i.test(logText)) return "host_proxy_error";
+  if (/unknown scheme for proxy url/i.test(logText) || /\bhtpp:\/\//i.test(logText)
+    || /invalid peer certificate:\s*unknownissuer/i.test(logText)) return "host_proxy_error";
   if (/unicodeencodeerror/i.test(logText) || /codec can't encode character/i.test(logText) || /illegal multibyte sequence/i.test(logText)) {
     return "host_encoding_error";
   }
@@ -3163,6 +3176,71 @@ export async function ensurePlaceholderTask(runDir, metadata) {
   });
 }
 
+const proxyEnvironmentKeys = [
+  "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"
+];
+const containerProxyEnvironmentKeys = [
+  "SIGMA_CONTAINER_PROXY_ENABLED",
+  "SIGMA_CONTAINER_HTTP_PROXY",
+  "SIGMA_CONTAINER_HTTPS_PROXY",
+  "SIGMA_CONTAINER_ALL_PROXY",
+  "SIGMA_CONTAINER_NO_PROXY"
+];
+
+function normalizedProxyScheme(value) {
+  return typeof value === "string" && /^htpp:\/\//i.test(value)
+    ? `http://${value.slice(7)}`
+    : value;
+}
+
+function containerProxyUrl(value) {
+  const normalized = normalizedProxyScheme(value);
+  if (typeof normalized !== "string" || normalized.trim().length === 0) return null;
+  const text = normalized.trim();
+  try {
+    const parsed = new URL(text);
+    const hostname = parsed.hostname.replace(/^\[|\]$/gu, "").toLowerCase();
+    if (hostname === "localhost" || hostname === "::1" || /^127(?:\.\d{1,3}){3}$/u.test(hostname)) {
+      parsed.hostname = "host.docker.internal";
+    }
+    let mapped = parsed.toString();
+    if (!text.endsWith("/") && parsed.pathname === "/" && !parsed.search && !parsed.hash) {
+      mapped = mapped.slice(0, -1);
+    }
+    return mapped;
+  } catch {
+    return text;
+  }
+}
+
+function firstProxyValue(env, keys) {
+  for (const key of keys) {
+    const value = env[key];
+    if (typeof value === "string" && value.trim().length > 0) return value;
+  }
+  return null;
+}
+
+function containerProxyEnvironment(env) {
+  const http = containerProxyUrl(firstProxyValue(env, [
+    "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"
+  ]));
+  const https = containerProxyUrl(firstProxyValue(env, [
+    "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"
+  ]));
+  const all = containerProxyUrl(firstProxyValue(env, [
+    "ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"
+  ]));
+  if (!http && !https && !all) return {};
+  return {
+    SIGMA_CONTAINER_PROXY_ENABLED: "1",
+    SIGMA_CONTAINER_HTTP_PROXY: http ?? https ?? all,
+    SIGMA_CONTAINER_HTTPS_PROXY: https ?? http ?? all,
+    SIGMA_CONTAINER_ALL_PROXY: all ?? https ?? http,
+    SIGMA_CONTAINER_NO_PROXY: firstProxyValue(env, ["NO_PROXY", "no_proxy"]) ?? ""
+  };
+}
+
 export function harborEnvForRun(runDir, env = process.env, options = {}) {
   const harness = harnessKind(options.harness ?? env.SIGMA_BENCH_HARNESS);
   resolveHarborAgentImportPath(env, harness);
@@ -3225,11 +3303,11 @@ export function harborEnvForRun(runDir, env = process.env, options = {}) {
       next.CODEX_FORCE_AUTH_JSON = "1";
     }
   }
-  for (const key of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]) {
+  for (const key of proxyEnvironmentKeys) {
     const value = next[key];
-    if (typeof value === "string" && /^htpp:\/\//i.test(value)) {
-      next[key] = `http://${value.slice(7)}`;
-    }
+    next[key] = normalizedProxyScheme(value);
   }
+  for (const key of containerProxyEnvironmentKeys) delete next[key];
+  Object.assign(next, containerProxyEnvironment(next));
   return next;
 }
