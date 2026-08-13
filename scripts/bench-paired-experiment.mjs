@@ -6,8 +6,14 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  buildHarborTimeoutProbeConfig,
+  harborEnvForRun,
+  harborPythonCommand,
+  harborTaskExecutionIdentitySha256,
   packageHarborRuntime,
+  parseHarborTimeoutProbe,
   rootDir,
+  runProcess,
   safePathPart,
   taskSelectionIdentitySha256
 } from "./bench-common.mjs";
@@ -66,6 +72,17 @@ async function jsonIfPresent(filePath) {
   } catch (error) {
     if (error?.code === "ENOENT") return null;
     throw error;
+  }
+}
+
+async function ensureStableJson(filePath, value) {
+  const expected = `${JSON.stringify(value, null, 2)}\n`;
+  try {
+    const existing = await readFile(filePath, "utf8");
+    if (existing !== expected) throw new Error(`Frozen control file drifted: ${filePath}`);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+    await writeExclusive(filePath, Buffer.from(expected));
   }
 }
 
@@ -432,6 +449,75 @@ async function prepareRuntime(outputDir, arms, deps) {
   return result;
 }
 
+async function prefetchPairedTasks({ manifest, stage, outputDir, arms }) {
+  const arm = [...arms.values()].find((candidate) => candidate.harness === "sigma")
+    ?? [...arms.values()][0];
+  if (!arm) throw new Error("Paired task prefetch requires at least one harness arm.");
+  const preflightDir = path.join(outputDir, "preflight");
+  const prefetchRunDir = path.join(preflightDir, "task-cache");
+  const env = harborEnvForRun(prefetchRunDir, process.env, {
+    harness: arm.harness,
+    runtimeArchive: arm.archive,
+    runtimeVersion: arm.runtime.version
+  });
+  const config = buildHarborTimeoutProbeConfig({
+    mode: "batch",
+    tasks: manifest.selection.selected_tasks,
+    harness: arm.harness,
+    provider: manifest.model.provider,
+    model: manifest.model.name,
+    reasoningEffort: manifest.model.reasoning_effort,
+    agentProfile: manifest.controls.agent_profile,
+    maxTurns: manifest.controls.max_turns,
+    commandTimeoutSec: manifest.controls.command_timeout_sec,
+    networkMode: manifest.controls.network_mode,
+    executionMode: manifest.controls.execution_mode,
+    writeScope: manifest.controls.write_scope,
+    managedEnvironmentMode: manifest.controls.managed_environment_mode,
+    harborTopology: manifest.controls.harbor_topology,
+    attemptsPerTask: 1,
+    retries: 0,
+    nConcurrentTrials: 1,
+    expectedArchiveSha256: arm.runtime.archive_sha256,
+    runtimeArchive: arm.archive,
+    runtimeLayout: arm.runtime.layout,
+    runtimeVersion: arm.runtime.version,
+    env
+  }, path.join(prefetchRunDir, "jobs"));
+  const configPath = path.join(preflightDir, "task-cache.config.json");
+  await ensureStableJson(configPath, config);
+  const label = `task-cache-${safePathPart(stage.id)}`;
+  const result = await runProcess(
+    harborPythonCommand(env),
+    [path.join(rootDir, "scripts", "probe-harbor-timeouts.py"), configPath],
+    {
+      cwd: rootDir,
+      env,
+      stdoutPath: path.join(preflightDir, `${label}.stdout.log`),
+      stderrPath: path.join(preflightDir, `${label}.stderr.log`),
+      rawPath: path.join(preflightDir, `${label}.raw.log`)
+    }
+  );
+  if (result.exitCode !== 0) {
+    throw new Error(`Harbor task-cache prefetch failed before stage ${stage.id}.`);
+  }
+  const probe = parseHarborTimeoutProbe(result.stdout);
+  const expected = manifest.selection.selected_tasks
+    .map((task) => harborTaskExecutionIdentitySha256(task)).sort();
+  const observed = (Array.isArray(probe?.resolved_tasks) ? probe.resolved_tasks : [])
+    .map((task) => harborTaskExecutionIdentitySha256(task)).sort();
+  if (JSON.stringify(observed) !== JSON.stringify(expected)) {
+    throw new Error("Harbor task-cache prefetch did not resolve the frozen selected task set exactly.");
+  }
+  await ensureStableJson(path.join(preflightDir, `${label}.completed.json`), {
+    schemaVersion: 1,
+    experiment_id: manifest.experiment_id,
+    stage: stage.id,
+    task_count: observed.length,
+    task_execution_identities: observed
+  });
+}
+
 export async function runPairedExperiment(argv = process.argv.slice(2), deps = {}) {
   const runOptions = options(argv);
   const bundle = await loadPairedExperiment(runOptions.preregistrationFile, runOptions.expectedSha256);
@@ -452,6 +538,9 @@ export async function runPairedExperiment(argv = process.argv.slice(2), deps = {
   const stage = selectStage(manifest, completed, runOptions.stage);
   const paths = stagePaths(outputDir, stage.id);
   const preparedRuntime = await prepareRuntime(outputDir, arms, deps);
+  await (deps.prefetchTasks ?? prefetchPairedTasks)({
+    manifest, stage, outputDir, arms, preparedRuntime
+  });
   await writeExclusive(paths.started, {
     schemaVersion: 1,
     experiment_id: manifest.experiment_id,

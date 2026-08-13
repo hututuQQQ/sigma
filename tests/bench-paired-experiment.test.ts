@@ -280,6 +280,7 @@ describe("paired Harness experiment", () => {
         assertFrozenArchives: async () => undefined,
         assertCredentials: async () => undefined,
         packageHarborRuntime: async () => ({ exitCode: 0, harborRuntimeDir: directory }),
+        prefetchTasks: async () => undefined,
         runArm: async (_args: string[], context: any) => {
           await context.beforeHarborDispatch();
           calls.push(`${context.pair.task_index}:${context.arm.id}`);
@@ -299,6 +300,32 @@ describe("paired Harness experiment", () => {
         assertFrozenArchives: async () => undefined,
         assertCredentials: async () => undefined
       })).rejects.toThrow(/next unconsumed stage|already complete/iu);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("runs task-cache prefetch before consuming a stage", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "sigma-paired-prefetch-"));
+    try {
+      const manifest = pairedExperimentPreregistration(draft(2, 1), { baseDir: directory });
+      const preregistration = await frozen(directory, manifest);
+      const output = path.join(directory, "output");
+      await expect(runPairedExperiment([
+        "--preregistration-file", preregistration.file,
+        "--expected-preregistration-sha256", preregistration.sha256,
+        "--output", output,
+        "--stage", "next"
+      ], {
+        assertFrozenArchives: async () => undefined,
+        assertCredentials: async () => undefined,
+        packageHarborRuntime: async () => ({ exitCode: 0, harborRuntimeDir: directory }),
+        prefetchTasks: async () => { throw new Error("prefetch fixture failed"); }
+      })).rejects.toThrow("prefetch fixture failed");
+      await expect(readFile(
+        path.join(output, "receipts", manifest.execution.stages[0].id, "stage.started.json"),
+        "utf8"
+      )).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -421,6 +448,7 @@ describe("paired Harness experiment", () => {
         assertFrozenArchives: async () => undefined,
         assertCredentials: async () => undefined,
         packageHarborRuntime: async () => ({ exitCode: 0, harborRuntimeDir: directory }),
+        prefetchTasks: async () => undefined,
         runArm: async (_args: string[], context: any) => {
           await context.beforeHarborDispatch();
           const runDir = path.join(directory, "analysis-runs", `${context.pair.task_index}-${context.arm.id}`);
