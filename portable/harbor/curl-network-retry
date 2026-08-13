@@ -21,7 +21,12 @@ trap 'exit 130' INT
 trap 'exit 143' HUP TERM
 
 attempt=1
-max_attempts=5
+# A host proxy or upstream TLS endpoint can remain unavailable for longer than
+# the original 15-second retry window when several verifier containers start at
+# once. Keep retrying only curl's transient transport failures, with a bounded
+# backoff window that still fits comfortably inside the verifier timeout.
+max_attempts=8
+max_delay=30
 while :; do
   : >"$stdout_file"
   : >"$stderr_file"
@@ -44,6 +49,9 @@ while :; do
   fi
 
   delay=$((1 << (attempt - 1)))
+  if [ "$delay" -gt "$max_delay" ]; then
+    delay=$max_delay
+  fi
   cat "$stderr_file" >&2
   printf '%s\n' \
     "Transient curl network failure (exit $status); retrying command ($attempt/$max_attempts) in ${delay}s." >&2

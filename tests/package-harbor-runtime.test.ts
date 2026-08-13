@@ -45,6 +45,8 @@ describe("package-harbor-runtime", () => {
     expect(aptRetryWrapper).toContain('exit "$status"');
     expect(curlRetryWrapper).toContain("Transient curl network failure");
     expect(curlRetryWrapper).toContain("5|6|7|18|28|35|52|55|56|92");
+    expect(curlRetryWrapper).toContain("max_attempts=8");
+    expect(curlRetryWrapper).toContain("max_delay=30");
     expect(curlRetryWrapper).toContain('cat "$stdout_file"');
     expect(path.isAbsolute(result.agentCliTarball)).toBe(true);
     expect(packagedFiles.some((name) => name.endsWith(".json"))).toBe(false);
