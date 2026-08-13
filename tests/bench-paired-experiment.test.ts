@@ -18,7 +18,7 @@ import {
   pairedSha256,
   validatePairedExperiment
 } from "../scripts/bench-paired-preregistration.mjs";
-import { packageCodexRuntime } from "../scripts/package-codex-runtime.mjs";
+import { normalizedProxyEnv, packageCodexRuntime } from "../scripts/package-codex-runtime.mjs";
 
 const revision = "a".repeat(40);
 
@@ -290,6 +290,16 @@ describe("paired Harness experiment", () => {
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
+  });
+
+  it("repairs malformed proxy schemes before invoking npm", async () => {
+    expect(normalizedProxyEnv({
+      http_proxy: "htpp://127.0.0.1:7890",
+      HTTPS_PROXY: "https://proxy.example"
+    })).toEqual({
+      http_proxy: "http://127.0.0.1:7890",
+      HTTPS_PROXY: "https://proxy.example"
+    });
   });
 
   it("analyzes paired outcomes and efficiency from immutable receipts", async () => {

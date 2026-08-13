@@ -17,6 +17,17 @@ function npmCommand(platform = process.platform) {
   return platform === "win32" ? "npm.cmd" : "npm";
 }
 
+export function normalizedProxyEnv(env = process.env) {
+  const next = { ...env };
+  for (const key of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]) {
+    const value = next[key];
+    if (typeof value === "string" && /^htpp:\/\//i.test(value)) {
+      next[key] = `http://${value.slice(7)}`;
+    }
+  }
+  return next;
+}
+
 function run(command, args, options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
@@ -56,7 +67,7 @@ export async function packageCodexRuntime(options, deps = {}) {
     const runner = deps.run ?? run;
     const result = await runner(npmCommand(deps.platform), [
       "pack", packageId, "--pack-destination", temporary, "--json"
-    ], { cwd: temporary, env: deps.env ?? process.env });
+    ], { cwd: temporary, env: normalizedProxyEnv(deps.env ?? process.env) });
     if (result.exitCode !== 0) {
       throw new Error(`npm pack failed for ${packageId}: ${String(result.stderr).trim()}`);
     }
