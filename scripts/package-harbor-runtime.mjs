@@ -5,6 +5,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   defaultAgentCliTarballForEnv,
+  harborAptNetworkConfigPath as defaultHarborAptNetworkConfigPath,
   harborProxyComposePath as defaultHarborProxyComposePath,
   harborRuntimeDir as defaultHarborRuntimeDir,
   harborSandboxComposePath as defaultHarborSandboxComposePath,
@@ -104,6 +105,12 @@ export async function packageHarborRuntime(options = {}) {
   const proxyComposePath = options.harborRuntimeDir || options.artifactsDir
     ? path.join(harborRuntimeDir, "docker-compose-sigma-proxy.yaml")
     : defaultHarborProxyComposePath;
+  const aptNetworkConfigSourcePath = options.aptNetworkConfigSourcePath
+    ? path.resolve(options.aptNetworkConfigSourcePath)
+    : path.join(rootDir, "portable", "harbor", "apt-network-retries.conf");
+  const aptNetworkConfigPath = options.harborRuntimeDir || options.artifactsDir
+    ? path.join(harborRuntimeDir, "apt-network-retries.conf")
+    : defaultHarborAptNetworkConfigPath;
   const agentCliTarball = resolveAgentCliTarball(rootDir, artifactsDir, env, options);
 
   if (!existsSync(sourcePath)) {
@@ -118,6 +125,9 @@ export async function packageHarborRuntime(options = {}) {
   if (!existsSync(proxyComposeSourcePath)) {
     throw new Error(`Portable Harbor proxy Compose overlay is missing: ${proxyComposeSourcePath}`);
   }
+  if (!existsSync(aptNetworkConfigSourcePath)) {
+    throw new Error(`Portable Harbor APT network config is missing: ${aptNetworkConfigSourcePath}`);
+  }
   if (options.requireAgentCliTarball !== false && !existsSync(agentCliTarball)) {
     throw new Error(`Packaged agent CLI is missing: ${agentCliTarball}. Run pnpm package:agent-cli first.`);
   }
@@ -126,6 +136,7 @@ export async function packageHarborRuntime(options = {}) {
   const codexSourceText = await readFile(codexSourcePath, "utf8");
   const sandboxComposeText = await readFile(sandboxComposeSourcePath, "utf8");
   const proxyComposeText = await readFile(proxyComposeSourcePath, "utf8");
+  const aptNetworkConfigText = await readFile(aptNetworkConfigSourcePath, "utf8");
   assertNoRemovedHarborAdapter(sourceText, "Portable Harbor runtime source");
   assertNoRemovedHarborAdapter(codexSourceText, "Portable Codex Harbor runtime source");
 
@@ -138,6 +149,7 @@ export async function packageHarborRuntime(options = {}) {
   await writeFile(codexRuntimePath, codexSourceText, "utf8");
   await writeFile(sandboxComposePath, sandboxComposeText, "utf8");
   await writeFile(proxyComposePath, proxyComposeText, "utf8");
+  await writeFile(aptNetworkConfigPath, aptNetworkConfigText, "utf8");
 
   const readmeText = runtimeReadme(agentCliTarball);
 
@@ -152,6 +164,7 @@ export async function packageHarborRuntime(options = {}) {
     codexRuntimePath,
     sandboxComposePath,
     proxyComposePath,
+    aptNetworkConfigPath,
     agentCliTarball
   };
 }

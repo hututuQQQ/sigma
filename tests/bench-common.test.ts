@@ -934,6 +934,7 @@ describe("Terminal-Bench command construction", () => {
     expect(env.SIGMA_CONTAINER_HTTPS_PROXY).toBe("http://host.docker.internal:7890");
     expect(env.SIGMA_CONTAINER_ALL_PROXY).toBe("socks5://host.docker.internal:7891");
     expect(env.SIGMA_CONTAINER_NO_PROXY).toBe("localhost,127.0.0.1");
+    expect(env.SIGMA_CONTAINER_APT_CONFIG).toMatch(/apt-network-retries\.conf$/u);
 
     const config = buildHarborJobConfig({ mode: "batch", tasks: [], env }, "jobs");
     expect(config.environment.extra_docker_compose).toEqual([

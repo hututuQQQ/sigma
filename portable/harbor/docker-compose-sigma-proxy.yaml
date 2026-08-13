@@ -11,3 +11,5 @@ services:
       https_proxy: "${SIGMA_CONTAINER_HTTPS_PROXY}"
       all_proxy: "${SIGMA_CONTAINER_ALL_PROXY}"
       no_proxy: "${SIGMA_CONTAINER_NO_PROXY}"
+    volumes:
+      - "${SIGMA_CONTAINER_APT_CONFIG}:/etc/apt/apt.conf.d/80sigma-network-retries:ro"

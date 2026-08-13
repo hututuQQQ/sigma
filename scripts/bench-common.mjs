@@ -38,6 +38,10 @@ export const harborProxyComposePath = path.join(
   harborRuntimeDir,
   "docker-compose-sigma-proxy.yaml"
 );
+export const harborAptNetworkConfigPath = path.join(
+  harborRuntimeDir,
+  "apt-network-retries.conf"
+);
 export const terminalBenchDataset = "terminal-bench/terminal-bench-2";
 export const portableAgentImportPath = "sigma_harbor_agent:SigmaCliHarborAgent";
 export const portableCodexAgentImportPath = "codex_harbor_agent:PortableCodex";
@@ -3184,7 +3188,8 @@ const containerProxyEnvironmentKeys = [
   "SIGMA_CONTAINER_HTTP_PROXY",
   "SIGMA_CONTAINER_HTTPS_PROXY",
   "SIGMA_CONTAINER_ALL_PROXY",
-  "SIGMA_CONTAINER_NO_PROXY"
+  "SIGMA_CONTAINER_NO_PROXY",
+  "SIGMA_CONTAINER_APT_CONFIG"
 ];
 
 function normalizedProxyScheme(value) {
@@ -3237,7 +3242,8 @@ function containerProxyEnvironment(env) {
     SIGMA_CONTAINER_HTTP_PROXY: http ?? https ?? all,
     SIGMA_CONTAINER_HTTPS_PROXY: https ?? http ?? all,
     SIGMA_CONTAINER_ALL_PROXY: all ?? https ?? http,
-    SIGMA_CONTAINER_NO_PROXY: firstProxyValue(env, ["NO_PROXY", "no_proxy"]) ?? ""
+    SIGMA_CONTAINER_NO_PROXY: firstProxyValue(env, ["NO_PROXY", "no_proxy"]) ?? "",
+    SIGMA_CONTAINER_APT_CONFIG: harborAptNetworkConfigPath
   };
 }
 
