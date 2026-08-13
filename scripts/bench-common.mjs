@@ -36,12 +36,15 @@ export const harborSandboxComposePath = path.join(
 );
 export const terminalBenchDataset = "terminal-bench/terminal-bench-2";
 export const portableAgentImportPath = "sigma_harbor_agent:SigmaCliHarborAgent";
+export const portableCodexAgentImportPath = "codex_harbor_agent:PortableCodex";
+export const benchmarkHarnessKinds = Object.freeze(["sigma", "codex"]);
 export const agentImportPath = portableAgentImportPath;
 export const removedHarborPackageName = ["integrations", "harbor"].join(".");
 export const removedHarborDirectoryName = ["integrations", "harbor"].join("/");
 export const removedHarborAdapterErrorMessage =
   `${removedHarborDirectoryName} has been removed. Use portable runtime import path ${portableAgentImportPath}.`;
 export const defaultAgentCliTarball = path.join(artifactsDir, "agent-cli-linux-x64.tgz");
+export const defaultCodexCliTarball = path.join(artifactsDir, "codex-cli-linux-x64.tgz");
 export const defaultAgentTimeoutFallbackSec = 1800;
 export const defaultAgentTimeoutGraceSec = 120;
 export const defaultAgentTimeoutLeniencyMultiplier = 1.5;
@@ -59,6 +62,7 @@ export const terminalBenchCliFlags = Object.freeze([
   "dataset",
   "execution-mode",
   "expected-archive-sha256",
+  "harness",
   "harbor-topology",
   "help",
   "k",
@@ -72,6 +76,9 @@ export const terminalBenchCliFlags = Object.freeze([
   "retries",
   "reuse-package",
   "run-label",
+  "runtime-archive",
+  "runtime-layout",
+  "runtime-version",
   "smoke",
   "task-id",
   "tasks-file",
@@ -229,11 +236,30 @@ export function defaultAgentCliTarballForEnv(env = process.env) {
   return path.join(artifactsDir, `agent-cli-linux-${targetArch}.tgz`);
 }
 
-export function resolveHarborAgentImportPath(env = process.env) {
-  if (typeof env.SIGMA_HARBOR_AGENT_IMPORT_PATH === "string" && env.SIGMA_HARBOR_AGENT_IMPORT_PATH.trim()) {
+export function defaultCodexCliTarballForEnv(env = process.env) {
+  const targetArch = env.CODEX_TARGET_ARCH || env.AGENT_TARGET_ARCH || "x64";
+  return path.join(artifactsDir, `codex-cli-linux-${targetArch}.tgz`);
+}
+
+function harnessKind(value, fallback = "sigma") {
+  const harness = asString(value, fallback);
+  if (!benchmarkHarnessKinds.includes(harness)) {
+    throw new Error(`harness must be one of: ${benchmarkHarnessKinds.join(", ")}.`);
+  }
+  return harness;
+}
+
+export function resolveHarborAgentImportPath(env = process.env, harness = "sigma") {
+  const resolvedHarness = harnessKind(harness);
+  if (typeof env.HARBOR_AGENT_IMPORT_PATH === "string" && env.HARBOR_AGENT_IMPORT_PATH.trim()) {
+    return assertSupportedHarborAgentImportPath(env.HARBOR_AGENT_IMPORT_PATH.trim());
+  }
+  if (resolvedHarness === "sigma"
+    && typeof env.SIGMA_HARBOR_AGENT_IMPORT_PATH === "string"
+    && env.SIGMA_HARBOR_AGENT_IMPORT_PATH.trim()) {
     return assertSupportedHarborAgentImportPath(env.SIGMA_HARBOR_AGENT_IMPORT_PATH.trim());
   }
-  return portableAgentImportPath;
+  return resolvedHarness === "codex" ? portableCodexAgentImportPath : portableAgentImportPath;
 }
 
 function isRemovedHarborAgentImportPath(importPath) {
@@ -248,8 +274,13 @@ function assertSupportedHarborAgentImportPath(importPath) {
   return importPath;
 }
 
-function resolveAgentCliTarballPath(options = {}, env = process.env) {
-  return path.resolve(options.agentCliTarball ?? env.AGENT_CLI_TARBALL ?? defaultAgentCliTarballForEnv(env));
+export function resolveHarnessRuntimeArchive(options = {}, env = process.env) {
+  const harness = harnessKind(options.harness ?? env.SIGMA_BENCH_HARNESS);
+  const configured = options.runtimeArchive
+    ?? (harness === "codex" ? env.CODEX_CLI_TARBALL : env.AGENT_CLI_TARBALL);
+  return path.resolve(configured ?? (harness === "codex"
+    ? defaultCodexCliTarballForEnv(env)
+    : defaultAgentCliTarballForEnv(env)));
 }
 
 export function makeRunId(date, provider, model) {
@@ -356,6 +387,18 @@ function reasoningEffort(value, fallback = "auto") {
   return effort;
 }
 
+function runtimeLayout(harness, value) {
+  const defaults = harness === "codex" ? "npm-linux-x64" : "sigma-agent-cli";
+  const layout = asString(value, defaults);
+  const supported = harness === "codex"
+    ? ["npm-linux-x64", "portable-root"]
+    : ["sigma-agent-cli"];
+  if (!supported.includes(layout)) {
+    throw new Error(`runtime layout for ${harness} must be one of: ${supported.join(", ")}.`);
+  }
+  return layout;
+}
+
 function normalizedSha256(value, name) {
   if (value === undefined || value === null || value === "") return null;
   const text = String(value).trim().toLowerCase();
@@ -377,6 +420,7 @@ export function readTaskSelectionFile(filePath) {
 
 export function resolveRunOptions(argv, env = process.env) {
   const flags = parseTerminalBenchArgs(argv);
+  const harness = harnessKind(flags.harness ?? env.SIGMA_BENCH_HARNESS);
   const mode = flags.smoke ? "smoke" : asString(flags.mode, "k");
   if (!["smoke", "k", "task", "batch"].includes(mode)) {
     throw new Error(`Unsupported benchmark mode: ${mode}`);
@@ -392,6 +436,18 @@ export function resolveRunOptions(argv, env = process.env) {
   if (flags["reuse-package"] === true && !expectedArchiveSha256) {
     throw new Error("--reuse-package requires --expected-archive-sha256.");
   }
+  if (harness === "codex" && flags["reuse-package"] !== true) {
+    throw new Error("The Codex harness requires a SHA-pinned runtime and --reuse-package.");
+  }
+  const runtimeVersion = asString(flags["runtime-version"]
+    ?? (harness === "codex" ? env.CODEX_CLI_VERSION : env.SIGMA_RUNTIME_VERSION));
+  if (harness === "codex" && !runtimeVersion) {
+    throw new Error("The Codex harness requires --runtime-version.");
+  }
+  const runtimeArchive = resolveHarnessRuntimeArchive({
+    harness,
+    runtimeArchive: flags["runtime-archive"]
+  }, env);
 
   const runClass = benchmarkClass(flags["benchmark-class"] ?? env.SIGMA_BENCHMARK_CLASS);
   const requestedLeniencyMultiplier = flags["timeout-leniency-multiplier"]
@@ -426,6 +482,11 @@ export function resolveRunOptions(argv, env = process.env) {
   const configuredMaxTurns = flags["max-turns"] ?? env.AGENT_MAX_TURNS;
   return {
     mode,
+    harness,
+    agentImportPath: resolveHarborAgentImportPath(env, harness),
+    runtimeArchive,
+    runtimeLayout: runtimeLayout(harness, flags["runtime-layout"]),
+    runtimeVersion: runtimeVersion ?? null,
     benchmarkClass: runClass,
     dataset: asString(flags.dataset ?? env.SIGMA_BENCH_DATASET, terminalBenchDataset),
     provider: asString(flags.provider, env.AGENT_PROVIDER ?? "deepseek"),
@@ -691,8 +752,24 @@ function selectedTaskRecords(timeoutProbe) {
 }
 
 function benchmarkAgentKwargs(options, timeoutPlan = null) {
+  if (options.harness === "codex") {
+    if (!options.expectedArchiveSha256) {
+      throw new Error("The Codex harness requires a frozen runtime SHA-256.");
+    }
+    if (!options.runtimeVersion) {
+      throw new Error("The Codex harness requires a frozen runtime version.");
+    }
+    return {
+      codex_cli_tarball: resolveHarnessRuntimeArchive(options, options.env ?? process.env),
+      codex_cli_sha256: options.expectedArchiveSha256,
+      codex_cli_layout: options.runtimeLayout ?? "npm-linux-x64",
+      version: options.runtimeVersion,
+      model_name: options.model,
+      reasoning_effort: options.reasoningEffort ?? "auto"
+    };
+  }
   const agentKwargs = {
-    agent_cli_tarball: resolveAgentCliTarballPath(options, options.env ?? process.env),
+    agent_cli_tarball: resolveHarnessRuntimeArchive(options, options.env ?? process.env),
     provider: options.provider,
     reasoning_effort: options.reasoningEffort ?? "auto",
     agent_profile: options.agentProfile ?? "standard",
@@ -724,7 +801,8 @@ export function buildHarborJobConfig(options, jobsDir, timeoutPlan = null, timeo
   const agentName = options.mode === "smoke"
     ? "oracle"
     : assertSupportedHarborAgentImportPath(
-        options.agentImportPath ?? resolveHarborAgentImportPath(options.env ?? process.env)
+        options.agentImportPath
+          ?? resolveHarborAgentImportPath(options.env ?? process.env, options.harness)
       );
   const agentKwargs = options.mode === "smoke" ? {} : benchmarkAgentKwargs(options, timeoutPlan);
 
@@ -902,7 +980,8 @@ export function buildHarborArgs(options) {
   }
 
   const selectedAgentImportPath = assertSupportedHarborAgentImportPath(
-    options.agentImportPath ?? resolveHarborAgentImportPath(options.env ?? process.env)
+    options.agentImportPath
+      ?? resolveHarborAgentImportPath(options.env ?? process.env, options.harness)
   );
   const args = [
     "run",
@@ -933,7 +1012,28 @@ export function buildHarborArgs(options) {
     args.push(capabilities.agentTimeoutMultiplierFlag, agentTimeoutMultiplier);
   }
 
-  args.push("--ak", formatAgentKwarg("agent_cli_tarball", "str", resolveAgentCliTarballPath(options, options.env ?? process.env), capabilities));
+  if (options.harness === "codex") {
+    if (!options.expectedArchiveSha256 || !options.runtimeVersion || !options.model) {
+      throw new Error("The Codex harness requires frozen archive, version, and model controls.");
+    }
+    args.push("--ak", formatAgentKwarg(
+      "codex_cli_tarball", "str", resolveHarnessRuntimeArchive(options, options.env ?? process.env), capabilities
+    ));
+    args.push("--ak", formatAgentKwarg(
+      "codex_cli_sha256", "str", options.expectedArchiveSha256, capabilities
+    ));
+    args.push("--ak", formatAgentKwarg(
+      "codex_cli_layout", "str", options.runtimeLayout ?? "npm-linux-x64", capabilities
+    ));
+    args.push("--ak", formatAgentKwarg("version", "str", options.runtimeVersion, capabilities));
+    args.push("--ak", formatAgentKwarg("model_name", "str", options.model, capabilities));
+    args.push("--ak", formatAgentKwarg(
+      "reasoning_effort", "str", options.reasoningEffort ?? "auto", capabilities
+    ));
+    return args;
+  }
+
+  args.push("--ak", formatAgentKwarg("agent_cli_tarball", "str", resolveHarnessRuntimeArchive(options, options.env ?? process.env), capabilities));
   args.push("--ak", formatAgentKwarg("provider", "str", options.provider, capabilities));
   args.push("--ak", formatAgentKwarg(
     "reasoning_effort", "str", options.reasoningEffort ?? "auto", capabilities
@@ -988,6 +1088,11 @@ export function buildCommandScript(commandOrArgs, maybeArgs, maybeEnv) {
     "set -euo pipefail",
     `cd ${shellQuote(rootDir)}`,
     `export AGENT_CLI_TARBALL=${shellQuote(env.AGENT_CLI_TARBALL)}`,
+    `export CODEX_CLI_TARBALL=${shellQuote(env.CODEX_CLI_TARBALL ?? "")}`,
+    `export CODEX_CLI_VERSION=${shellQuote(env.CODEX_CLI_VERSION ?? "")}`,
+    `export CODEX_AUTH_JSON_PATH=${shellQuote(env.CODEX_AUTH_JSON_PATH ?? "")}`,
+    `export CODEX_FORCE_AUTH_JSON=${shellQuote(env.CODEX_FORCE_AUTH_JSON ?? "")}`,
+    `export SIGMA_BENCH_HARNESS=${shellQuote(env.SIGMA_BENCH_HARNESS ?? "sigma")}`,
     `export PYTHONPATH=${shellQuote(env.PYTHONPATH ?? "")}`,
     `export PYTHONDONTWRITEBYTECODE=${shellQuote(env.PYTHONDONTWRITEBYTECODE ?? "1")}`,
     `export PYTHONPYCACHEPREFIX=${shellQuote(env.PYTHONPYCACHEPREFIX ?? "")}`,
@@ -1615,21 +1720,80 @@ function summarizeTraceEvents(events) {
   return summary;
 }
 
+function summarizeAtifTrajectory(trajectory) {
+  const steps = Array.isArray(trajectory?.steps) ? trajectory.steps : [];
+  const agentSteps = steps.filter((step) => step?.source === "agent");
+  const toolCalls = agentSteps.flatMap((step) => Array.isArray(step?.tool_calls) ? step.tool_calls : []);
+  const finalMetrics = trajectory?.final_metrics && typeof trajectory.final_metrics === "object"
+    ? trajectory.final_metrics : {};
+  const timestamps = steps
+    .map((step) => Date.parse(step?.timestamp))
+    .filter(Number.isFinite);
+  const durationMs = timestamps.length > 1 ? Math.max(...timestamps) - Math.min(...timestamps) : 0;
+  return {
+    status: steps.length > 0 ? "completed" : undefined,
+    finish_reason: undefined,
+    commands_executed: toolCalls.length,
+    input_tokens: Number(finalMetrics.total_prompt_tokens ?? 0),
+    output_tokens: Number(finalMetrics.total_completion_tokens ?? 0),
+    reasoning_tokens: Number(finalMetrics.extra?.reasoning_output_tokens ?? 0),
+    cache_tokens: Number(finalMetrics.total_cached_tokens ?? 0),
+    cache_read_tokens: Number(finalMetrics.total_cached_tokens ?? 0),
+    provider_reported_input_tokens: Number(finalMetrics.total_prompt_tokens ?? 0),
+    provider_reported_cache_read_tokens: Number(finalMetrics.total_cached_tokens ?? 0),
+    warm_provider_input_tokens: 0,
+    warm_provider_cache_read_tokens: 0,
+    provider_reported_model_records: Number(
+      agentSteps.reduce((total, step) => total + Number(step?.llm_call_count ?? 0), 0)
+    ),
+    length_finish_count: 0,
+    converge_turns: 0,
+    cost_usd: Number.isFinite(Number(finalMetrics.total_cost_usd))
+      ? Number(finalMetrics.total_cost_usd) : null,
+    duration_ms: durationMs,
+    suspension_to_exit_ms: null,
+    terminal_origin: "harbor_atif",
+    termination_source: "harbor_atif",
+    network_mode_effective: null,
+    execution_mode: null,
+    managed_environment_mode: null,
+    harbor_topology: null,
+    agent_profile: null,
+    harbor_deadline_sec: null,
+    sigma_deadline_sec: null,
+    last_error: null
+  };
+}
+
 async function readTrialTraceFallback(runDir, trialDir) {
   const traceFiles = await listNamedFiles(trialDir, "trace.jsonl");
   const preferred = traceFiles.find((filePath) => /[\\/]agent[\\/]trace\.jsonl$/i.test(filePath)) ?? traceFiles[0];
-  if (!preferred) {
+  if (preferred) {
+    const events = await readTraceEvents(preferred);
     return {
-      agent_trace_path: null,
-      agent_trace_summary: {},
+      agent_trace_path: relativePathOrNull(runDir, preferred),
+      agent_trace_format: "sigma-jsonl",
+      agent_trace_summary: summarizeTraceEvents(events),
+      agent_trace_events: events
+    };
+  }
+  const trajectories = await listNamedFiles(trialDir, "trajectory.json");
+  const trajectoryPath = trajectories.find((filePath) => /[\\/]agent[\\/]trajectory\.json$/i.test(filePath))
+    ?? trajectories[0];
+  if (trajectoryPath) {
+    const trajectory = await readJsonSafe(trajectoryPath);
+    return {
+      agent_trace_path: relativePathOrNull(runDir, trajectoryPath),
+      agent_trace_format: "atif-json",
+      agent_trace_summary: summarizeAtifTrajectory(trajectory),
       agent_trace_events: []
     };
   }
-  const events = await readTraceEvents(preferred);
   return {
-    agent_trace_path: relativePathOrNull(runDir, preferred),
-    agent_trace_summary: summarizeTraceEvents(events),
-    agent_trace_events: events
+    agent_trace_path: null,
+    agent_trace_format: null,
+    agent_trace_summary: {},
+    agent_trace_events: []
   };
 }
 
@@ -1854,7 +2018,13 @@ async function runSlotIntegrityReasons(runDir, config) {
       const kwargs = Array.isArray(jobConfig.agents) && jobConfig.agents.length === 1
         && jobConfig.agents[0] && typeof jobConfig.agents[0] === "object"
         ? jobConfig.agents[0].kwargs : null;
-      const frozenControls = {
+      const frozenControls = config.harness === "codex" ? {
+        codex_cli_sha256: config.runtime_archive_sha256,
+        codex_cli_layout: config.runtime_layout,
+        version: config.runtime_version,
+        model_name: config.model,
+        reasoning_effort: config.reasoning_effort
+      } : {
         network_mode: config.network_mode,
         execution_mode: config.execution_mode,
         write_scope: config.write_scope,
@@ -1962,6 +2132,7 @@ function emptyTaskForTrial(trialResult, index) {
     failure_signals: [],
     summary_path: null,
     trace_path: null,
+    trace_format: null,
     commands_executed: 0,
     input_tokens: 0,
     cache_tokens: 0,
@@ -2144,6 +2315,7 @@ function mergeHarborTrialResult(task, trialResult) {
     agent_exception: agentExceptionFromTrial(trialResult, exceptionMessage),
     infra_warnings: Array.isArray(task.infra_warnings) ? [...task.infra_warnings] : [],
     trace_path: task.trace_path ?? trialResult?.agent_trace_path ?? null,
+    trace_format: task.trace_format ?? trialResult?.agent_trace_format ?? null,
     commands_executed: Number(
       agentMetadata.commands_executed ?? (task.commands_executed || traceSummary.commands_executed || 0)
     ),
@@ -2362,6 +2534,7 @@ async function taskReportFromDir(runDir, taskDir, index, config, globalLogText) 
     failure_signals: failureSignals,
     summary_path: relativePathOrNull(runDir, summaryPath),
     trace_path: relativePathOrNull(runDir, tracePath),
+    trace_format: existsSync(tracePath) ? "sigma-jsonl" : null,
     commands_executed: Number(summary.commands_executed ?? metadata.commands_executed ?? 0),
     input_tokens: Number(summary.input_tokens ?? metadata.n_input_tokens ?? 0),
     cache_tokens: Number(summary.cache_tokens ?? metadata.n_cache_tokens ?? 0),
@@ -2425,6 +2598,7 @@ function syntheticRunTask(config, globalLogText) {
     failure_signals: status === "passed" ? [] : collectFailureSignals({ logText: globalLogText }),
     summary_path: null,
     trace_path: null,
+    trace_format: null,
     commands_executed: 0,
     input_tokens: 0,
     cache_tokens: 0,
@@ -2513,6 +2687,24 @@ export function assertComparableBenchmarkReports(...reports) {
       `Benchmark reports use different reasoning efforts (${reasoningEfforts.join(", ")}) and cannot be combined.`
     ), { code: "benchmark_reasoning_effort_mismatch" });
   }
+  for (const [field, code] of [
+    ["harness", "benchmark_harness_mismatch"],
+    ["provider", "benchmark_provider_mismatch"],
+    ["model", "benchmark_model_mismatch"],
+    ["dataset", "benchmark_dataset_mismatch"],
+    ["network_mode", "benchmark_network_mismatch"],
+    ["execution_mode", "benchmark_execution_mode_mismatch"],
+    ["write_scope", "benchmark_write_scope_mismatch"],
+    ["managed_environment_mode", "benchmark_managed_environment_mismatch"],
+    ["harbor_topology", "benchmark_harbor_topology_mismatch"]
+  ]) {
+    const values = [...new Set(reports.map((report) => report?.[field]).filter((value) => value !== undefined))];
+    if (values.length > 1) {
+      throw Object.assign(new Error(
+        `Benchmark reports use different ${field} values (${values.join(", ")}) and cannot be combined.`
+      ), { code });
+    }
+  }
 }
 
 function taskHasSignal(task, pattern) {
@@ -2552,6 +2744,7 @@ export function formatMarkdownReport(report) {
     `- Status: ${report.status}`,
     `- Score status: ${report.score_status ?? report.status}`,
     `- Infra status: ${report.infra_status ?? "unknown"}`,
+    `- Harness: ${report.harness ?? "sigma"}`,
     `- Provider: ${report.provider}`,
     `- Model: ${report.model ?? "default"}`,
     `- Reasoning effort: ${report.reasoning_effort ?? "auto"}`,
@@ -2566,6 +2759,7 @@ export function formatMarkdownReport(report) {
     `- Command: ${markdownEscape(report.command ?? "")}`,
     `- Harbor: ${markdownEscape(report.harbor_command ?? "harbor")}${report.harbor_version ? ` (${markdownEscape(report.harbor_version)})` : ""}`,
     `- Concurrent trials: ${report.n_concurrent_trials ?? "unknown"}`,
+    `- Runtime archive SHA-256: ${report.runtime_archive_sha256 ?? "unknown"}`,
     "",
     "## Trial Accounting",
     "",
@@ -2870,6 +3064,7 @@ export async function generateBenchReport(runDir) {
     run_id: config.run_id ?? path.basename(runDir),
     started_at: config.started_at ?? null,
     finished_at: config.finished_at ?? null,
+    harness: config.harness ?? "sigma",
     provider: config.provider ?? "unknown",
     model: config.model ?? null,
     reasoning_effort: config.reasoning_effort ?? "auto",
@@ -2889,6 +3084,11 @@ export async function generateBenchReport(runDir) {
     tasks_file_sha256: config.tasks_file_sha256 ?? null,
     task_selection_sha256: config.task_selection_sha256 ?? null,
     run_slots: Array.isArray(config.run_slots) ? config.run_slots : [],
+    runtime_archive_sha256: config.runtime_archive_sha256 ?? config.agent_cli_sha256 ?? null,
+    runtime_layout: config.runtime_layout ?? null,
+    runtime_version: config.runtime_version ?? null,
+    frozen_runtime_integrity: config.frozen_runtime_integrity ?? null,
+    docker_cleanup: config.docker_cleanup ?? null,
     agent_cli_sha256: config.agent_cli_sha256 ?? null,
     package_reused: config.package_reused ?? false,
     n_concurrent_trials: resolvedJobConfig?.n_concurrent_trials ?? config.n_concurrent_trials ?? null,
@@ -2956,8 +3156,9 @@ export async function ensurePlaceholderTask(runDir, metadata) {
   });
 }
 
-export function harborEnvForRun(runDir, env = process.env) {
-  resolveHarborAgentImportPath(env);
+export function harborEnvForRun(runDir, env = process.env, options = {}) {
+  const harness = harnessKind(options.harness ?? env.SIGMA_BENCH_HARNESS);
+  resolveHarborAgentImportPath(env, harness);
   const pythonPathEntries = [harborRuntimeDir];
   if (env.PYTHONPATH) {
     pythonPathEntries.push(env.PYTHONPATH);
@@ -2976,7 +3177,16 @@ export function harborEnvForRun(runDir, env = process.env) {
 
   const next = {
     ...env,
-    AGENT_CLI_TARBALL: env.AGENT_CLI_TARBALL || defaultAgentCliTarballForEnv(env),
+    AGENT_CLI_TARBALL: harness === "sigma"
+      ? resolveHarnessRuntimeArchive({ harness, runtimeArchive: options.runtimeArchive }, env)
+      : env.AGENT_CLI_TARBALL || defaultAgentCliTarballForEnv(env),
+    CODEX_CLI_TARBALL: harness === "codex"
+      ? resolveHarnessRuntimeArchive({ harness, runtimeArchive: options.runtimeArchive }, env)
+      : env.CODEX_CLI_TARBALL,
+    CODEX_CLI_VERSION: harness === "codex"
+      ? options.runtimeVersion ?? env.CODEX_CLI_VERSION
+      : env.CODEX_CLI_VERSION,
+    SIGMA_BENCH_HARNESS: harness,
     PYTHONPATH: pythonPathEntries.filter(Boolean).join(path.delimiter),
     SIGMA_BENCH_RUN_DIR: runDir,
     SIGMA_HARBOR_RUN_ID: safePathPart(path.basename(path.resolve(runDir))),
@@ -2994,6 +3204,19 @@ export function harborEnvForRun(runDir, env = process.env) {
     next.SIGMA_HOST_CREDENTIAL_FILE = hostCredentialFile;
   } else {
     delete next.SIGMA_HOST_CREDENTIAL_FILE;
+  }
+  if (harness === "codex") {
+    const configuredCodexAuth = (env.CODEX_AUTH_JSON_PATH || "").trim();
+    if (configuredCodexAuth && !path.isAbsolute(configuredCodexAuth)) {
+      throw new Error("credential_path_invalid: CODEX_AUTH_JSON_PATH must be absolute");
+    }
+    const codexAuth = path.resolve(
+      configuredCodexAuth || path.join(os.homedir(), ".codex", "auth.json")
+    );
+    if (existsSync(codexAuth)) {
+      next.CODEX_AUTH_JSON_PATH = codexAuth;
+      next.CODEX_FORCE_AUTH_JSON = "1";
+    }
   }
   for (const key of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]) {
     const value = next[key];

@@ -108,7 +108,7 @@ export async function packageHarborRuntime(options = {}) {
   if (!existsSync(sandboxComposeSourcePath)) {
     throw new Error(`Portable Harbor sandbox Compose overlay is missing: ${sandboxComposeSourcePath}`);
   }
-  if (!existsSync(agentCliTarball)) {
+  if (options.requireAgentCliTarball !== false && !existsSync(agentCliTarball)) {
     throw new Error(`Packaged agent CLI is missing: ${agentCliTarball}. Run pnpm package:agent-cli first.`);
   }
 

@@ -69,11 +69,15 @@ Selection:
   --dataset <name>                  Harbor dataset identifier
 
 Agent:
+  --harness <sigma|codex>           Harness implementation (default: sigma)
   --provider <id>                   Model provider (default: deepseek)
   --model <id>                      Provider model
   --reasoning-effort <level>        auto, none, low, medium, high, xhigh, or max
   --agent-profile <standard|strict> Sigma profile (default: standard)
   --max-turns <count>               Hard model-turn limit
+  --runtime-archive <path>          Immutable harness runtime archive
+  --runtime-version <version>       Runtime version (required for Codex)
+  --runtime-layout <layout>         sigma-agent-cli, npm-linux-x64, or portable-root
 
 Execution:
   --concurrency <count>             Concurrent trials
@@ -200,8 +204,9 @@ export async function runTerminalBenchCli(argv, deps = {}) {
 }
 
 async function runTerminalBenchCliImpl(argv, deps, signal) {
-  loadDotEnv();
-  const options = resolveRunOptions(argv);
+  const runtimeEnv = deps.env ?? process.env;
+  loadDotEnv(undefined, runtimeEnv);
+  const options = resolveRunOptions(argv, runtimeEnv);
   if (options.mode === "task" && !options.taskId) {
     throw new Error("Task mode requires --task-id <task-id>.");
   }
@@ -209,11 +214,11 @@ async function runTerminalBenchCliImpl(argv, deps, signal) {
     throw new Error("Batch mode requires at least one externally selected task.");
   }
 
-  const baseRunId = makeRunId(new Date(), options.provider, options.model);
+  const baseRunId = makeRunId(new Date(), options.provider, `${options.model ?? "default"}-${options.harness}`);
   const runId = boundedBenchmarkRunId(baseRunId, options.runLabel);
-  const runDir = path.join(benchRootDir, runId);
+  const runDir = path.join(path.resolve(deps.benchRootDir ?? benchRootDir), runId);
   const jobsDir = deps.harborJobsDir ?? portableHarborJobsDir(runDir);
-  const env = harborEnvForRun(runDir);
+  const env = harborEnvForRun(runDir, runtimeEnv, options);
   const startedAt = new Date().toISOString();
   const baseRunner = deps.runProcess ?? runProcess;
   const runner = (command, args, runnerOptions = {}) => baseRunner(command, args, {
@@ -234,6 +239,7 @@ async function runTerminalBenchCliImpl(argv, deps, signal) {
     started_at: startedAt,
     finished_at: null,
     mode: options.mode,
+    harness: options.harness,
     benchmark_class: options.benchmarkClass,
     agent_profile: options.agentProfile,
     evaluation_lane: evaluationLane(options.agentProfile),
@@ -253,8 +259,13 @@ async function runTerminalBenchCliImpl(argv, deps, signal) {
     tasks_file_sha256: options.tasksFileSha256,
     package_reused: options.reusePackage,
     expected_agent_cli_sha256: options.expectedArchiveSha256,
+    expected_runtime_archive_sha256: options.expectedArchiveSha256,
+    runtime_archive: options.runtimeArchive,
+    runtime_archive_sha256: null,
+    runtime_layout: options.runtimeLayout,
+    runtime_version: options.runtimeVersion,
     agent_cli_sha256: null,
-    agent_cli_tarball: env.AGENT_CLI_TARBALL,
+    agent_cli_tarball: options.harness === "sigma" ? options.runtimeArchive : null,
     harbor_jobs_dir: jobsDir,
     harbor_command: harborCommand,
     harbor_command_source: harborCommandInfo.source,
@@ -269,7 +280,7 @@ async function runTerminalBenchCliImpl(argv, deps, signal) {
   await writeRunFiles(runDir, config, harborCommand, harborArgs, env);
 
   if (options.reusePackage) {
-    process.stdout.write(`Reusing SHA-pinned Sigma agent CLI archive...\n`);
+    process.stdout.write(`Reusing SHA-pinned ${options.harness} runtime archive...\n`);
     await writeFile(path.join(runDir, "package.stdout.log"), "Reused existing SHA-pinned archive.\n", "utf8");
     await writeFile(path.join(runDir, "package.stderr.log"), "", "utf8");
     await writeFile(path.join(runDir, "package.raw.log"), "package_reused: true\n", "utf8");
@@ -277,7 +288,7 @@ async function runTerminalBenchCliImpl(argv, deps, signal) {
     process.stdout.write(`Packaging Sigma agent CLI for Terminal-Bench...\n`);
     const packageResult = await packager({
       cwd: rootDir,
-      env: process.env,
+      env: runtimeEnv,
       stdoutPath: path.join(runDir, "package.stdout.log"),
       stderrPath: path.join(runDir, "package.stderr.log"),
       rawPath: path.join(runDir, "package.raw.log")
@@ -292,23 +303,28 @@ async function runTerminalBenchCliImpl(argv, deps, signal) {
     }
   }
 
-  if (!existsSync(env.AGENT_CLI_TARBALL)) {
+  const runtimeArchive = options.runtimeArchive;
+  if (!existsSync(runtimeArchive)) {
     return await failBeforeHarbor(
       runDir,
       config,
-      `AGENT_CLI_TARBALL does not exist after packaging: ${env.AGENT_CLI_TARBALL}`,
+      `Harness runtime archive does not exist after packaging: ${runtimeArchive}`,
       1
     );
   }
 
-  const agentCliSha256 = await sha256File(env.AGENT_CLI_TARBALL);
-  config = { ...config, agent_cli_sha256: agentCliSha256 };
+  const runtimeArchiveSha256 = await sha256File(runtimeArchive);
+  config = {
+    ...config,
+    runtime_archive_sha256: runtimeArchiveSha256,
+    agent_cli_sha256: options.harness === "sigma" ? runtimeArchiveSha256 : null
+  };
   await writeJson(path.join(runDir, "config.json"), config);
-  if (options.expectedArchiveSha256 && agentCliSha256 !== options.expectedArchiveSha256) {
+  if (options.expectedArchiveSha256 && runtimeArchiveSha256 !== options.expectedArchiveSha256) {
     return await failBeforeHarbor(
       runDir,
       config,
-      `Agent CLI archive SHA-256 ${agentCliSha256} does not match frozen ${options.expectedArchiveSha256}.`,
+      `Harness runtime archive SHA-256 ${runtimeArchiveSha256} does not match frozen ${options.expectedArchiveSha256}.`,
       1
     );
   }
@@ -316,7 +332,7 @@ async function runTerminalBenchCliImpl(argv, deps, signal) {
   process.stdout.write(`Packaging portable Harbor runtime...\n`);
   const harborRuntimeResult = await harborRuntimePackager({
     cwd: rootDir,
-    env: process.env,
+    env: runtimeEnv,
     stdoutPath: path.join(runDir, "package-harbor-runtime.stdout.log"),
     stderrPath: path.join(runDir, "package-harbor-runtime.stderr.log"),
     rawPath: path.join(runDir, "package-harbor-runtime.raw.log")
@@ -342,10 +358,11 @@ async function runTerminalBenchCliImpl(argv, deps, signal) {
       1
     );
   }
+  const importModule = options.harness === "codex" ? "codex_harbor_agent" : "sigma_harbor_agent";
   const importSmokeScript = [
-    "import pathlib, sys, sigma_harbor_agent",
+    `import pathlib, sys, ${importModule}`,
     "expected = pathlib.Path(sys.argv[1]).resolve()",
-    "actual = pathlib.Path(sigma_harbor_agent.__file__).resolve().parent",
+    `actual = pathlib.Path(${importModule}.__file__).resolve().parent`,
     "assert actual == expected, f'loaded {actual}, expected {expected}'"
   ].join("; ");
   const importSmoke = await runner(
@@ -431,7 +448,8 @@ async function runTerminalBenchCliImpl(argv, deps, signal) {
     const timeoutProbeConfig = buildHarborTimeoutProbeConfig(
       {
         ...options,
-        agentCliTarball: env.AGENT_CLI_TARBALL
+        env,
+        runtimeArchive
       },
       timeoutProbeJobsDir
     );
@@ -470,7 +488,8 @@ async function runTerminalBenchCliImpl(argv, deps, signal) {
 
   const attemptOptions = {
     ...options,
-    agentCliTarball: env.AGENT_CLI_TARBALL
+    env,
+    runtimeArchive
   };
   const timeoutGroups = options.mode === "smoke"
     ? [{ tasks: [], resolved_tasks: [], configured_tasks: [], timeout_probe: null }]
