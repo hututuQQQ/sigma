@@ -5,6 +5,10 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   defaultAgentCliTarballForEnv,
+  harborAptNetworkConfigPath as defaultHarborAptNetworkConfigPath,
+  harborAptRetryWrapperPath as defaultHarborAptRetryWrapperPath,
+  harborCurlRetryWrapperPath as defaultHarborCurlRetryWrapperPath,
+  harborProxyComposePath as defaultHarborProxyComposePath,
   harborRuntimeDir as defaultHarborRuntimeDir,
   harborSandboxComposePath as defaultHarborSandboxComposePath,
   portableAgentImportPath,
@@ -97,6 +101,30 @@ export async function packageHarborRuntime(options = {}) {
   const sandboxComposePath = options.harborRuntimeDir || options.artifactsDir
     ? path.join(harborRuntimeDir, "docker-compose-sigma-sandbox.yaml")
     : defaultHarborSandboxComposePath;
+  const proxyComposeSourcePath = options.proxyComposeSourcePath
+    ? path.resolve(options.proxyComposeSourcePath)
+    : path.join(rootDir, "portable", "harbor", "docker-compose-sigma-proxy.yaml");
+  const proxyComposePath = options.harborRuntimeDir || options.artifactsDir
+    ? path.join(harborRuntimeDir, "docker-compose-sigma-proxy.yaml")
+    : defaultHarborProxyComposePath;
+  const aptNetworkConfigSourcePath = options.aptNetworkConfigSourcePath
+    ? path.resolve(options.aptNetworkConfigSourcePath)
+    : path.join(rootDir, "portable", "harbor", "apt-network-retries.conf");
+  const aptNetworkConfigPath = options.harborRuntimeDir || options.artifactsDir
+    ? path.join(harborRuntimeDir, "apt-network-retries.conf")
+    : defaultHarborAptNetworkConfigPath;
+  const aptRetryWrapperSourcePath = options.aptRetryWrapperSourcePath
+    ? path.resolve(options.aptRetryWrapperSourcePath)
+    : path.join(rootDir, "portable", "harbor", "apt-network-retry");
+  const aptRetryWrapperPath = options.harborRuntimeDir || options.artifactsDir
+    ? path.join(harborRuntimeDir, "apt-network-retry")
+    : defaultHarborAptRetryWrapperPath;
+  const curlRetryWrapperSourcePath = options.curlRetryWrapperSourcePath
+    ? path.resolve(options.curlRetryWrapperSourcePath)
+    : path.join(rootDir, "portable", "harbor", "curl-network-retry");
+  const curlRetryWrapperPath = options.harborRuntimeDir || options.artifactsDir
+    ? path.join(harborRuntimeDir, "curl-network-retry")
+    : defaultHarborCurlRetryWrapperPath;
   const agentCliTarball = resolveAgentCliTarball(rootDir, artifactsDir, env, options);
 
   if (!existsSync(sourcePath)) {
@@ -108,13 +136,29 @@ export async function packageHarborRuntime(options = {}) {
   if (!existsSync(sandboxComposeSourcePath)) {
     throw new Error(`Portable Harbor sandbox Compose overlay is missing: ${sandboxComposeSourcePath}`);
   }
-  if (!existsSync(agentCliTarball)) {
+  if (!existsSync(proxyComposeSourcePath)) {
+    throw new Error(`Portable Harbor proxy Compose overlay is missing: ${proxyComposeSourcePath}`);
+  }
+  if (!existsSync(aptNetworkConfigSourcePath)) {
+    throw new Error(`Portable Harbor APT network config is missing: ${aptNetworkConfigSourcePath}`);
+  }
+  if (!existsSync(aptRetryWrapperSourcePath)) {
+    throw new Error(`Portable Harbor APT retry wrapper is missing: ${aptRetryWrapperSourcePath}`);
+  }
+  if (!existsSync(curlRetryWrapperSourcePath)) {
+    throw new Error(`Portable Harbor curl retry wrapper is missing: ${curlRetryWrapperSourcePath}`);
+  }
+  if (options.requireAgentCliTarball !== false && !existsSync(agentCliTarball)) {
     throw new Error(`Packaged agent CLI is missing: ${agentCliTarball}. Run pnpm package:agent-cli first.`);
   }
 
   const sourceText = await readFile(sourcePath, "utf8");
   const codexSourceText = await readFile(codexSourcePath, "utf8");
   const sandboxComposeText = await readFile(sandboxComposeSourcePath, "utf8");
+  const proxyComposeText = await readFile(proxyComposeSourcePath, "utf8");
+  const aptNetworkConfigText = await readFile(aptNetworkConfigSourcePath, "utf8");
+  const aptRetryWrapperText = await readFile(aptRetryWrapperSourcePath, "utf8");
+  const curlRetryWrapperText = await readFile(curlRetryWrapperSourcePath, "utf8");
   assertNoRemovedHarborAdapter(sourceText, "Portable Harbor runtime source");
   assertNoRemovedHarborAdapter(codexSourceText, "Portable Codex Harbor runtime source");
 
@@ -126,6 +170,10 @@ export async function packageHarborRuntime(options = {}) {
   await writeFile(runtimePath, sourceText, "utf8");
   await writeFile(codexRuntimePath, codexSourceText, "utf8");
   await writeFile(sandboxComposePath, sandboxComposeText, "utf8");
+  await writeFile(proxyComposePath, proxyComposeText, "utf8");
+  await writeFile(aptNetworkConfigPath, aptNetworkConfigText, "utf8");
+  await writeFile(aptRetryWrapperPath, aptRetryWrapperText, { encoding: "utf8", mode: 0o755 });
+  await writeFile(curlRetryWrapperPath, curlRetryWrapperText, { encoding: "utf8", mode: 0o755 });
 
   const readmeText = runtimeReadme(agentCliTarball);
 
@@ -139,6 +187,10 @@ export async function packageHarborRuntime(options = {}) {
     runtimePath,
     codexRuntimePath,
     sandboxComposePath,
+    proxyComposePath,
+    aptNetworkConfigPath,
+    aptRetryWrapperPath,
+    curlRetryWrapperPath,
     agentCliTarball
   };
 }

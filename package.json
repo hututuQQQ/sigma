@@ -30,7 +30,7 @@
     "mutation:protocol": "stryker run stryker.protocol.conf.mjs",
     "mutation:kernel": "stryker run stryker.kernel.conf.mjs",
     "mutation": "pnpm mutation:protocol && pnpm mutation:kernel",
-    "test:harbor": "python -m unittest tests.test_harbor_agent tests.test_codex_harbor_agent",
+    "test:harbor": "python -m unittest tests.test_harbor_agent tests.test_codex_harbor_agent tests.test_harbor_probe",
     "test:all": "pnpm test && pnpm test:harbor",
     "typecheck": "tsc -b --pretty false",
     "lint:eslint": "eslint packages scripts tests *.ts *.mjs",
@@ -56,6 +56,7 @@
     "verify:package:agent-cli:windows": "node scripts/release/run-stage-graph.ts verify-package-windows",
     "verify:package:agent-cli:macos": "node scripts/release/run-stage-graph.ts verify-package-macos",
     "package:harbor-runtime": "node scripts/package-harbor-runtime.mjs",
+    "package:codex-runtime": "node scripts/package-codex-runtime.mjs",
     "smoke:local": "pnpm build && node scripts/smoke-local.mjs",
     "smoke:local:fake": "pnpm smoke:product",
     "smoke:product": "pnpm build && node --experimental-ffi --disable-warning=ExperimentalWarning scripts/smoke-product.mjs",
@@ -86,7 +87,10 @@
     "bench:tb:report:all": "node scripts/bench-report.mjs --all",
     "bench:tb:formal": "node scripts/bench-terminal-bench-formal.mjs",
     "bench:tb:preregister": "node scripts/bench-terminal-bench-formal-preregistration.mjs",
-    "bench:tb:identity-archive": "node scripts/bench-task-identity-archive.mjs"
+    "bench:tb:identity-archive": "node scripts/bench-task-identity-archive.mjs",
+    "bench:paired:preregister": "node scripts/bench-paired-preregistration.mjs",
+    "bench:paired:run": "node scripts/bench-paired-experiment.mjs",
+    "bench:paired:analyze": "node scripts/bench-paired-analysis.mjs"
   },
   "devDependencies": {
     "@agentclientprotocol/sdk": "1.3.0",

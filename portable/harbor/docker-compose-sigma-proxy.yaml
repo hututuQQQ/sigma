@@ -1,0 +1,18 @@
+services:
+  main:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      HTTP_PROXY: "${SIGMA_CONTAINER_HTTP_PROXY}"
+      HTTPS_PROXY: "${SIGMA_CONTAINER_HTTPS_PROXY}"
+      ALL_PROXY: "${SIGMA_CONTAINER_ALL_PROXY}"
+      NO_PROXY: "${SIGMA_CONTAINER_NO_PROXY}"
+      http_proxy: "${SIGMA_CONTAINER_HTTP_PROXY}"
+      https_proxy: "${SIGMA_CONTAINER_HTTPS_PROXY}"
+      all_proxy: "${SIGMA_CONTAINER_ALL_PROXY}"
+      no_proxy: "${SIGMA_CONTAINER_NO_PROXY}"
+    volumes:
+      - "${SIGMA_CONTAINER_APT_CONFIG}:/etc/apt/apt.conf.d/80sigma-network-retries:ro"
+      - "${SIGMA_CONTAINER_APT_RETRY_WRAPPER}:/usr/local/bin/apt:ro"
+      - "${SIGMA_CONTAINER_APT_RETRY_WRAPPER}:/usr/local/bin/apt-get:ro"
+      - "${SIGMA_CONTAINER_CURL_RETRY_WRAPPER}:/usr/local/bin/curl:ro"

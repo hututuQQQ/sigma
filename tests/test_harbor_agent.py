@@ -117,6 +117,19 @@ def managed_doctor_payload() -> str:
     return json.dumps(payload)
 
 
+def transient_doctor_api_failure(category: str = "timeout") -> str:
+    payload = json.loads(current_doctor_payload())
+    payload["status"] = "error"
+    payload["checks"] = [{
+        "name": "api",
+        "status": "error",
+        "message": f"transient {category}",
+        "failure_kind": "network_error" if category in {"network", "timeout"} else "api_error",
+        "error_category": category,
+    }]
+    return json.dumps(payload)
+
+
 class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self._saved_agent_env = {
@@ -879,12 +892,47 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                     "command -v /usr/local/bin/agent >/dev/null 2>&1",
                     "/usr/local/bin/agent --help",
                     "/usr/local/bin/agent doctor --workspace /app --json --strict "
+                    "--provider deepseek --model auto "
                     "--execution-mode sandboxed --network full --read-scope host "
                     "--write-scope workspace "
                     "--managed-environment-mode disabled --reasoning-effort auto "
                     "--max-model-turns 200 "
                     "--command-timeout-sec 180 --check-api",
                 ],
+            )
+
+    async def test_setup_retries_only_transient_api_doctor_failure_for_selected_model(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            env = SimpleNamespace(exec=AsyncMock(side_effect=[
+                SimpleNamespace(return_code=0, stdout="usage", stderr=""),
+                SimpleNamespace(return_code=1, stdout=transient_doctor_api_failure(), stderr=""),
+                SimpleNamespace(return_code=1, stdout=transient_doctor_api_failure("server"), stderr=""),
+                SimpleNamespace(return_code=0, stdout=current_doctor_payload(), stderr=""),
+            ]))
+            agent = module.SigmaCliHarborAgent(
+                logs_dir=Path(tmp) / "logs",
+                provider="openai-codex",
+                model="gpt-5.6-sol",
+            )
+            agent._workspace = "/app"
+
+            with patch.object(module.asyncio, "sleep", new_callable=AsyncMock) as sleep:
+                await agent._verify_agent_ready(env)
+
+            self.assertEqual([item.args[0] for item in sleep.await_args_list], [1, 2])
+            doctor_commands = [item.args[0] for item in env.exec.await_args_list[1:]]
+            self.assertEqual(len(doctor_commands), 3)
+            self.assertTrue(all(
+                "--provider openai-codex --model gpt-5.6-sol" in command
+                for command in doctor_commands
+            ))
+            record = json.loads((Path(tmp) / "logs" / "setup-check.json").read_text(encoding="utf-8"))
+            attempts = record["checks"][1]["preflight_attempts"]
+            self.assertEqual([item["exit_code"] for item in attempts], [1, 1, 0])
+            self.assertEqual(
+                [item["retryable_api_failure"] for item in attempts],
+                [True, True, False],
             )
 
     async def test_setup_doctor_failure_is_classified_and_persisted(self):

@@ -19,6 +19,10 @@ describe("package-harbor-runtime", () => {
     const runtimeSource = await readFile(path.join(result.harborRuntimeDir, "sigma_harbor_agent.py"), "utf8");
     const codexRuntimeSource = await readFile(path.join(result.harborRuntimeDir, "codex_harbor_agent.py"), "utf8");
     const sandboxCompose = await readFile(result.sandboxComposePath, "utf8");
+    const proxyCompose = await readFile(result.proxyComposePath, "utf8");
+    const aptNetworkConfig = await readFile(result.aptNetworkConfigPath, "utf8");
+    const aptRetryWrapper = await readFile(result.aptRetryWrapperPath, "utf8");
+    const curlRetryWrapper = await readFile(result.curlRetryWrapperPath, "utf8");
     const readme = await readFile(path.join(result.harborRuntimeDir, "README.md"), "utf8");
     const packagedFiles = await readdir(result.harborRuntimeDir);
 
@@ -30,6 +34,20 @@ describe("package-harbor-runtime", () => {
     expect(runtimeSource).toContain(portableAgentImportPath.split(":")[1]);
     expect(sandboxCompose).toContain("SYS_ADMIN");
     expect(sandboxCompose).toContain("seccomp=unconfined");
+    expect(proxyCompose).toContain("host.docker.internal:host-gateway");
+    expect(proxyCompose).toContain("SIGMA_CONTAINER_HTTPS_PROXY");
+    expect(proxyCompose).toContain("80sigma-network-retries");
+    expect(proxyCompose).toContain("SIGMA_CONTAINER_APT_RETRY_WRAPPER");
+    expect(proxyCompose).toContain("SIGMA_CONTAINER_CURL_RETRY_WRAPPER");
+    expect(aptNetworkConfig).toContain('Acquire::Retries "5";');
+    expect(aptRetryWrapper).toContain("Transient APT network failure");
+    expect(aptRetryWrapper).toContain("502[[:space:]]+Bad Gateway");
+    expect(aptRetryWrapper).toContain('exit "$status"');
+    expect(curlRetryWrapper).toContain("Transient curl network failure");
+    expect(curlRetryWrapper).toContain("5|6|7|18|28|35|52|55|56|92");
+    expect(curlRetryWrapper).toContain("max_attempts=8");
+    expect(curlRetryWrapper).toContain("max_delay=30");
+    expect(curlRetryWrapper).toContain('cat "$stdout_file"');
     expect(path.isAbsolute(result.agentCliTarball)).toBe(true);
     expect(packagedFiles.some((name) => name.endsWith(".json"))).toBe(false);
     expect(readme).not.toContain(removedHarborPackageName);

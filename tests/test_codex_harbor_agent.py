@@ -116,6 +116,46 @@ class PortableCodexTest(unittest.IsolatedAsyncioTestCase):
                     codex_cli_sha256="0" * 64,
                 )
 
+    async def test_installs_official_npm_linux_archive_layout(self):
+        module, _stub = import_portable_codex_module()
+        with TemporaryDirectory() as tmp:
+            archive = Path(tmp) / "codex-linux-x64.tgz"
+            archive.write_bytes(b"official-platform-runtime")
+            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            agent = module.PortableCodex(
+                logs_dir=Path(tmp) / "logs",
+                version="0.146.0",
+                codex_cli_tarball=archive,
+                codex_cli_sha256=digest,
+                codex_cli_layout="npm-linux-x64",
+            )
+            environment = RecordingEnvironment()
+
+            await agent.install(environment)
+
+        commands = "\n".join(command for command, _kwargs in environment.exec_calls)
+        self.assertIn("--strip-components=0", commands)
+        self.assertIn(
+            "/opt/codex-cli/package/vendor/"
+            "x86_64-unknown-linux-musl/bin/codex",
+            commands,
+        )
+
+    async def test_rejects_unknown_archive_layout(self):
+        module, _stub = import_portable_codex_module()
+        with TemporaryDirectory() as tmp:
+            archive = Path(tmp) / "codex-cli.tgz"
+            archive.write_bytes(b"runtime")
+            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            with self.assertRaisesRegex(ValueError, "codex_cli_layout"):
+                module.PortableCodex(
+                    logs_dir=Path(tmp) / "logs",
+                    version="0.146.0",
+                    codex_cli_tarball=archive,
+                    codex_cli_sha256=digest,
+                    codex_cli_layout="unknown",
+                )
+
     async def test_rejects_extracted_version_mismatch(self):
         module, _stub = import_portable_codex_module()
         with TemporaryDirectory() as tmp:

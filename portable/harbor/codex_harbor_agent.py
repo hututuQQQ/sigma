@@ -18,6 +18,24 @@ from harbor.environments.base import BaseEnvironment
 
 
 _SHA256_PATTERN = re.compile(r"^[a-f0-9]{64}$")
+_ARCHIVE_LAYOUTS = {
+    "portable-root": {
+        "strip_components": 1,
+        "binary": "/opt/codex-cli/bin/codex",
+        "rg": "/opt/codex-cli/bin/rg",
+    },
+    "npm-linux-x64": {
+        "strip_components": 0,
+        "binary": (
+            "/opt/codex-cli/package/vendor/"
+            "x86_64-unknown-linux-musl/bin/codex"
+        ),
+        "rg": (
+            "/opt/codex-cli/package/vendor/"
+            "x86_64-unknown-linux-musl/codex-path/rg"
+        ),
+    },
+}
 
 
 def _sha256_file(path: pathlib.Path) -> str:
@@ -39,6 +57,7 @@ class PortableCodex(Codex):
         *args: Any,
         codex_cli_tarball: pathlib.Path | str | None = None,
         codex_cli_sha256: str | None = None,
+        codex_cli_layout: str = "portable-root",
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -60,8 +79,15 @@ class PortableCodex(Codex):
                 f"expected {expected_sha256}, got {actual_sha256}"
             )
 
+        if codex_cli_layout not in _ARCHIVE_LAYOUTS:
+            raise ValueError(
+                "codex_cli_layout must be one of: "
+                + ", ".join(sorted(_ARCHIVE_LAYOUTS))
+            )
+
         self.codex_cli_tarball = runtime_path
         self.codex_cli_sha256 = expected_sha256
+        self.codex_cli_layout = codex_cli_layout
 
     async def install(self, environment: BaseEnvironment) -> None:
         # A matching version string is not a content identity. Re-check the
@@ -81,6 +107,10 @@ class PortableCodex(Codex):
         await environment.upload_file(self.codex_cli_tarball, self._REMOTE_ARCHIVE)
         remote_root = shlex.quote(self._REMOTE_ROOT)
         remote_archive = shlex.quote(self._REMOTE_ARCHIVE)
+        layout = _ARCHIVE_LAYOUTS[self.codex_cli_layout]
+        codex_binary = shlex.quote(layout["binary"])
+        rg_binary = shlex.quote(layout["rg"])
+        strip_components = int(layout["strip_components"])
         await self.exec_as_root(
             environment,
             command=(
@@ -90,13 +120,14 @@ class PortableCodex(Codex):
                 f"rm -f {remote_archive}; exit 1; fi; "
                 f"rm -rf {remote_root}; "
                 f"mkdir -p {remote_root} /usr/local/bin; "
-                f"tar -xzf {remote_archive} -C {remote_root} --strip-components=1; "
-                f"test -x {remote_root}/bin/codex; "
-                f"chmod 0755 {remote_root}/bin/codex; "
-                f"ln -sf {remote_root}/bin/codex /usr/local/bin/codex; "
-                f"if test -f {remote_root}/bin/rg; then "
-                f"chmod 0755 {remote_root}/bin/rg; "
-                f"ln -sf {remote_root}/bin/rg /usr/local/bin/rg; "
+                f"tar -xzf {remote_archive} -C {remote_root} "
+                f"--strip-components={strip_components}; "
+                f"test -x {codex_binary}; "
+                f"chmod 0755 {codex_binary}; "
+                f"ln -sf {codex_binary} /usr/local/bin/codex; "
+                f"if test -f {rg_binary}; then "
+                f"chmod 0755 {rg_binary}; "
+                f"ln -sf {rg_binary} /usr/local/bin/rg; "
                 "fi; "
                 f"rm -f {remote_archive}"
             ),

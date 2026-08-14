@@ -13,6 +13,8 @@ from harbor.job import Job
 from harbor.models.job.config import JobConfig
 from harbor.models.task.config import TaskConfig as TaskDefinitionConfig
 from harbor.models.task.paths import TaskPaths
+from harbor.tasks.client import TaskClient
+from harbor_task_download_retry import install_git_task_download_retry
 
 
 def _number(value: Any) -> float | None:
@@ -101,6 +103,7 @@ def _max_number(records: list[dict[str, Any]], key: str) -> float | None:
 
 
 async def _main(config_path: Path) -> None:
+    install_git_task_download_retry(TaskClient)
     config = JobConfig.model_validate_json(config_path.read_text(encoding="utf-8-sig"))
     job = await Job.create(config)
 

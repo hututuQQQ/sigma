@@ -1,0 +1,50 @@
+#!/bin/sh
+
+# Retry only transient network failures from the same apt/apt-get invocation.
+# Package, dpkg, argument, and other deterministic failures retain the original
+# exit code without retrying.
+
+command_name=${0##*/}
+case "$command_name" in
+  apt|apt-get) ;;
+  *)
+    printf '%s\n' "Unsupported APT wrapper command: $command_name" >&2
+    exit 64
+    ;;
+esac
+
+real_bin_dir=${SIGMA_APT_REAL_BIN_DIR:-/usr/bin}
+real_command=$real_bin_dir/$command_name
+if [ ! -x "$real_command" ]; then
+  printf '%s\n' "APT executable is unavailable: $real_command" >&2
+  exit 127
+fi
+
+log_file=$(mktemp "${TMPDIR:-/tmp}/sigma-apt-network-retry.XXXXXX") || exit 70
+trap 'rm -f "$log_file"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' HUP TERM
+
+attempt=1
+max_attempts=5
+while :; do
+  : >"$log_file"
+  "$real_command" "$@" >"$log_file" 2>&1
+  status=$?
+  cat "$log_file"
+  if [ "$status" -eq 0 ]; then
+    exit 0
+  fi
+
+  if [ "$attempt" -ge "$max_attempts" ] || ! grep -Eiq \
+    '502[[:space:]]+Bad Gateway|503[[:space:]]+Service Unavailable|504[[:space:]]+Gateway (Time-out|Timeout)|Temporary failure resolving|Could not resolve|Could not connect|Connection failed|Connection timed out|Connection reset by peer|Network is unreachable|TLS connection was non-properly terminated|Resource temporarily unavailable' \
+    "$log_file"; then
+    exit "$status"
+  fi
+
+  delay=$((1 << (attempt - 1)))
+  printf '%s\n' \
+    "Transient APT network failure; retrying command ($attempt/$max_attempts) in ${delay}s." >&2
+  sleep "$delay"
+  attempt=$((attempt + 1))
+done
