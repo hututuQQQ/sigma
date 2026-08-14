@@ -10,7 +10,11 @@ import {
   runSlotIntegrityReasons,
   taskSelectionIdentitySha256
 } from "../scripts/bench-common.mjs";
-import { analyzePairedExperiment } from "../scripts/bench-paired-analysis.mjs";
+import {
+  analyzePairedExperiment,
+  bootstrapByTask,
+  semanticToolCategory
+} from "../scripts/bench-paired-analysis.mjs";
 import {
   classifyBlockingCondition,
   runPairedExperiment,
@@ -478,5 +482,26 @@ describe("paired Harness experiment", () => {
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
+  });
+
+  it("cluster-resamples tasks with replacement instead of cycling low PRNG bits", () => {
+    const rows = Array.from({ length: 8 }, (_unused, task_index) => ({ task_index, value: task_index }));
+    const interval = bootstrapByTask(rows, (row) => row.value, "bootstrap-fixture");
+    expect(interval).toMatchObject({ samples: 4_000 });
+    expect(interval!.low).toBeLessThan(interval!.high);
+    expect(interval!.low).toBeLessThan(3.5);
+    expect(interval!.high).toBeGreaterThan(3.5);
+  });
+
+  it("normalizes cross-harness tool aliases into semantic categories", () => {
+    expect(semanticToolCategory("exec")).toBe("command");
+    expect(semanticToolCategory("shell")).toBe("command");
+    expect(semanticToolCategory("read")).toBe("inspect");
+    expect(semanticToolCategory("grep")).toBe("inspect");
+    expect(semanticToolCategory("apply_patch")).toBe("edit");
+    expect(semanticToolCategory("update_plan")).toBe("plan");
+    expect(semanticToolCategory("spawn_agent")).toBe("delegate");
+    expect(semanticToolCategory("join_agent")).toBe("wait");
+    expect(semanticToolCategory("custom-tool")).toBe("other:custom_tool");
   });
 });

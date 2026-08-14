@@ -96,6 +96,20 @@ function canonical(value) {
   return JSON.stringify(value);
 }
 
+export function semanticToolCategory(name) {
+  const normalized = String(name ?? "unknown").trim().toLowerCase().replace(/[^a-z0-9]+/gu, "_");
+  if (["exec", "shell"].includes(normalized)) return "command";
+  if ([
+    "read", "grep", "list", "repository_inspect", "repository_stats", "git_status", "git_diff",
+    "web_run", "inspect_image"
+  ].includes(normalized)) return "inspect";
+  if (["edit", "write", "apply_patch"].includes(normalized)) return "edit";
+  if (["update_plan", "request_strategy"].includes(normalized)) return "plan";
+  if (normalized === "spawn_agent") return "delegate";
+  if (["wait", "join_agent"].includes(normalized)) return "wait";
+  return `other:${normalized || "unknown"}`;
+}
+
 function sigmaTrace(records) {
   let modelTurns = 0;
   let toolCalls = 0;
@@ -115,7 +129,7 @@ function sigmaTrace(records) {
       toolCalls += 1;
       const name = String(metadata.toolName ?? payload.toolName ?? payload.name ?? "unknown");
       tools[name] = (tools[name] ?? 0) + 1;
-      sequence.push(name);
+      sequence.push(semanticToolCategory(name));
       signatures.push(`${name}\0${canonical(payload.args ?? payload.input ?? metadata.args ?? {})}`);
     }
     if ((type === "tool_end" || durableType === "tool.completed")
@@ -143,7 +157,7 @@ function atifTrace(trajectory) {
       toolCalls += 1;
       const name = String(call?.function_name ?? "unknown");
       tools[name] = (tools[name] ?? 0) + 1;
-      sequence.push(name);
+      sequence.push(semanticToolCategory(name));
       signatures.push(`${name}\0${canonical(call?.arguments ?? {})}`);
       const result = results.find((item) => item?.source_call_id === call?.tool_call_id);
       if (result?.is_error === true) toolFailures += 1;
@@ -320,7 +334,7 @@ function pairedRows(records, arms) {
   return [...map.values()].filter((pair) => pair[arms[0]] && pair[arms[1]]);
 }
 
-function bootstrapByTask(rows, accessor, seedText) {
+export function bootstrapByTask(rows, accessor, seedText) {
   const taskIds = [...new Set(rows.map((row) => row.task_index))].sort((a, b) => a - b);
   if (taskIds.length === 0) return null;
   const byTask = new Map(taskIds.map((task) => [task, rows.filter((row) => row.task_index === task)]));
@@ -330,7 +344,7 @@ function bootstrapByTask(rows, accessor, seedText) {
     const values = [];
     for (let index = 0; index < taskIds.length; index += 1) {
       state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
-      const selected = taskIds[state % taskIds.length];
+      const selected = taskIds[Math.floor((state / 0x1_0000_0000) * taskIds.length)];
       values.push(...byTask.get(selected).map(accessor).filter(Number.isFinite));
     }
     if (values.length > 0) medians.push(median(values));
@@ -505,7 +519,7 @@ function markdown(report) {
     "",
     `- ${reference}: ${left.trace.available}/${left.attempts}`,
     `- ${comparison}: ${right.trace.available}/${right.attempts}`,
-    `- Median normalized tool-sequence distance: ${report.paired.trace.tool_sequence_normalized_edit_distance.median ?? "n/a"}`,
+    `- Median normalized semantic tool-category sequence distance: ${report.paired.trace.tool_sequence_normalized_edit_distance.median ?? "n/a"}`,
     "",
     "Ratios below 1 favor the comparison arm for cost-like metrics. Confidence intervals cluster-resample tasks, retaining all repetitions within each sampled task.",
     ""
