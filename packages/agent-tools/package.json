@@ -25,7 +25,7 @@
     "agent-protocol": "workspace:*",
     "agent-web": "workspace:*",
     "ajv": "8.18.0",
-    "pdfjs-dist": "6.1.200",
+    "pdfjs-dist": "6.2.108",
     "tesseract.js": "7.0.0"
   },
   "engines": {
