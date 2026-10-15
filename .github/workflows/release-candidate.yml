@@ -343,7 +343,7 @@ jobs:
           cache: pnpm
           cache-dependency-path: sigma-code/pnpm-lock.yaml
       - name: Download verified Windows Runtime
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: release-input-runtime-win32-x64-${{ github.run_id }}
           path: runtime-assets
@@ -451,7 +451,7 @@ jobs:
           cache: pnpm
           cache-dependency-path: sigma-code/pnpm-lock.yaml
       - name: Download verified macOS Runtime
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: release-input-runtime-darwin-arm64-${{ github.run_id }}
           path: runtime-assets
@@ -698,7 +698,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
       - name: Download verified release inputs
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: release-input-*-${{ github.run_id }}
           path: release-inputs
